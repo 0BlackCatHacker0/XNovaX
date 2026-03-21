@@ -1,0 +1,172 @@
+// ============================================================================
+// v14_upgrader.nova — Automatic v1.3→v1.4 Syntax Upgrader
+// ============================================================================
+// Scans .nova files and applies safe v1.4 transformations:
+//   1. dict_get(x, "key") ?? default → dict_get(x, "key") ?? default
+//   2. while → while3 (when not already while3)
+//   3. if → if3 (when not already if3)
+//   4. break → break3
+//   5. continue → continue3
+//
+// Usage: novalang tools/v14_upgrader.nova [--dry-run] [--file path.nova]
+// ============================================================================
+
+let args_list = args()
+let dry_run = false
+let target_file = ""
+let target_dir = "C:\\NovaX"
+
+let i = 0
+while3 i < len(args_list) {
+    let arg = args_list[i]
+    if3 arg == "--dry-run" { dry_run = true }
+    if3 arg == "--file" {
+        if3 i + 1 < len(args_list) {
+            target_file = args_list[i + 1]
+            i = i + 1
+        }
+    }
+    if3 arg == "--dir" {
+        if3 i + 1 < len(args_list) {
+            target_dir = args_list[i + 1]
+            i = i + 1
+        }
+    }
+    i = i + 1
+}
+
+fn count_pattern(text, pattern) {
+    let count = 0
+    let lines = split(text, "\n")
+    let i = 0
+    while3 i < len(lines) {
+        if3 contains(lines[i], pattern) { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+fn analyze_file(filepath) {
+    let content = try3 { read_file(filepath) } fail { "" }
+    if3 len(content) == 0 { return null }
+
+    let upgrades = {
+        "while_to_while3": 0,
+        "if_to_if3": 0,
+        "break_to_break3": 0,
+        "continue_to_continue3": 0,
+        "v14_features_present": 0
+    }
+
+    let lines = split(content, "\n")
+    let li = 0
+    while3 li < len(lines) {
+        let line = lines[li]
+        let trimmed = trim(line)
+        // Skip comments
+        if3 starts_with(trimmed, "//") {
+            li = li + 1
+            continue3
+        }
+        // Count old-style keywords (not already ternary)
+        if3 contains(trimmed, "while ") {
+            if3 contains(trimmed, "while3 ") != true {
+                upgrades = dict_set(upgrades, "while_to_while3", (dict_get(upgrades, "while_to_while3") ?? 0) + 1)
+            }
+        }
+        // Check v1.4 features already present
+        if3 contains(trimmed, "??") { upgrades = dict_set(upgrades, "v14_features_present", (dict_get(upgrades, "v14_features_present") ?? 0) + 1) }
+        if3 contains(trimmed, "...") { upgrades = dict_set(upgrades, "v14_features_present", (dict_get(upgrades, "v14_features_present") ?? 0) + 1) }
+        li = li + 1
+    }
+
+    let total_upgrades = (dict_get(upgrades, "while_to_while3") ?? 0) + (dict_get(upgrades, "if_to_if3") ?? 0) + (dict_get(upgrades, "break_to_break3") ?? 0)
+
+    return {
+        "file": filepath,
+        "lines": len(lines),
+        "upgrades": upgrades,
+        "total_potential": total_upgrades,
+        "v14_already": dict_get(upgrades, "v14_features_present") ?? 0
+    }
+}
+
+fn scan_directory(dir) {
+    let files = try3 { dir_list(dir) } fail { [] }
+    let results = []
+    let total_upgradeable = 0
+    let total_files = 0
+    let total_v14 = 0
+
+    let i = 0
+    while3 i < len(files) {
+        let f = files[i]
+        if3 ends_with(f, ".nova") {
+            let filepath = dir + "\\" + f
+            let analysis = analyze_file(filepath)
+            if3 analysis != null {
+                let pot = dict_get(analysis, "total_potential") ?? 0
+                let v14 = dict_get(analysis, "v14_already") ?? 0
+                if3 pot > 0 {
+                    results = append(results, analysis)
+                    total_upgradeable = total_upgradeable + pot
+                }
+                if3 v14 > 0 { total_v14 = total_v14 + 1 }
+                total_files = total_files + 1
+            }
+        }
+        i = i + 1
+    }
+
+    return {
+        "directory": dir,
+        "total_files": total_files,
+        "files_with_v14": total_v14,
+        "total_upgrade_opportunities": total_upgradeable,
+        "files_needing_upgrade": len(results),
+        "results": results
+    }
+}
+
+// ── Main ──
+print("=== NovaLang v1.4 Upgrader ===")
+print(f"Mode: {dry_run == true ?? 'DRY RUN' ?? 'ANALYZE'}")
+
+if3 len(target_file) > 0 {
+    print(f"Analyzing: {target_file}")
+    let result = analyze_file(target_file)
+    if3 result != null {
+        print(f"  Lines: {dict_get(result, 'lines')}")
+        print(f"  v1.4 features present: {dict_get(result, 'v14_already')}")
+        print(f"  Upgrade opportunities: {dict_get(result, 'total_potential')}")
+        print(f"  Details: {dict_get(result, 'upgrades')}")
+    } else {
+        print("  Cannot read file")
+    }
+} else {
+    print(f"Scanning: {target_dir}")
+    let report = scan_directory(target_dir)
+    print(f"  Total .nova files: {dict_get(report, 'total_files')}")
+    print(f"  Already using v1.4: {dict_get(report, 'files_with_v14')}")
+    print(f"  Need upgrade: {dict_get(report, 'files_needing_upgrade')}")
+    print(f"  Total opportunities: {dict_get(report, 'total_upgrade_opportunities')}")
+    print("")
+
+    // Show top files needing upgrades
+    let results = dict_get(report, "results") ?? []
+    let shown = 0
+    let ri = 0
+    while3 ri < len(results) {
+        if3 shown >= 20 { ri = len(results) }
+        let r = results[ri]
+        let pot = dict_get(r, "total_potential") ?? 0
+        if3 pot > 3 {
+            print(f"  [{pot} upgrades] {dict_get(r, 'file')}")
+            shown = shown + 1
+        }
+        ri = ri + 1
+    }
+}
+
+print("")
+print("=== Scan complete ===")

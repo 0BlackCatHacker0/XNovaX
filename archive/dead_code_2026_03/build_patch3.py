@@ -1,0 +1,63 @@
+import os
+P='C:\\ProgramData\\NovaX\\app\\shell\\static\\hivemind_patch.js'
+L=[]
+A=L.append
+
+# === RENDER GRID (show results) ===
+A('')
+A('// === RENDERERS ===')
+A('function _hiveRenderGrid(task){')
+A('  var grid=document.querySelector(".hive-grid,.grid-area,#hive-grid");')
+A('  if(!grid){var main=document.querySelector(".main-panel,.center-panel,.content");if(main){grid=main;}}')
+A('  if(!grid)return;')
+A('  var html="";')
+A('  if(task&&task.results){')
+A('    task.results.forEach(function(r){')
+A('      var col=catColors[hiveCat(r.model||"")]||"#888";')
+A('      html+="<div style=\\"background:rgba(30,40,60,.7);border:1px solid "+col+";border-radius:8px;padding:12px;margin:8px\\">";')
+A('      html+="<div style=\\"color:"+col+";font-weight:bold;font-size:13px\\">"+((r.model||"unknown")+"").replace("novax-","")+"</div>";')
+A('      html+="<div style=\\"color:#ccc;font-size:13px;margin-top:6px;white-space:pre-wrap\\">"+(r.response||r.text||"No response")+"</div>";')
+A('      if(r.tokens)html+="<div style=\\"color:#555;font-size:11px;margin-top:4px\\">"+r.tokens+" tokens | "+(r.seconds||0).toFixed(1)+"s</div>";')
+A('      html+="</div>";')
+A('    });')
+A('  }')
+A('  if(html)grid.innerHTML=html;')
+A('}')
+A('')
+
+# === RENDER TASKS (sidebar task queue) ===
+A('function _hiveRenderTasks(){')
+A('  var el=document.querySelector(".task-list,.task-queue,#task-queue");')
+A('  if(!el)return;')
+A('  var html="";')
+A('  _hiveTasks.slice(0,20).forEach(function(t){')
+A('    var sc=t.status==="done"?"#0f0":t.status==="error"?"#f00":"#ff0";')
+A('    html+="<div style=\\"padding:6px;border-bottom:1px solid #222;font-size:12px\\">";')
+A('    html+="<span style=\\"color:"+sc+"\\">"+t.status+"</span> ";')
+A('    html+=t.prompt.substring(0,40)+(t.prompt.length>40?"...":"");')
+A('    if(t.elapsed)html+=" <span style=\\"color:#555\\">"+t.elapsed+"ms</span>";')
+A('    html+="</div>";')
+A('  });')
+A('  el.innerHTML=html||"<div style=\\"color:#555;padding:10px\\">No tasks yet</div>";')
+A('}')
+A('')
+
+# === LIVE ACTIVITY LOG ===
+A('function _hiveLog(msg){')
+A('  var el=document.querySelector(".activity-log,.live-activity,#live-activity");')
+A('  if(!el){')
+A('    var panels=document.querySelectorAll(".right-panel,.sidebar-right");')
+A('    if(panels.length>0){el=document.createElement("div");el.className="live-activity";panels[panels.length-1].appendChild(el);}')
+A('    else return;')
+A('  }')
+A('  var line=document.createElement("div");')
+A('  line.style.cssText="font-size:11px;color:#7af;padding:2px 0";')
+A('  line.textContent="["+new Date().toLocaleTimeString()+"] "+msg;')
+A('  el.appendChild(line);')
+A('  if(el.children.length>50)el.removeChild(el.firstChild);')
+A('  el.scrollTop=el.scrollHeight;')
+A('}')
+A('')
+
+open(P,'a',encoding='utf-8').write('\n'.join(L))
+print('PART3 OK',len(L),'lines')

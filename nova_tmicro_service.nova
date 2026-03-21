@@ -1,0 +1,341 @@
+// Nova TMicro Service v1.0 — Micro-Tool Factory & Registry
+// Port 9936 | Tracks problems→tools, builds antibodies
+// "Every problem a new tool, every new tool another idea made real"
+//
+// The immune system: problems encountered become micro-tools.
+// Each tool returns +1 (fixed), 0 (in-progress), -1 (failed/needs attention).
+//
+// Endpoints:
+//   GET  /health              — health check
+//   GET  /micro/registry      — all registered micro-tools
+//   GET  /micro/problems      — tracked problems awaiting tools
+//   GET  /micro/stats         — tool build stats
+//   POST /micro/problem       — register a new problem
+//   POST /micro/solve         — mark problem as solved (link to tool)
+//   POST /micro/check         — run a tool's health trit
+//   POST /micro/diagnose      — diagnose a port/service issue
+//   POST /micro/port-guard    — tport_guard: check port ownership
+//   POST /micro/bind-check    — tbind_check: verify port binding
+//   POST /micro/import-check  — timport_check: validate imports
+//   POST /micro/zombie-kill   — kill zombies on a port
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9936
+let SERVICE_NAME = "nova-tmicro"
+let VERSION = "1.0.0"
+
+
+let RE_LAMINAR = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT = 343
+
+// ── Problem Registry ──
+let _problems = []
+let _tools = {}
+let _stats = {"problems_logged": 0, "tools_built": 0, "diagnoses": 0, "t0": time()}
+
+// Pre-seed with known problems from history
+fn seed_registry() {
+    // Built tools
+    let built = [
+        {"name": "tserve", "problem": "20 services repeat same HTTP boilerplate", "status": "built", "trit": 1},
+        {"name": "TCapture", "problem": "Timed-out futures silently discarded", "status": "built", "trit": 1},
+        {"name": "TTimeout", "problem": "Scatter timeout too short for chaotic", "status": "built", "trit": 1},
+        {"name": "TWave", "problem": "All models submitted at once, first 2 finish", "status": "built", "trit": 1},
+        {"name": "TProbe", "problem": "Health only checks socket, not queue saturation", "status": "built", "trit": 1},
+        {"name": "TVram", "problem": "Cold models take 30-60s to load into VRAM", "status": "built", "trit": 1},
+        {"name": "TSize", "problem": "No way to estimate model size for priority", "status": "built", "trit": 1},
+        {"name": "TRoute", "problem": "All cloud models go through single rate-limited tier", "status": "built", "trit": 1},
+        {"name": "TRate", "problem": "First 429 doesnt stop remaining queries", "status": "built", "trit": 1},
+        {"name": "TEmpty", "problem": "OpenRouter returns empty responses silently", "status": "built", "trit": 1},
+        {"name": "TProbeCloud", "problem": "First scatter sends to ALL cloud models", "status": "built", "trit": 1},
+        {"name": "TFilter", "problem": "Cloud pool contains rate-limited providers", "status": "built", "trit": 1},
+        {"name": "TKeyGuard", "problem": "Anthropic probe succeeds but real query fails", "status": "built", "trit": 1},
+        {"name": "TDedup", "problem": "Duplicate OpenAI queries from prefix mismatch", "status": "built", "trit": 1},
+        {"name": "TDebug", "problem": "scatter_detail missing from response", "status": "built", "trit": 1},
+        {"name": "THunter", "problem": "TSpin killing own services when >13 running", "status": "built", "trit": 1},
+        {"name": "parse-hunt", "problem": "No way to find swallowed functions in parser", "status": "built", "trit": 1}
+    ]
+
+    // Idea tools (not yet built)
+    let ideas = [
+        {"name": "vram_check", "problem": "Models in VRAM unknown — cold-start waste", "status": "idea", "trit": 0},
+        {"name": "terror", "problem": "cluster_query crash invisible", "status": "idea", "trit": 0},
+        {"name": "tadaptive_timeout", "problem": "Scatter timeout too long for laminar", "status": "idea", "trit": 0},
+        {"name": "tmodel_trace", "problem": "No way to know which model responded", "status": "idea", "trit": 0},
+        {"name": "tcoerce", "problem": "compute_momentum expects dicts but gets strings", "status": "idea", "trit": 0},
+        {"name": "tdiagnose", "problem": "Handler crashes before try/except = zero diagnostics", "status": "idea", "trit": 0},
+        {"name": "tport_check", "problem": "Zombie servers stack on same port", "status": "idea", "trit": 0},
+        {"name": "timport_check", "problem": "urllib.parse not imported but used", "status": "idea", "trit": 0},
+        {"name": "tlog", "problem": "NovaLang print() goes to internal buffer", "status": "idea", "trit": 0},
+        {"name": "tport_guard", "problem": "Two services claim same port silently", "status": "idea", "trit": 0},
+        {"name": "tbind_check", "problem": "Orchestrator started but couldnt bind", "status": "idea", "trit": 0},
+        {"name": "tlaunch_verify", "problem": "nova-cortex produces zero logs", "status": "idea", "trit": 0},
+        {"name": "nova_claude_panel", "problem": "Switching between browser + Claude Desktop", "status": "idea", "trit": 0},
+        {"name": "thive_desktop", "problem": "No way to scatter to multiple desktop AIs", "status": "idea", "trit": 0}
+    ]
+
+    let i = 0
+    while3 i < len(built) {
+        let tool = built[i]
+        let name = dict_get(tool, "name") ?? ""
+        _tools = dict_set(_tools, name, tool)
+        i = i + 1
+    }
+
+    let j = 0
+    while3 j < len(ideas) {
+        let tool = ideas[j]
+        let name = dict_get(tool, "name") ?? ""
+        _tools = dict_set(_tools, name, tool)
+        _problems = append(_problems, dict_get(tool, "problem") ?? "")
+        j = j + 1
+    }
+
+    _stats = dict_set(_stats, "tools_built", len(built))
+    _stats = dict_set(_stats, "problems_logged", len(built) + len(ideas))
+}
+
+// ── Health ──
+fn handle_health(req) {
+    let up = round(time() - dict_get(_stats, "t0") ?? 0)
+    let total_tools = len(dict_keys(_tools))
+    let built_count = dict_get(_stats, "tools_built") ?? 0
+    let counters = {"total_tools": total_tools, "built": built_count, "diagnoses": dict_get(_stats, "diagnoses") ?? 0}
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, counters)
+    resp = dict_set(resp, "self_trit", 1)
+    resp = dict_set(resp, "char", "1")
+    resp = dict_set(resp, "uptime", up)
+    resp = dict_set(resp, "ideas", total_tools - built_count)
+    resp = dict_set(resp, "problems_pending", len(_problems))
+    return resp
+}
+
+// ── Registry ──
+fn handle_registry(req) {
+    return {"ok": true, "tools": _tools, "count": len(dict_keys(_tools)), "trit": 1}
+}
+
+// ── Problems ──
+fn handle_problems(req) {
+    return {"ok": true, "problems": _problems, "count": len(_problems), "trit": 1}
+}
+
+// ── Stats ──
+fn handle_stats(req) {
+    return {"ok": true, "stats": _stats, "trit": 1}
+}
+
+// ── Register Problem ──
+fn handle_problem(req) {
+    let description = dict_get(req, "description") ?? ""
+    let suggested_tool = dict_get(req, "tool") ?? ""
+    if3 description == "" {
+        return {"ok": false, "error": "missing description", "trit": -1}
+    } else3 {
+        _problems = append(_problems, description)
+        _stats = dict_set(_stats, "problems_logged", (dict_get(_stats, "problems_logged") ?? 0) + 1)
+        if3 suggested_tool != "" {
+            _tools = dict_set(_tools, suggested_tool, {
+                "name": suggested_tool,
+                "problem": description,
+                "status": "idea",
+                "trit": 0,
+                "created": time()
+            })
+        }
+        return {"ok": true, "logged": description, "tool": suggested_tool, "trit": 1}
+    }
+}
+
+// ── Mark Solved ──
+fn handle_solve(req) {
+    let tool_name = dict_get(req, "tool") ?? ""
+    if3 tool_name == "" {
+        return {"ok": false, "error": "missing tool name", "trit": -1}
+    } else3 {
+        let existing = dict_get(_tools, tool_name) ?? null
+        if3 existing != null {
+            existing = dict_set(existing, "status", "built")
+            existing = dict_set(existing, "trit", 1)
+            existing = dict_set(existing, "built_at", time())
+            _tools = dict_set(_tools, tool_name, existing)
+            _stats = dict_set(_stats, "tools_built", (dict_get(_stats, "tools_built") ?? 0) + 1)
+            return {"ok": true, "tool": tool_name, "status": "built", "trit": 1}
+        } else3 {
+            return {"ok": false, "error": "tool not found: " + tool_name, "trit": -1}
+        }
+    }
+}
+
+// ── Port Guard (inline micro-tool) ──
+fn handle_port_guard(req) {
+    let port = dict_get(req, "port") ?? 0
+    if3 port == 0 {
+        return {"ok": false, "error": "missing port", "trit": -1}
+    } else3 {
+        _stats = dict_set(_stats, "diagnoses", (dict_get(_stats, "diagnoses") ?? 0) + 1)
+        // Try to connect to the port
+        let result = try3 { http_get("http://127.0.0.1:" + str(port) + "/health") } fail { null }
+        if3 result == null {
+            return {"ok": true, "port": port, "state": "free", "trit": 1}
+        } else3 {
+            let svc = dict_get(result, "service") ?? "unknown"
+            return {"ok": true, "port": port, "state": "occupied", "owner": svc, "trit": 0}
+        }
+    }
+}
+
+// ── Bind Check (inline micro-tool) ──
+fn handle_bind_check(req) {
+    let port = dict_get(req, "port") ?? 0
+    let expected = dict_get(req, "service") ?? ""
+    if3 port == 0 {
+        return {"ok": false, "error": "missing port", "trit": -1}
+    } else3 {
+        _stats = dict_set(_stats, "diagnoses", (dict_get(_stats, "diagnoses") ?? 0) + 1)
+        let result = try3 { http_get("http://127.0.0.1:" + str(port) + "/health") } fail { null }
+        if3 result == null {
+            return {"ok": false, "port": port, "bound": false, "trit": -1}
+        } else3 {
+            let actual = dict_get(result, "service") ?? "unknown"
+            if3 expected != "" {
+                if3 contains(actual, expected) {
+                    return {"ok": true, "port": port, "bound": true, "owner": actual, "match": true, "trit": 1}
+                } else3 {
+                    return {"ok": true, "port": port, "bound": true, "owner": actual, "expected": expected, "match": false, "trit": 0}
+                }
+            } else3 {
+                return {"ok": true, "port": port, "bound": true, "owner": actual, "trit": 1}
+            }
+        }
+    }
+}
+
+// ── Diagnose (multi-check) ──
+fn handle_diagnose(req) {
+    let port = dict_get(req, "port") ?? 0
+    let service = dict_get(req, "service") ?? ""
+    _stats = dict_set(_stats, "diagnoses", (dict_get(_stats, "diagnoses") ?? 0) + 1)
+
+    let checks = []
+
+    // Port check
+    if3 port > 0 {
+        let health = try3 { http_get("http://127.0.0.1:" + str(port) + "/health") } fail { null }
+        if3 health != null {
+            checks = append(checks, {"check": "port_reachable", "trit": 1, "detail": dict_get(health, "service") ?? "up"})
+        } else {
+            checks = append(checks, {"check": "port_reachable", "trit": -1, "detail": "unreachable"})
+        }
+    }
+
+    // Orchestrator knows about it?
+    if3 service != "" {
+        let orch = try3 { http_get("http://127.0.0.1:9999/api/services/health") } fail { null }
+        if3 orch != null {
+            let services = dict_get(orch, "services") ?? []
+            let found = false
+            let i = 0
+            while3 i < len(services) {
+                let s = services[i]
+                if3 dict_get(s, "name") ?? "" == service {
+                    found = true
+                    checks = append(checks, {"check": "orchestrator_registered", "trit": 1, "status": dict_get(s, "status") ?? ""})
+                }
+                i = i + 1
+            }
+            if3 found == false {
+                checks = append(checks, {"check": "orchestrator_registered", "trit": -1, "detail": "not in fleet"})
+            }
+        }
+    }
+
+    // Overall trit
+    let overall = 1
+    let ci = 0
+    while3 ci < len(checks) {
+        let c = checks[ci]
+        if3 dict_get(c, "trit") ?? 0 == -1 {
+            overall = -1
+        } else3 {
+            if3 dict_get(c, "trit") ?? 0 == 0 {
+                if3 overall != -1 {
+                    overall = 0
+                }
+            }
+        }
+        ci = ci + 1
+    }
+
+    return {"ok": true, "checks": checks, "overall_trit": overall, "trit": overall}
+}
+
+// ── Zombie Kill ──
+fn handle_zombie_kill(req) {
+    let port = dict_get(req, "port") ?? 0
+    if3 port == 0 {
+        return {"ok": false, "error": "missing port", "trit": -1}
+    } else3 {
+        _stats = dict_set(_stats, "diagnoses", (dict_get(_stats, "diagnoses") ?? 0) + 1)
+        // Find PID on port and kill it
+        let result = try3 {
+            shell("netstat -ano | findstr :" + str(port) + " | findstr LISTENING")
+        } fail { "" }
+        if3 result == "" {
+            return {"ok": true, "port": port, "zombies": 0, "trit": 1}
+        } else3 {
+            // Extract PID (last column)
+            let lines = split(result, "\n")
+            let killed = 0
+            let i = 0
+            while3 i < len(lines) {
+                let line = lines[i]
+                let parts = split(line, " ")
+                // PID is the last non-empty part
+                let pid = ""
+                let j = len(parts) - 1
+                while3 j >= 0 {
+                    if3 parts[j] != "" {
+                        pid = parts[j]
+                        j = -1  // break
+                    }
+                    j = j - 1
+                }
+                if3 pid != "" {
+                    let kill_result = try3 { shell("taskkill /F /PID " + pid) } fail { "" }
+                    killed = killed + 1
+                }
+                i = i + 1
+            }
+            return {"ok": true, "port": port, "zombies": killed, "trit": 1}
+        }
+    }
+}
+
+// ── Initialize ──
+seed_registry()
+
+// ── Server Setup ──
+let server = tserve(PORT, SERVICE_NAME)
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/micro/registry", "handle_registry")
+troute(server, "GET", "/micro/problems", "handle_problems")
+troute(server, "GET", "/micro/stats", "handle_stats")
+troute(server, "POST", "/micro/problem", "handle_problem")
+troute(server, "POST", "/micro/solve", "handle_solve")
+troute(server, "POST", "/micro/diagnose", "handle_diagnose")
+troute(server, "POST", "/micro/port-guard", "handle_port_guard")
+troute(server, "POST", "/micro/bind-check", "handle_bind_check")
+troute(server, "POST", "/micro/zombie-kill", "handle_zombie_kill")
+
+print("[TMicro] v" + VERSION + " on port " + str(PORT))
+print("[TMicro] Registry: " + str(len(dict_keys(_tools))) + " tools tracked")
+print("[TMicro] Pending problems: " + str(len(_problems)))
+print("[TMicro] Immune system active")
+
+tstart(server)

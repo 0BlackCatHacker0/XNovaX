@@ -1,0 +1,144 @@
+// =================================================================
+// NOVA PURIFY SWARM — Convert ALL Python to Pure NovaLang
+// =================================================================
+// Fires targeted conversion tasks to all providers.
+// Each task takes a specific Python module and generates
+// the NovaLang replacement micro-service.
+//
+// Usage: novalang.exe nova_purify_swarm.nova
+// =================================================================
+
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let ROUTER = "http://127.0.0.1:9878/query"
+let OUT = "C:/NovaX/purify_upgrades"
+shell("mkdir " + OUT + " 2>NUL")
+
+let CTX = "You are converting Python services to pure NovaLang for NovaX AI OS. NovaLang is a ternary-native language running on a Rust VM (novalang.exe). CRITICAL SYNTAX RULES: 1) if3 COND { } (NO parentheses around condition), 2) for3 item in list { }, 3) try3 { expr } { fallback }, 4) dict_set(d,k,v) returns NEW dict - MUST reassign: d = dict_set(d,k,v), 5) append(l,item) returns NEW list - MUST reassign, 6) dict_get(d,key) only on dicts NOT lists - use brackets for lists: list[i], 7) http_post(url, json_encode(body)), 8) tserve(PORT,NAME) with troute(server,METHOD,PATH,HANDLER_NAME) for HTTP services, 9) handler receives req dict with body as raw string - MUST json_decode(req[\"body\"]), 10) return DICTS from handlers (auto-serialized to JSON), 11) No || or && operators (use nested if3), 12) shell() returns {ok,stdout,stderr,code} dict, 13) write_file(path,content) and read_file(path) for file I/O, 14) import3(path) for imports. Service pattern: tserve(PORT,NAME) then troute() for each endpoint, then tstart(server). Every service needs GET /health returning {ok:1,service:NAME}. Write COMPLETE working NovaLang .nova files."
+
+// Python modules that need NovaLang replacements
+// Grouped by domain for focused swarm tasks
+let TASKS = [
+    "orchestrator-core: Write a NovaLang orchestrator service on port 9999. It must: serve GET / returning {status:'NovaX Orchestrator',version:'6.0.0'}, GET /health, GET /api/status returning fleet health by calling health3() on all known ports, POST /api/services/boot that spawns novalang.exe processes using shell() for each service in BOOT_ORDER. This is the central nerve. Include BOOT_ORDER list of all 111 services with their .nova files and ports. Use tserve with H7 concurrent threads.",
+
+    "orchestrator-routes: Write NovaLang route handlers for the orchestrator: POST /think that forwards prompt to cloud router at :9878/query, POST /execute that runs shell() commands, GET /api/skills that reads skills from C:/NovaX/skills/, POST /api/claude that forwards to cloud router with provider='anthropic', GET /api/conversation for session history, GET /api/system for system info via shell('systeminfo'). Each handler parses req body with json_decode.",
+
+    "orchestrator-api: Write NovaLang API handlers: GET /api/fs/list that lists directory with shell('dir'), POST /api/fs/read that reads files with read_file(), POST /api/fs/write that writes with write_file(), GET /api/processes that runs shell('tasklist'), POST /api/novalang/run that executes .nova files with shell('novalang.exe ' + path), GET /api/routing/stats, GET /api/audit returning audit log.",
+
+    "ai-router: Write NovaLang AI router micro-service on port 9870. Replaces core/ai_router.py. Routes AI queries to best provider using Reynolds scoring. Tracks provider response times, success rates. Cascade failover: try provider list in order, skip failed ones. Ternary scoring: +1=fast, 0=ok, -1=slow. Store provider stats in memory dict.",
+
+    "event-bus: Write NovaLang event bus micro-service on port 9871. Replaces core/event_bus.py. Central pub/sub system. POST /publish with {topic,data,trit} to publish event. POST /subscribe with {topic,callback_url}. GET /events for recent events list. Ternary event classification: +1=success, 0=info, -1=error. Store subscribers and event history in dicts.",
+
+    "skills-engine: Write NovaLang skills engine micro-service on port 9872. Replaces core/skills_engine.py. POST /skills/match takes {query} and returns best matching skill by scanning C:/NovaX/skills/*.nova files. GET /skills lists all skills. POST /skills/run executes a skill file. Use read_file to scan skill files, split/contains for matching.",
+
+    "session-memory: Write NovaLang session memory micro-service on port 9873. Replaces core/session_memory.py. POST /remember with {key,value} stores to memory dict. GET /recall with {key} retrieves. POST /save persists to C:/NovaX/data/session_memory.json using write_file(). POST /load reads from disk. GET /history returns conversation turns.",
+
+    "profile-manager: Write NovaLang profile manager micro-service on port 9862. Replaces core/profile_manager.py. GET /profiles lists profiles from C:/NovaX/profiles/. POST /profile/switch sets active profile. GET /profile/active returns current. Profiles are JSON files with settings.",
+
+    "task-classifier: Write NovaLang task classifier micro-service on port 9863. Replaces core/task_classifier.py. POST /classify takes {text} and returns {domain,trit,route}. Classify by keywords: code/programming -> code domain, search/find -> search domain, system/process -> system domain. Ternary confidence: +1=clear match, 0=ambiguous, -1=unknown.",
+
+    "vcc-engine: Write NovaLang VCC (Version Control Coordinator) micro-service on port 9864. Replaces core/vcc.py. GET /vcc/summary returns git status via shell('git -C C:/NovaX status'). POST /vcc/commit runs git commit. GET /vcc/log returns git log. GET /vcc/diff returns git diff.",
+
+    "conservation-monitor: Write NovaLang conservation monitor micro-service on port 9865. Replaces core/conservation_monitor.py. Monitors resource usage. GET /resources returns {cpu,memory,disk} via shell commands. GET /budget tracks API token usage. POST /budget/add records token spend. Ternary budget state: +1=under budget, 0=near limit, -1=over.",
+
+    "mode-system: Write NovaLang mode system micro-service on port 9866. Replaces core/mode_system.py. Manages NovaX operational modes. POST /mode/set with {mode} where mode is 'dev','production','research','creative'. GET /mode returns current mode. Each mode adjusts temperature, max_tokens, provider preferences.",
+
+    "workspace-manager: Write NovaLang workspace manager micro-service on port 9867. Replaces core/workspace_manager.py. GET /workspace returns current workspace path. POST /workspace/set changes workspace. GET /workspace/files lists files. POST /workspace/scan indexes workspace for project detection."
+]
+
+let PROVIDERS = [
+    "ollama", "openai", "anthropic", "google",
+    "cerebras_direct", "sambanova_direct", "google_ai_studio",
+    "openrouter", "mistral", "groq", "deepseek",
+    "cohere", "together", "cortex", "novax-prime"
+]
+
+let total_hits = 0
+let total_chars = 0
+
+fn extract_text(parsed) {
+    let r = try3 { dict_get(parsed, "result") } { {} }
+    let inner_str = try3 { dict_get(r, "body") } { "{}" }
+    let inner = try3 { json_decode(inner_str) } { {} }
+    let text = try3 { dict_get(inner, "response") } { "" }
+    if3 len(text) > 5 { return text }
+    let choices = try3 { dict_get(inner, "choices") } { [] }
+    if3 len(choices) > 0 {
+        let first = choices[0]
+        let msg = try3 { dict_get(first, "message") } { {} }
+        let content = try3 { dict_get(msg, "content") } { "" }
+        return content
+    }
+    ""
+}
+
+fn fire(task_desc, provider, task_id) {
+    let body = {}
+    body = dict_set(body, "prompt", CTX + "\n\nTASK: " + task_desc)
+    body = dict_set(body, "provider", provider)
+    body = dict_set(body, "max_tokens", 4096)
+
+    let result = try3 { http_post(ROUTER, json_encode(body)) } { {} }
+    let status = try3 { dict_get(result, "status") } { 0 }
+
+    if3 status == 0 {
+        print("  FAIL " + task_id + " | " + provider)
+        return -1
+    }
+
+    let resp_body = try3 { dict_get(result, "body") } { "{}" }
+    let parsed = try3 { json_decode(resp_body) } { {} }
+    let ok = try3 { dict_get(parsed, "ok") } { 0 }
+
+    if3 ok == 0 {
+        print("  MISS " + task_id + " | " + provider + ": not ok")
+        return 0
+    }
+
+    let text = extract_text(parsed)
+    let tlen = len(text)
+
+    if3 tlen > 100 {
+        let save = {}
+        save = dict_set(save, "task", task_id)
+        save = dict_set(save, "provider", provider)
+        save = dict_set(save, "chars", tlen)
+        save = dict_set(save, "text", text)
+        write_file(OUT + "/" + task_id + "_" + provider + ".json", json_encode(save))
+        print("  HIT  " + task_id + " | " + provider + ": " + str(tlen) + " chars")
+        return tlen
+    }
+
+    print("  MISS " + task_id + " | " + provider + ": short (" + str(tlen) + ")")
+    return 0
+}
+
+print("=" * 65)
+print("NOVA PURIFY SWARM — PYTHON -> PURE NOVALANG")
+print("Conversion tasks: " + str(len(TASKS)))
+print("Providers: " + str(len(PROVIDERS)))
+print("Target: Zero Python, 100% NovaLang")
+print("=" * 65)
+
+let tidx = 0
+for3 task_desc in TASKS {
+    let parts = split(task_desc, ":")
+    let task_id = trim(parts[0])
+    tidx = tidx + 1
+    print("\n--- Convert " + str(tidx) + "/" + str(len(TASKS)) + ": " + task_id + " ---")
+
+    for3 provider in PROVIDERS {
+        let chars = fire(task_desc, provider, task_id)
+        if3 chars > 0 {
+            total_hits = total_hits + 1
+            total_chars = total_chars + chars
+        }
+    }
+}
+
+print("\n" + "=" * 65)
+print("PURIFY SWARM COMPLETE")
+print("Hits:  " + str(total_hits))
+print("Chars: " + str(total_chars))
+print("Files: " + OUT + "/")
+print("=" * 65)

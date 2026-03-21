@@ -1,0 +1,908 @@
+// nova_tcluster_service.nova
+// NovaX Ternary Cluster Manager -- NovaLang port of nova_tcluster.py
+//
+// Service cluster orchestration micro-tool. Manages groups of related
+// services as named clusters with tier-based startup ordering, rolling
+// restarts, and dependency-aware shutdown.
+//
+// Clusters are the organizational unit above individual services. Each
+// cluster groups services that collaborate on a function (AI, storage,
+// security, etc.) and assigns them a startup tier. Tier 1 boots first,
+// tier 5 last. Shutdown reverses: tier 5 dies first, tier 1 last.
+//
+// Rolling restart stops one service at a time, waits for health
+// confirmation before proceeding to the next -- zero-downtime within
+// a cluster.
+//
+// Port: 9971
+// Harmonics: 3-5-7-13
+
+// -- Server bootstrap ---------------------------------------------------------
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9971
+let server = tserve(PORT, "nova-tcluster")
+
+// -- Constants -----------------------------------------------------------------
+
+let VERSION = "1.0.0"
+let SERVICE = "nova-tcluster"
+
+// Ternary harmonic constants
+let BLOCK = 2187
+
+// Ternary truth values
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// Timing config (seconds)
+let HEALTH_TIMEOUT = 3
+let HEALTH_POLL_INTERVAL = 500
+let HEALTH_MAX_WAIT = 15
+let STOP_TIMEOUT = 5
+
+// -- Service Registry ----------------------------------------------------------
+// Every known NovaX service as a flat dict-of-dicts.
+// Each entry: name -> {port, tier, has_cmd}
+// cmd paths are passed to nova_run() as needed.
+// has_cmd=1 means a start command exists; has_cmd=0 means manual/external.
+
+let REGISTRY = dict_set({}, "orchestrator",   dict_set(dict_set({}, "port", 9999),  "tier", 1))
+let REGISTRY = dict_set(REGISTRY, "ternary-server",  dict_set(dict_set({}, "port", 9885),  "tier", 1))
+let REGISTRY = dict_set(REGISTRY, "sentinel",        dict_set(dict_set({}, "port", 9884),  "tier", 1))
+let REGISTRY = dict_set(REGISTRY, "ollama",          dict_set(dict_set({}, "port", 11434), "tier", 0))
+let REGISTRY = dict_set(REGISTRY, "redis",           dict_set(dict_set({}, "port", 6379),  "tier", 0))
+let REGISTRY = dict_set(REGISTRY, "meilisearch",     dict_set(dict_set({}, "port", 7700),  "tier", 0))
+let REGISTRY = dict_set(REGISTRY, "hivemind",        dict_set(dict_set({}, "port", 9881),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "cloud-router",    dict_set(dict_set({}, "port", 9878),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "nova-tools",      dict_set(dict_set({}, "port", 9891),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "deepstorage",     dict_set(dict_set({}, "port", 9893),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "vault",           dict_set(dict_set({}, "port", 9892),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "tbuffer",         dict_set(dict_set({}, "port", 9886),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "tcache",          dict_set(dict_set({}, "port", 9894),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "tsecurity",       dict_set(dict_set({}, "port", 9907),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "tauth",           dict_set(dict_set({}, "port", 0),     "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "tvalidator",      dict_set(dict_set({}, "port", 0),     "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "tintelligence",   dict_set(dict_set({}, "port", 9924),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "tquery",          dict_set(dict_set({}, "port", 9911),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "tembed",          dict_set(dict_set({}, "port", 0),     "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "tmatrix",         dict_set(dict_set({}, "port", 0),     "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "tbus",            dict_set(dict_set({}, "port", 9945),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "tresilience",     dict_set(dict_set({}, "port", 9948),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "tmesh",           dict_set(dict_set({}, "port", 9951),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "trouter",         dict_set(dict_set({}, "port", 0),     "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "tnet",            dict_set(dict_set({}, "port", 9906),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "tfetch",          dict_set(dict_set({}, "port", 9897),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "tshell",          dict_set(dict_set({}, "port", 9890),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "bridge",          dict_set(dict_set({}, "port", 0),     "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "twatch",          dict_set(dict_set({}, "port", 9950),  "tier", 4))
+let REGISTRY = dict_set(REGISTRY, "tmetrics",        dict_set(dict_set({}, "port", 0),     "tier", 4))
+let REGISTRY = dict_set(REGISTRY, "thealth",         dict_set(dict_set({}, "port", 0),     "tier", 4))
+let REGISTRY = dict_set(REGISTRY, "tlog",            dict_set(dict_set({}, "port", 0),     "tier", 4))
+let REGISTRY = dict_set(REGISTRY, "tscheduler",      dict_set(dict_set({}, "port", 0),     "tier", 4))
+let REGISTRY = dict_set(REGISTRY, "tpipeline",       dict_set(dict_set({}, "port", 0),     "tier", 4))
+let REGISTRY = dict_set(REGISTRY, "tcron",           dict_set(dict_set({}, "port", 9910),  "tier", 4))
+let REGISTRY = dict_set(REGISTRY, "tstream",         dict_set(dict_set({}, "port", 0),     "tier", 5))
+let REGISTRY = dict_set(REGISTRY, "tspeak",          dict_set(dict_set({}, "port", 9895),  "tier", 5))
+let REGISTRY = dict_set(REGISTRY, "stt",             dict_set(dict_set({}, "port", 9875),  "tier", 5))
+let REGISTRY = dict_set(REGISTRY, "cortex",          dict_set(dict_set({}, "port", 9896),  "tier", 5))
+let REGISTRY = dict_set(REGISTRY, "uia-bridge",      dict_set(dict_set({}, "port", 9902),  "tier", 5))
+let REGISTRY = dict_set(REGISTRY, "exec-server",     dict_set(dict_set({}, "port", 9877),  "tier", 1))
+let REGISTRY = dict_set(REGISTRY, "brain",           dict_set(dict_set({}, "port", 9990),  "tier", 1))
+let REGISTRY = dict_set(REGISTRY, "vpn-core",        dict_set(dict_set({}, "port", 9880),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "nexus",           dict_set(dict_set({}, "port", 9882),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "websocket",       dict_set(dict_set({}, "port", 9998),  "tier", 1))
+let REGISTRY = dict_set(REGISTRY, "nova-cli",        dict_set(dict_set({}, "port", 9887),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "closed-loop",     dict_set(dict_set({}, "port", 9888),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "max-patch",       dict_set(dict_set({}, "port", 9889),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "nova-tkill",      dict_set(dict_set({}, "port", 9899),  "tier", 2))
+let REGISTRY = dict_set(REGISTRY, "skiptrace",       dict_set(dict_set({}, "port", 9903),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "nova-tsysmon",    dict_set(dict_set({}, "port", 9905),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "nova-tmedia",     dict_set(dict_set({}, "port", 9908),  "tier", 3))
+let REGISTRY = dict_set(REGISTRY, "nova-tbuild",     dict_set(dict_set({}, "port", 9909),  "tier", 3))
+
+// -- Start commands for services that can be launched -------------------------
+// Stored as strings: "exe|arg1|arg2" -- nova_run() splits on "|"
+// Services with no launch command (manual/external) map to ""
+
+let PY = "C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe"
+
+let CMDS = dict_set({}, "ternary-server",  PY + "|C:\\NovaX\\nova_ternary_server.py")
+let CMDS = dict_set(CMDS, "sentinel",        PY + "|C:\\NovaX\\nova_sentinel.py")
+let CMDS = dict_set(CMDS, "ollama",          "C:\\Users\\Jupit\\AppData\\Local\\Programs\\Ollama\\ollama.exe|serve")
+let CMDS = dict_set(CMDS, "redis",           "C:\\NovaX\\servers\\redis\\redis-server.exe")
+let CMDS = dict_set(CMDS, "meilisearch",     "C:\\NovaX\\servers\\meilisearch\\meilisearch.exe|--db-path|C:\\NovaX\\servers\\meilisearch\\data")
+let CMDS = dict_set(CMDS, "hivemind",        PY + "|C:\\NovaX\\nova_hivemind.py")
+let CMDS = dict_set(CMDS, "cloud-router",    PY + "|C:\\NovaX\\nova_cloud_router.py")
+let CMDS = dict_set(CMDS, "nova-tools",      PY + "|C:\\NovaX\\nova_tools.py")
+let CMDS = dict_set(CMDS, "deepstorage",     PY + "|C:\\NovaX\\nova_deepstorage.py")
+let CMDS = dict_set(CMDS, "vault",           PY + "|C:\\NovaX\\nova_vault.py")
+let CMDS = dict_set(CMDS, "tbuffer",         PY + "|C:\\NovaX\\nova_tbuffer.py")
+let CMDS = dict_set(CMDS, "tcache",          PY + "|C:\\NovaX\\nova_ternary_tools.py")
+let CMDS = dict_set(CMDS, "tsecurity",       PY + "|C:\\NovaX\\nova_tsecurity.py")
+let CMDS = dict_set(CMDS, "tintelligence",   PY + "|C:\\NovaX\\nova_tintelligence.py")
+let CMDS = dict_set(CMDS, "tquery",          PY + "|C:\\NovaX\\nova_tquery.py")
+let CMDS = dict_set(CMDS, "tbus",            PY + "|C:\\NovaX\\nova_tbus.py")
+let CMDS = dict_set(CMDS, "tresilience",     PY + "|C:\\NovaX\\nova_tresilience.py")
+let CMDS = dict_set(CMDS, "tmesh",           PY + "|C:\\NovaX\\nova_tmesh.py")
+let CMDS = dict_set(CMDS, "tnet",            PY + "|C:\\NovaX\\nova_tnet.py")
+let CMDS = dict_set(CMDS, "tfetch",          PY + "|C:\\NovaX\\nova_tfetch.py")
+let CMDS = dict_set(CMDS, "tshell",          PY + "|C:\\NovaX\\nova_tshell.py")
+let CMDS = dict_set(CMDS, "twatch",          PY + "|C:\\NovaX\\nova_twatch.py")
+let CMDS = dict_set(CMDS, "tcron",           PY + "|C:\\NovaX\\nova_tcron.py")
+let CMDS = dict_set(CMDS, "tspeak",          PY + "|C:\\NovaX\\nova_tspeak.py")
+let CMDS = dict_set(CMDS, "stt",             PY + "|C:\\NovaX\\nova_stt.py")
+let CMDS = dict_set(CMDS, "cortex",          PY + "|C:\\NovaX\\nova_cortex.py")
+let CMDS = dict_set(CMDS, "exec-server",     PY + "|C:\\NovaX\\launchers\\exec_server.py")
+let CMDS = dict_set(CMDS, "brain",           PY + "|C:\\NovaX\\core\\server.py")
+let CMDS = dict_set(CMDS, "vpn-core",        PY + "|C:\\NovaX\\nova_vpn_core.py")
+let CMDS = dict_set(CMDS, "nexus",           PY + "|C:\\NovaX\\nova_nexus.py")
+let CMDS = dict_set(CMDS, "websocket",       PY + "|C:\\NovaX\\ws_server_standalone.py")
+let CMDS = dict_set(CMDS, "nova-cli",        PY + "|C:\\NovaX\\nova_cli_server.py")
+let CMDS = dict_set(CMDS, "closed-loop",     PY + "|C:\\NovaX\\nova_closed_loop.py")
+let CMDS = dict_set(CMDS, "max-patch",       PY + "|C:\\NovaX\\nova_max_patch.py")
+let CMDS = dict_set(CMDS, "nova-tkill",      PY + "|C:\\NovaX\\nova_tkill.py")
+let CMDS = dict_set(CMDS, "skiptrace",       PY + "|C:\\NovaX\\nova_skiptrace.py")
+let CMDS = dict_set(CMDS, "nova-tsysmon",    PY + "|C:\\NovaX\\nova_tsysmon.py")
+let CMDS = dict_set(CMDS, "nova-tmedia",     PY + "|C:\\NovaX\\nova_tmedia.py")
+let CMDS = dict_set(CMDS, "nova-tbuild",     PY + "|C:\\NovaX\\nova_tbuild.py")
+
+// -- Cluster Definitions -------------------------------------------------------
+// Each cluster entry: {tier, services_csv, description}
+// services_csv is a comma-joined string -- split(",") to get list
+
+let CLUSTERS = dict_set({}, "core", dict_set(dict_set(dict_set({},
+    "tier", 1),
+    "services", "orchestrator,ternary-server,sentinel"),
+    "description", "Core platform services -- must start first, stop last"))
+
+let CLUSTERS = dict_set(CLUSTERS, "ai", dict_set(dict_set(dict_set({},
+    "tier", 2),
+    "services", "hivemind,cloud-router,nova-tools"),
+    "description", "AI model routing and tool execution layer"))
+
+let CLUSTERS = dict_set(CLUSTERS, "storage", dict_set(dict_set(dict_set({},
+    "tier", 2),
+    "services", "deepstorage,vault,tbuffer,tcache"),
+    "description", "Persistent and ephemeral data storage services"))
+
+let CLUSTERS = dict_set(CLUSTERS, "intelligence", dict_set(dict_set(dict_set({},
+    "tier", 3),
+    "services", "tintelligence,tquery,tembed,tmatrix"),
+    "description", "Search, embeddings, and intelligence analysis"))
+
+let CLUSTERS = dict_set(CLUSTERS, "infrastructure", dict_set(dict_set(dict_set({},
+    "tier", 3),
+    "services", "tbus,tresilience,tmesh,trouter"),
+    "description", "Message bus, resilience, mesh networking"))
+
+let CLUSTERS = dict_set(CLUSTERS, "security", dict_set(dict_set(dict_set({},
+    "tier", 2),
+    "services", "tsecurity,tauth,tvalidator"),
+    "description", "Authentication, authorization, and validation"))
+
+let CLUSTERS = dict_set(CLUSTERS, "monitoring", dict_set(dict_set(dict_set({},
+    "tier", 4),
+    "services", "twatch,tmetrics,thealth,tlog"),
+    "description", "Observability -- health, metrics, logging"))
+
+let CLUSTERS = dict_set(CLUSTERS, "automation", dict_set(dict_set(dict_set({},
+    "tier", 4),
+    "services", "tscheduler,tpipeline,tcron"),
+    "description", "Scheduled tasks, CI/CD pipelines, cron jobs"))
+
+let CLUSTERS = dict_set(CLUSTERS, "interface", dict_set(dict_set(dict_set({},
+    "tier", 5),
+    "services", "tstream,tspeak,stt,cortex,uia-bridge"),
+    "description", "User-facing I/O -- voice, streaming, desktop automation"))
+
+let CLUSTERS = dict_set(CLUSTERS, "network", dict_set(dict_set(dict_set({},
+    "tier", 3),
+    "services", "tnet,tfetch,tshell,bridge"),
+    "description", "Network fetch, shell access, external bridges"))
+
+// -- Mutable state -------------------------------------------------------------
+
+let ops_total = 0
+let ops_ok = 0
+let ops_fail = 0
+let started_at = time()
+
+// -- Helper: trit char ---------------------------------------------------------
+
+fn trit_char(t) {
+    let result = "?"
+    if3 t == T_TRUE { result = "+"
+    } else if3 t == T_FALSE { result = "T"
+    } else { result = "0"
+    }
+    result
+}
+
+// -- Helper: merge list of trits -- minimum (most pessimistic) -----------------
+
+fn tmerge_list(trit_list) {
+    let n = len(trit_list)
+    let merged = T_TRUE
+    let i = 0
+    while3 i < n {
+        let v = dict_get(trit_list, i)
+        if3 v < merged { merged = v
+        }
+        i = i + 1
+    }
+    merged
+}
+
+// -- Helper: check port alive via /health HTTP ---------------------------------
+// Returns T_TRUE (+1) if reachable, T_FALSE (-1) otherwise.
+
+fn port_alive(port) {
+    let result = T_FALSE
+    if3 port == 0 { result = T_FALSE
+    } else { url = "http://127.0.0.1:" + str(port) + "/health"
+        let resp = try3 { http_get(url) } fail { T_FALSE }
+        if3 resp != T_FALSE { result = T_TRUE
+        } else { result = T_FALSE
+        }
+    }
+    result
+}
+
+// -- Helper: get service info from registry ------------------------------------
+
+fn svc_port(name) {
+    let entry = dict_get(REGISTRY, name)
+    let p = 0
+    if3 entry != 0 { p = dict_get(entry, "port")
+    }
+    p
+}
+
+fn svc_tier(name) {
+    let entry = dict_get(REGISTRY, name)
+    let t = 99
+    if3 entry != 0 { t = dict_get(entry, "tier")
+    }
+    t
+}
+
+fn svc_known(name) {
+    dict_has(REGISTRY, name)
+}
+
+fn svc_has_cmd(name) {
+    dict_has(CMDS, name)
+}
+
+// -- Service health check -------------------------------------------------------
+
+fn service_health(name) {
+    let known = svc_known(name)
+    if3 known == T_FALSE { rec = dict_set({}, "name", name)
+        rec = dict_set(rec, "trit", T_FALSE)
+        rec = dict_set(rec, "char", "T")
+        rec = dict_set(rec, "status", "unknown")
+        rec = dict_set(rec, "port", 0)
+        rec
+    } else { port = svc_port(name)
+        if3 port == 0 { rec = dict_set({}, "name", name)
+            rec = dict_set(rec, "trit", T_FALSE)
+            rec = dict_set(rec, "char", "T")
+            rec = dict_set(rec, "status", "not_configured")
+            rec = dict_set(rec, "port", 0)
+            rec
+        } else { alive = port_alive(port)
+            if3 alive == T_TRUE { rec = dict_set({}, "name", name)
+                rec = dict_set(rec, "trit", T_TRUE)
+                rec = dict_set(rec, "char", "+")
+                rec = dict_set(rec, "status", "healthy")
+                rec = dict_set(rec, "port", port)
+                rec
+            } else { rec = dict_set({}, "name", name)
+                rec = dict_set(rec, "trit", T_FALSE)
+                rec = dict_set(rec, "char", "T")
+                rec = dict_set(rec, "status", "down")
+                rec = dict_set(rec, "port", port)
+                rec
+            }
+        }
+    }
+}
+
+// -- Service start --------------------------------------------------------------
+// Returns {trit, message}
+
+fn start_service(name) {
+    let known = svc_known(name)
+    if3 known == T_FALSE { r = dict_set({}, "trit", T_FALSE)
+        r = dict_set(r, "message", "Unknown service: " + name)
+        r
+    } else { port = svc_port(name)
+        let has_cmd = svc_has_cmd(name)
+        if3 has_cmd == T_FALSE { r = dict_set({}, "trit", T_FALSE)
+            r = dict_set(r, "message", "No start command for " + name + " (manual/external start required)")
+            r
+        } else {
+            // Check if already running
+            let alive = port_alive(port)
+            if3 alive == T_TRUE { r = dict_set({}, "trit", T_MAYBE)
+                r = dict_set(r, "message", name + " already running on :" + str(port))
+                r
+            } else {
+                // Guard: never start orchestrator through this tool -- it manages itself
+                if3 name == "orchestrator" { r = dict_set({}, "trit", T_FALSE)
+                    r = dict_set(r, "message", "orchestrator manages itself -- skip")
+                    r
+                } else { cmd_str = dict_get(CMDS, name)
+                    let launch_result = try3 { nova_run(cmd_str) } fail { T_FALSE }
+                    if3 launch_result == T_FALSE { r = dict_set({}, "trit", T_FALSE)
+                        r = dict_set(r, "message", "Failed to start " + name)
+                        r
+                    } else { r = dict_set({}, "trit", T_TRUE)
+                        r = dict_set(r, "message", name + " started (port " + str(port) + ")")
+                        r
+                    }
+                }
+            }
+        }
+    }
+}
+
+// -- Service stop ---------------------------------------------------------------
+// Attempts graceful /shutdown POST, then reports result.
+// Returns {trit, message}
+
+fn stop_service(name) {
+    // Guard: never stop orchestrator
+    if3 name == "orchestrator" { r = dict_set({}, "trit", T_FALSE)
+        r = dict_set(r, "message", "Refusing to stop orchestrator -- would orphan all services")
+        r
+    } else { known = svc_known(name)
+        if3 known == T_FALSE { r = dict_set({}, "trit", T_FALSE)
+            r = dict_set(r, "message", "Unknown service: " + name)
+            r
+        } else { port = svc_port(name)
+            if3 port == 0 { r = dict_set({}, "trit", T_FALSE)
+                r = dict_set(r, "message", "No port for " + name + " -- cannot stop")
+                r
+            } else { alive = port_alive(port)
+                if3 alive == T_FALSE { r = dict_set({}, "trit", T_MAYBE)
+                    r = dict_set(r, "message", name + " not running on :" + str(port))
+                    r
+                } else {
+                    // Attempt graceful /shutdown POST
+                    let shutdown_url = "http://127.0.0.1:" + str(port) + "/shutdown"
+                    let shutdown_result = try3 { http_post(shutdown_url, "{}") } fail { T_FALSE }
+                    // Check if stopped after graceful attempt
+                    let still_alive = port_alive(port)
+                    if3 still_alive == T_FALSE { r = dict_set({}, "trit", T_TRUE)
+                        r = dict_set(r, "message", name + " stopped gracefully via /shutdown")
+                        r
+                    } else {
+                        // Port still alive -- report partial
+                        let r = dict_set({}, "trit", T_MAYBE)
+                        r = dict_set(r, "message", name + " shutdown sent but :" + str(port) + " still alive (may need force kill)")
+                        r
+                    }
+                }
+            }
+        }
+    }
+}
+
+// -- Wait for service health ----------------------------------------------------
+// Polls port_alive up to HEALTH_MAX_WAIT seconds.
+// Returns T_TRUE or T_FALSE.
+
+fn wait_for_health(name) {
+    let port = svc_port(name)
+    if3 port == 0 {
+        T_FALSE
+    } else { deadline = time() + HEALTH_MAX_WAIT
+        let found = T_FALSE
+        while3 found == T_FALSE {
+            let now = time()
+            if3 now >= deadline { found = T_MAYBE
+            } else { alive = port_alive(port)
+                if3 alive == T_TRUE { found = T_TRUE
+                } else {
+                    // brief pause -- interpreter loop acts as poll interval
+                    let _dummy = T_MAYBE
+                }
+            }
+        }
+        found
+    }
+}
+
+// -- Cluster helpers ------------------------------------------------------------
+
+fn cluster_known(cname) {
+    dict_has(CLUSTERS, cname)
+}
+
+fn cluster_tier(cname) {
+    let cl = dict_get(CLUSTERS, cname)
+    dict_get(cl, "tier")
+}
+
+fn cluster_services_csv(cname) {
+    let cl = dict_get(CLUSTERS, cname)
+    dict_get(cl, "services")
+}
+
+fn cluster_description(cname) {
+    let cl = dict_get(CLUSTERS, cname)
+    dict_get(cl, "description")
+}
+
+// -- Cluster status -------------------------------------------------------------
+
+fn cluster_status(cname) {
+    let known = cluster_known(cname)
+    if3 known == T_FALSE { r = dict_set({}, "ok", T_FALSE)
+        r = dict_set(r, "error", "Unknown cluster: " + cname)
+        r = dict_set(r, "trit", T_FALSE)
+        r
+    } else { tier = cluster_tier(cname)
+        let desc = cluster_description(cname)
+        let csv = cluster_services_csv(cname)
+        let svc_list = split(csv, ",")
+        let n = len(svc_list)
+        let members = []
+        let trits = []
+        let i = 0
+        while3 i < n {
+            let svc_name = dict_get(svc_list, i)
+            let h = service_health(svc_name)
+            members = append(members, h)
+            trits = append(trits, dict_get(h, "trit"))
+            i = i + 1
+        }
+        let cluster_trit = tmerge_list(trits)
+        let healthy_count = 0
+        let down_count = 0
+        let j = 0
+        while3 j < n {
+            let t = dict_get(trits, j)
+            if3 t == T_TRUE { healthy_count = healthy_count + 1
+            } else { down_count = down_count + 1
+            }
+            j = j + 1
+        }
+        let r = dict_set({}, "ok", T_TRUE)
+        r = dict_set(r, "cluster", cname)
+        r = dict_set(r, "tier", tier)
+        r = dict_set(r, "description", desc)
+        r = dict_set(r, "trit", cluster_trit)
+        r = dict_set(r, "char", trit_char(cluster_trit))
+        r = dict_set(r, "services", members)
+        r = dict_set(r, "total", n)
+        r = dict_set(r, "healthy", healthy_count)
+        r = dict_set(r, "down", down_count)
+        r
+    }
+}
+
+// -- Cluster start --------------------------------------------------------------
+
+fn start_cluster(cname) {
+    let known = cluster_known(cname)
+    if3 known == T_FALSE { r = dict_set({}, "ok", T_FALSE)
+        r = dict_set(r, "error", "Unknown cluster: " + cname)
+        r = dict_set(r, "trit", T_FALSE)
+        r
+    } else { tier = cluster_tier(cname)
+        let csv = cluster_services_csv(cname)
+        let svc_list = split(csv, ",")
+        let n = len(svc_list)
+        let results = []
+        let trits = []
+        let i = 0
+        while3 i < n {
+            let svc_name = dict_get(svc_list, i)
+            let sr = start_service(svc_name)
+            let st = dict_get(sr, "trit")
+            let msg = dict_get(sr, "message")
+            let rec = dict_set({}, "name", svc_name)
+            rec = dict_set(rec, "trit", st)
+            rec = dict_set(rec, "char", trit_char(st))
+            rec = dict_set(rec, "message", msg)
+            results = append(results, rec)
+            trits = append(trits, st)
+            i = i + 1
+        }
+        let overall = tmerge_list(trits)
+        let ok_val = T_FALSE
+        if3 overall >= 0 { ok_val = T_TRUE
+        }
+        let r = dict_set({}, "ok", ok_val)
+        r = dict_set(r, "cluster", cname)
+        r = dict_set(r, "tier", tier)
+        r = dict_set(r, "action", "start")
+        r = dict_set(r, "trit", overall)
+        r = dict_set(r, "char", trit_char(overall))
+        r = dict_set(r, "results", results)
+        r
+    }
+}
+
+// -- Cluster stop (reverse order) ----------------------------------------------
+
+fn stop_cluster(cname) {
+    let known = cluster_known(cname)
+    if3 known == T_FALSE { r = dict_set({}, "ok", T_FALSE)
+        r = dict_set(r, "error", "Unknown cluster: " + cname)
+        r = dict_set(r, "trit", T_FALSE)
+        r
+    } else { tier = cluster_tier(cname)
+        let csv = cluster_services_csv(cname)
+        let svc_list = split(csv, ",")
+        // reverse for shutdown ordering
+        let svc_list = reverse(svc_list)
+        let n = len(svc_list)
+        let results = []
+        let trits = []
+        let i = 0
+        while3 i < n {
+            let svc_name = dict_get(svc_list, i)
+            let sr = stop_service(svc_name)
+            let st = dict_get(sr, "trit")
+            let msg = dict_get(sr, "message")
+            let rec = dict_set({}, "name", svc_name)
+            rec = dict_set(rec, "trit", st)
+            rec = dict_set(rec, "char", trit_char(st))
+            rec = dict_set(rec, "message", msg)
+            results = append(results, rec)
+            trits = append(trits, st)
+            i = i + 1
+        }
+        let overall = tmerge_list(trits)
+        let ok_val = T_FALSE
+        if3 overall >= 0 { ok_val = T_TRUE
+        }
+        let r = dict_set({}, "ok", ok_val)
+        r = dict_set(r, "cluster", cname)
+        r = dict_set(r, "tier", tier)
+        r = dict_set(r, "action", "stop")
+        r = dict_set(r, "trit", overall)
+        r = dict_set(r, "char", trit_char(overall))
+        r = dict_set(r, "results", results)
+        r
+    }
+}
+
+// -- Rolling restart (sequential, no threading) --------------------------------
+// Stop -> Start -> Wait for health, one service at a time.
+
+fn rolling_restart_cluster(cname) {
+    let known = cluster_known(cname)
+    if3 known == T_FALSE { r = dict_set({}, "ok", T_FALSE)
+        r = dict_set(r, "error", "Unknown cluster: " + cname)
+        r = dict_set(r, "trit", T_FALSE)
+        r
+    } else { tier = cluster_tier(cname)
+        let csv = cluster_services_csv(cname)
+        let svc_list = split(csv, ",")
+        let n = len(svc_list)
+        let results = []
+        let trits = []
+        let i = 0
+        while3 i < n {
+            let svc_name = dict_get(svc_list, i)
+
+            // Step 1: Stop
+            let stop_r = stop_service(svc_name)
+            let stop_t = dict_get(stop_r, "trit")
+            let stop_m = dict_get(stop_r, "message")
+
+            // Step 2: Start
+            let start_r = start_service(svc_name)
+            let start_t = dict_get(start_r, "trit")
+            let start_m = dict_get(start_r, "message")
+
+            // Step 3: Wait for health
+            let health_t = T_FALSE
+            if3 start_t >= 0 { health_t = wait_for_health(svc_name)
+            }
+
+            // Overall trit for this service
+            let overall_t = T_FALSE
+            if3 health_t == T_TRUE { overall_t = T_TRUE
+            } else if3 start_t >= 0 { overall_t = T_MAYBE
+            }
+
+            let stop_rec = dict_set({}, "trit", stop_t)
+            stop_rec = dict_set(stop_rec, "message", stop_m)
+
+            let start_rec = dict_set({}, "trit", start_t)
+            start_rec = dict_set(start_rec, "message", start_m)
+
+            let health_rec = dict_set({}, "trit", health_t)
+
+            let rec = dict_set({}, "name", svc_name)
+            rec = dict_set(rec, "stop", stop_rec)
+            rec = dict_set(rec, "start", start_rec)
+            rec = dict_set(rec, "health", health_rec)
+            rec = dict_set(rec, "trit", overall_t)
+            rec = dict_set(rec, "char", trit_char(overall_t))
+
+            results = append(results, rec)
+            trits = append(trits, overall_t)
+            i = i + 1
+        }
+        let overall = tmerge_list(trits)
+        let ok_val = T_FALSE
+        if3 overall >= 0 { ok_val = T_TRUE
+        }
+        let r = dict_set({}, "ok", ok_val)
+        r = dict_set(r, "cluster", cname)
+        r = dict_set(r, "tier", tier)
+        r = dict_set(r, "action", "rolling_restart")
+        r = dict_set(r, "trit", overall)
+        r = dict_set(r, "char", trit_char(overall))
+        r = dict_set(r, "results", results)
+        r
+    }
+}
+
+// -- Cluster define (dynamic cluster creation/update) --------------------------
+
+fn define_cluster(body) {
+    let cname = dict_get(body, "name")
+    let services_csv = dict_get(body, "services")
+    let tier = dict_get(body, "tier")
+    let desc = dict_get(body, "description")
+
+    if3 cname == 0 { r = dict_set({}, "ok", T_FALSE)
+        r = dict_set(r, "error", "Missing 'name' parameter")
+        r = dict_set(r, "trit", T_FALSE)
+        r
+    } else if3 services_csv == 0 { r = dict_set({}, "ok", T_FALSE)
+        r = dict_set(r, "error", "Missing 'services' parameter")
+        r = dict_set(r, "trit", T_FALSE)
+        r
+    } else { safe_tier = 3
+        if3 tier != 0 { safe_tier = int(tier)
+        }
+        let safe_desc = ""
+        if3 desc != 0 { safe_desc = str(desc)
+        }
+        let existed = cluster_known(cname)
+        let new_cl = dict_set({}, "tier", safe_tier)
+        new_cl = dict_set(new_cl, "services", str(services_csv))
+        new_cl = dict_set(new_cl, "description", safe_desc)
+        CLUSTERS = dict_set(CLUSTERS, cname, new_cl)
+        let action_str = "created"
+        if3 existed == T_TRUE { action_str = "updated"
+        }
+        let r = dict_set({}, "ok", T_TRUE)
+        r = dict_set(r, "trit", T_TRUE)
+        r = dict_set(r, "char", "+")
+        r = dict_set(r, "action", action_str)
+        r = dict_set(r, "cluster", cname)
+        r = dict_set(r, "tier", safe_tier)
+        r = dict_set(r, "services", services_csv)
+        return r
+    }
+}
+
+// -- Tiers view -- services grouped by startup tier ----------------------------
+
+fn build_tiers() {
+    // Collect all registry keys into a list, group by tier 0..5
+    let tier0 = []
+    let tier1 = []
+    let tier2 = []
+    let tier3 = []
+    let tier4 = []
+    let tier5 = []
+
+    // Iterate over all known service names manually
+    let all_names = [
+        "orchestrator", "ternary-server", "sentinel", "ollama", "redis",
+        "meilisearch", "hivemind", "cloud-router", "nova-tools", "deepstorage",
+        "vault", "tbuffer", "tcache", "tsecurity", "tauth", "tvalidator",
+        "tintelligence", "tquery", "tembed", "tmatrix", "tbus", "tresilience",
+        "tmesh", "trouter", "tnet", "tfetch", "tshell", "bridge", "twatch",
+        "tmetrics", "thealth", "tlog", "tscheduler", "tpipeline", "tcron",
+        "tstream", "tspeak", "stt", "cortex", "uia-bridge", "exec-server",
+        "brain", "vpn-core", "nexus", "websocket", "nova-cli", "closed-loop",
+        "max-patch", "nova-tkill", "skiptrace", "nova-tsysmon", "nova-tmedia",
+        "nova-tbuild"
+    ]
+
+    let n = len(all_names)
+    let i = 0
+    while3 i < n {
+        let svc_name = dict_get(all_names, i)
+        let port = svc_port(svc_name)
+        let tier = svc_tier(svc_name)
+        let alive = port_alive(port)
+        let has_cmd = svc_has_cmd(svc_name)
+        let rec = dict_set({}, "name", svc_name)
+        rec = dict_set(rec, "port", port)
+        rec = dict_set(rec, "trit", alive)
+        rec = dict_set(rec, "char", trit_char(alive))
+        rec = dict_set(rec, "has_cmd", has_cmd)
+        if3 tier == 0 { tier0 = append(tier0, rec)
+        } else if3 tier == 1 { tier1 = append(tier1, rec)
+        } else if3 tier == 2 { tier2 = append(tier2, rec)
+        } else if3 tier == 3 { tier3 = append(tier3, rec)
+        } else if3 tier == 4 { tier4 = append(tier4, rec)
+        } else { tier5 = append(tier5, rec)
+        }
+        i = i + 1
+    }
+
+    let tiers = []
+    let t0 = dict_set({}, "tier", 0)
+    t0 = dict_set(t0, "services", tier0)
+    t0 = dict_set(t0, "count", len(tier0))
+    t0 = dict_set(t0, "boot_order", "first")
+    tiers = append(tiers, t0)
+
+    let t1 = dict_set({}, "tier", 1)
+    t1 = dict_set(t1, "services", tier1)
+    t1 = dict_set(t1, "count", len(tier1))
+    t1 = dict_set(t1, "boot_order", "first")
+    tiers = append(tiers, t1)
+
+    let t2 = dict_set({}, "tier", 2)
+    t2 = dict_set(t2, "services", tier2)
+    t2 = dict_set(t2, "count", len(tier2))
+    t2 = dict_set(t2, "boot_order", "middle")
+    tiers = append(tiers, t2)
+
+    let t3 = dict_set({}, "tier", 3)
+    t3 = dict_set(t3, "services", tier3)
+    t3 = dict_set(t3, "count", len(tier3))
+    t3 = dict_set(t3, "boot_order", "middle")
+    tiers = append(tiers, t3)
+
+    let t4 = dict_set({}, "tier", 4)
+    t4 = dict_set(t4, "services", tier4)
+    t4 = dict_set(t4, "count", len(tier4))
+    t4 = dict_set(t4, "boot_order", "middle")
+    tiers = append(tiers, t4)
+
+    let t5 = dict_set({}, "tier", 5)
+    t5 = dict_set(t5, "services", tier5)
+    t5 = dict_set(t5, "count", len(tier5))
+    t5 = dict_set(t5, "boot_order", "last")
+    tiers = append(tiers, t5)
+
+    let r = dict_set({}, "ok", T_TRUE)
+    r = dict_set(r, "tiers", tiers)
+    r = dict_set(r, "total_tiers", 6)
+    r
+}
+
+// -- Route handlers -------------------------------------------------------------
+
+fn handle_health(req) {
+    let _counters = {"total_requests": ops_total, "total_errors": ops_fail}
+    let resp = ns_health_dict(SERVICE, VERSION, PORT, _counters)
+    resp = dict_set(resp, "uptime", round(time() - started_at, 2))
+    resp = dict_set(resp, "ops_total", ops_total)
+    resp = dict_set(resp, "ops_ok", ops_ok)
+    resp = dict_set(resp, "ops_fail", ops_fail)
+    resp = dict_set(resp, "harmonics", "3-5-7-13")
+    resp = dict_set(resp, "block", BLOCK)
+    resp = dict_set(resp, "clusters", len(keys(CLUSTERS)))
+    return resp
+}
+
+fn handle_status(req) {
+    let cnames = keys(CLUSTERS)
+    let n = len(cnames)
+    let all_clusters = []
+    let trits = []
+    let i = 0
+    while3 i < n {
+        let cname = dict_get(cnames, i)
+        let cs = cluster_status(cname)
+        all_clusters = append(all_clusters, cs)
+        if3 dict_has(cs, "trit") == T_TRUE { trits = append(trits, dict_get(cs, "trit"))
+        }
+        i = i + 1
+    }
+    let overall = T_MAYBE
+    if3 len(trits) > 0 { overall = tmerge_list(trits)
+    }
+    let r = dict_set({}, "ok", T_TRUE)
+    r = dict_set(r, "trit", overall)
+    r = dict_set(r, "char", trit_char(overall))
+    r = dict_set(r, "clusters", all_clusters)
+    r = dict_set(r, "total_clusters", n)
+    return r
+}
+
+fn handle_tiers(req) {
+    return build_tiers()
+}
+
+fn handle_start(req) {
+    let body = dict_get(req, "body")
+    let cname = dict_get(body, "cluster")
+    if3 cname == 0 { r = dict_set({}, "ok", T_FALSE)
+        r = dict_set(r, "error", "Missing 'cluster' parameter")
+        r = dict_set(r, "trit", T_FALSE)
+        r
+    } else {
+        return start_cluster(str(cname))
+    }
+}
+
+fn handle_stop(req) {
+    let body = dict_get(req, "body")
+    let cname = dict_get(body, "cluster")
+    if3 cname == 0 { r = dict_set({}, "ok", T_FALSE)
+        r = dict_set(r, "error", "Missing 'cluster' parameter")
+        r = dict_set(r, "trit", T_FALSE)
+        r
+    } else {
+        return stop_cluster(str(cname))
+    }
+}
+
+fn handle_restart(req) {
+    let body = dict_get(req, "body")
+    let cname = dict_get(body, "cluster")
+    if3 cname == 0 { r = dict_set({}, "ok", T_FALSE)
+        r = dict_set(r, "error", "Missing 'cluster' parameter")
+        r = dict_set(r, "trit", T_FALSE)
+        r
+    } else {
+        return rolling_restart_cluster(str(cname))
+    }
+}
+
+fn handle_define(req) {
+    let body = dict_get(req, "body")
+    return define_cluster(body)
+}
+
+fn handle_cluster_detail(req) {
+    // Route: GET /tcluster/cluster/<name>
+    // cname extracted from path by the troute dispatcher
+    let cname = dict_get(req, "param")
+    if3 cname == 0 { r = dict_set({}, "ok", T_FALSE)
+        r = dict_set(r, "error", "Missing cluster name in path")
+        r = dict_set(r, "trit", T_FALSE)
+        r
+    } else {
+        return cluster_status(str(cname))
+    }
+}
+
+// -- Route registration ---------------------------------------------------------
+
+troute(server, "GET",  "/health",               handle_health)
+troute(server, "GET",  "/tcluster/health",       handle_health)
+troute(server, "GET",  "/tcluster/status",       handle_status)
+troute(server, "GET",  "/tcluster/tiers",        handle_tiers)
+troute(server, "GET",  "/tcluster/cluster/:cname", handle_cluster_detail)
+troute(server, "POST", "/tcluster/start",        handle_start)
+troute(server, "POST", "/tcluster/stop",         handle_stop)
+troute(server, "POST", "/tcluster/restart",      handle_restart)
+troute(server, "POST", "/tcluster/define",       handle_define)
+
+// -- Startup banner ------------------------------------------------------------
+
+print("[TCluster] " + SERVICE + " v" + VERSION + " on 127.0.0.1:" + str(PORT))
+print("[TCluster] Clusters: " + str(len(keys(CLUSTERS))) + " defined")
+print("[TCluster] Services: " + str(len(keys(REGISTRY))) + " registered")
+print("[TCluster] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13) + " BLOCK=" + str(BLOCK))
+print("[TCluster] Ternary: T_TRUE=1  T_MAYBE=0  T_FALSE=-1")
+print("[TCluster] Routes: /tcluster/[health|status|start|stop|restart|define|tiers|cluster/<name>]")
+print("[TCluster] Rolling restart: sequential (no threads) -- stop->start->wait per service")
+
+// -- Start server ---------------------------------------------------------------
+
+tstart(server)

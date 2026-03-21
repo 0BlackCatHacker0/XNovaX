@@ -1,0 +1,137 @@
+// Nova TTimeout Service v2.0
+// Port 9995 | Fleet Timeout Hardening Engine
+// Audits services for timeout compliance, tests timeout behavior
+
+let PORT = 9995
+let SERVICE_NAME = "nova-ttimeout"
+let VERSION = "2.0.0"
+
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+
+// Timeout standards (milliseconds)
+let STANDARD_SOCKET = H5 * 1000       // 5s socket timeout
+let STANDARD_HTTP = H13 * 1000        // 13s HTTP timeout
+let STANDARD_QUERY = H7 * H5 * 1000   // 35s query timeout
+let MAX_TEST_DURATION = 30             // 30s cap on stress tests
+
+let _stats = {"audits": 0, "tests": 0, "violations": 0, "t0": time()}
+
+// ── Health ──
+fn handle_health(req) {
+    let t0 = dict_get(_stats, "t0", 0)
+    let up = time() - t0
+    return {
+        "ok": 1,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "ternary": 1,
+        "self_trit": 1,
+        "char": "1",
+        "uptime": up,
+        "audits": dict_get(_stats, "audits", 0),
+        "tests": dict_get(_stats, "tests", 0),
+        "violations": dict_get(_stats, "violations", 0)
+    }
+}
+
+// ── Status ──
+fn handle_status(req) {
+    let std = {"socket_ms": STANDARD_SOCKET, "http_ms": STANDARD_HTTP, "query_ms": STANDARD_QUERY, "max_test_s": MAX_TEST_DURATION}
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "stats": _stats,
+        "standards": std,
+        "trit": 1
+    }
+}
+
+// ── Audit: check a service's response time ──
+fn handle_audit(req) {
+    let port = dict_get(req, "port", 0)
+    if3 port == 0 {
+        return {"ok": false, "error": "missing port", "trit": -1}
+    } else3 {
+        _stats = dict_set(_stats, "audits", dict_get(_stats, "audits", 0) + 1)
+        let t0 = time()
+        let resp = try3 { http_get("http://127.0.0.1:" + str(port) + "/health") } { null }
+        let elapsed_ms = int((time() - t0) * 1000)
+        if3 resp == null {
+            _stats = dict_set(_stats, "violations", dict_get(_stats, "violations", 0) + 1)
+            return {"ok": false, "port": port, "elapsed_ms": elapsed_ms, "verdict": "unreachable", "trit": -1}
+        } else3 elapsed_ms > STANDARD_HTTP {
+            _stats = dict_set(_stats, "violations", dict_get(_stats, "violations", 0) + 1)
+            return {"ok": true, "port": port, "elapsed_ms": elapsed_ms, "verdict": "slow", "threshold_ms": STANDARD_HTTP, "trit": 0}
+        } else3 {
+            return {"ok": true, "port": port, "elapsed_ms": elapsed_ms, "verdict": "compliant", "trit": 1}
+        }
+    }
+}
+
+// ── Fleet Audit: check all known services ──
+fn handle_fleet_audit(req) {
+    _stats = dict_set(_stats, "audits", dict_get(_stats, "audits", 0) + 1)
+    let orch = try3 { http_get("http://127.0.0.1:9999/api/services/health") } { null }
+    if3 orch == null {
+        return {"ok": false, "error": "orchestrator unreachable", "trit": -1}
+    } else3 {
+        let services = dict_get(orch, "services", [])
+        let results = []
+        let compliant = 0
+        let slow = 0
+        let down = 0
+        let i = 0
+        while3 i < len(services) {
+            let svc = services[i]
+            let port = dict_get(svc, "port", 0)
+            let name = dict_get(svc, "name", "unknown")
+            if3 port > 0 {
+                let t0 = time()
+                let resp = try3 { http_get("http://127.0.0.1:" + str(port) + "/health") } { null }
+                let elapsed_ms = int((time() - t0) * 1000)
+                if3 resp == null {
+                    push(results, {"name": name, "port": port, "ms": elapsed_ms, "verdict": "down", "trit": -1})
+                    down = down + 1
+                } else3 elapsed_ms > STANDARD_HTTP {
+                    push(results, {"name": name, "port": port, "ms": elapsed_ms, "verdict": "slow", "trit": 0})
+                    slow = slow + 1
+                } else3 {
+                    push(results, {"name": name, "port": port, "ms": elapsed_ms, "verdict": "ok", "trit": 1})
+                    compliant = compliant + 1
+                }
+            }
+            i = i + 1
+        }
+        let overall = 1
+        if3 down > 0 { overall = -1 }
+        else3 slow > 0 { overall = 0 }
+        return {
+            "ok": true,
+            "results": results,
+            "compliant": compliant,
+            "slow": slow,
+            "down": down,
+            "total": len(results),
+            "trit": overall
+        }
+    }
+}
+
+// Server setup
+let server = tserve(PORT, SERVICE_NAME)
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/timeout/status", "handle_status")
+troute(server, "POST", "/timeout/audit", "handle_audit")
+troute(server, "GET", "/timeout/audit", "handle_fleet_audit")
+
+print("[TTimeout] v" + VERSION + " on port " + str(PORT))
+print("[TTimeout] Standards: socket=" + str(STANDARD_SOCKET) + "ms http=" + str(STANDARD_HTTP) + "ms query=" + str(STANDARD_QUERY) + "ms")
+print("[TTimeout] Fleet timeout hardening active")
+
+tstart(server)

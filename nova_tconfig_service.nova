@@ -1,0 +1,222 @@
+// ============================================================
+// NOVAX SERVICE: TConfig -- Ternary Configuration Manager
+// ============================================================
+// Port: 9932
+// Centralized configuration for all NovaX services.
+// Supports namespaces, versioning, and live reload.
+// ============================================================
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let VERSION = "1.1"
+let PORT = 9932
+let _ns = ns_init_counters()
+
+// -- Config Storage --
+let _configs = {}
+let _config_versions = {}
+let _config_max_versions = H13
+let _watchers = {}
+
+// -- Set a config value --
+fn handle_set(req) {
+  let namespace = dict_get(req, "namespace") ?? "global"
+  let key = dict_get(req, "key") ?? ""
+  let value = dict_get(req, "value") ?? null
+
+  if3 cmp3(key, "") {
+    return {"error": "key required", "trit": -1}
+  } maybe {
+    return {"error": "key required", "trit": -1}
+  } else3 {
+    // ok
+  }
+
+  // Get or create namespace
+  let ns = dict_get(_configs, namespace) ?? {}
+  let old_value = dict_get(ns, key) ?? null
+  ns = dict_set(ns, key, value)
+  _configs = dict_set(_configs, namespace, ns)
+
+  // Version tracking
+  let vkey = namespace + "." + key
+  let versions = dict_get(_config_versions, vkey) ?? []
+  versions = append(versions, {
+    "value": value,
+    "timestamp": time_now(),
+    "previous": old_value
+  })
+  if3 cmp3(len(versions), _config_max_versions) { versions = slice(versions, len(versions) - H13, len(versions))
+  } maybe {} else3 {}
+  _config_versions = dict_set(_config_versions, vkey, versions)
+
+  return {"set": key, "namespace": namespace, "trit": 1}
+}
+
+// -- Get a config value --
+fn handle_get(req) {
+  let namespace = dict_get(req, "namespace") ?? "global"
+  let key = dict_get(req, "key") ?? ""
+  let default_val = dict_get(req, "default") ?? null
+
+  let ns = dict_get(_configs, namespace) ?? {}
+  let value = dict_get(ns, key) ?? default_val
+
+  if3 cmp3(value, null) {
+    return {"key": key, "value": null, "found": -1, "trit": 0}
+  } else3 {
+    return {"key": key, "value": value, "namespace": namespace, "found": 1, "trit": 1}
+  }
+}
+
+// -- Get all config in a namespace --
+fn handle_namespace(req) {
+  let namespace = dict_get(req, "namespace") ?? "global"
+  let ns = dict_get(_configs, namespace) ?? {}
+  let keys = dict_keys(ns)
+  return {
+    "namespace": namespace,
+    "keys": keys,
+    "count": len(keys),
+    "config": ns,
+    "trit": 1
+  }
+}
+
+// -- List all namespaces --
+fn handle_list(req) {
+  let namespaces = dict_keys(_configs)
+  let result = []
+  for3 ns_name in namespaces {
+    let ns = dict_get(_configs, ns_name) ?? {}
+    result = append(result, {
+      "namespace": ns_name,
+      "keys": len(dict_keys(ns))
+    })
+  }
+  return {"namespaces": result, "total": len(result), "trit": 1}
+}
+
+// -- Get config history/versions --
+fn handle_history(req) {
+  let namespace = dict_get(req, "namespace") ?? "global"
+  let key = dict_get(req, "key") ?? ""
+  let vkey = namespace + "." + key
+  let versions = dict_get(_config_versions, vkey) ?? []
+  return {
+    "key": key,
+    "namespace": namespace,
+    "versions": versions,
+    "version_count": len(versions),
+    "trit": 1
+  }
+}
+
+// -- Delete a config key --
+fn handle_delete(req) {
+  let namespace = dict_get(req, "namespace") ?? "global"
+  let key = dict_get(req, "key") ?? ""
+  let ns = dict_get(_configs, namespace) ?? {}
+  let existed = dict_get(ns, key) ?? "__MISSING__"
+
+  if3 cmp3(existed, "__MISSING__") {
+    return {"error": "key not found", "trit": -1}
+  } else3 {
+    // Remove key by rebuilding without it
+    let new_ns = {}
+    let all_keys = dict_keys(ns)
+    for3 k in all_keys {
+      if3 cmp3(k, key) {
+        // skip this key
+      } maybe {
+        // skip - matches
+      } else3 {
+        new_ns = dict_set(new_ns, k, dict_get(ns, k) ?? null)
+      }
+    }
+    _configs = dict_set(_configs, namespace, new_ns)
+    return {"deleted": key, "namespace": namespace, "trit": 1}
+  }
+}
+
+// -- Bulk set: set multiple keys at once --
+fn handle_bulk_set(req) {
+  let namespace = dict_get(req, "namespace") ?? "global"
+  let entries = dict_get(req, "entries") ?? {}
+  let keys = dict_keys(entries)
+  let set_count = 0
+
+  for3 key in keys {
+    let value = dict_get(entries, key) ?? null
+    handle_set({"namespace": namespace, "key": key, "value": value})
+    set_count = set_count + 1
+  }
+
+  return {"set_count": set_count, "namespace": namespace, "trit": 1}
+}
+
+// -- Export all config as flat map --
+fn handle_export(req) {
+  let all_config = {}
+  let namespaces = dict_keys(_configs)
+  for3 ns_name in namespaces {
+    let ns = dict_get(_configs, ns_name) ?? {}
+    let keys = dict_keys(ns)
+    for3 key in keys {
+      let flat_key = ns_name + "." + key
+      all_config = dict_set(all_config, flat_key, dict_get(ns, key) ?? null)
+    }
+  }
+  return {"config": all_config, "total_keys": len(dict_keys(all_config)), "trit": 1}
+}
+
+// -- Stats --
+fn handle_stats(req) {
+  let namespaces = dict_keys(_configs)
+  let total_keys = 0
+  let total_versions = 0
+
+  for3 ns_name in namespaces {
+    let ns = dict_get(_configs, ns_name) ?? {}
+    total_keys = total_keys + len(dict_keys(ns))
+  }
+
+  let vkeys = dict_keys(_config_versions)
+  for3 vk in vkeys {
+    let versions = dict_get(_config_versions, vk) ?? []
+    total_versions = total_versions + len(versions)
+  }
+
+  return {
+    "namespaces": len(namespaces),
+    "total_keys": total_keys,
+    "total_versions": total_versions,
+    "max_versions_per_key": _config_max_versions,
+    "trit": 1
+  }
+}
+
+// -- Health --
+fn handle_health(req) {
+  let h = ns_health_dict("nova-tconfig2", VERSION, PORT, _ns)
+  h = dict_set(h, "tools", 9)
+  return h
+}
+
+// -- Server --
+let server = tserve(PORT, "TConfig v1.1 -- Ternary Configuration Manager")
+
+// -- Routes --
+troute(server, "GET", "/health", "handle_health")
+troute(server, "POST", "/tconfig/set", "handle_set")
+troute(server, "GET", "/tconfig/get", "handle_get")
+troute(server, "GET", "/tconfig/namespace", "handle_namespace")
+troute(server, "GET", "/tconfig/list", "handle_list")
+troute(server, "GET", "/tconfig/history", "handle_history")
+troute(server, "POST", "/tconfig/delete", "handle_delete")
+troute(server, "POST", "/tconfig/bulk", "handle_bulk_set")
+troute(server, "GET", "/tconfig/export", "handle_export")
+troute(server, "GET", "/tconfig/stats", "handle_stats")
+
+tstart(server)

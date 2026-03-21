@@ -1,0 +1,145 @@
+// hivemind_helper.nova - Scatter/Warm queries to Ollama models
+// Replaces hivemind_helper.py
+// Called by nova_hivemind_service.nova via nova_run()
+
+let OLLAMA_URL = "http://127.0.0.1:11434"
+
+fn3 query_model(model, prompt, system_prompt, timeout) {
+    let t0 = time_ms()
+    try3 {
+        let payload = {}
+        payload = dict_set(payload, "model", model)
+        payload = dict_set(payload, "prompt", prompt)
+        payload = dict_set(payload, "stream", false)
+        if3 len(system_prompt) > 0 {
+            payload = dict_set(payload, "system", system_prompt)
+        }
+
+        let resp = http_post(OLLAMA_URL + "/api/generate", to_json(payload))
+        let data = parse_json(resp)
+        let elapsed = int(time_ms() - t0)
+
+        let err = dict_get(data, "error") ?? ""
+        if3 len(err) > 0 {
+            let r = {}
+            r = dict_set(r, "model", model)
+            r = dict_set(r, "ok", false)
+            r = dict_set(r, "error", err)
+            r = dict_set(r, "response", "")
+            r = dict_set(r, "time_ms", elapsed)
+            return3 r
+        }
+
+        let r = {}
+        r = dict_set(r, "model", model)
+        r = dict_set(r, "ok", true)
+        r = dict_set(r, "response", dict_get(data, "response") ?? "")
+        r = dict_set(r, "time_ms", elapsed)
+        r = dict_set(r, "eval_count", dict_get(data, "eval_count") ?? 0)
+        r = dict_set(r, "eval_duration", dict_get(data, "eval_duration") ?? 0)
+        return3 r
+    } catch3 {
+        let elapsed = int(time_ms() - t0)
+        let r = {}
+        r = dict_set(r, "model", model)
+        r = dict_set(r, "ok", false)
+        r = dict_set(r, "error", "request_failed")
+        r = dict_set(r, "response", "")
+        r = dict_set(r, "time_ms", elapsed)
+        return3 r
+    }
+}
+
+fn3 scatter(payload_str) {
+    let payload = {}
+    try3 {
+        payload = parse_json(payload_str)
+    } catch3 {
+        print(to_json({"results": [], "ok_count": 0, "total_ms": 0, "error": "invalid_json"}))
+        return3 null
+    }
+
+    let models = dict_get(payload, "models") ?? []
+    let prompt = dict_get(payload, "prompt") ?? ""
+    let system_prompt = dict_get(payload, "system") ?? ""
+    let timeout = dict_get(payload, "timeout") ?? 30
+    let early_return = dict_get(payload, "early_return") ?? 7
+
+    if3 len(models) == 0 {
+        print(to_json({"results": [], "ok_count": 0, "total_ms": 0, "error": "missing_models_or_prompt"}))
+        return3 null
+    }
+    if3 len(prompt) == 0 {
+        print(to_json({"results": [], "ok_count": 0, "total_ms": 0, "error": "missing_models_or_prompt"}))
+        return3 null
+    }
+
+    let t0 = time_ms()
+    let results = []
+    let ok_count = 0
+
+    // Sequential query (NovaLang doesn't have thread pools)
+    // For parallel, the caller should use multiple nova_run instances
+    for3 m in models {
+        let result = query_model(m, prompt, system_prompt, timeout)
+        results = append(results, result)
+        if3 dict_get(result, "ok") ?? false {
+            ok_count = ok_count + 1
+        }
+        // Early return if we have enough good results
+        if3 ok_count >= early_return {
+            // break not available, use flag
+            let total_ms = int(time_ms() - t0)
+            print(to_json({"results": results, "ok_count": ok_count, "total_ms": total_ms}))
+            return3 null
+        }
+    }
+
+    let total_ms = int(time_ms() - t0)
+    print(to_json({"results": results, "ok_count": ok_count, "total_ms": total_ms}))
+}
+
+fn3 warm(payload_str) {
+    let payload = {}
+    try3 {
+        payload = parse_json(payload_str)
+    } catch3 {
+        print(to_json({"warmed": 0, "error": "invalid_json"}))
+        return3 null
+    }
+
+    let models = dict_get(payload, "models") ?? []
+    let warmed = 0
+
+    for3 m in models {
+        let result = query_model(m, "hi", "", 10)
+        if3 dict_get(result, "ok") ?? false {
+            warmed = warmed + 1
+        }
+    }
+
+    print(to_json({"warmed": warmed, "total": len(models)}))
+}
+
+fn3 main() {
+    let args = sys_args()
+    if3 len(args) < 2 {
+        print(to_json({"error": "usage: hivemind_helper.nova <scatter|warm> <json_payload>"}))
+        return3 null
+    }
+
+    let cmd = args[0]
+    let payload = args[1]
+
+    if3 cmd == "scatter" {
+        scatter(payload)
+    } else3 {
+        if3 cmd == "warm" {
+            warm(payload)
+        } else3 {
+            print(to_json({"error": "unknown command: " + cmd}))
+        }
+    }
+}
+
+main()

@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NovaX LLM Training Monitor</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#e0e0e0;font-family:'Consolas','Courier New',monospace;overflow:hidden}
+.wrap{padding:16px;height:100vh;display:flex;flex-direction:column;gap:12px}
+h1{font-size:16px;color:#ff6b35;display:flex;align-items:center;gap:8px}
+h1 .dot{width:8px;height:8px;border-radius:50%;background:#ff2d55;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.card{background:#12121a;border:1px solid #1e1e2e;border-radius:8px;padding:12px}
+.card .label{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:1px}
+.card .value{font-size:22px;font-weight:bold;margin-top:4px}
+.card .sub{font-size:11px;color:#666;margin-top:2px}
+.loss{color:#00ff88}.ppl{color:#ff6b35}.speed{color:#00bfff}.eta{color:#ff2d55}
+.progress-wrap{background:#12121a;border:1px solid #1e1e2e;border-radius:8px;padding:12px}
+.progress-bar{width:100%;height:28px;background:#1a1a2e;border-radius:4px;overflow:hidden;position:relative}
+.progress-fill{height:100%;background:linear-gradient(90deg,#ff6b35,#ff2d55);transition:width .5s ease;border-radius:4px}
+.progress-text{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:bold;color:#fff;text-shadow:0 0 4px rgba(0,0,0,.8)}
+.chart-wrap{flex:1;background:#12121a;border:1px solid #1e1e2e;border-radius:8px;padding:12px;min-height:120px;position:relative}
+.chart-title{font-size:11px;color:#888;margin-bottom:8px}
+.trend{display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.trend-pt{background:#1a1a2e;border-radius:4px;padding:4px 8px;font-size:11px}
+.trend-arrow{color:#00ff88}
+.status-row{display:flex;gap:10px;align-items:center}
+.status-badge{padding:3px 10px;border-radius:12px;font-size:11px;font-weight:bold}
+.badge-training{background:rgba(255,107,53,.2);color:#ff6b35;border:1px solid #ff6b35}
+.badge-done{background:rgba(0,255,136,.2);color:#00ff88;border:1px solid #00ff88}
+.badge-waiting{background:rgba(136,136,136,.2);color:#888;border:1px solid #888}
+.bottom-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.info-list{font-size:11px;color:#aaa;line-height:1.8}
+.info-list span{color:#ff6b35}
+#error-msg{color:#ff2d55;font-size:12px;text-align:center;padding:4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="status-row">
+    <h1><span class="dot" id="live-dot"></span> LLM Training Monitor</h1>
+    <span class="status-badge badge-waiting" id="status-badge">WAITING</span>
+    <span style="flex:1"></span>
+    <span style="font-size:11px;color:#666" id="last-update"></span>
+  </div>
+
+  <div class="progress-wrap">
+    <div class="progress-bar">
+      <div class="progress-fill" id="prog-fill" style="width:0%"></div>
+      <div class="progress-text" id="prog-text">0 / 20,000</div>
+    </div>
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="label">Loss</div><div class="value loss" id="v-loss">--</div><div class="sub" id="v-best">best: --</div></div>
+    <div class="card"><div class="label">Perplexity</div><div class="value ppl" id="v-ppl">--</div><div class="sub" id="v-epoch">epoch --</div></div>
+    <div class="card"><div class="label">Speed</div><div class="value speed" id="v-speed">--</div><div class="sub" id="v-toks">-- tok/s</div></div>
+    <div class="card"><div class="label">ETA</div><div class="value eta" id="v-eta">--</div><div class="sub" id="v-elapsed">elapsed --</div></div>
+  </div>
+
+  <div class="chart-wrap">
+    <div class="chart-title">Loss Curve (log scale)</div>
+    <canvas id="chart"></canvas>
+  </div>
+
+  <div class="bottom-row">
+    <div class="card">
+      <div class="label">Trend (last 5 steps)</div>
+      <div class="trend" id="trend-row"></div>
+    </div>
+    <div class="card">
+      <div class="label">Configuration</div>
+      <div class="info-list">
+        Model: <span>117M params, 13 layers, ternary</span><br>
+        Tokenizer: <span>BPE 32K vocab (71% compression)</span><br>
+        Batch: <span>12, bf16 mixed precision</span><br>
+        Cache: <span>Paged trit KV (1M context)</span>
+      </div>
+    </div>
+  </div>
+  <div id="error-msg"></div>
+</div>
+
+<script>
+// Try NovaLang monitor service first, fall back to reading training log via LLM info endpoint
+const MONITOR_URL = 'http://127.0.0.1:9802/train/status';
+const HISTORY_URL = 'http://127.0.0.1:9802/train/history';
+const LLM_INFO_URL = 'http://127.0.0.1:9800/llm/info';
+const REFRESH_MS = 5000;
+
+function fmt(n, d) {
+  if (n === undefined || n === null) return '--';
+  d = d !== undefined ? d : 2;
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return typeof n === 'number' ? n.toFixed(d) : String(n);
+}
+
+function drawChart(canvas, points) {
+  if (!points || points.length < 2) return;
+  var ctx = canvas.getContext('2d');
+  var rect = canvas.parentElement.getBoundingClientRect();
+  var W = canvas.width = rect.width - 24;
+  var H = canvas.height = Math.max(rect.height - 36, 80);
+  ctx.clearRect(0, 0, W, H);
+
+  var losses = points.map(function(p){ return Math.log10(Math.max(p.loss, 0.001)); });
+  var minL = Math.min.apply(null, losses);
+  var maxL = Math.max.apply(null, losses);
+  var rangeL = maxL - minL || 1;
+  var steps = points.map(function(p){ return p.step; });
+  var maxS = Math.max.apply(null, steps);
+  var minS = Math.min.apply(null, steps);
+  var rangeS = maxS - minS || 1;
+
+  // Grid lines
+  ctx.strokeStyle = '#1e1e2e';
+  ctx.lineWidth = 1;
+  for (var i = 0; i <= 4; i++) {
+    var gy = H * i / 4;
+    ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke();
+  }
+
+  // Loss line with glow
+  ctx.strokeStyle = 'rgba(0,255,136,0.15)';
+  ctx.lineWidth = 8;
+  ctx.beginPath();
+  for (var j = 0; j < points.length; j++) {
+    var x = ((points[j].step - minS) / rangeS) * W;
+    var y = H - ((losses[j] - minL) / rangeL) * H;
+    if (j === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  ctx.strokeStyle = '#00ff88';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (var k = 0; k < points.length; k++) {
+    var x2 = ((points[k].step - minS) / rangeS) * W;
+    var y2 = H - ((losses[k] - minL) / rangeL) * H;
+    if (k === 0) ctx.moveTo(x2, y2); else ctx.lineTo(x2, y2);
+  }
+  ctx.stroke();
+
+  // Current point dot
+  if (points.length > 0) {
+    var last = points[points.length - 1];
+    var lx = ((last.step - minS) / rangeS) * W;
+    var ly = H - ((Math.log10(Math.max(last.loss, 0.001)) - minL) / rangeL) * H;
+    ctx.fillStyle = '#ff2d55';
+    ctx.beginPath(); ctx.arc(lx, ly, 4, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // Axis labels
+  ctx.fillStyle = '#555';
+  ctx.font = '10px Consolas';
+  ctx.fillText('Step ' + minS, 4, H - 4);
+  ctx.textAlign = 'right';
+  ctx.fillText('Step ' + maxS, W - 4, H - 4);
+  ctx.textAlign = 'left';
+  ctx.fillText(Math.pow(10, maxL).toFixed(1), 4, 12);
+  ctx.fillText(Math.pow(10, minL).toFixed(4), 4, H - 16);
+}
+
+function updateUI(data) {
+  var badge = document.getElementById('status-badge');
+  if (!data || !data.step) {
+    badge.className = 'status-badge badge-waiting';
+    badge.textContent = 'WAITING';
+    return;
+  }
+
+  var total = data.total_steps || 20000;
+  var done = data.step >= total;
+
+  if (done) {
+    badge.className = 'status-badge badge-done';
+    badge.textContent = 'COMPLETE';
+    document.getElementById('live-dot').style.background = '#00ff88';
+  } else {
+    badge.className = 'status-badge badge-training';
+    badge.textContent = 'TRAINING';
+  }
+
+  var pct = (data.step / total) * 100;
+  document.getElementById('prog-fill').style.width = pct + '%';
+  document.getElementById('prog-text').textContent =
+    data.step.toLocaleString() + ' / ' + total.toLocaleString() + ' (' + pct.toFixed(1) + '%)';
+
+  document.getElementById('v-loss').textContent = fmt(data.loss, 4);
+  document.getElementById('v-best').textContent = 'best: ' + fmt(data.best_loss, 4) + ' @ step ' + (data.best_step || '?');
+  document.getElementById('v-ppl').textContent = fmt(data.perplexity);
+  document.getElementById('v-epoch').textContent = 'epoch ' + (data.epoch || '?');
+  document.getElementById('v-speed').textContent = fmt(data.steps_per_sec) + ' s/s';
+  document.getElementById('v-toks').textContent = fmt(data.tokens_per_sec, 0) + ' tok/s';
+
+  var eh = data.eta_hours || 0, em = data.eta_minutes || 0;
+  document.getElementById('v-eta').textContent = eh + 'h ' + em + 'm';
+  var es = data.elapsed_sec || 0;
+  document.getElementById('v-elapsed').textContent =
+    'elapsed ' + Math.floor(es/3600) + 'h ' + Math.floor((es%3600)/60) + 'm';
+
+  // Trend
+  if (data.trend && data.trend.length) {
+    var html = '';
+    for (var i = 0; i < data.trend.length; i++) {
+      var t = data.trend[i];
+      var arrow = (i > 0 && t.loss < data.trend[i-1].loss) ? ' <span class="trend-arrow">&#x2193;</span>' : '';
+      html += '<span class="trend-pt">' + fmt(t.loss, 2) + arrow + '</span>';
+    }
+    document.getElementById('trend-row').innerHTML = html;
+  }
+
+  document.getElementById('last-update').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+  document.getElementById('error-msg').textContent = '';
+}
+
+function poll() {
+  // Try NovaLang monitor service first
+  fetch(MONITOR_URL).then(function(r){ return r.json(); }).then(function(data) {
+    updateUI(data);
+    // Fetch history for chart
+    fetch(HISTORY_URL).then(function(r2){ return r2.json(); }).then(function(hd) {
+      if (hd && hd.points) drawChart(document.getElementById('chart'), hd.points);
+    }).catch(function(){
+      if (data.trend) drawChart(document.getElementById('chart'), data.trend);
+    });
+  }).catch(function() {
+    // Fallback: try LLM info endpoint
+    fetch(LLM_INFO_URL).then(function(r){ return r.json(); }).then(function(info) {
+      if (info.training) {
+        updateUI({
+          step: info.training.total_steps,
+          total_steps: 20000,
+          loss: info.training.last_loss,
+          perplexity: info.training.best_perplexity,
+          best_loss: info.training.best_loss,
+          best_step: info.training.best_step,
+          steps_per_sec: 0,
+          tokens_per_sec: 0,
+          epoch: info.training.epochs,
+          eta_hours: 0, eta_minutes: 0,
+          elapsed_sec: 0,
+          trend: []
+        });
+      }
+    }).catch(function() {
+      document.getElementById('error-msg').textContent =
+        'Start nova_train_monitor.nova (port 9801) or inference server (port 9800)';
+    });
+  });
+}
+
+poll();
+setInterval(poll, REFRESH_MS);
+</script>
+</body>
+</html>

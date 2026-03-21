@@ -1,0 +1,1274 @@
+// NovaX Ternary Media Processor v2.0 -- NovaLang Edition
+// Port 9908: 7 Tools on 3-5-7-13 Harmonics
+//
+// N-S Mapping:
+//   media_flow      = velocity_field (file data stream)
+//   file_bytes      = flow_velocity (throughput pressure)
+//   transition_rate = viscosity (byte-level variation)
+//   entropy         = turbulent_energy (data randomness)
+//   Reynolds = (file_bytes / BLOCK_SIZE) * H5
+//   Re < 27 (H3^3)  = LAMINAR (small/uniform media)
+//   Re < 125 (H5^3) = TRANSITIONAL (moderate complexity)
+//   Re < 343 (H7^3) = TURBULENT (large/complex media)
+//   Re >= 343        = CHAOTIC (extreme entropy)
+//
+// Tools:
+//   1. Info       -- PIL image metadata (dimensions, format, mode, size)
+//   2. Convert    -- PIL image format conversion (handles RGBA->RGB for JPEG)
+//   3. Thumbnail  -- PIL thumbnail generation (width x height, LANCZOS)
+//   4. AudioInfo  -- ffprobe audio metadata (fallback: basic file stats)
+//   5. DocGen     -- Markdown to HTML/text document via python-markdown
+//   6. Cheat      -- Cheat sheet image generator via PIL ImageDraw
+//   7. Manifest   -- Directory media inventory with Reynolds classification
+//
+// Endpoints:
+//   GET  /health              -- Health check
+//   GET  /tmedia/status       -- Toolkit status
+//   POST /tmedia/info         -- Image metadata (params: path)
+//   POST /tmedia/convert      -- Image format conversion (params: input_path, output_path)
+//   POST /tmedia/thumbnail    -- Thumbnail generator (params: path, width, height, output_path)
+//   POST /tmedia/audio-info   -- Audio file info (params: path)
+//   POST /tmedia/doc-gen      -- Markdown to document (params: text|path, output_path, format)
+//   POST /tmedia/cheat        -- Cheat sheet image (params: title, items, output_path)
+//   POST /tmedia/manifest     -- Directory media inventory (params: path)
+
+let PORT        = 9908
+let server      = tserve(PORT, "TMedia v2.0 - Ternary Media Processor")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE    = 2187
+let RE_LAMINAR    = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT  = 343
+
+let TOOLS_COUNT  = 7
+let VERSION      = "2.0.0"
+let SERVICE_NAME = "nova-tmedia"
+let PY_TIMEOUT   = 13
+let TMP_DIR      = "C:\\NovaX\\data"
+
+// -- Global Stats --
+let stat_ops        = 0
+let stat_trit_true  = 0
+let stat_trit_maybe = 0
+let stat_trit_false = 0
+let stat_t0         = time()
+
+// by_tool counters (one per tool, H7 = 7 tools)
+let by_tool_info      = 0
+let by_tool_convert   = 0
+let by_tool_thumbnail = 0
+let by_tool_audioinfo = 0
+let by_tool_docgen    = 0
+let by_tool_cheat     = 0
+let by_tool_manifest  = 0
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: 3-char balanced ternary string from integer
+// ===========================================================================
+fn bt_three(n) {
+    let result = ""
+    let val = n
+    let i = 0
+    while3 i < 3 {
+        let rem = val % 3
+        if3 rem == 0 {
+            result = "0" + result
+        }
+        if3 rem == 1 {
+            result = "+" + result
+            val = val - 1
+        }
+        if3 rem == 2 {
+            result = "T" + result
+            val = val + 1
+        }
+        val = val / 3
+        i = i + 1
+    }
+    return result
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_op(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "info" {
+        by_tool_info = by_tool_info + 1
+    }
+    if3 tool_name == "convert" {
+        by_tool_convert = by_tool_convert + 1
+    }
+    if3 tool_name == "thumbnail" {
+        by_tool_thumbnail = by_tool_thumbnail + 1
+    }
+    if3 tool_name == "audioinfo" {
+        by_tool_audioinfo = by_tool_audioinfo + 1
+    }
+    if3 tool_name == "docgen" {
+        by_tool_docgen = by_tool_docgen + 1
+    }
+    if3 tool_name == "cheat" {
+        by_tool_cheat = by_tool_cheat + 1
+    }
+    if3 tool_name == "manifest" {
+        by_tool_manifest = by_tool_manifest + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: Reynolds from file size bytes
+// N-S: file_bytes = flow_velocity => Re = (bytes / BLOCK_SIZE) * H5
+// ===========================================================================
+fn calc_reynolds_bytes(size_bytes) {
+    let re = (size_bytes / BLOCK_SIZE) * H5
+    if3 re > 999 {
+        re = 999
+    }
+    if3 re < 0 {
+        re = 0
+    }
+    return re
+}
+
+// ===========================================================================
+// HELPER: Reynolds from pixel dimensions
+// N-S: resolution_pressure = turbulent_energy
+// Reynolds = (width * height / BLOCK_SIZE) * H5
+// ===========================================================================
+fn calc_reynolds_pixels(width, height) {
+    let pixels = width * height
+    let re = (pixels / BLOCK_SIZE) * H5
+    if3 re > 999 {
+        re = 999
+    }
+    if3 re < 0 {
+        re = 0
+    }
+    return re
+}
+
+// ===========================================================================
+// HELPER: run a Python command with standard timeout (H13=13s)
+// Returns trimmed string output
+// ===========================================================================
+fn run_py(cmd) {
+    let raw = nova_run(cmd, PY_TIMEOUT)
+    let output = trim(str(raw))
+    return output
+}
+
+// ===========================================================================
+// HELPER: check if output indicates a Python error
+// ===========================================================================
+fn is_py_error(output) {
+    let lc = lower(output)
+    if3 contains(lc, "traceback") {
+        return true
+    }
+    if3 contains(lc, "error:") {
+        return true
+    }
+    if3 contains(lc, "exception") {
+        return true
+    }
+    if3 contains(lc, "no such file") {
+        return true
+    }
+    if3 contains(lc, "filenotfounderror") {
+        return true
+    }
+    if3 contains(lc, "modulenotfounderror") {
+        return true
+    }
+    if3 contains(lc, "cannot identify image") {
+        return true
+    }
+    if3 contains(lc, "permission denied") {
+        return true
+    }
+    if3 contains(lc, "oserror") {
+        return true
+    }
+    if3 contains(lc, "ioerror") {
+        return true
+    }
+    if3 contains(lc, "syntaxerror") {
+        return true
+    }
+    if3 contains(lc, "valueerror") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: escape a file path for use inside Python single-quoted strings
+// Replaces backslash with double-backslash, escapes single quotes
+// ===========================================================================
+fn escape_for_py(s) {
+    let escaped = replace(s, "\\", "\\\\")
+    escaped = replace(escaped, "'", "\\'")
+    return escaped
+}
+
+// ===========================================================================
+// HELPER: generate a unique temp file path
+// ===========================================================================
+fn tmp_path(prefix, ext) {
+    let ts = str(int(time() * 1000))
+    let path = TMP_DIR + "\\" + prefix + "_" + ts + "." + ext
+    return path
+}
+
+// ===========================================================================
+// HELPER: clean up a temp file silently
+// ===========================================================================
+fn cleanup_temp(fpath) {
+    let epath = escape_for_py(fpath)
+    let cmd = "python -c \"import os; os.remove('" + epath + "') if os.path.exists('" + epath + "') else None; print('ok')\""
+    nova_run(cmd)
+}
+
+// ===========================================================================
+// HELPER: get file size via Python
+// ===========================================================================
+fn get_file_size(fpath) {
+    let epath = escape_for_py(fpath)
+    let cmd = "python -c \"import os; print(os.path.getsize('" + epath + "') if os.path.exists('" + epath + "') else 0)\""
+    let result = run_py(cmd)
+    if3 is_py_error(result) {
+        return 0
+    }
+    return int(trim(result))
+}
+
+// ===========================================================================
+// TOOL 1: POST /tmedia/info
+// Get image metadata via PIL: dimensions, format, color mode, file size
+// Body: {path: "C:\\path\\to\\image.png"}
+// Trit: +1=success, 0=partial, -1=error
+// ===========================================================================
+fn handle_info(body) {
+    let fpath = dict_get(body, "path", "")
+
+    if3 len(fpath) == 0 {
+        record_op("info", T_FALSE)
+        return {
+            "ok": false,
+            "error": "path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let esc_path = escape_for_py(fpath)
+
+    // Get image width
+    let cmd_w = "python -c \"from PIL import Image; img=Image.open('" + esc_path + "'); print(img.width)\""
+    let width_str = run_py(cmd_w)
+
+    if3 is_py_error(width_str) {
+        record_op("info", T_FALSE)
+        return {
+            "ok": false,
+            "path": fpath,
+            "error": width_str,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Get image height
+    let cmd_h = "python -c \"from PIL import Image; img=Image.open('" + esc_path + "'); print(img.height)\""
+    let height_str = run_py(cmd_h)
+
+    // Get image format
+    let cmd_f = "python -c \"from PIL import Image; img=Image.open('" + esc_path + "'); print(img.format)\""
+    let format_str = run_py(cmd_f)
+
+    // Get color mode
+    let cmd_m = "python -c \"from PIL import Image; img=Image.open('" + esc_path + "'); print(img.mode)\""
+    let mode_str = run_py(cmd_m)
+
+    // Get file size in bytes
+    let cmd_s = "python -c \"import os; print(os.path.getsize('" + esc_path + "'))\""
+    let size_str = run_py(cmd_s)
+
+    let width      = int(trim(width_str))
+    let height     = int(trim(height_str))
+    let format_val = trim(format_str)
+    let mode_val   = trim(mode_str)
+    let size_bytes = int(trim(size_str))
+
+    let re     = calc_reynolds_pixels(width, height)
+    let regime = flow_regime(re)
+
+    record_op("info", T_TRUE)
+    return {
+        "ok": true,
+        "path": fpath,
+        "width": width,
+        "height": height,
+        "format": format_val,
+        "mode": mode_val,
+        "size_bytes": size_bytes,
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 2: POST /tmedia/convert
+// Convert between image formats via PIL
+// Body: {input_path: "...", output_path: "..."}
+// Handles RGBA->RGB for JPEG targets automatically
+// Trit: +1=converted, 0=same format (soft pass), -1=error
+// ===========================================================================
+fn handle_convert(body) {
+    let input_path  = dict_get(body, "input_path", "")
+    let output_path = dict_get(body, "output_path", "")
+
+    if3 len(input_path) == 0 {
+        record_op("convert", T_FALSE)
+        return {
+            "ok": false,
+            "error": "input_path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output_path) == 0 {
+        record_op("convert", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output_path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let esc_in  = escape_for_py(input_path)
+    let esc_out = escape_for_py(output_path)
+
+    // Single-line convert: auto-handle RGBA->RGB for JPEG
+    let py_cmd = "python -c \"from PIL import Image; import json; img=Image.open('" + esc_in + "'); img=img.convert('RGB') if '" + esc_out + "'.lower().endswith(('.jpg','.jpeg')) and img.mode=='RGBA' else img; img.save('" + esc_out + "'); print(json.dumps({'ok':True,'width':img.width,'height':img.height,'mode':img.mode}))\""
+
+    let result = run_py(py_cmd)
+
+    if3 is_py_error(result) {
+        record_op("convert", T_FALSE)
+        return {
+            "ok": false,
+            "input_path": input_path,
+            "output_path": output_path,
+            "error": result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Get output file size
+    let out_size = get_file_size(output_path)
+
+    // Reynolds from output bytes
+    let re     = calc_reynolds_bytes(out_size)
+    let regime = flow_regime(re)
+
+    // Detect if format really changed (compare extension of in vs out)
+    let in_lc     = lower(input_path)
+    let out_lc    = lower(output_path)
+    let conv_trit = T_TRUE
+    if3 in_lc == out_lc {
+        conv_trit = T_MAYBE
+    }
+
+    record_op("convert", conv_trit)
+    return {
+        "ok": true,
+        "input_path": input_path,
+        "output_path": output_path,
+        "output_size_bytes": out_size,
+        "reynolds": re,
+        "regime": regime,
+        "trit": conv_trit,
+        "char": bt_one(conv_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 3: POST /tmedia/thumbnail
+// Generate thumbnail via PIL (LANCZOS resampling, aspect-ratio preserved)
+// Body: {path: "...", width: N, height: N, output_path: "..."}
+// Trit: +1=shrunk, 0=already fits, -1=error
+// ===========================================================================
+fn handle_thumbnail(body) {
+    let fpath       = dict_get(body, "path", "")
+    let width       = dict_get(body, "width", 128)
+    let height      = dict_get(body, "height", 128)
+    let output_path = dict_get(body, "output_path", "")
+
+    if3 len(fpath) == 0 {
+        record_op("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "error": "path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output_path) == 0 {
+        record_op("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output_path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 width <= 0 {
+        width = 128
+    }
+    if3 height <= 0 {
+        height = 128
+    }
+    // Clamp to sane max
+    if3 width > 4096 {
+        width = 4096
+    }
+    if3 height > 4096 {
+        height = 4096
+    }
+
+    let esc_path = escape_for_py(fpath)
+    let esc_out  = escape_for_py(output_path)
+    let w_str    = str(width)
+    let h_str    = str(height)
+
+    // Get original dimensions first
+    let orig_cmd = "python -c \"from PIL import Image; img=Image.open('" + esc_path + "'); print(str(img.width)+'x'+str(img.height))\""
+    let orig_result = run_py(orig_cmd)
+
+    if3 is_py_error(orig_result) {
+        record_op("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "path": fpath,
+            "error": orig_result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let orig_dims = split(trim(orig_result), "x")
+    let orig_w    = int(dict_get(orig_dims, 0, "0"))
+    let orig_h    = int(dict_get(orig_dims, 1, "0"))
+
+    // Build thumbnail command (PIL thumbnail preserves aspect ratio)
+    let thumb_cmd = "python -c \"from PIL import Image; img=Image.open('" + esc_path + "'); img.thumbnail((" + w_str + "," + h_str + "),Image.LANCZOS); img.save('" + esc_out + "'); print(str(img.width)+'x'+str(img.height))\""
+
+    let thumb_result = run_py(thumb_cmd)
+
+    if3 is_py_error(thumb_result) {
+        record_op("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "path": fpath,
+            "output_path": output_path,
+            "target_width": width,
+            "target_height": height,
+            "error": thumb_result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse output dimensions
+    let out_dims = split(trim(thumb_result), "x")
+    let out_w    = int(dict_get(out_dims, 0, "0"))
+    let out_h    = int(dict_get(out_dims, 1, "0"))
+
+    // Get output file size
+    let out_size = get_file_size(output_path)
+
+    // Trit: +1 if actually shrunk, 0 if already fit within bounds
+    let thumb_trit = T_TRUE
+    if3 out_w == orig_w {
+        if3 out_h == orig_h {
+            thumb_trit = T_MAYBE
+        }
+    }
+
+    let re     = calc_reynolds_pixels(out_w, out_h)
+    let regime = flow_regime(re)
+
+    record_op("thumbnail", thumb_trit)
+    return {
+        "ok": true,
+        "path": fpath,
+        "output_path": output_path,
+        "target_width": width,
+        "target_height": height,
+        "original_width": orig_w,
+        "original_height": orig_h,
+        "output_width": out_w,
+        "output_height": out_h,
+        "output_size_bytes": out_size,
+        "reynolds": re,
+        "regime": regime,
+        "trit": thumb_trit,
+        "char": bt_one(thumb_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 4: POST /tmedia/audio-info
+// Get audio file metadata via ffprobe (fallback: basic file stats)
+// Body: {path: "C:\\path\\to\\audio.mp3"}
+// Trit: +1=full info (ffprobe), 0=basic info (fallback), -1=error
+// ===========================================================================
+fn handle_audio_info(body) {
+    let fpath = dict_get(body, "path", "")
+
+    if3 len(fpath) == 0 {
+        record_op("audioinfo", T_FALSE)
+        return {
+            "ok": false,
+            "error": "path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let esc_path = escape_for_py(fpath)
+
+    // Check file exists first
+    let exist_cmd = "python -c \"import os; print('yes' if os.path.exists('" + esc_path + "') else 'no')\""
+    let exist_result = run_py(exist_cmd)
+
+    if3 contains(trim(exist_result), "no") {
+        record_op("audioinfo", T_FALSE)
+        return {
+            "ok": false,
+            "path": fpath,
+            "error": "File not found",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Try ffprobe first (returns JSON with full audio metadata)
+    let ffprobe_cmd = "ffprobe -v quiet -print_format json -show_format -show_streams \"" + fpath + "\""
+    let ffprobe_result = run_py(ffprobe_cmd)
+
+    // Check if ffprobe worked (result should contain "format" key)
+    if3 contains(ffprobe_result, "format_name") {
+        // ffprobe succeeded -- extract key fields via Python
+        let tmp_ffprobe = tmp_path("ffprobe", "json")
+        let esc_tmp = escape_for_py(tmp_ffprobe)
+        nova_write(tmp_ffprobe, ffprobe_result)
+
+        let parse_cmd = "python -c \"import json,os; data=json.load(open('" + esc_tmp + "')); fmt=data.get('format',{}); streams=data.get('streams',[]); astream=next((s for s in streams if s.get('codec_type')=='audio'),{}); result={'duration':float(fmt.get('duration',0)),'size_bytes':int(fmt.get('size',0)),'bit_rate':int(fmt.get('bit_rate',0)),'format_name':fmt.get('format_name',''),'format_long':fmt.get('format_long_name',''),'codec':astream.get('codec_name',''),'sample_rate':astream.get('sample_rate',''),'channels':astream.get('channels',0),'channel_layout':astream.get('channel_layout','')}; print(json.dumps(result))\""
+
+        let parse_result = run_py(parse_cmd)
+        cleanup_temp(tmp_ffprobe)
+
+        if3 is_py_error(parse_result) {
+            // Parse failed -- fall through to basic info
+        }
+
+        if3 is_py_error(parse_result) == false {
+            // Successfully parsed ffprobe output
+            // Extract individual fields the NovaLang way
+            let dur_cmd  = "python -c \"import json; d=json.loads('" + trim(parse_result) + "'); print(d.get('duration',0))\""
+            let size_cmd = "python -c \"import json; d=json.loads('" + trim(parse_result) + "'); print(d.get('size_bytes',0))\""
+            let br_cmd   = "python -c \"import json; d=json.loads('" + trim(parse_result) + "'); print(d.get('bit_rate',0))\""
+            let fmt_cmd  = "python -c \"import json; d=json.loads('" + trim(parse_result) + "'); print(d.get('format_name',''))\""
+            let cod_cmd  = "python -c \"import json; d=json.loads('" + trim(parse_result) + "'); print(d.get('codec',''))\""
+            let sr_cmd   = "python -c \"import json; d=json.loads('" + trim(parse_result) + "'); print(d.get('sample_rate',''))\""
+            let ch_cmd   = "python -c \"import json; d=json.loads('" + trim(parse_result) + "'); print(d.get('channels',0))\""
+
+            let dur_str  = trim(run_py(dur_cmd))
+            let size_str = trim(run_py(size_cmd))
+            let br_str   = trim(run_py(br_cmd))
+            let fmt_str  = trim(run_py(fmt_cmd))
+            let cod_str  = trim(run_py(cod_cmd))
+            let sr_str   = trim(run_py(sr_cmd))
+            let ch_str   = trim(run_py(ch_cmd))
+
+            let file_size  = int(size_str)
+            let re     = calc_reynolds_bytes(file_size)
+            let regime = flow_regime(re)
+
+            record_op("audioinfo", T_TRUE)
+            return {
+                "ok": true,
+                "path": fpath,
+                "source": "ffprobe",
+                "duration_s": dur_str,
+                "size_bytes": file_size,
+                "bit_rate_bps": br_str,
+                "format": fmt_str,
+                "codec": cod_str,
+                "sample_rate": sr_str,
+                "channels": ch_str,
+                "reynolds": re,
+                "regime": regime,
+                "trit": T_TRUE,
+                "char": bt_one(T_TRUE),
+                "runtime": "novalang"
+            }
+        }
+    }
+
+    // Fallback: basic file info only (no ffprobe available)
+    let size_cmd2 = "python -c \"import os; print(os.path.getsize('" + esc_path + "'))\""
+    let size_str2 = trim(run_py(size_cmd2))
+
+    let name_cmd = "python -c \"import os; print(os.path.basename('" + esc_path + "'))\""
+    let name_str = trim(run_py(name_cmd))
+
+    let ext_cmd = "python -c \"import os; print(os.path.splitext('" + esc_path + "')[1].lstrip('.'))\""
+    let ext_str = trim(run_py(ext_cmd))
+
+    if3 is_py_error(size_str2) {
+        record_op("audioinfo", T_FALSE)
+        return {
+            "ok": false,
+            "path": fpath,
+            "error": size_str2,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let file_size2 = int(size_str2)
+    let re2        = calc_reynolds_bytes(file_size2)
+    let regime2    = flow_regime(re2)
+
+    record_op("audioinfo", T_MAYBE)
+    return {
+        "ok": true,
+        "path": fpath,
+        "source": "basic_stat",
+        "filename": name_str,
+        "extension": ext_str,
+        "size_bytes": file_size2,
+        "note": "ffprobe not available; install ffprobe for full audio metadata",
+        "reynolds": re2,
+        "regime": regime2,
+        "trit": T_MAYBE,
+        "char": bt_one(T_MAYBE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 5: POST /tmedia/doc-gen
+// Generate a document from markdown text or a markdown file
+// Body: {text: "...", output_path: "...", format: "html"|"text"}
+//   OR: {path: "C:\\file.md", output_path: "...", format: "html"|"text"}
+// Trit: +1=generated, 0=empty input, -1=error
+// ===========================================================================
+fn handle_doc_gen(body) {
+    let text_val    = dict_get(body, "text", "")
+    let path_val    = dict_get(body, "path", "")
+    let output_path = dict_get(body, "output_path", "")
+    let fmt         = dict_get(body, "format", "html")
+
+    if3 len(output_path) == 0 {
+        record_op("docgen", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output_path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Determine markdown source
+    let md_path   = ""
+    let is_temp   = false
+    let input_src = ""
+
+    if3 len(path_val) > 0 {
+        // Use file directly
+        let esc_check = escape_for_py(path_val)
+        let check_cmd = "python -c \"import os; print('exists' if os.path.exists('" + esc_check + "') else 'missing')\""
+        let check_res = trim(run_py(check_cmd))
+        if3 contains(check_res, "missing") {
+            record_op("docgen", T_FALSE)
+            return {
+                "ok": false,
+                "error": "Markdown file not found: " + path_val,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+        md_path   = path_val
+        is_temp   = false
+        input_src = "file"
+    }
+
+    if3 len(path_val) == 0 {
+        if3 len(text_val) == 0 {
+            record_op("docgen", T_MAYBE)
+            return {
+                "ok": true,
+                "note": "No text or path provided; nothing to generate",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "runtime": "novalang"
+            }
+        }
+        // Write text to a temp .md file
+        let tmp = tmp_path("docgen", "md")
+        nova_write(tmp, text_val)
+        md_path   = tmp
+        is_temp   = true
+        input_src = "text"
+    }
+
+    let esc_md  = escape_for_py(md_path)
+    let esc_out = escape_for_py(output_path)
+    let fmt_lc  = lower(fmt)
+
+    // Write the Python script to a temp file (complex logic -- uses nova_write)
+    let py_script_path = tmp_path("docgen_script", "py")
+    let esc_script     = escape_for_py(py_script_path)
+
+    let py_html = "import markdown,sys,os\nmd_src=open('" + esc_md + "',encoding='utf-8').read()\nhtml=markdown.markdown(md_src,extensions=['extra','codehilite','toc'])\nfull_html='<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Generated Document</title><style>body{font-family:sans-serif;max-width:900px;margin:2em auto;line-height:1.6;color:#222}h1,h2,h3{color:#1a1a6e}pre{background:#f4f4f4;padding:1em;border-radius:4px;overflow-x:auto}code{background:#f0f0f0;padding:0.1em 0.3em;border-radius:2px}blockquote{border-left:4px solid #ccc;padding-left:1em;color:#555}</style></head><body>'+html+'</body></html>'\nopen('" + esc_out + "','w',encoding='utf-8').write(full_html)\nprint(len(full_html))\n"
+
+    let py_text = "import re,sys,os\nmd_src=open('" + esc_md + "',encoding='utf-8').read()\n# Strip markdown syntax for plain text\ntxt=re.sub(r'#+\\s*','',md_src)\ntxt=re.sub(r'\\*{1,2}([^*]+)\\*{1,2}','\\\\1',txt)\ntxt=re.sub(r'`([^`]+)`','\\\\1',txt)\ntxt=re.sub(r'!?\\[([^\\]]+)\\]\\([^)]+\\)','\\\\1',txt)\nopen('" + esc_out + "','w',encoding='utf-8').write(txt)\nprint(len(txt))\n"
+
+    if3 fmt_lc == "text" {
+        nova_write(py_script_path, py_text)
+    }
+    if3 fmt_lc != "text" {
+        nova_write(py_script_path, py_html)
+    }
+
+    let run_cmd = "python \"" + py_script_path + "\""
+    let run_result = run_py(run_cmd)
+    cleanup_temp(py_script_path)
+
+    if3 is_temp == true {
+        cleanup_temp(md_path)
+    }
+
+    if3 is_py_error(run_result) {
+        record_op("docgen", T_FALSE)
+        return {
+            "ok": false,
+            "error": run_result,
+            "output_path": output_path,
+            "format": fmt,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let out_size    = get_file_size(output_path)
+    let out_chars   = int(trim(run_result))
+    let re          = calc_reynolds_bytes(out_size)
+    let regime      = flow_regime(re)
+
+    record_op("docgen", T_TRUE)
+    return {
+        "ok": true,
+        "output_path": output_path,
+        "format": fmt,
+        "input_source": input_src,
+        "output_size_bytes": out_size,
+        "output_chars": out_chars,
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 6: POST /tmedia/cheat
+// Generate a cheat sheet image from a title + list of items via PIL ImageDraw
+// Body: {title: "...", items: ["item1","item2",...], output_path: "..."}
+// Trit: +1=generated, 0=empty items, -1=error
+// ===========================================================================
+fn handle_cheat(body) {
+    let title       = dict_get(body, "title", "Cheat Sheet")
+    let items       = dict_get(body, "items", [])
+    let output_path = dict_get(body, "output_path", "")
+
+    if3 len(output_path) == 0 {
+        record_op("cheat", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output_path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let item_count = len(items)
+
+    if3 item_count == 0 {
+        record_op("cheat", T_MAYBE)
+        return {
+            "ok": true,
+            "note": "No items provided; nothing to render",
+            "output_path": output_path,
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Write the items list + title to a JSON temp file for the Python script to read
+    let data_path   = tmp_path("cheat_data", "json")
+    let esc_data    = escape_for_py(data_path)
+    let esc_out     = escape_for_py(output_path)
+
+    // Build JSON content for the data file
+    // Serialize items array
+    let items_json = "["
+    let i = 0
+    while3 i < item_count {
+        let item = str(dict_get(items, i, ""))
+        // Escape any quotes in items
+        let safe_item = replace(item, "\"", "\\\"")
+        if3 i > 0 {
+            items_json = items_json + ","
+        }
+        items_json = items_json + "\"" + safe_item + "\""
+        i = i + 1
+    }
+    items_json = items_json + "]"
+
+    let safe_title = replace(title, "\"", "\\\"")
+    let data_json  = "{\"title\":\"" + safe_title + "\",\"items\":" + items_json + "}"
+    nova_write(data_path, data_json)
+
+    // Write the Python script
+    let py_script_path = tmp_path("cheat_script", "py")
+    let esc_script     = escape_for_py(py_script_path)
+
+    let py_code = "import json,os\nfrom PIL import Image,ImageDraw,ImageFont\n\n# Load data\nwith open('" + esc_data + "',encoding='utf-8') as f:\n    data=json.load(f)\ntitle=data['title']\nitems=data['items']\n\n# Layout constants\nPAD=20\nFONT_TITLE=20\nFONT_ITEM=14\nLINE_H=24\nCOL_W=360\nCOLS=2 if len(items)>8 else 1\nROWS=max(1,(len(items)+COLS-1)//COLS)\n\nW=PAD*2+COL_W*COLS+(COLS-1)*PAD\nH=PAD*2+FONT_TITLE+PAD+ROWS*LINE_H+PAD\n\n# Create image\nimg=Image.new('RGB',(W,H),(30,30,46))\nd=ImageDraw.Draw(img)\n\n# Try to load a font; fall back to default\ntry:\n    fnt_title=ImageFont.truetype('arial.ttf',FONT_TITLE)\n    fnt_item=ImageFont.truetype('arial.ttf',FONT_ITEM)\nexcept:\n    fnt_title=ImageFont.load_default()\n    fnt_item=ImageFont.load_default()\n\n# Draw title bar\nd.rectangle([(0,0),(W,FONT_TITLE+PAD*2)],fill=(20,20,100))\nd.text((PAD,PAD),title,font=fnt_title,fill=(255,220,50))\n\n# Draw items\nfor idx,item in enumerate(items):\n    col=idx%COLS\n    row=idx//COLS\n    x=PAD+col*(COL_W+PAD)\n    y=PAD*2+FONT_TITLE+PAD+row*LINE_H\n    bg=(40,40,60) if idx%2==0 else (35,35,55)\n    d.rectangle([(x-4,y-2),(x+COL_W-8,y+LINE_H-4)],fill=bg)\n    d.text((x,y),'  '+item,font=fnt_item,fill=(200,230,255))\n\n# Save\nimg.save('" + esc_out + "')\nprint(str(W)+'x'+str(H))\n"
+
+    nova_write(py_script_path, py_code)
+
+    let run_cmd    = "python \"" + py_script_path + "\""
+    let run_result = run_py(run_cmd)
+    cleanup_temp(py_script_path)
+    cleanup_temp(data_path)
+
+    if3 is_py_error(run_result) {
+        record_op("cheat", T_FALSE)
+        return {
+            "ok": false,
+            "error": run_result,
+            "output_path": output_path,
+            "title": title,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse output dimensions (WxH)
+    let dims   = split(trim(run_result), "x")
+    let out_w  = int(dict_get(dims, 0, "0"))
+    let out_h  = int(dict_get(dims, 1, "0"))
+    let out_sz = get_file_size(output_path)
+    let re     = calc_reynolds_pixels(out_w, out_h)
+    let regime = flow_regime(re)
+
+    record_op("cheat", T_TRUE)
+    return {
+        "ok": true,
+        "output_path": output_path,
+        "title": title,
+        "item_count": item_count,
+        "image_width": out_w,
+        "image_height": out_h,
+        "output_size_bytes": out_sz,
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 7: POST /tmedia/manifest
+// Generate a media manifest for a directory: lists all media files with metadata
+// Body: {path: "C:\\path\\to\\dir"}
+// Trit: +1=found media, 0=empty dir, -1=error
+// ===========================================================================
+fn handle_manifest(body) {
+    let dir_path = dict_get(body, "path", "")
+
+    if3 len(dir_path) == 0 {
+        record_op("manifest", T_FALSE)
+        return {
+            "ok": false,
+            "error": "path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let esc_dir = escape_for_py(dir_path)
+
+    // Check directory exists
+    let exist_cmd = "python -c \"import os; print('yes' if os.path.isdir('" + esc_dir + "') else 'no')\""
+    let exist_res = trim(run_py(exist_cmd))
+
+    if3 contains(exist_res, "no") {
+        record_op("manifest", T_FALSE)
+        return {
+            "ok": false,
+            "path": dir_path,
+            "error": "Directory not found",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Write the manifest Python script to a temp file
+    let py_script_path = tmp_path("manifest_script", "py")
+    let out_json_path  = tmp_path("manifest_out", "json")
+    let esc_script     = escape_for_py(py_script_path)
+    let esc_json_out   = escape_for_py(out_json_path)
+
+    let py_code = "import os,json\nfrom PIL import Image\n\nMEDIA_EXTS={\n    'image':['.png','.jpg','.jpeg','.gif','.bmp','.webp','.tiff','.tif','.ico'],\n    'audio':['.mp3','.wav','.flac','.ogg','.aac','.m4a','.wma','.opus'],\n    'video':['.mp4','.avi','.mkv','.mov','.wmv','.flv','.webm','.m4v'],\n    'doc':  ['.pdf','.md','.txt','.html','.htm','.rtf','.docx','.doc']\n}\n\ndef classify_ext(ext):\n    for kind,exts in MEDIA_EXTS.items():\n        if ext.lower() in exts:\n            return kind\n    return 'other'\n\nfiles=[]\nfor root,dirs,fnames in os.walk('" + esc_dir + "'):\n    for fn in fnames:\n        fp=os.path.join(root,fn)\n        ext=os.path.splitext(fn)[1]\n        kind=classify_ext(ext)\n        if kind=='other':\n            continue\n        size=os.path.getsize(fp)\n        entry={'name':fn,'path':fp,'type':kind,'extension':ext.lstrip('.'),'size_bytes':size}\n        if kind=='image':\n            try:\n                img=Image.open(fp)\n                entry['width']=img.width\n                entry['height']=img.height\n                entry['format']=str(img.format)\n                entry['mode']=str(img.mode)\n                img.close()\n            except:\n                entry['width']=0\n                entry['height']=0\n        files.append(entry)\n\ntotal_size=sum(e['size_bytes'] for e in files)\nby_type={}\nfor e in files:\n    t=e['type']\n    if t not in by_type:\n        by_type[t]=0\n    by_type[t]+=1\n\nresult={'file_count':len(files),'total_bytes':total_size,'by_type':by_type,'files':files}\nwith open('" + esc_json_out + "','w',encoding='utf-8') as f:\n    json.dump(result,f)\nprint(str(len(files)))\n"
+
+    nova_write(py_script_path, py_code)
+
+    let run_cmd    = "python \"" + py_script_path + "\""
+    let run_result = run_py(run_cmd)
+    cleanup_temp(py_script_path)
+
+    if3 is_py_error(run_result) {
+        cleanup_temp(out_json_path)
+        record_op("manifest", T_FALSE)
+        return {
+            "ok": false,
+            "path": dir_path,
+            "error": run_result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let file_count = int(trim(run_result))
+
+    // Read back the JSON output to serve the manifest data
+    let esc_json_out2 = escape_for_py(out_json_path)
+    let count_cmd  = "python -c \"import json; d=json.load(open('" + esc_json_out2 + "')); print(d['file_count'])\""
+    let tbytes_cmd = "python -c \"import json; d=json.load(open('" + esc_json_out2 + "')); print(d['total_bytes'])\""
+    let bytype_cmd = "python -c \"import json; d=json.load(open('" + esc_json_out2 + "')); print(json.dumps(d['by_type']))\""
+
+    let count_res  = trim(run_py(count_cmd))
+    let tbytes_res = trim(run_py(tbytes_cmd))
+    let bytype_res = trim(run_py(bytype_cmd))
+
+    // Get first 20 files (sample for the response body -- full data in JSON file)
+    let sample_cmd = "python -c \"import json; d=json.load(open('" + esc_json_out2 + "')); files=d['files'][:20]; [f.pop('path',None) for f in files]; print(json.dumps(files))\""
+    let sample_res = trim(run_py(sample_cmd))
+
+    cleanup_temp(out_json_path)
+
+    let total_count = int(count_res)
+    let total_bytes = int(tbytes_res)
+    let re          = calc_reynolds_bytes(total_bytes)
+    let regime      = flow_regime(re)
+
+    let manifest_trit = T_TRUE
+    if3 total_count == 0 {
+        manifest_trit = T_MAYBE
+    }
+
+    record_op("manifest", manifest_trit)
+    return {
+        "ok": true,
+        "path": dir_path,
+        "file_count": total_count,
+        "total_bytes": total_bytes,
+        "by_type_json": bytype_res,
+        "sample_files_json": sample_res,
+        "note": "sample_files_json and by_type_json are JSON strings; parse client-side",
+        "reynolds": re,
+        "regime": regime,
+        "trit": manifest_trit,
+        "char": bt_one(manifest_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// GET /health -- Standard health endpoint
+// ===========================================================================
+fn health() {
+    let uptime    = time() - stat_t0
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        self_trit = T_TRUE
+    }
+
+    // Check PIL availability
+    let pil_check = run_py("python -c \"from PIL import Image; import PIL; print(PIL.__version__)\"")
+    let pil_ok    = true
+    let pil_ver   = trim(pil_check)
+    if3 is_py_error(pil_check) {
+        pil_ok  = false
+        pil_ver = "not installed"
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "runtime": "novalang",
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "tools": TOOLS_COUNT,
+        "pil_available": pil_ok,
+        "pil_version": pil_ver,
+        "self_trit": self_trit,
+        "char": bt_one(self_trit),
+        "uptime_s": uptime,
+        "quality": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        }
+    }
+}
+
+// ===========================================================================
+// GET /tmedia/status -- Full service status with per-tool counters
+// ===========================================================================
+fn tmedia_status() {
+    let uptime = time() - stat_t0
+
+    // Reynolds from total false ops (error pressure)
+    let re = stat_trit_false * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    // System trit
+    let sys_trit = T_TRUE
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    let by_tool = {}
+    dict_set(by_tool, "info",      by_tool_info)
+    dict_set(by_tool, "convert",   by_tool_convert)
+    dict_set(by_tool, "thumbnail", by_tool_thumbnail)
+    dict_set(by_tool, "audioinfo", by_tool_audioinfo)
+    dict_set(by_tool, "docgen",    by_tool_docgen)
+    dict_set(by_tool, "cheat",     by_tool_cheat)
+    dict_set(by_tool, "manifest",  by_tool_manifest)
+
+    // Check PIL
+    let pil_check = run_py("python -c \"import PIL; print(PIL.__version__)\"")
+    let pil_ok    = true
+    let pil_ver   = trim(pil_check)
+    if3 is_py_error(pil_check) {
+        pil_ok  = false
+        pil_ver = "not installed"
+    }
+
+    // Check OpenCV
+    let cv_check = run_py("python -c \"import cv2; print(cv2.__version__)\"")
+    let cv_ok    = true
+    let cv_ver   = trim(cv_check)
+    if3 is_py_error(cv_check) {
+        cv_ok  = false
+        cv_ver = "not installed"
+    }
+
+    // Check markdown module
+    let md_check = run_py("python -c \"import markdown; print(markdown.__version__)\"")
+    let md_ok    = true
+    let md_ver   = trim(md_check)
+    if3 is_py_error(md_check) {
+        md_ok  = false
+        md_ver = "not installed"
+    }
+
+    // Check ffprobe
+    let ff_check = run_py("ffprobe -version")
+    let ff_ok    = false
+    if3 contains(lower(ff_check), "ffprobe version") {
+        ff_ok = true
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "total_ops": stat_ops,
+        "by_tool": by_tool,
+        "trits": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        },
+        "libraries": {
+            "pil_available": pil_ok,
+            "pil_version": pil_ver,
+            "opencv_available": cv_ok,
+            "opencv_version": cv_ver,
+            "markdown_available": md_ok,
+            "markdown_version": md_ver,
+            "ffprobe_available": ff_ok
+        },
+        "reynolds": re,
+        "regime": regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "n_s_mapping": {
+            "media_flow": "velocity_field",
+            "file_bytes": "flow_velocity",
+            "transition_rate": "viscosity",
+            "entropy": "turbulent_energy"
+        },
+        "supported_formats": {
+            "image": ["png","jpg","jpeg","gif","bmp","webp","tiff","ico"],
+            "audio": ["mp3","wav","flac","ogg","aac","m4a","wma","opus"],
+            "video": ["mp4","avi","mkv","mov","wmv","flv","webm","m4v"],
+            "doc":   ["pdf","md","txt","html","htm","rtf","docx","doc"]
+        },
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE
+    }
+}
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+troute(server, "GET",  "/health",           "health")
+troute(server, "GET",  "/tmedia/status",    "tmedia_status")
+troute(server, "POST", "/tmedia/info",      "handle_info")
+troute(server, "POST", "/tmedia/convert",   "handle_convert")
+troute(server, "POST", "/tmedia/thumbnail", "handle_thumbnail")
+troute(server, "POST", "/tmedia/audio-info","handle_audio_info")
+troute(server, "POST", "/tmedia/doc-gen",   "handle_doc_gen")
+troute(server, "POST", "/tmedia/cheat",     "handle_cheat")
+troute(server, "POST", "/tmedia/manifest",  "handle_manifest")
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[TMedia] NovaX Ternary Media Processor v" + VERSION + " on port " + str(PORT))
+print("[TMedia] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT) + " (H7)")
+print("[TMedia] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TMedia] Reynolds boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TMedia] N-S: media_flow=velocity_field | file_bytes=flow_velocity | entropy=turbulent_energy")
+print("[TMedia] Libraries: Pillow 12.1.1 | OpenCV 4.13.0 | markdown 3.10.2 | ffprobe (optional)")
+print("[TMedia] Temp dir: " + TMP_DIR + " | PY timeout: " + str(PY_TIMEOUT) + "s (H13)")
+print("[TMedia] Routes:")
+print("[TMedia]   GET  /health")
+print("[TMedia]   GET  /tmedia/status")
+print("[TMedia]   POST /tmedia/info         -- PIL image metadata")
+print("[TMedia]   POST /tmedia/convert      -- PIL format conversion (RGBA->RGB auto)")
+print("[TMedia]   POST /tmedia/thumbnail    -- PIL thumbnail (LANCZOS, aspect-preserved)")
+print("[TMedia]   POST /tmedia/audio-info   -- ffprobe metadata (fallback: file stat)")
+print("[TMedia]   POST /tmedia/doc-gen      -- Markdown->HTML/text via python-markdown")
+print("[TMedia]   POST /tmedia/cheat        -- Cheat sheet PNG via PIL ImageDraw")
+print("[TMedia]   POST /tmedia/manifest     -- Directory media inventory + Reynolds class")
+print("[TMedia] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

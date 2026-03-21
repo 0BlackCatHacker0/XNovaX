@@ -1,0 +1,603 @@
+// tmarkdown.nova - Markdown processing micro-tool (zero Python)
+// Usage: novalang.exe tools/tmarkdown.nova <operation> <input_path> [output_path]
+// Operations:
+//   render <input_path>           -- Convert markdown to HTML, output JSON {html, input_len, output_len}
+//   toc <input_path>              -- Extract headings, output JSON {headings: [{level, text, line}]}
+//   links <input_path>            -- Extract links, output JSON {links: [{text, url, line}]}
+//   stats <input_path>            -- Document stats, output JSON {words, lines, headings, links, code_blocks, ...}
+//   validate <input_path>         -- Check markdown issues, output JSON {issues: [{line, type, message}]}
+//   extract <input_path> <heading> -- Extract section by heading
+// Returns JSON to stdout (zero Python)
+
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let op = try3 { args()[0] } { "help" }
+let input_path = try3 { args()[1] } { "" }
+
+// Read input file
+let content = ""
+if3 len(input_path) > 0 {
+    content = try3 { read_file(input_path) } { "" }
+}
+
+let lines = split(content, "\n")
+
+// ============================================================================
+// HELPER: Extract heading level and text from a line
+// Returns {level: N, text: "..."} or {level: 0} if not a heading
+// ============================================================================
+fn parse_heading(line) {
+    let l = trim(line)
+    let result = {}
+    result = dict_set(result, "level", 0)
+    result = dict_set(result, "text", "")
+
+    if3 starts_with(l, "######") {
+        result = dict_set(result, "level", 6)
+        result = dict_set(result, "text", trim(slice(l, 6, len(l))))
+    } else3 starts_with(l, "#####") {
+        result = dict_set(result, "level", 5)
+        result = dict_set(result, "text", trim(slice(l, 5, len(l))))
+    } else3 starts_with(l, "####") {
+        result = dict_set(result, "level", 4)
+        result = dict_set(result, "text", trim(slice(l, 4, len(l))))
+    } else3 starts_with(l, "###") {
+        result = dict_set(result, "level", 3)
+        result = dict_set(result, "text", trim(slice(l, 3, len(l))))
+    } else3 starts_with(l, "##") {
+        result = dict_set(result, "level", 2)
+        result = dict_set(result, "text", trim(slice(l, 2, len(l))))
+    } else3 starts_with(l, "#") {
+        // Make sure it's "# text" not "#hashtag"
+        if3 len(l) > 1 {
+            if3 slice(l, 1, 2) == " " {
+                result = dict_set(result, "level", 1)
+                result = dict_set(result, "text", trim(slice(l, 2, len(l))))
+            }
+        }
+    }
+    return result
+}
+
+// ============================================================================
+// HELPER: Extract links [text](url) from a line
+// Returns list of {text, url}
+// ============================================================================
+fn extract_links_from_line(line) {
+    let found = []
+    let i = 0
+    while3 i < len(line) - 4 {
+        if3 slice(line, i, i + 1) == "[" {
+            // Find closing ]
+            let j = i + 1
+            let bracket_text = ""
+            while3 j < len(line) {
+                if3 slice(line, j, j + 1) == "]" {
+                    // Check for (
+                    if3 j + 1 < len(line) {
+                        if3 slice(line, j + 1, j + 2) == "(" {
+                            // Find closing )
+                            let k = j + 2
+                            let url_text = ""
+                            while3 k < len(line) {
+                                if3 slice(line, k, k + 1) == ")" {
+                                    let le = {}
+                                    le = dict_set(le, "text", bracket_text)
+                                    le = dict_set(le, "url", url_text)
+                                    found = append(found, le)
+                                    i = k
+                                    k = len(line)
+                                    j = len(line)
+                                } else3 {
+                                    url_text = url_text + slice(line, k, k + 1)
+                                }
+                                k = k + 1
+                            }
+                        }
+                    }
+                    j = len(line)
+                } else3 {
+                    bracket_text = bracket_text + slice(line, j, j + 1)
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return found
+}
+
+// ============================================================================
+// HELPER: Inline formatting (bold, italic, code, links)
+// ============================================================================
+fn format_inline(text) {
+    let result = text
+
+    // Inline code: `code`
+    while3 contains(result, "`") {
+        let idx1 = -1
+        let idx2 = -1
+        let ci = 0
+        while3 ci < len(result) {
+            if3 slice(result, ci, ci + 1) == "`" {
+                if3 idx1 == -1 {
+                    idx1 = ci
+                } else3 idx2 == -1 {
+                    idx2 = ci
+                }
+            }
+            ci = ci + 1
+        }
+        if3 idx1 >= 0 {
+            if3 idx2 > idx1 {
+                let before = slice(result, 0, idx1)
+                let code = slice(result, idx1 + 1, idx2)
+                let after = slice(result, idx2 + 1, len(result))
+                result = before + "<code>" + code + "</code>" + after
+            } else3 {
+                // Only one backtick, stop processing
+                ci = len(result)
+                result = result
+                return result
+            }
+        } else3 {
+            return result
+        }
+    }
+
+    // Bold: **text**
+    while3 contains(result, "**") {
+        let idx1 = -1
+        let idx2 = -1
+        let ci2 = 0
+        while3 ci2 < len(result) - 1 {
+            if3 slice(result, ci2, ci2 + 2) == "**" {
+                if3 idx1 == -1 {
+                    idx1 = ci2
+                } else3 idx2 == -1 {
+                    idx2 = ci2
+                }
+            }
+            ci2 = ci2 + 1
+        }
+        if3 idx1 >= 0 {
+            if3 idx2 > idx1 {
+                let before = slice(result, 0, idx1)
+                let bold = slice(result, idx1 + 2, idx2)
+                let after = slice(result, idx2 + 2, len(result))
+                result = before + "<strong>" + bold + "</strong>" + after
+            } else3 {
+                return result
+            }
+        } else3 {
+            return result
+        }
+    }
+
+    // Links: [text](url)
+    let links = extract_links_from_line(result)
+    for3 lnk in links {
+        let lt = dict_get(lnk, "text") ?? ""
+        let lu = dict_get(lnk, "url") ?? ""
+        let old_link = "[" + lt + "](" + lu + ")"
+        let new_link = "<a href=\"" + lu + "\">" + lt + "</a>"
+        result = replace(result, old_link, new_link)
+    }
+
+    return result
+}
+
+// ============================================================================
+// OPERATION: render
+// ============================================================================
+if3 op == "render" {
+    let html_parts = []
+    let in_code_block = false
+    let code_lang = ""
+    let in_list = false
+    let list_type = ""
+    let line_num = 0
+
+    for3 line in lines {
+        line_num = line_num + 1
+        let l = trim(line)
+        // Remove trailing \r
+        if3 ends_with(l, "\r") { l = slice(l, 0, len(l) - 1) }
+
+        // Fenced code block toggle
+        if3 starts_with(l, "```") {
+            if3 in_code_block == false {
+                in_code_block = true
+                code_lang = trim(slice(l, 3, len(l)))
+                if3 len(code_lang) > 0 {
+                    html_parts = append(html_parts, "<pre><code class=\"language-" + code_lang + "\">")
+                } else3 {
+                    html_parts = append(html_parts, "<pre><code>")
+                }
+            } else3 {
+                in_code_block = false
+                html_parts = append(html_parts, "</code></pre>")
+            }
+        } else3 in_code_block == true {
+            // Inside code block - preserve raw text (HTML escape)
+            let escaped = replace(l, "&", "&amp;")
+            escaped = replace(escaped, "<", "&lt;")
+            escaped = replace(escaped, ">", "&gt;")
+            html_parts = append(html_parts, escaped)
+        } else3 len(l) == 0 {
+            // Blank line - close list if open
+            if3 in_list == true {
+                if3 list_type == "ul" {
+                    html_parts = append(html_parts, "</ul>")
+                } else3 {
+                    html_parts = append(html_parts, "</ol>")
+                }
+                in_list = false
+            }
+        } else3 {
+            // Headings
+            let h = parse_heading(l)
+            let hlevel = dict_get(h, "level") ?? 0
+            if3 hlevel > 0 {
+                let htext = dict_get(h, "text") ?? ""
+                html_parts = append(html_parts, "<h" + str(hlevel) + ">" + format_inline(htext) + "</h" + str(hlevel) + ">")
+            } else3 starts_with(l, "---") {
+                // Horizontal rule (3+ dashes)
+                html_parts = append(html_parts, "<hr>")
+            } else3 starts_with(l, "***") {
+                html_parts = append(html_parts, "<hr>")
+            } else3 starts_with(l, "> ") {
+                // Blockquote
+                let bq_text = slice(l, 2, len(l))
+                html_parts = append(html_parts, "<blockquote>" + format_inline(bq_text) + "</blockquote>")
+            } else3 starts_with(l, "- ") {
+                // Unordered list item
+                if3 in_list == false {
+                    html_parts = append(html_parts, "<ul>")
+                    in_list = true
+                    list_type = "ul"
+                }
+                let li_text = slice(l, 2, len(l))
+                html_parts = append(html_parts, "<li>" + format_inline(li_text) + "</li>")
+            } else3 starts_with(l, "* ") {
+                if3 in_list == false {
+                    html_parts = append(html_parts, "<ul>")
+                    in_list = true
+                    list_type = "ul"
+                }
+                let li_text = slice(l, 2, len(l))
+                html_parts = append(html_parts, "<li>" + format_inline(li_text) + "</li>")
+            } else3 {
+                // Check for numbered list (1. text)
+                let is_ol = false
+                if3 len(l) > 2 {
+                    let first_dot = -1
+                    let fd_i = 0
+                    while3 fd_i < len(l) {
+                        if3 slice(l, fd_i, fd_i + 1) == "." {
+                            if3 first_dot == -1 { first_dot = fd_i }
+                        }
+                        fd_i = fd_i + 1
+                    }
+                    if3 first_dot > 0 {
+                        if3 first_dot < 4 {
+                            let num_part = slice(l, 0, first_dot)
+                            let maybe_num = try3 { to_int(num_part) } { -1 }
+                            if3 maybe_num >= 0 {
+                                if3 first_dot + 1 < len(l) {
+                                    if3 slice(l, first_dot + 1, first_dot + 2) == " " {
+                                        is_ol = true
+                                        if3 in_list == false {
+                                            html_parts = append(html_parts, "<ol>")
+                                            in_list = true
+                                            list_type = "ol"
+                                        }
+                                        let ol_text = slice(l, first_dot + 2, len(l))
+                                        html_parts = append(html_parts, "<li>" + format_inline(ol_text) + "</li>")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if3 is_ol == false {
+                    // Regular paragraph
+                    html_parts = append(html_parts, "<p>" + format_inline(l) + "</p>")
+                }
+            }
+        }
+    }
+
+    // Close any open list
+    if3 in_list == true {
+        if3 list_type == "ul" {
+            html_parts = append(html_parts, "</ul>")
+        } else3 {
+            html_parts = append(html_parts, "</ol>")
+        }
+    }
+    // Close any open code block
+    if3 in_code_block == true {
+        html_parts = append(html_parts, "</code></pre>")
+    }
+
+    // Join HTML parts
+    let html = ""
+    for3 part in html_parts {
+        html = html + part + "\n"
+    }
+
+    let out = {}
+    out = dict_set(out, "html", html)
+    out = dict_set(out, "input_len", len(content))
+    out = dict_set(out, "output_len", len(html))
+    print(json_encode(out))
+
+} else3 op == "toc" {
+    // Extract table of contents (headings)
+    let headings = []
+    let line_num = 0
+    for3 line in lines {
+        line_num = line_num + 1
+        let l = trim(line)
+        if3 ends_with(l, "\r") { l = slice(l, 0, len(l) - 1) }
+        let h = parse_heading(l)
+        let hlevel = dict_get(h, "level") ?? 0
+        if3 hlevel > 0 {
+            let he = {}
+            he = dict_set(he, "level", hlevel)
+            he = dict_set(he, "text", dict_get(h, "text") ?? "")
+            he = dict_set(he, "line", line_num)
+            headings = append(headings, he)
+        }
+    }
+
+    let out = {}
+    out = dict_set(out, "headings", headings)
+    out = dict_set(out, "count", len(headings))
+    print(json_encode(out))
+
+} else3 op == "links" {
+    // Extract all links
+    let all_links = []
+    let line_num = 0
+    for3 line in lines {
+        line_num = line_num + 1
+        let l = trim(line)
+        if3 ends_with(l, "\r") { l = slice(l, 0, len(l) - 1) }
+        let found = extract_links_from_line(l)
+        for3 lnk in found {
+            lnk = dict_set(lnk, "line", line_num)
+            all_links = append(all_links, lnk)
+        }
+    }
+
+    let out = {}
+    out = dict_set(out, "links", all_links)
+    out = dict_set(out, "count", len(all_links))
+    print(json_encode(out))
+
+} else3 op == "stats" {
+    // Document statistics
+    let word_count = 0
+    let heading_count = 0
+    let link_count = 0
+    let code_block_count = 0
+    let list_item_count = 0
+    let blank_lines = 0
+    let in_code = false
+    let max_heading_depth = 0
+    let line_num = 0
+
+    for3 line in lines {
+        line_num = line_num + 1
+        let l = trim(line)
+        if3 ends_with(l, "\r") { l = slice(l, 0, len(l) - 1) }
+
+        if3 starts_with(l, "```") {
+            if3 in_code == false {
+                in_code = true
+                code_block_count = code_block_count + 1
+            } else3 {
+                in_code = false
+            }
+        } else3 in_code == false {
+            // Count words
+            if3 len(l) > 0 {
+                let words = split(l, " ")
+                for3 w in words {
+                    if3 len(trim(w)) > 0 { word_count = word_count + 1 }
+                }
+            } else3 {
+                blank_lines = blank_lines + 1
+            }
+
+            // Headings
+            let h = parse_heading(l)
+            let hlevel = dict_get(h, "level") ?? 0
+            if3 hlevel > 0 {
+                heading_count = heading_count + 1
+                if3 hlevel > max_heading_depth {
+                    max_heading_depth = hlevel
+                }
+            }
+
+            // Links
+            let found = extract_links_from_line(l)
+            link_count = link_count + len(found)
+
+            // List items
+            if3 starts_with(l, "- ") { list_item_count = list_item_count + 1 }
+            if3 starts_with(l, "* ") { list_item_count = list_item_count + 1 }
+        }
+    }
+
+    // Estimate reading time (200 words per minute)
+    let reading_time_min = 0
+    if3 word_count > 0 { reading_time_min = word_count / 200 }
+    if3 reading_time_min < 1 { reading_time_min = 1 }
+
+    let out = {}
+    out = dict_set(out, "lines", len(lines))
+    out = dict_set(out, "words", word_count)
+    out = dict_set(out, "characters", len(content))
+    out = dict_set(out, "headings", heading_count)
+    out = dict_set(out, "max_heading_depth", max_heading_depth)
+    out = dict_set(out, "links", link_count)
+    out = dict_set(out, "code_blocks", code_block_count)
+    out = dict_set(out, "list_items", list_item_count)
+    out = dict_set(out, "blank_lines", blank_lines)
+    out = dict_set(out, "reading_time_min", reading_time_min)
+    print(json_encode(out))
+
+} else3 op == "validate" {
+    // Validate markdown for common issues
+    let issues = []
+    let in_code = false
+    let last_heading_level = 0
+    let consecutive_blanks = 0
+    let line_num = 0
+
+    for3 line in lines {
+        line_num = line_num + 1
+        let l = trim(line)
+        if3 ends_with(l, "\r") { l = slice(l, 0, len(l) - 1) }
+
+        if3 starts_with(l, "```") {
+            in_code = !in_code
+        } else3 in_code == false {
+            // Check heading level jumps (e.g., h1 → h3 skipping h2)
+            let h = parse_heading(l)
+            let hlevel = dict_get(h, "level") ?? 0
+            if3 hlevel > 0 {
+                if3 last_heading_level > 0 {
+                    if3 hlevel > last_heading_level + 1 {
+                        let iss = {}
+                        iss = dict_set(iss, "line", line_num)
+                        iss = dict_set(iss, "type", "heading_skip")
+                        iss = dict_set(iss, "message", "Heading level jump from h" + str(last_heading_level) + " to h" + str(hlevel))
+                        issues = append(issues, iss)
+                    }
+                }
+                last_heading_level = hlevel
+            }
+
+            // Check for trailing whitespace
+            if3 len(line) > 0 {
+                if3 ends_with(line, " ") {
+                    let iss2 = {}
+                    iss2 = dict_set(iss2, "line", line_num)
+                    iss2 = dict_set(iss2, "type", "trailing_whitespace")
+                    iss2 = dict_set(iss2, "message", "Line has trailing whitespace")
+                    issues = append(issues, iss2)
+                }
+            }
+
+            // Check for multiple consecutive blank lines
+            if3 len(l) == 0 {
+                consecutive_blanks = consecutive_blanks + 1
+                if3 consecutive_blanks > 2 {
+                    let iss3 = {}
+                    iss3 = dict_set(iss3, "line", line_num)
+                    iss3 = dict_set(iss3, "type", "excessive_blanks")
+                    iss3 = dict_set(iss3, "message", "Multiple consecutive blank lines")
+                    issues = append(issues, iss3)
+                }
+            } else3 {
+                consecutive_blanks = 0
+            }
+
+            // Check for heading without space after #
+            if3 starts_with(l, "#") {
+                if3 hlevel == 0 {
+                    if3 len(l) > 1 {
+                        if3 slice(l, 1, 2) != " " {
+                            if3 slice(l, 1, 2) != "#" {
+                                let iss4 = {}
+                                iss4 = dict_set(iss4, "line", line_num)
+                                iss4 = dict_set(iss4, "type", "heading_no_space")
+                                iss4 = dict_set(iss4, "message", "Heading missing space after #")
+                                issues = append(issues, iss4)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for unclosed code block
+    if3 in_code == true {
+        let iss5 = {}
+        iss5 = dict_set(iss5, "line", len(lines))
+        iss5 = dict_set(iss5, "type", "unclosed_code_block")
+        iss5 = dict_set(iss5, "message", "Unclosed fenced code block")
+        issues = append(issues, iss5)
+    }
+
+    let out = {}
+    out = dict_set(out, "issues", issues)
+    out = dict_set(out, "issue_count", len(issues))
+    out = dict_set(out, "valid", len(issues) == 0)
+    print(json_encode(out))
+
+} else3 op == "extract" {
+    // Extract section by heading
+    let target_heading = try3 { args()[2] } { "" }
+    let target_lower = lower(target_heading)
+    let found_section = false
+    let section_lines = []
+    let section_level = 0
+    let line_num = 0
+
+    for3 line in lines {
+        line_num = line_num + 1
+        let l = trim(line)
+        if3 ends_with(l, "\r") { l = slice(l, 0, len(l) - 1) }
+
+        let h = parse_heading(l)
+        let hlevel = dict_get(h, "level") ?? 0
+        let htext = dict_get(h, "text") ?? ""
+
+        if3 found_section == true {
+            // Check if we hit another heading at same or higher level
+            if3 hlevel > 0 {
+                if3 hlevel <= section_level {
+                    // End of section
+                    found_section = false
+                } else3 {
+                    section_lines = append(section_lines, line)
+                }
+            } else3 {
+                section_lines = append(section_lines, line)
+            }
+        } else3 {
+            // Look for the target heading
+            if3 hlevel > 0 {
+                if3 lower(htext) == target_lower {
+                    found_section = true
+                    section_level = hlevel
+                } else3 contains(lower(htext), target_lower) {
+                    found_section = true
+                    section_level = hlevel
+                }
+            }
+        }
+    }
+
+    // Join section lines
+    let section_text = ""
+    for3 sl in section_lines {
+        section_text = section_text + sl + "\n"
+    }
+
+    let out = {}
+    out = dict_set(out, "heading", target_heading)
+    out = dict_set(out, "found", len(section_lines) > 0)
+    out = dict_set(out, "text", section_text)
+    out = dict_set(out, "lines", len(section_lines))
+    print(json_encode(out))
+
+} else3 {
+    print("{\"error\":\"unknown operation: " + op + "\",\"ops\":[\"render\",\"toc\",\"links\",\"stats\",\"validate\",\"extract\"]}")
+}

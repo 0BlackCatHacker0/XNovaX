@@ -1,0 +1,953 @@
+"""NovaX Unified API Server - HTTP/1.1 Threaded, one process, all endpoints."""
+import os, sys, json, time, subprocess, platform, signal, shutil
+import urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs, unquote
+from pathlib import Path
+
+PORT = 9999
+STATIC_DIR = "C:/ProgramData/NovaX/app/shell/static"
+NOVAX_ROOT = "C:/NovaX"
+
+MIME_TYPES = {
+    ".html":"text/html", ".css":"text/css", ".js":"application/javascript",
+    ".json":"application/json", ".png":"image/png", ".jpg":"image/jpeg",
+    ".gif":"image/gif", ".svg":"image/svg+xml", ".ico":"image/x-icon",
+    ".woff":"font/woff", ".woff2":"font/woff2", ".ttf":"font/ttf",
+    ".txt":"text/plain", ".md":"text/plain", ".py":"text/plain", ".csv":"text/csv",
+}
+
+# Will be set by main.py after boot
+_nova = None
+def set_nova(nova_instance):
+    global _nova
+    _nova = nova_instance
+
+class NovaHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, fmt, *args): pass
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+        self.send_header("Access-Control-Max-Age", "86400")
+
+    def _json(self, code, obj):
+        body = json.dumps(obj, default=str, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _binary(self, code, data, ct="application/octet-stream"):
+        self.send_response(code)
+        self.send_header("Content-Type", ct)
+        self.send_header("Content-Length", str(len(data)))
+        self._cors()
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            if n: return json.loads(self.rfile.read(n))
+        except: pass
+        return {}
+
+    def _url(self):
+        p = urlparse(self.path)
+        path = unquote(p.path)
+        params = {k: v[0] if len(v)==1 else v for k,v in parse_qs(p.query).items()}
+        return path, params
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._cors()
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+    # ================ GET ================
+    def do_GET(self):
+        path, params = self._url()
+
+        # --- Static files ---
+        if path.startswith("/static/"):
+            self._serve_static(path[8:])
+            return
+        if path in ("/", "/shell", "/shell/"):
+            self._serve_static("ghostx.html")
+            return
+        if path in ("/desktop", "/desktop/"):
+            self._serve_static("nova_desktop.html")
+            return
+        if path in ("/boot", "/boot/"):
+            self._serve_static("boot.html")
+            return
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        # --- NovaX OS API (GET) ---
+        if path == "/system/status": return self._system_status()
+        if path == "/system/health": return self._system_health()
+        if path == "/system/incidents": return self._system_incidents()
+        if path == "/jobs/active": return self._jobs_active()
+        if path == "/jobs/history": return self._jobs_history()
+        if path.startswith("/jobs/"): return self._job_get(path[6:])
+        if path == "/memory/threads": return self._memory_threads()
+        if path == "/memory/unfinished": return self._memory_unfinished()
+        if path.startswith("/memory/thread/"): return self._memory_thread(path[15:])
+        if path == "/policy/rules": return self._policy_rules()
+        if path == "/snapshot/list": return self._snapshot_list()
+        if path == "/events/recent": return self._events_recent()
+
+        # --- Discovery GET endpoints ---
+        if path == "/discovery/graph":
+            return self._discovery("graph")
+        if path == "/discovery/hardware":
+            return self._discovery("hardware")
+        if path == "/discovery/software":
+            return self._discovery("software")
+        if path == "/discovery/services":
+            return self._discovery("services")
+        if path == "/discovery/models":
+            return self._discovery("models")
+        if path == "/discovery/abilities":
+            return self._discovery("abilities")
+        if path == "/discovery/health":
+            return self._discovery("health")
+
+        # --- Filesystem aliases (frontend uses /api/fs/*) ---
+        if path == "/api/fs/list":
+            return self._api_files(params.get("path", NOVAX_ROOT))
+        if path == "/api/fs/read":
+            return self._api_read_file(params.get("path", ""))
+
+        # --- Frontend bridge endpoints ---
+        if path == "/api/wallet":
+            return self._api_wallet_status()
+        if path.startswith("/api/wallet/log"):
+            return self._api_wallet_log(params)
+        if path == "/api/voice/status":
+            return self._api_voice_status()
+        if path == "/api/skills":
+            return self._api_skills_list()
+        if path == "/api/events":
+            return self._events_recent()
+        if path == "/api/modules/stats":
+            return self._api_modules_stats()
+        if path == "/api/processes":
+            return self._api_processes()
+
+        # --- VCC status ---
+        if path == "/api/vcc":
+            return self._api_vcc()
+
+        # --- Wallet ---
+        if path == "/api/wallet/status":
+            return self._api_wallet_status()
+
+        # --- Modules ---
+        if path == "/api/modules":
+            return self._api_modules_list()
+
+        # --- Workflows GET ---
+        if path == "/workflow/list":
+            return self._api_workflow_list()
+
+        # --- AI & API Config GET ---
+        if path == "/api/ai/config":
+            return self._api_ai_config_get()
+        if path == "/api/ai/cloud":
+            return self._api_ai_cloud()
+
+        # --- WiFi GET ---
+        if path == "/api/wifi/status":
+            return self._api_wifi_status()
+        if path == "/api/wifi/speedtest":
+            return self._api_wifi_speedtest()
+
+        # --- OpenClaw GET ---
+        if path == "/api/openclaw/config":
+            return self._api_openclaw_config_get()
+        if path == "/api/openclaw/health":
+            return self._api_openclaw_health()
+
+        # --- VPN / Security GET ---
+        if path == "/api/vpn/status":
+            return self._api_vpn_status()
+        if path == "/api/vpn/servers":
+            return self._api_vpn_servers()
+        if path == "/api/tor/status":
+            return self._api_tor_status()
+
+        # --- Sentinel GET ---
+        if path == "/api/sentinel/status":
+            return self._api_sentinel_status()
+        if path == "/api/sentinel/events":
+            return self._api_sentinel_events()
+
+        # --- Legacy bridge GET endpoints ---
+        if path == "/api/files":
+            self._api_files(params.get("path", NOVAX_ROOT))
+            return
+        if path == "/api/files/read":
+            self._api_read_file(params.get("path", ""))
+            return
+
+        self._json(404, {"ok": False, "error": "not found", "path": path})
+
+    # ================ POST ================
+    def do_POST(self):
+        path, params = self._url()
+        data = self._body()
+
+        # --- Discovery POST endpoints ---
+        if path == "/discovery/can":
+            return self._discovery_can(data)
+        if path == "/discovery/scan":
+            return self._discovery_scan(data)
+
+        # --- NovaX OS API (POST) ---
+        if path == "/system/recover": return self._system_recover(data)
+        if path == "/system/explain": return self._system_explain(data)
+        if path == "/jobs/create": return self._job_create(data)
+        if path.endswith("/cancel"): return self._job_cancel(path.split("/")[2])
+        if path == "/memory/resume": return self._memory_resume(data)
+        if path == "/policy/evaluate": return self._policy_evaluate(data)
+        if path == "/policy/mode": return self._policy_mode(data)
+        if path == "/snapshot/create": return self._snapshot_create(data)
+        if path == "/snapshot/restore": return self._snapshot_restore(data)
+        if path == "/tool/run": return self._tool_run(data)
+
+        # --- Killswitch ---
+        if path == "/killswitch/status": return self._killswitch_status()
+        if path == "/killswitch/stop": return self._killswitch_stop(data)
+        if path == "/killswitch/start": return self._killswitch_start(data)
+
+        # --- Filesystem aliases ---
+        if path == "/api/fs/write":
+            return self._api_write_file(data)
+
+        # --- Run alias (frontend uses /api/run) ---
+        if path == "/api/run":
+            return self._api_terminal(data)
+
+        # --- Think (Two-Phase Intent) ---
+        if path == "/think":
+            return self._api_think(data)
+
+        # --- Wallet send ---
+        if path == "/api/wallet/send":
+            return self._api_wallet_send(data)
+
+        # --- Workflow list (POST or GET) ---
+        if path == "/workflow/list":
+            return self._api_workflow_list()
+
+        # --- Wallet POST ---
+        if path == "/api/wallet/generate":
+            return self._api_wallet_generate(data)
+
+        # --- Modules POST ---
+        if path == "/api/modules/create":
+            return self._api_module_create(data)
+        if path.startswith("/api/modules/") and path.endswith("/enable"):
+            return self._api_module_toggle(path.split("/")[3], True)
+        if path.startswith("/api/modules/") and path.endswith("/disable"):
+            return self._api_module_toggle(path.split("/")[3], False)
+
+        # --- AI & API Config POST ---
+        if path == "/api/ai/config":
+            return self._api_ai_config_post(data)
+        if path == "/api/ai/test":
+            return self._api_ai_test(data)
+        if path == "/api/ai/query":
+            return self._api_ai_query(data)
+
+        # --- WiFi POST ---
+        if path == "/api/wifi/bridge":
+            return self._api_wifi_bridge(data)
+        if path == "/api/wifi/unbridge":
+            return self._api_wifi_unbridge(data)
+
+        # --- OpenClaw POST ---
+        if path == "/api/openclaw/config":
+            return self._api_openclaw_config_post(data)
+
+        # --- VPN / Tor POST ---
+        if path == "/api/tor/start":
+            return self._api_tor_start(data)
+        if path == "/api/tor/stop":
+            return self._api_tor_stop(data)
+
+        # --- Legacy bridge POST endpoints ---
+        if path in ("/api/terminal", "/api/command"):
+            return self._api_terminal(data)
+        if path == "/api/mode":
+            return self._api_mode(data)
+        if path == "/api/system":
+            return self._api_system_info()
+        if path == "/api/files/write":
+            return self._api_write_file(data)
+        if path == "/api/files/create":
+            return self._api_create_file(data)
+        if path == "/api/files/delete":
+            return self._api_delete_file(data)
+        if path == "/api/files/rename":
+            return self._api_rename_file(data)
+        if path == "/api/launch":
+            return self._api_launch(data)
+        if path == "/api/process/kill":
+            return self._api_kill(data)
+        if path == "/api/processes":
+            return self._api_processes()
+        if path == "/api/model/select":
+            return self._api_model_select(data)
+        if path == "/api/apps":
+            return self._api_apps()
+        if path.startswith("/api/action/"):
+            return self._json(200, {"ok": True, "action": path[12:], "data": data})
+        if path == "/api/agent/run":
+            return self._api_agent_run(data)
+
+        self._json(404, {"ok": False, "error": "not found", "path": path})
+
+    # ================ DELETE ================
+    def do_DELETE(self):
+        path, params = self._url()
+        if path.startswith("/api/modules/"):
+            name = path.split("/")[3]
+            sys.path.insert(0, "C:/NovaX")
+            try:
+                from core.module_manager import ModuleManager
+                mgr = ModuleManager()
+                mgr.uninstall_module(name)
+                self._json(200, {"ok": True, "deleted": name})
+            except Exception as e:
+                self._json(200, {"ok": False, "error": str(e)})
+            return
+        self._json(404, {"ok": False, "error": "not found"})
+
+    # ====== NovaX OS Handlers ======
+    def _system_status(self):
+        n = _nova
+        self._json(200, {"ok": True, "status": "running", "uptime": time.time() - n.boot_time,
+            "mode": n.policy.mode, "jobs_active": len(n.orchestrator.active()),
+            "jobs_total": len(n.orchestrator.jobs),
+            "services": n.health.status(), "pid": os.getpid()})
+
+    def _system_health(self):
+        r = _nova.health.check_all()
+        self._json(200, {"ok": True, "services": r})
+
+    def _system_incidents(self):
+        incs = _nova.health.recent_incidents()
+        self._json(200, {"ok": True, "incidents": [
+            {"id": i.id, "service": i.service, "error": i.error,
+             "recovered": i.recovered, "ts": i.ts} for i in incs]})
+
+    def _system_recover(self, data):
+        svc = data.get("service", "")
+        r = _nova.health.check_all()
+        self._json(200, {"ok": True, "results": r})
+
+    def _system_explain(self, data):
+        event = data.get("event", "")
+        self._json(200, {"ok": True, "explanation": _nova.explainer.explain(event, data)})
+
+    def _jobs_active(self):
+        jobs = _nova.orchestrator.active()
+        self._json(200, {"ok": True, "jobs": [
+            {"id": j.id, "status": j.status.value, "action": j.intent.action if j.intent else ""} for j in jobs]})
+
+    def _jobs_history(self):
+        jobs = _nova.orchestrator.history()
+        self._json(200, {"ok": True, "jobs": [
+            {"id": j.id, "status": j.status.value, "finished": j.finished} for j in jobs]})
+
+    def _job_get(self, jid):
+        j = _nova.orchestrator.get(jid)
+        if not j: return self._json(404, {"ok": False, "error": "job not found"})
+        self._json(200, {"ok": True, "job": {"id": j.id, "status": j.status.value,
+            "result": j.result, "error": j.error}})
+
+    def _job_create(self, data):
+        from ..objects import Intent
+        intent = _nova.context.infer(data.get("text", data.get("task", "")))
+        decision = _nova.policy.evaluate(intent)
+        if not decision.allowed:
+            return self._json(403, {"ok": False, "reason": "policy denied", "risk": decision.risk.value})
+        job = _nova.orchestrator.submit(intent)
+        receipt = _nova.orchestrator.run_next()
+        self._json(200, {"ok": True, "job_id": job.id, "result": receipt.output})
+
+    def _job_cancel(self, jid):
+        ok = _nova.orchestrator.cancel(jid)
+        self._json(200, {"ok": ok})
+
+    def _memory_threads(self):
+        threads = _nova.threads.all_threads()
+        self._json(200, {"ok": True, "threads": [
+            {"id": t.id, "name": t.name, "status": t.status.value} for t in threads]})
+
+    def _memory_unfinished(self):
+        uf = _nova.threads.unfinished()
+        self._json(200, {"ok": True, "unfinished": [
+            {"id": t.id, "name": t.name} for t in uf]})
+
+    def _memory_thread(self, tid):
+        t = _nova.threads.get(tid)
+        if not t: return self._json(404, {"ok": False})
+        self._json(200, {"ok": True, "thread": {"id": t.id, "name": t.name,
+            "status": t.status.value, "jobs": t.jobs}})
+
+    def _memory_resume(self, data):
+        tid = data.get("thread_id", "")
+        t = _nova.threads.get(tid)
+        if not t: return self._json(404, {"ok": False})
+        self._json(200, {"ok": True, "resumed": tid})
+
+    def _policy_evaluate(self, data):
+        from ..objects import Intent
+        intent = _nova.context.infer(data.get("text", ""))
+        d = _nova.policy.evaluate(intent)
+        self._json(200, {"ok": True, "allowed": d.allowed, "risk": d.risk.value,
+            "rules": d.rules_matched})
+
+    def _policy_mode(self, data):
+        mode = data.get("mode", "normal")
+        _nova.policy.set_mode(mode)
+        self._json(200, {"ok": True, "mode": mode})
+
+    def _policy_rules(self):
+        self._json(200, {"ok": True, "rules": [r["name"] for r in _nova.policy.rules],
+            "mode": _nova.policy.mode})
+
+    def _snapshot_list(self):
+        self._json(200, {"ok": True, "snapshots": _nova.snapshots.list_snapshots()})
+
+    def _snapshot_create(self, data):
+        s = _nova.snapshots.create(label=data.get("label",""), paths=data.get("paths"))
+        self._json(200, {"ok": True, "id": s.id})
+
+    def _snapshot_restore(self, data):
+        ok = _nova.snapshots.restore(data.get("id",""))
+        self._json(200, {"ok": ok})
+
+    def _tool_run(self, data):
+        r = _nova.tools.shell(data.get("command", data.get("cmd", "")),
+                             cwd=data.get("cwd"), timeout=data.get("timeout", 30))
+        self._json(200, {"ok": r.success, "output": r.output, "duration": r.duration})
+
+    def _events_recent(self):
+        from ..events.bus import bus
+        self._json(200, {"ok": True, "events": bus.recent(30)})
+
+    # ====== Killswitch ======
+    def _killswitch_status(self):
+        self._json(200, {"ok": True, "services": _nova.managed_services(),
+            "master": "running", "pid": os.getpid()})
+
+    def _killswitch_stop(self, data):
+        svc = data.get("service", "all")
+        result = _nova.stop_service(svc)
+        self._json(200, {"ok": True, "stopped": svc, "result": result})
+
+    def _killswitch_start(self, data):
+        svc = data.get("service", "all")
+        result = _nova.start_service(svc)
+        self._json(200, {"ok": True, "started": svc, "result": result})
+
+    # ====== Legacy Bridge Handlers ======
+    def _api_terminal(self, data):
+        cmd = data.get("command", "")
+        cwd = data.get("cwd")
+        timeout = data.get("timeout", 30)
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                             timeout=timeout, cwd=cwd, encoding="utf-8", errors="replace")
+            self._json(200, {"ok": True, "output": r.stdout + r.stderr,
+                "returncode": r.returncode, "command": cmd})
+        except subprocess.TimeoutExpired:
+            self._json(200, {"ok": False, "output": "TIMEOUT", "command": cmd})
+        except Exception as e:
+            self._json(200, {"ok": False, "output": str(e), "command": cmd})
+
+    def _api_mode(self, data):
+        action = data.get("action", "get")
+        if action == "set":
+            mode = data.get("mode", "general")
+            _nova.policy.set_mode(mode)
+            self._json(200, {"ok": True, "mode": mode})
+        else:
+            self._json(200, {"ok": True, "mode": _nova.policy.mode})
+
+    def _api_system_info(self):
+        self._json(200, {"platform": platform.system(), "version": platform.version(),
+            "machine": platform.machine(), "node": platform.node(),
+            "python": sys.version, "pid": os.getpid(), "novax_root": NOVAX_ROOT})
+
+    def _api_write_file(self, data):
+        fp = data.get("path","")
+        content = data.get("content","")
+        try:
+            os.makedirs(os.path.dirname(fp), exist_ok=True)
+            with open(fp, "w", encoding="utf-8") as f: f.write(content)
+            self._json(200, {"ok": True, "path": fp, "size": len(content)})
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    def _api_create_file(self, data):
+        fp = data.get("path","")
+        ft = data.get("type","file")
+        try:
+            if ft == "directory": os.makedirs(fp, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(fp), exist_ok=True)
+                Path(fp).touch()
+            self._json(200, {"ok": True, "path": fp})
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    def _api_delete_file(self, data):
+        fp = data.get("path","")
+        try:
+            if os.path.isdir(fp): shutil.rmtree(fp)
+            else: os.remove(fp)
+            self._json(200, {"ok": True, "deleted": fp})
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    def _api_rename_file(self, data):
+        old = data.get("old", data.get("from",""))
+        new = data.get("new", data.get("to",""))
+        try:
+            os.rename(old, new)
+            self._json(200, {"ok": True, "from": old, "to": new})
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    def _api_launch(self, data):
+        cmd = data.get("command", data.get("app",""))
+        try:
+            subprocess.Popen(cmd, shell=True)
+            self._json(200, {"ok": True, "launched": cmd})
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    def _api_kill(self, data):
+        pid = data.get("pid", 0)
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            self._json(200, {"ok": True, "killed": pid})
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    def _api_processes(self):
+        try:
+            r = subprocess.run("tasklist /FO CSV /NH", shell=True,
+                capture_output=True, text=True, timeout=10)
+            self._json(200, {"raw": r.stdout[:5000]})
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    def _api_model_select(self, data):
+        self._json(200, {"ok": True, "model": data.get("model","llama3")})
+
+    def _api_apps(self):
+        apps = []
+        if os.path.isdir(STATIC_DIR):
+            for f in os.listdir(STATIC_DIR):
+                if f.endswith(".html"):
+                    apps.append({"name": f.replace(".html","").replace("_"," ").title(),
+                                "file": f, "url": f"/static/{f}"})
+        self._json(200, {"apps": apps})
+
+    def _api_agent_run(self, data):
+        task = data.get("task", data.get("text",""))
+        r = _nova.tools.shell(f'echo Agent task: {task}')
+        self._json(200, {"ok": True, "result": r.output})
+
+    # ====== Think (Two-Phase Intent) ======
+    def _api_think(self, data):
+        text = data.get("text", "")
+        if not _nova:
+            return self._json(503, {"ok": False, "error": "NovaX not ready"})
+        try:
+            intent = _nova.context.infer(text)
+            decision = _nova.policy.evaluate(intent)
+            # Try to get AI response via Cloud Router
+            ai_result = self._proxy_post("http://localhost:9878/api/v1/query", {
+                "prompt": text, "providers": ["ollama"]
+            })
+            best = ai_result.get("best", {})
+            self._json(200, {
+                "ok": True,
+                "reply": best.get("resp", "I understand. Let me help with that."),
+                "model": best.get("model", intent.action if hasattr(intent, 'action') else "novax"),
+                "task": intent.action if hasattr(intent, 'action') else "chat",
+                "mode": _nova.policy.mode,
+                "risk": decision.risk.value if hasattr(decision, 'risk') else "low",
+                "optionA": {"label": "Execute", "action": intent.action if hasattr(intent, 'action') else text},
+                "optionB": {"label": "Plan", "action": f"Plan: {text}"},
+            })
+        except Exception as e:
+            self._json(200, {
+                "ok": True, "reply": f"Processing: {text}", "model": "novax",
+                "task": "chat", "mode": "general", "risk": "low",
+                "optionA": {"label": "Execute", "action": text},
+                "optionB": {"label": "Plan", "action": f"Plan: {text}"},
+            })
+
+    # ====== Voice Status ======
+    def _api_voice_status(self):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.voice import voice_status
+            self._json(200, voice_status())
+        except Exception:
+            self._json(200, {
+                "ready": False, "wake_word": "nova",
+                "stt_engine": "google", "tts_engine": "pyttsx3",
+                "dependencies": {"pyttsx3": False, "speech_recognition": False}
+            })
+
+    # ====== Skills ======
+    def _api_skills_list(self):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.skills_engine import list_skills
+            self._json(200, list_skills())
+        except Exception:
+            self._json(200, [])
+
+    # ====== Workflows ======
+    def _api_workflow_list(self):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.workflows import list_workflows
+            self._json(200, {"workflows": list_workflows()})
+        except Exception:
+            self._json(200, {"workflows": []})
+
+    # ====== Wallet extras ======
+    def _api_wallet_log(self, params):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.xrpl_wallet import get_tx_log
+            limit = int(params.get("limit", 10))
+            self._json(200, get_tx_log(limit))
+        except Exception:
+            self._json(200, [])
+
+    def _api_wallet_send(self, data):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.xrpl_wallet import send_payment
+            result = send_payment(data.get("destination", ""), data.get("amount", 0))
+            self._json(200, result)
+        except Exception as e:
+            self._json(200, {"ok": False, "status": "error", "error": str(e)})
+
+    # ====== Modules stats ======
+    def _api_modules_stats(self):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.module_manager import list_modules
+            mods = list_modules()
+            self._json(200, {
+                "total_discovered": len(mods),
+                "valid": sum(1 for m in mods if m.get("valid")),
+                "enabled": sum(1 for m in mods if m.get("enabled")),
+            })
+        except Exception:
+            self._json(200, {"total_discovered": 0, "valid": 0, "enabled": 0})
+
+    # ====== VCC Status ======
+    def _api_vcc(self):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.vcc import get_vcc_status
+            self._json(200, get_vcc_status())
+        except Exception as e:
+            self._json(200, {"error": str(e)})
+
+    # ====== Wallet (proxies to xrpl_wallet) ======
+    def _api_wallet_status(self):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.xrpl_wallet import wallet_status
+            self._json(200, wallet_status())
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    def _api_wallet_generate(self, data):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.xrpl_wallet import generate_wallet
+            self._json(200, generate_wallet(network=data.get("network", "testnet")))
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    # ====== Module Manager ======
+    def _api_modules_list(self):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.module_manager import list_modules
+            self._json(200, {"ok": True, "modules": list_modules()})
+        except Exception as e:
+            self._json(200, {"ok": True, "modules": []})
+
+    def _api_module_create(self, data):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.module_manager import create_module_template
+            result = create_module_template(data.get("name", ""), data.get("description", ""))
+            self._json(200, {"ok": True, "created": result})
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    def _api_module_toggle(self, name, enable):
+        sys.path.insert(0, "C:/NovaX")
+        try:
+            from core.module_manager import ModuleManager
+            mgr = ModuleManager()
+            if enable:
+                mgr.enable_module(name)
+            else:
+                mgr.disable_module(name)
+            self._json(200, {"ok": True, "module": name, "enabled": enable})
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
+    # ====== AI / API Config (proxies to Cloud Router :9878) ======
+    def _proxy_get(self, url):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _proxy_post(self, url, payload):
+        try:
+            data = json.dumps(payload).encode()
+            req = urllib.request.Request(url, data, {"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return json.loads(r.read())
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _api_ai_config_get(self):
+        raw = self._proxy_get("http://localhost:9878/api/v1/providers")
+        # Transform: Cloud Router uses 'anthropic', frontend uses 'claude'
+        # Frontend expects {provider: {configured: bool}}
+        result = {}
+        name_map = {"anthropic": "claude", "openai": "openai", "deepseek": "deepseek",
+                     "ollama": "ollama", "google": "google", "mistral": "mistral",
+                     "groq": "groq", "cohere": "cohere", "together": "together"}
+        for pid, info in raw.items():
+            if isinstance(info, dict):
+                key = name_map.get(pid, pid)
+                result[key] = {
+                    "configured": bool(info.get("key")) and info.get("on", False),
+                    "enabled": info.get("on", False),
+                    "has_key": bool(info.get("key")),
+                    "models": info.get("models", []),
+                    "name": info.get("name", pid),
+                    "priority": info.get("pri", 99),
+                }
+        self._json(200, result)
+
+    def _api_ai_config_post(self, data):
+        # Frontend sends {provider: 'claude', api_key: '...'}
+        # Cloud Router expects {provider: 'anthropic', api_key: '...'}
+        name_map = {"claude": "anthropic"}
+        provider = data.get("provider", "")
+        data["provider"] = name_map.get(provider, provider)
+        self._json(200, self._proxy_post("http://localhost:9878/api/v1/bind", data))
+
+    def _api_ai_test(self, data):
+        provider = data.get("provider", "ollama")
+        prompt = "Reply with exactly: NOVAX_OK"
+        payload = {"prompt": prompt, "providers": [provider]}
+        result = self._proxy_post("http://localhost:9878/api/v1/query", payload)
+        ok = result.get("succeeded", 0) > 0
+        self._json(200, {"ok": ok, "provider": provider, "result": result})
+
+    def _api_ai_query(self, data):
+        self._json(200, self._proxy_post("http://localhost:9878/api/v1/query", data))
+
+    def _api_ai_cloud(self):
+        self._json(200, self._proxy_get("http://localhost:9878/api/v1/cloud"))
+
+    # ====== WiFi Bridge (proxies to VPN Core :9880) ======
+    def _api_wifi_status(self):
+        raw = self._proxy_get("http://localhost:9880/n/wifi/speeds")
+        # Transform for frontend: expects {bridged, download_speed, upload_speed}
+        adapters = raw.get("adapters", [])
+        bonded = raw.get("bonded_speed_mbps", 0)
+        count = raw.get("count", len(adapters))
+        self._json(200, {
+            "ok": True,
+            "bridged": count > 1,
+            "adapter_count": count,
+            "adapters": adapters,
+            "bonded_speed_mbps": bonded,
+            "download_speed": f"{bonded:.0f} Mbps" if bonded else "N/A",
+            "upload_speed": f"{bonded/2:.0f} Mbps" if bonded else "N/A",
+        })
+
+    def _api_wifi_bridge(self, data):
+        result = self._proxy_post("http://localhost:9880/n/wifi/optimize", data)
+        result["status"] = "Bridge optimized" if result.get("ok") else "Bridge failed"
+        self._json(200, result)
+
+    def _api_wifi_unbridge(self, data):
+        self._json(200, {"ok": True, "bridged": False,
+            "message": "WiFi bridge disconnected", "status": "Disconnected"})
+
+    def _api_wifi_speedtest(self):
+        self._json(200, self._proxy_get("http://localhost:9880/n/wifi/speedtest"))
+
+    # ====== OpenClaw Integration ======
+    def _api_openclaw_config_get(self):
+        sys.path.insert(0, "C:/NovaX")
+        from core.openclaw_client import _config, is_enabled
+        cfg = _config()
+        cfg["enabled"] = is_enabled()
+        cfg["token"] = bool(cfg.get("token"))  # mask token
+        self._json(200, {"ok": True, **cfg})
+
+    def _api_openclaw_config_post(self, data):
+        sys.path.insert(0, "C:/NovaX")
+        from core.openclaw_client import configure
+        result = configure(
+            url=data.get("url"),
+            token=data.get("token"),
+            enabled=data.get("enabled")
+        )
+        self._json(200, {"ok": True, **result})
+
+    def _api_openclaw_health(self):
+        sys.path.insert(0, "C:/NovaX")
+        from core.openclaw_client import health
+        alive, msg = health()
+        self._json(200, {"ok": alive, "message": msg})
+
+    # ====== VPN / Security ======
+    def _api_vpn_status(self):
+        self._json(200, self._proxy_get("http://localhost:9880/n/status"))
+
+    def _api_vpn_servers(self):
+        self._json(200, self._proxy_get("http://localhost:9880/n/servers"))
+
+    def _api_tor_status(self):
+        self._json(200, self._proxy_get("http://localhost:9880/n/tor/status"))
+
+    def _api_tor_start(self, data):
+        self._json(200, self._proxy_post("http://localhost:9880/n/tor/start", data))
+
+    def _api_tor_stop(self, data):
+        self._json(200, self._proxy_post("http://localhost:9880/n/tor/stop", data))
+
+    # ====== Sentinel ======
+    def _api_sentinel_status(self):
+        self._json(200, self._proxy_get("http://localhost:9883/sentinel/status"))
+
+    def _api_sentinel_events(self):
+        self._json(200, self._proxy_get("http://localhost:9883/sentinel/events"))
+
+    # ====== Static + File serving ======
+    def _serve_static(self, filename):
+        # Try primary static dir first, then C:\NovaX\web
+        for base in [STATIC_DIR, "C:/NovaX/web"]:
+            filepath = os.path.normpath(os.path.join(base, filename))
+            if not filepath.startswith(os.path.normpath(base)):
+                continue
+            if os.path.isfile(filepath):
+                ext = os.path.splitext(filename)[1].lower()
+                ct = MIME_TYPES.get(ext, "application/octet-stream")
+                with open(filepath, "rb") as f: data = f.read()
+                return self._binary(200, data, ct)
+        self._json(404, {"error": f"not found: {filename}"})
+
+    def _api_files(self, fpath):
+        try:
+            if not os.path.isdir(fpath):
+                return self._json(404, {"error": f"not a directory: {fpath}"})
+            entries = []
+            for name in sorted(os.listdir(fpath)):
+                full = os.path.join(fpath, name)
+                is_dir = os.path.isdir(full)
+                try:
+                    st = os.stat(full)
+                    size = st.st_size if not is_dir else 0
+                    mod = st.st_mtime
+                except: size, mod = 0, 0
+                entries.append({"name": name, "path": full.replace("\\","/"),
+                    "is_dir": is_dir, "size": size, "modified": mod,
+                    "ext": os.path.splitext(name)[1].lower() if not is_dir else ""})
+            self._json(200, {"path": fpath, "entries": entries})
+        except Exception as e:
+            self._json(500, {"error": str(e)})
+
+    def _api_read_file(self, fpath):
+        try:
+            if not fpath or not os.path.isfile(fpath):
+                return self._json(404, {"error": f"not found: {fpath}"})
+            size = os.path.getsize(fpath)
+            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(100000)
+            self._json(200, {"path": fpath, "content": content,
+                "truncated": size > 100000, "size": size})
+        except Exception as e:
+            self._json(500, {"error": str(e)})
+
+    def _discovery(self, what):
+        if not _nova or not hasattr(_nova, 'scanner'):
+            return self._json(503, {"ok": False, "error": "scanner not ready"})
+        s = _nova.scanner
+        if what == "graph":
+            r = {"ok": True, "nodes": s.to_dict(), "count": len(s.nodes)}
+        elif what == "hardware":
+            r = {"ok": True, "nodes": [n.to_dict() for n in s.by_type("hardware")]}
+        elif what == "software":
+            r = {"ok": True, "nodes": [n.to_dict() for n in s.by_type("software")]}
+        elif what == "services":
+            r = {"ok": True, "nodes": [n.to_dict() for n in s.by_type("service")]}
+        elif what == "models":
+            r = {"ok": True, "nodes": [n.to_dict() for n in s.by_type("model")]}
+        elif what == "abilities":
+            r = {"ok": True, "abilities": s.abilities_summary()}
+        elif what == "health":
+            r = {"ok": True, "health": s.health_summary()}
+        else:
+            r = {"ok": False, "error": f"unknown: {what}"}
+        return self._json(200, r)
+
+    def _discovery_can(self, data):
+        if not _nova or not hasattr(_nova, 'scanner'):
+            return self._json(503, {"ok": False})
+        ability = data.get("ability", "")
+        return self._json(200, _nova.scanner.can(ability))
+
+    def _discovery_scan(self, data):
+        if not _nova or not hasattr(_nova, 'scanner'):
+            return self._json(503, {"ok": False})
+        elapsed = _nova.scanner.full_scan()
+        return self._json(200, {"ok": True, "nodes": len(_nova.scanner.nodes), "elapsed": elapsed})
+
+
+def start_server(port=PORT):
+    server = ThreadingHTTPServer(("0.0.0.0", port), NovaHandler)
+    server.daemon_threads = True
+    return server

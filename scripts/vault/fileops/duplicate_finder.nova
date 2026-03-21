@@ -1,0 +1,114 @@
+// NovaX Script Vault — fileops/duplicate_finder.nova
+// Description: Finds duplicate files by size comparison
+// Category: fileops | Trit: +1=success (dupes found), 0=no dupes, -1=fail
+// PURE NOVALANG — zero shell() calls. Uses dir_walk() builtin.
+// NOTE: Hash-based dedup requires shell; this uses size+name matching instead.
+
+let target_dir = dict_get(args, "dir") ?? "."
+
+print("=== NovaX Duplicate Finder ===")
+print("Directory: " + target_dir)
+print("Method: size + filename match")
+print("")
+
+let entries = dir_walk(target_dir, 999)
+let entry_count = len(entries)
+
+// Group files by size (only files, skip dirs)
+let size_buckets = {}
+let i = 0
+while3 i < entry_count {
+    let e = entries[i]
+    let e_is_dir = dict_get(e, "is_dir") ?? -1
+    if3 e_is_dir != 1 {
+        let sz = dict_get(e, "size") ?? 0
+        let epath = dict_get(e, "path") ?? ""
+        let key = str(sz)
+        let bucket = dict_get(size_buckets, key) ?? []
+        append(bucket, epath)
+        dict_set(size_buckets, key, bucket)
+    }
+    let i = i + 1
+}
+
+// Find size groups with more than 1 file (potential duplicates)
+let size_keys = dict_keys(size_buckets)
+let group_count = 0
+let total_dupes = 0
+let dupe_groups = []
+
+let i = 0
+while3 i < len(size_keys) {
+    let key = size_keys[i]
+    let bucket = dict_get(size_buckets, key) ?? []
+    if3 len(bucket) > 1 {
+        // Further group by filename to increase confidence
+        let name_buckets = {}
+        let j = 0
+        while3 j < len(bucket) {
+            let fpath = bucket[j]
+            let fname = path_filename(fpath)
+            let nb = dict_get(name_buckets, fname) ?? []
+            append(nb, fpath)
+            dict_set(name_buckets, fname, nb)
+            let j = j + 1
+        }
+        // Report groups where same size AND same filename
+        let nkeys = dict_keys(name_buckets)
+        let k = 0
+        while3 k < len(nkeys) {
+            let nk = nkeys[k]
+            let paths = dict_get(name_buckets, nk) ?? []
+            if3 len(paths) > 1 {
+                let group = {"size": key, "name": nk, "files": paths}
+                append(dupe_groups, group)
+                let group_count = group_count + 1
+                let total_dupes = total_dupes + len(paths)
+            }
+            let k = k + 1
+        }
+    }
+    let i = i + 1
+}
+
+if3 group_count == 0 {
+    // Fall back: report any same-size groups as potential dupes
+    let i = 0
+    while3 i < len(size_keys) {
+        let key = size_keys[i]
+        let bucket = dict_get(size_buckets, key) ?? []
+        if3 len(bucket) > 1 {
+            // Only flag files > 0 bytes (empty files are not interesting dupes)
+            if3 key != "0" {
+                let group = {"size": key, "name": "(same size)", "files": bucket}
+                append(dupe_groups, group)
+                let group_count = group_count + 1
+                let total_dupes = total_dupes + len(bucket)
+            }
+        }
+        let i = i + 1
+    }
+}
+
+if3 group_count == 0 {
+    print("No duplicates found.")
+    print("[0] CLEAN: No duplicate files detected.")
+    let trit = 0
+} {
+    let i = 0
+    while3 i < group_count {
+        let group = dupe_groups[i]
+        let files = dict_get(group, "files") ?? []
+        let gsize = dict_get(group, "size") ?? "?"
+        let gname = dict_get(group, "name") ?? "?"
+        print("Duplicate group (" + str(len(files)) + " files, " + gsize + " bytes, " + gname + "):")
+        for3 fp in files {
+            print("  " + fp)
+        }
+        print("")
+        let i = i + 1
+    }
+    print("Found " + str(group_count) + " duplicate groups, " + str(total_dupes) + " total files.")
+    print("[+1] SUCCESS: Duplicates identified.")
+    let trit = 1
+}

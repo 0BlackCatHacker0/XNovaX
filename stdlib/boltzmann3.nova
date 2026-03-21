@@ -1,0 +1,264 @@
+// ============================================================================
+// boltzmann3.nova — Boltzmann/Softmax Probabilistic Router
+// ============================================================================
+// Uses thermodynamic free energy for intelligent request routing:
+//   F[routing] = U[latency, errors] - T * S[diversity] + λ * C[capacity]
+//
+// Temperature T controls exploration vs exploitation:
+//   T → 0: always pick the best provider (exploitation/greedy)
+//   T → ∞: pick randomly (exploration/uniform)
+//   T = 1: balanced softmax selection
+//
+// Ternary state:
+//   +1 = routed successfully via optimal path
+//    0 = routed via suboptimal path (exploration)
+//   -1 = all paths failed
+//
+// Uses v1.4 features: ??, default params
+// 3-5-7-13: temperature steps at H3(3) levels, window=H13(13)
+// ============================================================================
+
+fn boltz3_new(name = "router", temperature = 1.0) {
+    return {
+        "name": name,
+        "temperature": temperature,
+        "providers": {},
+        "total_routes": 0,
+        "exploration_count": 0,
+        "exploitation_count": 0
+    }
+}
+
+fn boltz3_register(router, provider_name, initial_score = 50) {
+    let providers = dict_get(router, "providers") ?? {}
+    let entry = {
+        "name": provider_name,
+        "score": initial_score,
+        "successes": 0,
+        "failures": 0,
+        "total_latency_ms": 0,
+        "avg_latency_ms": 0,
+        "last_used": 0
+    }
+    providers = dict_set(providers, provider_name, entry)
+    let result = deep_clone(router)
+    result = dict_set(result, "providers", providers)
+    return result
+}
+
+// ── Softmax probability calculation ───────────────────────────────
+fn boltz3_softmax_scores(router) {
+    let providers = dict_get(router, "providers") ?? {}
+    let temp = dict_get(router, "temperature") ?? 1.0
+    let prov_names = dict_keys(providers)
+    if3 len(prov_names) == 0 { return {} }
+
+    // Collect scores
+    let scores = {}
+    let max_score = -999999
+    let i = 0
+    while3 i < len(prov_names) {
+        let pname = prov_names[i]
+        let entry = dict_get(providers, pname) ?? {}
+        let score = dict_get(entry, "score") ?? 50
+        scores = dict_set(scores, pname, score)
+        if3 score > max_score { max_score = score }
+        i = i + 1
+    }
+
+    // Compute exp(score/T) for each — subtract max for numerical stability
+    let exp_sum = 0
+    let exp_vals = {}
+    let j = 0
+    while3 j < len(prov_names) {
+        let pname = prov_names[j]
+        let score = dict_get(scores, pname) ?? 50
+        let x = 0
+        if3 temp > 0 {
+            x = (score - max_score) / temp
+        }
+        // Clamp to [-20, 20] to avoid overflow
+        if3 x < -20 { x = -20 }
+        if3 x > 20 { x = 20 }
+        // exp(x) ≈ (1 + x/256)^256 via repeated squaring (8 doublings)
+        // This gives good accuracy for |x| ≤ 20
+        let base = 1 + x / 256
+        if3 base < 0 { base = 0 }
+        // Square 8 times: 2^8 = 256
+        base = base * base   // ^2
+        base = base * base   // ^4
+        base = base * base   // ^8
+        base = base * base   // ^16
+        base = base * base   // ^32
+        base = base * base   // ^64
+        base = base * base   // ^128
+        base = base * base   // ^256
+        let exp_val = base
+        if3 exp_val < 0.000001 { exp_val = 0.000001 }
+        exp_vals = dict_set(exp_vals, pname, exp_val)
+        exp_sum = exp_sum + exp_val
+        j = j + 1
+    }
+
+    // Normalize to probabilities
+    let probs = {}
+    let k = 0
+    while3 k < len(prov_names) {
+        let pname = prov_names[k]
+        let ev = dict_get(exp_vals, pname) ?? 0
+        let prob = 0
+        if3 exp_sum > 0 { prob = (ev * 100) / exp_sum }
+        probs = dict_set(probs, pname, prob)
+        k = k + 1
+    }
+
+    return probs
+}
+
+// ── Select provider using softmax probabilities ───────────────────
+fn boltz3_select(router) {
+    let probs = boltz3_softmax_scores(router)
+    let prov_names = dict_keys(probs)
+    if3 len(prov_names) == 0 {
+        return {"provider": null, "trit": -1}
+    }
+
+    // Weighted random selection
+    let roll = floor(random(0, 1) * 100)
+    let cumulative = 0
+    let selected = prov_names[0]
+    let was_exploration = 0
+
+    let i = 0
+    while3 i < len(prov_names) {
+        let pname = prov_names[i]
+        let prob = dict_get(probs, pname) ?? 0
+        cumulative = cumulative + prob
+        if3 roll < cumulative {
+            selected = pname
+            i = len(prov_names)
+        }
+        i = i + 1
+    }
+
+    // Check if this was the top-scored provider (exploitation) or not (exploration)
+    let best_name = prov_names[0]
+    let best_prob = 0
+    let j = 0
+    while3 j < len(prov_names) {
+        let pname = prov_names[j]
+        let prob = dict_get(probs, pname) ?? 0
+        if3 prob > best_prob {
+            best_prob = prob
+            best_name = pname
+        }
+        j = j + 1
+    }
+    if3 selected != best_name { was_exploration = 1 }
+
+    let trit = 1
+    if3 was_exploration == 1 { trit = 0 }
+
+    return {
+        "provider": selected,
+        "trit": trit,
+        "probability": dict_get(probs, selected) ?? 0,
+        "exploration": was_exploration,
+        "probabilities": probs
+    }
+}
+
+// ── Record outcome and update scores ──────────────────────────────
+fn boltz3_record(router, provider_name, success = 1, latency_ms = 0) {
+    let providers = dict_get(router, "providers") ?? {}
+    let entry = dict_get(providers, provider_name) ?? {}
+
+    let old_score = dict_get(entry, "score") ?? 50
+    let successes = dict_get(entry, "successes") ?? 0
+    let failures = dict_get(entry, "failures") ?? 0
+    let total_lat = dict_get(entry, "total_latency_ms") ?? 0
+    let total_routes = (dict_get(router, "total_routes") ?? 0) + 1
+    let explore_count = dict_get(router, "exploration_count") ?? 0
+    let exploit_count = dict_get(router, "exploitation_count") ?? 0
+
+    // Update counters
+    if3 success == 1 {
+        successes = successes + 1
+        exploit_count = exploit_count + 1
+    } else {
+        failures = failures + 1
+        explore_count = explore_count + 1
+    }
+    total_lat = total_lat + latency_ms
+
+    // Update score using exponential moving average
+    // New score = 0.8 * old + 0.2 * reward
+    let reward = 0
+    if3 success == 1 {
+        // Reward = 100 - latency_penalty
+        let lat_penalty = latency_ms / 50
+        if3 lat_penalty > 80 { lat_penalty = 80 }
+        reward = 100 - lat_penalty
+    }
+    // else reward stays 0 for failures
+
+    let new_score = (old_score * 80 + reward * 20) / 100
+    if3 new_score < 1 { new_score = 1 }
+    if3 new_score > 100 { new_score = 100 }
+
+    // Update average latency
+    let total_calls = successes + failures
+    let avg_lat = 0
+    if3 total_calls > 0 { avg_lat = total_lat / total_calls }
+
+    entry = dict_set(entry, "score", new_score)
+    entry = dict_set(entry, "successes", successes)
+    entry = dict_set(entry, "failures", failures)
+    entry = dict_set(entry, "total_latency_ms", total_lat)
+    entry = dict_set(entry, "avg_latency_ms", avg_lat)
+    entry = dict_set(entry, "last_used", time_ms())
+    providers = dict_set(providers, provider_name, entry)
+
+    let result = deep_clone(router)
+    result = dict_set(result, "providers", providers)
+    result = dict_set(result, "total_routes", total_routes)
+    result = dict_set(result, "exploration_count", explore_count)
+    result = dict_set(result, "exploitation_count", exploit_count)
+    return result
+}
+
+// ── Adjust temperature (cooling schedule) ─────────────────────────
+fn boltz3_cool(router, factor = 0.95) {
+    let temp = dict_get(router, "temperature") ?? 1.0
+    let new_temp = temp * factor
+    if3 new_temp < 0.01 { new_temp = 0.01 }
+    let result = deep_clone(router)
+    result = dict_set(result, "temperature", new_temp)
+    return result
+}
+
+fn boltz3_heat(router, factor = 1.5) {
+    let temp = dict_get(router, "temperature") ?? 1.0
+    let new_temp = temp * factor
+    if3 new_temp > 100 { new_temp = 100 }
+    let result = deep_clone(router)
+    result = dict_set(result, "temperature", new_temp)
+    return result
+}
+
+// ── Stats ─────────────────────────────────────────────────────────
+fn boltz3_stats(router) {
+    let total = dict_get(router, "total_routes") ?? 0
+    let explore = dict_get(router, "exploration_count") ?? 0
+    let exploit = dict_get(router, "exploitation_count") ?? 0
+    let explore_pct = 0
+    if3 total > 0 { explore_pct = (explore * 100) / total }
+    return {
+        "name": dict_get(router, "name") ?? "router",
+        "temperature": dict_get(router, "temperature") ?? 1.0,
+        "total_routes": total,
+        "exploration_pct": explore_pct,
+        "provider_count": len(dict_keys(dict_get(router, "providers") ?? {})),
+        "probabilities": boltz3_softmax_scores(router)
+    }
+}

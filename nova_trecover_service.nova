@@ -1,0 +1,1123 @@
+// Nova TRecover v1.0 -- Ternary Session Crash Recovery (NovaLang port)
+// Port 9993: Reads dead Claude Code sessions, extracts what was in progress,
+// and builds recovery manifests with 3-state ternary scoring.
+//
+// When "prompt too long" kills a session, TRecover:
+//   1. Finds the latest conversation JSONL via nova_run dir listing
+//   2. Reads the last BLOCK_SIZE bytes and splits into lines
+//   3. Parses 7 recovery categories (H7 composition)
+//   4. Assigns +1/0/-1 trit per category
+//   5. Writes manifest to memory/session-continuity.md
+//
+// 3-5-7-13 Harmonic Design:
+//   - Scans last 13 messages by default (H13 carrier)
+//   - 7 recovery categories (H7 composition)
+//   - 3-state trit per category (-1, 0, +1)
+//   - Block reads in 2187-byte chunks (3^7)
+//
+// N-S Reynolds flow:
+//   Re < 27  = laminar  (clean session, good data)
+//   Re < 125 = transitional (partial data)
+//   Re < 343 = turbulent (heavy crash, poor data)
+//   Re >= 343 = chaotic (nothing recoverable)
+//
+// NOTE: No threading. Background scans are on-demand POST endpoints.
+// NOTE: ASCII-only -- no Unicode, no box chars, no em-dashes.
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9993
+let server = tserve(PORT, "TRecover v1.0 - Ternary Session Recovery")
+
+// -- 3-5-7-13 Harmonic Constants --
+let BLOCK = 2187
+
+// -- N-S Reynolds Boundaries --
+let RE_LAMINAR      = 27
+let RE_TRANSITIONAL = 125
+let RE_TURBULENT    = 343
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Version / Identity --
+let VERSION      = "1.0.0"
+let SERVICE_NAME = "nova-trecover"
+
+// -- Default scan depth: last 13 messages (H13 carrier) --
+let DEFAULT_SCAN_DEPTH = 13
+
+// -- Paths --
+let CLAUDE_BASE    = "C:\\Users\\Jupit\\.claude\\projects"
+let NOVAX_PROJECT  = "C--Users-Jupit-OneDrive-Documents-new-openclaw-clauade-novax-servers"
+let MEMORY_DIR     = CLAUDE_BASE + "\\" + NOVAX_PROJECT + "\\memory"
+let CONVOS_DIR     = CLAUDE_BASE + "\\" + NOVAX_PROJECT
+
+// -- Category names as comma-separated string (H7 = 7 categories) --
+let CATEGORIES = "active_tools,active_agents,modified_files,pending_tasks,error_context,service_state,user_intent"
+
+// -- Service pattern keywords for reference extraction --
+let SVC_PATTERNS = "orchestrator,hivemind,cloud.router,cortex,tkill,tspeak,ttools,deepstorage,vault,tools,tfetch,tbuffer,tshell,tsysmon,tnet,tsecurity,tmedia,tbuild,tcron,tquery,brain,nexus,sentinel,skiptrace,novalang,trecover"
+
+// -- Error keywords for error detection --
+let ERR_PATTERNS = "error,Error,ERROR,failed,Failed,exception,Exception,prompt too long,Prompt is too long"
+
+// -- Session scan stats --
+let total_scans    = 0
+let total_recovers = 0
+
+
+// ================================================================
+// Helper: convert trit integer to display char (+, 0, -)
+// ================================================================
+fn trit_char(t) {
+    if3 t == T_TRUE {
+        return "+"
+    } else t == T_MAYBE {
+        return "0"
+    } else {
+        return "-"
+    }
+}
+
+// ================================================================
+// Helper: compute N-S Reynolds regime label from error + warn counts
+// ================================================================
+fn calc_regime(err_count, warn_count) {
+    let re = err_count * warn_count
+    if3 re >= RE_TURBULENT {
+        return "chaotic"
+    } else re >= RE_TRANSITIONAL {
+        return "turbulent"
+    } else re >= RE_LAMINAR {
+        return "transitional"
+    } else {
+        return "laminar"
+    }
+}
+
+// ================================================================
+// Helper: list JSONL conversation files via dir command
+// Returns newline-joined string of full paths, newest first
+// ================================================================
+fn list_jsonl_files() {
+    // Use dir /b /s /o-d to list JSONL files newest-first
+    let cmd = "cmd /c dir /b /s /o-d \"" + CONVOS_DIR + "\\*.jsonl\" 2>nul"
+    let raw = nova_run(cmd)
+    return str(raw)
+}
+
+// ================================================================
+// Helper: filter out subagent paths from dir listing
+// Returns cleaned newline string of main session JSONL paths
+// ================================================================
+fn filter_main_sessions(raw_listing) {
+    let lines = split(raw_listing, "\n")
+    let result = []
+    let i = 0
+    let total = len(lines)
+    while3 i < total {
+        let line = lines[i]
+        let trimmed = replace(line, "\r", "")
+        if3 len(trimmed) < 5 { i = i + 1
+        } else contains(lower(trimmed), "subagents") { i = i + 1
+        } else contains(lower(trimmed), ".jsonl") {
+            result = append(result, trimmed)
+            i = i + 1
+        } else { i = i + 1
+        }
+    }
+    return result
+}
+
+// ================================================================
+// Helper: read a file's tail (last BLOCK*depth bytes) via nova_read
+// Returns the raw string content
+// ================================================================
+fn read_file_tail(filepath) {
+    try3 {
+        let content = nova_read(filepath)
+        return str(content)
+    } catch3 {
+        return ""
+    }
+}
+
+// ================================================================
+// Helper: extract last N lines from a newline-split string
+// Returns a list of line strings
+// ================================================================
+fn last_n_lines(text, n) {
+    let all_lines = split(text, "\n")
+    let total = len(all_lines)
+    let start = 0
+    if3 total > n { start = total - n
+    } else total == n { start = 0
+    } else { start = 0
+    }
+    let result = []
+    let i = start
+    while3 i < total {
+        let ln = all_lines[i]
+        let trimmed = replace(ln, "\r", "")
+        if3 len(trimmed) > 0 {
+            result = append(result, trimmed)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ================================================================
+// Helper: safely parse a JSON line -- returns dict or empty dict
+// ================================================================
+fn safe_json(line) {
+    try3 {
+        let parsed = json_decode(line)
+        return parsed
+    } catch3 {
+        return {}
+    }
+}
+
+// ================================================================
+// Extract active tool calls from a list of message dicts
+// Returns list of {tool, input_preview} dicts
+// ================================================================
+fn extract_tools(msg_list) {
+    let found = []
+    let i = 0
+    let total = len(msg_list)
+    while3 i < total {
+        let msg = msg_list[i]
+        // Check top-level type == "tool_use"
+        let msg_type = str(dict_get(msg, "type"))
+        if3 msg_type == "tool_use" { name = str(dict_get(msg, "name"))
+            let inp  = str(dict_get(msg, "input"))
+            let preview = inp
+            if3 len(inp) > 200 { preview = slice(inp, 0, 200)
+            } else inp == "False" { preview = ""
+            } else { preview = inp
+            }
+            found = append(found, {"tool": name, "input_preview": preview})
+        } else {
+            // Nothing extra for non tool_use at top level
+        }
+        // Also check content array field
+        let content = dict_get(msg, "content")
+        let content_str = str(content)
+        if3 contains(content_str, "tool_use") {
+            // Record that content had tool_use -- we stringify and note it
+            let note_tool = "content-embedded-tool"
+            let short = content_str
+            if3 len(content_str) > 200 { short = slice(content_str, 0, 200)
+            } else content_str == "False" { short = ""
+            } else { short = content_str
+            }
+            if3 len(short) > 5 {
+                found = append(found, {"tool": note_tool, "input_preview": short})
+        } else {
+            // no embedded tool_use
+        }
+        i = i + 1
+    }
+    return found
+}
+
+// ================================================================
+// Extract user intent messages (role==user or role==human)
+// Returns list of strings, last H7 entries
+// ================================================================
+}
+fn extract_intent(msg_list) {
+    let found = []
+    let i = 0
+    let total = len(msg_list)
+    while3 i < total {
+        let msg = msg_list[i]
+        let role = str(dict_get(msg, "role"))
+        if3 role == "user" { content = dict_get(msg, "content")
+            let cstr = str(content)
+            if3 len(cstr) > 5 { preview = cstr
+                if3 len(cstr) > 300 { preview = slice(cstr, 0, 300)
+                } else cstr == "False" { preview = ""
+                } else { preview = cstr
+                }
+                if3 len(preview) > 5 {
+                    found = append(found, preview)
+                }
+            } else cstr == "False" {
+                // skip
+            } else {
+                // skip short content
+            }
+        } else role == "human" { content = dict_get(msg, "content")
+            let cstr = str(content)
+            if3 len(cstr) > 5 { preview = cstr
+                if3 len(cstr) > 300 { preview = slice(cstr, 0, 300)
+                } else cstr == "False" { preview = ""
+                } else { preview = cstr
+                }
+                if3 len(preview) > 5 {
+                    found = append(found, preview)
+            } else {
+                // skip
+        } else {
+            // not a user/human message
+        }
+        i = i + 1
+    }
+    // Return last H7 items
+    let found_count = len(found)
+    let start = 0
+    if3 found_count > H7 { start = found_count - H7
+    } else { start = 0
+    }
+    let result = []
+    let j = start
+    while3 j < found_count {
+        result = append(result, found[j])
+        j = j + 1
+    }
+    return result
+}
+
+// ================================================================
+// Extract file path references (NovaX paths) from stringified messages
+// Returns list of strings, capped at 20
+// ================================================================
+}
+}
+fn extract_files(msg_list) {
+    let found = []
+    let i = 0
+    let total = len(msg_list)
+    while3 i < total {
+        let msg = msg_list[i]
+        let text = str(json_encode(msg))
+        // Look for C:\NovaX pattern occurrences
+        if3 contains(text, "NovaX") {
+            // Extract surrounding snippet as a file reference note
+            let idx = 0
+            let scan = text
+            while3 contains(scan, "NovaX") {
+                let pos = 0
+                // Find first occurrence by splitting on "NovaX"
+                let parts = split(scan, "NovaX")
+                let pre = parts[0]
+                let pre_len = len(pre)
+                // Extract context: up to 60 chars before + "NovaX" + 60 after
+                let context_start = pre_len
+                if3 pre_len > 60 { context_start = pre_len - 60
+                } else { context_start = 0
+                }
+                let snippet = slice(text, context_start, context_start + 80)
+                if3 len(snippet) > 5 {
+                    found = append(found, snippet)
+                }
+                // Advance scan past this "NovaX" hit to avoid infinite loop
+                if3 len(parts) > 1 { rest = parts[1]
+                    let scan = rest
+                } else { scan = ""
+                }
+                if3 len(found) >= 20 { scan = ""
+                } else {
+                    // continue scanning
+                }
+            }
+        } else contains(lower(text), "nova") { snippet = text
+            if3 len(text) > 80 { snippet = slice(text, 0, 80)
+            } else { snippet = text
+            }
+            found = append(found, snippet)
+        } else {
+            // no nova reference
+        }
+        i = i + 1
+        // Cap at 20
+        if3 len(found) >= 20 { i = total
+        } else {
+            // keep going
+        }
+    }
+    // Trim to 20
+    let result = []
+    let j = 0
+    let cap = len(found)
+    if3 cap > 20 { cap = 20
+    } else { cap = len(found)
+    }
+    while3 j < cap {
+        result = append(result, found[j])
+        j = j + 1
+    }
+    return result
+}
+
+// ================================================================
+// Extract error contexts from stringified messages
+// Returns list of {pattern, context} dicts, capped at H13=13
+// ================================================================
+fn extract_errors(msg_list) {
+    let found = []
+    let err_pats = split(ERR_PATTERNS, ",")
+    let i = 0
+    let total = len(msg_list)
+    while3 i < total {
+        let msg = msg_list[i]
+        let text = str(json_encode(msg))
+        let ltext = lower(text)
+        // Check each error pattern
+        let p = 0
+        let pat_count = len(err_pats)
+        let matched = 0
+        while3 p < pat_count {
+            if3 matched > 0 { p = pat_count
+            } else { pat = err_pats[p]
+                let lpat = lower(replace(pat, "\r", ""))
+                if3 contains(ltext, lpat) {
+                    // Extract context snippet around the match
+                    let parts = split(ltext, lpat)
+                    let pre = parts[0]
+                    let pre_len = len(pre)
+                    let ctx_start = 0
+                    if3 pre_len > 100 { ctx_start = pre_len - 100
+                    } else { ctx_start = 0
+                    }
+                    let ctx = slice(text, ctx_start, ctx_start + 300)
+                    found = append(found, {"pattern": pat, "context": ctx})
+                    let matched = 1
+                } else {
+                    // pattern not in this message
+                }
+                p = p + 1
+            }
+        }
+        i = i + 1
+        if3 len(found) >= H13 { i = total
+        } else {
+            // keep going
+        }
+    }
+    // Trim to H13
+    let result = []
+    let j = 0
+    let cap = len(found)
+    if3 cap > H13 { cap = H13
+    } else { cap = len(found)
+    }
+    while3 j < cap {
+        result = append(result, found[j])
+        j = j + 1
+    }
+    return result
+}
+
+// ================================================================
+// Extract NovaX service references from message texts
+// Returns list of unique service name strings
+// ================================================================
+fn extract_services(msg_list) {
+    let svc_list = split(SVC_PATTERNS, ",")
+    let found = {}
+    let i = 0
+    let total = len(msg_list)
+    while3 i < total {
+        let msg = msg_list[i]
+        let text = lower(str(json_encode(msg)))
+        let s = 0
+        let svc_total = len(svc_list)
+        while3 s < svc_total {
+            let pat = svc_list[s]
+            if3 contains(text, pat) {
+                found = dict_set(found, pat, 1)
+            } else {
+                // not found
+            }
+            s = s + 1
+        }
+        i = i + 1
+    }
+    return keys(found)
+}
+
+// ================================================================
+// Compute ternary recovery trit for each of the 7 categories
+// Returns a dict: {category_name: trit_value}
+// ================================================================
+fn compute_trits(active_tools, active_agents, modified_files, error_context, service_state, user_intent) {
+    let trits = {}
+
+    // active_tools: +1 if >3, 0 if >0, -1 if none
+    let nt = len(active_tools)
+    if3 nt > H3 {
+        trits = dict_set(trits, "active_tools", T_TRUE)
+    } else nt > 0 {
+        trits = dict_set(trits, "active_tools", T_MAYBE)
+    } else {
+        trits = dict_set(trits, "active_tools", T_FALSE)
+    }
+
+    // active_agents: +1 if >2, 0 if >0, -1 if none
+    let na = len(active_agents)
+    if3 na > 2 {
+        trits = dict_set(trits, "active_agents", T_TRUE)
+    } else na > 0 {
+        trits = dict_set(trits, "active_agents", T_MAYBE)
+    } else {
+        trits = dict_set(trits, "active_agents", T_FALSE)
+    }
+
+    // modified_files: +1 if >5, 0 if >0, -1 if none
+    let nf = len(modified_files)
+    if3 nf > H5 {
+        trits = dict_set(trits, "modified_files", T_TRUE)
+    } else nf > 0 {
+        trits = dict_set(trits, "modified_files", T_MAYBE)
+    } else {
+        trits = dict_set(trits, "modified_files", T_FALSE)
+    }
+
+    // pending_tasks: always 0 (partial from crash -- no TodoWrite parsing)
+    trits = dict_set(trits, "pending_tasks", T_MAYBE)
+
+    // error_context: +1 if errors found, -1 if none
+    let ne = len(error_context)
+    if3 ne > 0 {
+        trits = dict_set(trits, "error_context", T_TRUE)
+    } else {
+        trits = dict_set(trits, "error_context", T_FALSE)
+    }
+
+    // service_state: +1 if >3, 0 if >0, -1 if none
+    let ns = len(service_state)
+    if3 ns > H3 {
+        trits = dict_set(trits, "service_state", T_TRUE)
+    } else ns > 0 {
+        trits = dict_set(trits, "service_state", T_MAYBE)
+    } else {
+        trits = dict_set(trits, "service_state", T_FALSE)
+    }
+
+    // user_intent: +1 if any intent captured, -1 if none
+    let ni = len(user_intent)
+    if3 ni > 0 {
+        trits = dict_set(trits, "user_intent", T_TRUE)
+    } else {
+        trits = dict_set(trits, "user_intent", T_FALSE)
+    }
+
+    return trits
+}
+
+// ================================================================
+// Build balanced-ternary string from recovery trits
+// Returns a 7-char string e.g. "+0-+0++"
+// ================================================================
+fn build_bt_string(trits) {
+    let cat_list = split(CATEGORIES, ",")
+    let bt = ""
+    let i = 0
+    let total = len(cat_list)
+    while3 i < total {
+        let cat = cat_list[i]
+        let t = dict_get(trits, cat)
+        let c = "-"
+        if3 t == T_TRUE { c = "+"
+        } else t == T_MAYBE { c = "0"
+        } else { c = "-"
+        }
+        bt = bt + c
+        i = i + 1
+    }
+    return bt
+}
+
+// ================================================================
+// Sum all category trits for overall recovery score
+// ================================================================
+fn sum_trits(trits) {
+    let cat_list = split(CATEGORIES, ",")
+    let total = 0
+    let i = 0
+    let n = len(cat_list)
+    while3 i < n {
+        let cat = cat_list[i]
+        let t = dict_get(trits, cat)
+        let tval = 0
+        if3 t == T_TRUE { tval = 1
+        } else t == T_FALSE { tval = -1
+        } else { tval = 0
+        }
+        total = total + tval
+        i = i + 1
+    }
+    return total
+}
+
+// ================================================================
+// Core: scan a session file and return full recovery result
+// conversation_path must be an absolute path string.
+// depth = number of messages to inspect.
+// ================================================================
+fn scan_session_file(conversation_path, depth) {
+    // Read the file tail
+    let raw = read_file_tail(conversation_path)
+    if3 len(raw) < 5 {
+        return {"ok": false, "trit": T_FALSE, "error": "Could not read session file"}
+    } else raw == "False" {
+        return {"ok": false, "trit": T_FALSE, "error": "Could not read session file"}
+    } else {
+        // nothing wrong, continue
+    }
+
+    // Split into lines, take last depth*H3 lines
+    let scan_lines = depth * H3
+    let line_list = last_n_lines(raw, scan_lines)
+
+    if3 len(line_list) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "No lines parsed from session file"}
+    } else {
+        // continue
+    }
+
+    // Parse each line as JSONL
+    let messages = []
+    let li = 0
+    let lcount = len(line_list)
+    while3 li < lcount {
+        let line = line_list[li]
+        if3 len(line) > 2 { parsed = safe_json(line)
+            let parsed_str = str(parsed)
+            if3 parsed_str == "{}" {
+                // skip empty parse
+            } else parsed_str == "False" {
+                // skip failed parse
+            } else {
+                messages = append(messages, parsed)
+        } else {
+            // skip tiny lines
+        }
+        li = li + 1
+    }
+
+    if3 len(messages) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "No parseable messages in session"}
+    } else {
+        // continue
+    }
+
+    // Extract all 7 categories
+    let tools    = extract_tools(messages)
+    let agents   = []
+    let files    = extract_files(messages)
+    let errors   = extract_errors(messages)
+    let services = extract_services(messages)
+    let intents  = extract_intent(messages)
+
+    // Compute per-category trits
+    let trits = compute_trits(tools, agents, files, errors, services, intents)
+    let bt    = build_bt_string(trits)
+    let tsum  = sum_trits(trits)
+
+    // Overall trit: +1 if mostly recovered (sum>3), 0 if partial, -1 if mostly lost
+    let overall = T_FALSE
+    if3 tsum > H3 { overall = T_TRUE
+    } else tsum > 0 { overall = T_MAYBE
+    } else { overall = T_FALSE
+    }
+
+    // N-S regime based on errors vs services found
+    let err_count = len(errors)
+    let svc_count = len(services)
+    let regime    = calc_regime(err_count, svc_count)
+
+    // Get session ID from path (last directory component)
+    let path_parts = split(conversation_path, "\\")
+    let n_parts = len(path_parts)
+    let session_id = "unknown"
+    if3 n_parts >= 2 {
+        // second to last part is the session dir
+        let session_id = path_parts[n_parts - 2]
+    } else n_parts == 1 { session_id = path_parts[0]
+    } else { session_id = "unknown"
+    }
+
+    // Build last-H7 tools slice
+    let tools_count = len(tools)
+    let tools_start = 0
+    if3 tools_count > H7 { tools_start = tools_count - H7
+    } else { tools_start = 0
+    }
+    let tools_slice = []
+    let ti = tools_start
+    while3 ti < tools_count {
+        tools_slice = append(tools_slice, tools[ti])
+        ti = ti + 1
+    }
+
+    // Build last-H3 errors slice
+    let err_count2 = len(errors)
+    let err_start = 0
+    if3 err_count2 > H3 { err_start = err_count2 - H3
+    } else { err_start = 0
+    }
+    let errors_slice = []
+    let ei = err_start
+    while3 ei < err_count2 {
+        errors_slice = append(errors_slice, errors[ei])
+        ei = ei + 1
+    }
+
+    // Build last-H3 intents slice
+    let int_count = len(intents)
+    let int_start = 0
+    if3 int_count > H3 { int_start = int_count - H3
+    } else { int_start = 0
+    }
+    let intents_slice = []
+    let ii = int_start
+    while3 ii < int_count {
+        intents_slice = append(intents_slice, intents[ii])
+        ii = ii + 1
+    }
+
+    total_scans = total_scans + 1
+
+    return {
+        "ok": true,
+        "trit": overall,
+        "char": trit_char(overall),
+        "recovery_bt": bt,
+        "recovery_trits": trits,
+        "session_id": session_id,
+        "session_path": conversation_path,
+        "scan_depth": depth,
+        "msg_count": len(messages),
+        "reynolds_regime": regime,
+        "categories": {
+            "active_tools":    tools_slice,
+            "active_agents":   agents,
+            "modified_files":  files,
+            "pending_tasks":   [],
+            "error_context":   errors_slice,
+            "service_state":   services,
+            "user_intent":     intents_slice
+        }
+    }
+}
+
+// ================================================================
+// Core: get sorted list of session dicts
+// Returns list of {session_id, path, size_note} dicts
+// ================================================================
+}
+fn get_sessions() {
+    let raw   = list_jsonl_files()
+    let paths = filter_main_sessions(raw)
+    let result = []
+    let i = 0
+    let total = len(paths)
+    while3 i < total {
+        let p = paths[i]
+        if3 len(p) > 5 { parts = split(p, "\\")
+            let n = len(parts)
+            let sid = "unknown"
+            if3 n >= 2 { sid = parts[n - 2]
+            } else n == 1 { sid = parts[0]
+            } else { sid = "unknown"
+            }
+            result = append(result, {"session_id": sid, "path": p})
+        } else {
+            // skip blank path
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ================================================================
+// Core: write recovery manifest to session-continuity.md
+// ================================================================
+fn write_manifest(scan_result) {
+    let ok = dict_get(scan_result, "ok")
+    if3 ok == false {
+        return {"ok": false, "trit": T_FALSE, "error": "No scan data to write"}
+    } else ok == "False" {
+        return {"ok": false, "trit": T_FALSE, "error": "No scan data to write"}
+    } else {
+        // continue
+    }
+
+    let cats   = dict_get(scan_result, "categories")
+    let trits  = dict_get(scan_result, "recovery_trits")
+    let bt     = str(dict_get(scan_result, "recovery_bt"))
+    let sid    = str(dict_get(scan_result, "session_id"))
+    let regime = str(dict_get(scan_result, "reynolds_regime"))
+
+    // Build trit summary string: "active_tools=+ active_agents=- ..."
+    let cat_list = split(CATEGORIES, ",")
+    let trit_summary = ""
+    let ci = 0
+    let cn = len(cat_list)
+    while3 ci < cn {
+        let cat = cat_list[ci]
+        let tv  = dict_get(trits, cat)
+        let tc  = trit_char(tv)
+        trit_summary = trit_summary + cat + "=" + tc + " "
+        ci = ci + 1
+    }
+
+    // Build content string line by line
+    let now_ts = str(time())
+    let content = "# Session Continuity and Recovery\n\n"
+    content = content + "## Auto-Recovered: " + now_ts + "\n"
+    content = content + "- Recovery BT: " + bt + " (balanced ternary: " + trit_summary + ")\n"
+    content = content + "- Session: " + sid + "\n"
+    content = content + "- Reynolds regime: " + regime + "\n\n"
+    content = content + "## Last User Intent\n"
+
+    let intents = dict_get(cats, "user_intent")
+    let ii = 0
+    let in_total = len(intents)
+    while3 ii < in_total {
+        let intent_text = str(intents[ii])
+        let preview = intent_text
+        if3 len(intent_text) > 200 { preview = slice(intent_text, 0, 200)
+        } else { preview = intent_text
+        }
+        content = content + "- " + preview + "\n"
+        ii = ii + 1
+    }
+
+    content = content + "\n## Active Tools (at crash)\n"
+    let tools_list = dict_get(cats, "active_tools")
+    let tl = 0
+    let tl_total = len(tools_list)
+    while3 tl < tl_total {
+        let tool_entry = tools_list[tl]
+        let tool_name  = str(dict_get(tool_entry, "tool"))
+        let tool_prev  = str(dict_get(tool_entry, "input_preview"))
+        let tool_short = tool_prev
+        if3 len(tool_prev) > 100 { tool_short = slice(tool_prev, 0, 100)
+        } else { tool_short = tool_prev
+        }
+        content = content + "- " + tool_name + ": " + tool_short + "\n"
+        tl = tl + 1
+    }
+
+    content = content + "\n## Modified Files\n"
+    let files_list = dict_get(cats, "modified_files")
+    let fl = 0
+    let fl_total = len(files_list)
+    while3 fl < fl_total {
+        let fpath = str(files_list[fl])
+        content = content + "- " + fpath + "\n"
+        fl = fl + 1
+    }
+
+    content = content + "\n## Services Referenced\n"
+    let svcs_list = dict_get(cats, "service_state")
+    let sl = 0
+    let sl_total = len(svcs_list)
+    while3 sl < sl_total {
+        let svc = str(svcs_list[sl])
+        content = content + "- " + svc + "\n"
+        sl = sl + 1
+    }
+
+    content = content + "\n## Errors Captured\n"
+    let errs_list = dict_get(cats, "error_context")
+    let el = 0
+    let el_total = len(errs_list)
+    while3 el < el_total {
+        let err_entry = errs_list[el]
+        let epat  = str(dict_get(err_entry, "pattern"))
+        let ectx  = str(dict_get(err_entry, "context"))
+        let eshort = ectx
+        if3 len(ectx) > 150 { eshort = slice(ectx, 0, 150)
+        } else { eshort = ectx
+        }
+        content = content + "- " + epat + ": " + eshort + "\n"
+        el = el + 1
+    }
+
+    // Write to memory/session-continuity.md
+    let manifest_path = MEMORY_DIR + "\\session-continuity.md"
+    try3 {
+        nova_write(manifest_path, content)
+        total_recovers = total_recovers + 1
+        return {
+            "ok": true,
+            "trit": T_TRUE,
+            "path": manifest_path,
+            "chars": len(content)
+        }
+    } catch3 {
+        return {"ok": false, "trit": T_FALSE, "error": "Write failed"}
+    }
+}
+
+
+// ================================================================
+// Route: GET /health
+// ================================================================
+fn health() {
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "char", "+")
+    resp = dict_set(resp, "categories", 7)
+    resp = dict_set(resp, "scan_depth", DEFAULT_SCAN_DEPTH)
+    resp = dict_set(resp, "block_size", BLOCK)
+    resp = dict_set(resp, "total_scans", total_scans)
+    resp = dict_set(resp, "total_recovers", total_recovers)
+    resp = dict_set(resp, "reynolds_boundaries", {
+        "laminar": RE_LAMINAR,
+        "transitional": RE_TRANSITIONAL,
+        "turbulent": RE_TURBULENT
+    })
+    return resp
+}
+
+// ================================================================
+// Route: GET /trecover/status
+// Lists sessions found + service metadata
+// ================================================================
+fn trecover_status() {
+    let sessions = get_sessions()
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "runtime": "novalang",
+        "sessions_found": len(sessions),
+        "memory_dir": MEMORY_DIR,
+        "convos_dir": CONVOS_DIR,
+        "categories": split(CATEGORIES, ","),
+        "total_scans": total_scans,
+        "total_recovers": total_recovers
+    }
+}
+
+// ================================================================
+// Route: GET /trecover/sessions
+// Returns list of all discovered session paths
+// ================================================================
+fn trecover_sessions() {
+    let sessions = get_sessions()
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "sessions": sessions,
+        "count": len(sessions)
+    }
+}
+
+// ================================================================
+// Route: POST /trecover/scan
+// Body: {session_path: "...", depth: N}
+// Scans a specific (or latest) session
+// ================================================================
+fn trecover_scan(body) {
+    let session_path = str(dict_get(body, "session_path"))
+    let depth_raw    = dict_get(body, "depth")
+    let depth = DEFAULT_SCAN_DEPTH
+    if3 depth_raw == false { depth = DEFAULT_SCAN_DEPTH
+    } else depth_raw == "False" { depth = DEFAULT_SCAN_DEPTH
+    } else { depth = int(depth_raw)
+    }
+
+    // If no path given, use the latest session
+    if3 session_path == "False" { sessions = get_sessions()
+        if3 len(sessions) == 0 {
+            return {"ok": false, "trit": T_FALSE, "error": "No conversations found"}
+        } else { first = sessions[0]
+            let session_path = str(dict_get(first, "path"))
+        }
+    } else len(session_path) < 5 { sessions = get_sessions()
+        if3 len(sessions) == 0 {
+            return {"ok": false, "trit": T_FALSE, "error": "No conversations found"}
+        } else { first = sessions[0]
+            let session_path = str(dict_get(first, "path"))
+    } else {
+        // use provided path
+    }
+
+    let result = scan_session_file(session_path, depth)
+    return result
+}
+
+// ================================================================
+// Route: POST /trecover/scan-latest
+// Scans most recent session with depth * H3
+// ================================================================
+}
+fn trecover_scan_latest(body) {
+    let depth_raw = dict_get(body, "depth")
+    let depth = DEFAULT_SCAN_DEPTH * H3
+    if3 depth_raw == false { depth = DEFAULT_SCAN_DEPTH * H3
+    } else depth_raw == "False" { depth = DEFAULT_SCAN_DEPTH * H3
+    } else { depth = int(depth_raw)
+    }
+
+    let sessions = get_sessions()
+    if3 len(sessions) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "No conversations found"}
+    } else { first = sessions[0]
+        let spath = str(dict_get(first, "path"))
+        let result = scan_session_file(spath, depth)
+        return result
+    }
+}
+
+// ================================================================
+// Route: POST /trecover/scan-all
+// Quick-scans up to H7=7 sessions
+// ================================================================
+fn trecover_scan_all(body) {
+    let sessions = get_sessions()
+    let results  = []
+    let i = 0
+    let cap = len(sessions)
+    if3 cap > H7 { cap = H7
+    } else { cap = len(sessions)
+    }
+
+    while3 i < cap {
+        let s    = sessions[i]
+        let spath = str(dict_get(s, "path"))
+        let sid  = str(dict_get(s, "session_id"))
+        let res  = scan_session_file(spath, H7)
+        let rbt  = str(dict_get(res, "recovery_bt"))
+        let rt   = dict_get(res, "trit")
+        if3 rt == false { rt = T_FALSE
+        } else rt == "False" { rt = T_FALSE
+        } else { rt = int(rt)
+        }
+        append(results, {
+            "session_id":   sid,
+            "recovery_bt":  rbt,
+            "trit":         rt,
+            "char":         trit_char(rt),
+            "path":         spath
+        })
+        i = i + 1
+    }
+
+    // Overall: T_TRUE if all trits >= 0, else T_MAYBE
+    let all_ok = 1
+    let ri = 0
+    let rn = len(results)
+    while3 ri < rn { r = results[ri]
+        let t = dict_get(r, "trit")
+        if3 t == T_FALSE { all_ok = 0
+        } else {
+            // ok
+        }
+        ri = ri + 1
+    }
+    let overall_trit = T_MAYBE
+    if3 all_ok == 1 { overall_trit = T_TRUE
+    } else { overall_trit = T_MAYBE
+    }
+
+    return {
+        "ok": true,
+        "trit": overall_trit,
+        "char": trit_char(overall_trit),
+        "sessions": results,
+        "count": len(results)
+    }
+}
+
+// ================================================================
+// Route: POST /trecover/recover
+// Full recovery: scan latest + write manifest
+// ================================================================
+fn trecover_recover(body) {
+    let depth_raw = dict_get(body, "depth")
+    let depth = DEFAULT_SCAN_DEPTH * H3
+    if3 depth_raw == false { depth = DEFAULT_SCAN_DEPTH * H3
+    } else depth_raw == "False" { depth = DEFAULT_SCAN_DEPTH * H3
+    } else { depth = int(depth_raw)
+    }
+
+    let sessions = get_sessions()
+    if3 len(sessions) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "No conversations found"}
+    } else { first  = sessions[0]
+        let spath  = str(dict_get(first, "path"))
+        let scan   = scan_session_file(spath, depth)
+        let scan_ok = dict_get(scan, "ok")
+        if3 scan_ok == false {
+            return scan
+        } else scan_ok == "False" {
+            return scan
+        } else { manifest = write_manifest(scan)
+            return {
+                "ok": true,
+                "trit": T_TRUE,
+                "char": "+",
+                "scan": scan,
+                "manifest": manifest
+            }
+        }
+    }
+}
+
+// ================================================================
+// Route: POST /trecover/manifest
+// Reads the current session-continuity.md
+// ================================================================
+fn trecover_manifest(body) {
+    let manifest_path = MEMORY_DIR + "\\session-continuity.md"
+    try3 {
+        let content = nova_read(manifest_path)
+        let cstr = str(content)
+        if3 len(cstr) < 2 {
+            return {"ok": false, "trit": T_FALSE, "error": "Manifest is empty"}
+        } else cstr == "False" {
+            return {"ok": false, "trit": T_FALSE, "error": "No manifest found"}
+        } else {
+            return {
+                "ok": true,
+                "trit": T_TRUE,
+                "char": "+",
+                "path": manifest_path,
+                "content": cstr,
+                "size": len(cstr)
+            }
+        }
+    } catch3 {
+        return {"ok": false, "trit": T_FALSE, "error": "No manifest found"}
+    }
+}
+
+
+// ================================================================
+// Register routes
+// ================================================================
+troute(server, "GET",  "/health",              "health")
+troute(server, "GET",  "/trecover/status",     "trecover_status")
+troute(server, "GET",  "/trecover/sessions",   "trecover_sessions")
+troute(server, "POST", "/trecover/scan",       "trecover_scan")
+troute(server, "POST", "/trecover/scan-latest","trecover_scan_latest")
+troute(server, "POST", "/trecover/scan-all",   "trecover_scan_all")
+troute(server, "POST", "/trecover/recover",    "trecover_recover")
+troute(server, "POST", "/trecover/manifest",   "trecover_manifest")
+
+print("[TRecover] NovaLang TRecover v1.0 -- Ternary Session Recovery")
+print("[TRecover] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TRecover] Scanning: " + CONVOS_DIR)
+print("[TRecover] Memory:   " + MEMORY_DIR)
+print("[TRecover] Categories: 7 (H7) | Depth: " + str(DEFAULT_SCAN_DEPTH) + " (H13) | Block: " + str(BLOCK) + " (3^7)")
+print("[TRecover] N-S Reynolds: Re<27=laminar Re<125=transitional Re<343=turbulent Re>=343=chaotic")
+print("[TRecover] Routes: /health, /trecover/status, /trecover/sessions, /trecover/scan,")
+print("[TRecover]         /trecover/scan-latest, /trecover/scan-all, /trecover/recover, /trecover/manifest")
+print("[TRecover] NOTE: No background threads -- all scanning is on-demand via POST endpoints")
+
+tstart(server)

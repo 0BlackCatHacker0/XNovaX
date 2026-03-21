@@ -1,0 +1,144 @@
+// ============================================================================
+// pid3.nova — PID Controller for Adaptive Service Tuning
+// ============================================================================
+// Proportional-Integral-Derivative controller for real-time adjustment:
+//   output = Kp * error + Ki * integral + Kd * derivative
+//
+// Applications in NovaX:
+//   - Adaptive rate limiting (target: 70% utilization)
+//   - Temperature auto-tuning for Boltzmann router
+//   - Load balancer weight adjustment
+//   - Queue depth regulation
+//
+// Ternary state:
+//   +1 = within target (error < threshold)
+//    0 = correcting (error moderate, controller active)
+//   -1 = diverging (error growing, may need manual intervention)
+//
+// Uses v1.4 features: ??, default params
+// 3-5-7-13: Kp=0.3, Ki=0.05, Kd=0.07 (harmonic-tuned)
+// ============================================================================
+
+fn pid3_new(name = "pid", setpoint = 70, kp = 0.3, ki = 0.05, kd = 0.07) {
+    return {
+        "name": name,
+        "setpoint": setpoint,
+        "kp": kp,
+        "ki": ki,
+        "kd": kd,
+        "integral": 0,
+        "prev_error": 0,
+        "output": 0,
+        "iterations": 0,
+        "min_output": -100,
+        "max_output": 100,
+        "integral_clamp": 500
+    }
+}
+
+fn pid3_set_limits(pid, min_out = -100, max_out = 100, integral_clamp = 500) {
+    let result = deep_clone(pid)
+    result = dict_set(result, "min_output", min_out)
+    result = dict_set(result, "max_output", max_out)
+    result = dict_set(result, "integral_clamp", integral_clamp)
+    return result
+}
+
+// ── Core PID update: feed current measurement, get control output ──
+fn pid3_update(pid, measurement) {
+    let setpoint = dict_get(pid, "setpoint") ?? 70
+    let kp = dict_get(pid, "kp") ?? 0.3
+    let ki = dict_get(pid, "ki") ?? 0.05
+    let kd = dict_get(pid, "kd") ?? 0.07
+    let integral = dict_get(pid, "integral") ?? 0
+    let prev_error = dict_get(pid, "prev_error") ?? 0
+    let min_out = dict_get(pid, "min_output") ?? -100
+    let max_out = dict_get(pid, "max_output") ?? 100
+    let i_clamp = dict_get(pid, "integral_clamp") ?? 500
+    let iterations = (dict_get(pid, "iterations") ?? 0) + 1
+
+    // Calculate error
+    let error = setpoint - measurement
+
+    // Proportional term
+    let p_term = kp * error
+
+    // Integral term (with anti-windup clamping)
+    integral = integral + error
+    if3 integral > i_clamp { integral = i_clamp }
+    if3 integral < (0 - i_clamp) { integral = 0 - i_clamp }
+    let i_term = ki * integral
+
+    // Derivative term
+    let d_term = kd * (error - prev_error)
+
+    // Combined output
+    let output = p_term + i_term + d_term
+
+    // Clamp output
+    if3 output > max_out { output = max_out }
+    if3 output < min_out { output = min_out }
+
+    let result = deep_clone(pid)
+    result = dict_set(result, "integral", integral)
+    result = dict_set(result, "prev_error", error)
+    result = dict_set(result, "output", output)
+    result = dict_set(result, "iterations", iterations)
+    return {
+        "pid": result,
+        "output": output,
+        "error": error,
+        "p_term": p_term,
+        "i_term": i_term,
+        "d_term": d_term,
+        "trit": pid3_health_from_error(error, setpoint)
+    }
+}
+
+// ── Health trit from error magnitude ────────────────────────────
+fn pid3_health_from_error(error, setpoint) {
+    let threshold = setpoint * 0.1
+    if3 threshold < 3 { threshold = 3 }
+    let abs_error = error
+    if3 abs_error < 0 { abs_error = 0 - abs_error }
+    if3 abs_error < threshold { return 1 }
+    if3 abs_error < threshold * 3 { return 0 }
+    return -1
+}
+
+// ── Reset integral (anti-windup on setpoint change) ─────────────
+fn pid3_reset(pid) {
+    let result = deep_clone(pid)
+    result = dict_set(result, "integral", 0)
+    result = dict_set(result, "prev_error", 0)
+    return result
+}
+
+// ── Change setpoint ─────────────────────────────────────────────
+fn pid3_set_target(pid, new_setpoint) {
+    let result = deep_clone(pid)
+    result = dict_set(result, "setpoint", new_setpoint)
+    // Reset integral to avoid windup from setpoint change
+    result = dict_set(result, "integral", 0)
+    return result
+}
+
+// ── Stats ───────────────────────────────────────────────────────
+fn pid3_stats(pid) {
+    let error = dict_get(pid, "prev_error") ?? 0
+    let setpoint = dict_get(pid, "setpoint") ?? 70
+    return {
+        "name": dict_get(pid, "name") ?? "pid",
+        "setpoint": setpoint,
+        "output": dict_get(pid, "output") ?? 0,
+        "error": error,
+        "integral": dict_get(pid, "integral") ?? 0,
+        "iterations": dict_get(pid, "iterations") ?? 0,
+        "trit": pid3_health_from_error(error, setpoint),
+        "gains": {
+            "kp": dict_get(pid, "kp") ?? 0.3,
+            "ki": dict_get(pid, "ki") ?? 0.05,
+            "kd": dict_get(pid, "kd") ?? 0.07
+        }
+    }
+}

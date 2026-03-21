@@ -1,0 +1,1188 @@
+// NovaX Ternary Media Processor v2.0 -- NovaLang Edition
+// Port 9908: 7 Tools on 3-5-7-13 Harmonics
+//
+// N-S Mapping:
+//   media_flow      = velocity_field (file data stream)
+//   file_bytes      = flow_velocity (throughput pressure)
+//   transition_rate = viscosity (byte-level variation)
+//   entropy         = turbulent_energy (data randomness)
+//   Reynolds = (file_bytes / BLOCK_SIZE) * H5
+//   Re < 27 (H3^3)  = LAMINAR (small/uniform media)
+//   Re < 125 (H5^3) = TRANSITIONAL (moderate complexity)
+//   Re < 343 (H7^3) = TURBULENT (large/complex media)
+//   Re >= 343        = CHAOTIC (extreme entropy)
+//
+// Tools:
+//   1. Info       -- PIL image metadata (dimensions, format, mode, size)
+//   2. Convert    -- PIL image format conversion (handles RGBA->RGB for JPEG)
+//   3. Thumbnail  -- PIL thumbnail generation (width x height, LANCZOS)
+//   4. AudioInfo  -- ffprobe audio metadata (fallback: basic file stats)
+//   5. DocGen     -- Markdown to HTML/text document via tmarkdown.nova
+//   6. Cheat      -- Cheat sheet image generator via PIL ImageDraw
+//   7. Manifest   -- Directory media inventory with Reynolds classification
+//
+// Endpoints:
+//   GET  /health              -- Health check
+//   GET  /tmedia/status       -- Toolkit status
+//   POST /tmedia/info         -- Image metadata (params: path)
+//   POST /tmedia/convert      -- Image format conversion (params: input_path, output_path)
+//   POST /tmedia/thumbnail    -- Thumbnail generator (params: path, width, height, output_path)
+//   POST /tmedia/audio-info   -- Audio file info (params: path)
+//   POST /tmedia/doc-gen      -- Markdown to document (params: text|path, output_path, format)
+//   POST /tmedia/cheat        -- Cheat sheet image (params: title, items, output_path)
+//   POST /tmedia/manifest     -- Directory media inventory (params: path)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT        = 9908
+let server      = tserve(PORT, "TMedia v2.0 - Ternary Media Processor")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE    = 2187
+let RE_LAMINAR    = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT  = 343
+
+let TOOLS_COUNT  = 7
+let VERSION      = "2.0.0"
+let SERVICE_NAME = "nova-tmedia"
+let PY_TIMEOUT   = 13
+let TMP_DIR      = "C:\\NovaX\\data"
+
+// -- Global Stats --
+let stat_ops        = 0
+let stat_trit_true  = 0
+let stat_trit_maybe = 0
+let stat_trit_false = 0
+let stat_t0         = time()
+
+// by_tool counters (one per tool, H7 = 7 tools)
+let by_tool_info      = 0
+let by_tool_convert   = 0
+let by_tool_thumbnail = 0
+let by_tool_audioinfo = 0
+let by_tool_docgen    = 0
+let by_tool_cheat     = 0
+let by_tool_manifest  = 0
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: 3-char balanced ternary string from integer
+// ===========================================================================
+fn bt_three(n) {
+    let result = ""
+    let val = n
+    let i = 0
+    while3 i < 3 {
+        let rem = val % 3
+        if3 rem == 0 {
+            result = "0" + result
+        }
+        if3 rem == 1 {
+            result = "+" + result
+            val = val - 1
+        }
+        if3 rem == 2 {
+            result = "T" + result
+            val = val + 1
+        }
+        val = val / 3
+        i = i + 1
+    }
+    return result
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_op(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "info" {
+        by_tool_info = by_tool_info + 1
+    }
+    if3 tool_name == "convert" {
+        by_tool_convert = by_tool_convert + 1
+    }
+    if3 tool_name == "thumbnail" {
+        by_tool_thumbnail = by_tool_thumbnail + 1
+    }
+    if3 tool_name == "audioinfo" {
+        by_tool_audioinfo = by_tool_audioinfo + 1
+    }
+    if3 tool_name == "docgen" {
+        by_tool_docgen = by_tool_docgen + 1
+    }
+    if3 tool_name == "cheat" {
+        by_tool_cheat = by_tool_cheat + 1
+    }
+    if3 tool_name == "manifest" {
+        by_tool_manifest = by_tool_manifest + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: Reynolds from file size bytes
+// N-S: file_bytes = flow_velocity => Re = (bytes / BLOCK_SIZE) * H5
+// ===========================================================================
+fn calc_reynolds_bytes(size_bytes) {
+    let re = (size_bytes / BLOCK_SIZE) * H5
+    if3 re > 999 {
+        re = 999
+    }
+    if3 re < 0 {
+        re = 0
+    }
+    return re
+}
+
+// ===========================================================================
+// HELPER: Reynolds from pixel dimensions
+// N-S: resolution_pressure = turbulent_energy
+// Reynolds = (width * height / BLOCK_SIZE) * H5
+// ===========================================================================
+fn calc_reynolds_pixels(width, height) {
+    let pixels = width * height
+    let re = (pixels / BLOCK_SIZE) * H5
+    if3 re > 999 {
+        re = 999
+    }
+    if3 re < 0 {
+        re = 0
+    }
+    return re
+}
+
+// ===========================================================================
+// HELPER: run a shell command with standard timeout (H13=13s)
+// Returns trimmed string output (pure NovaLang, zero Python)
+// ===========================================================================
+fn run_cmd(cmd) {
+    let raw = nova_run(cmd, PY_TIMEOUT)
+    let output = trim(str(raw))
+    return output
+}
+
+// ===========================================================================
+// HELPER: run tmedia_img.nova micro-tool
+// ===========================================================================
+fn run_img_tool(op_and_args) {
+    let cmd = "C:/NovaX/novalang.exe C:/NovaX/tools/tmedia_img.nova " + op_and_args
+    let raw = trim(nova_run(cmd, PY_TIMEOUT))
+    return raw
+}
+
+// ===========================================================================
+// HELPER: check if output indicates an error
+// ===========================================================================
+fn is_cmd_error(output) {
+    let lc = lower(output)
+    if3 contains(lc, "error") {
+        return true
+    }
+    if3 contains(lc, "not found") {
+        return true
+    }
+    if3 contains(lc, "cannot") {
+        return true
+    }
+    if3 contains(lc, "denied") {
+        return true
+    }
+    if3 contains(lc, "\"ok\":false") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: escape a file path for use in shell commands
+// ===========================================================================
+fn escape_path(s) {
+    let escaped = replace(s, "/", "\\")
+    return escaped
+}
+
+// ===========================================================================
+// HELPER: generate a unique temp file path
+// ===========================================================================
+fn tmp_path(prefix, ext) {
+    let ts = str(int(time() * 1000))
+    let path = TMP_DIR + "\\" + prefix + "_" + ts + "." + ext
+    return path
+}
+
+// ===========================================================================
+// HELPER: clean up a temp file silently (pure NovaLang, zero Python)
+// ===========================================================================
+fn cleanup_temp(fpath) {
+    let win_path = escape_path(fpath)
+    shell("del /q \"" + win_path + "\" 2>NUL")
+}
+
+// ===========================================================================
+// HELPER: get file size via shell (pure NovaLang, zero Python)
+// ===========================================================================
+fn get_file_size(fpath) {
+    let win_path = escape_path(fpath)
+    let cmd = "for %I in (\"" + win_path + "\") do @echo %~zI"
+    let result = trim(shell(cmd))
+    if3 len(result) == 0 {
+        return 0
+    }
+    return to_int(result)
+}
+
+// ===========================================================================
+// TOOL 1: POST /tmedia/info
+// Get image metadata via PIL: dimensions, format, color mode, file size
+// Body: {path: "C:\\path\\to\\image.png"}
+// Trit: +1=success, 0=partial, -1=error
+// ===========================================================================
+fn handle_info(body) {
+    let fpath = dict_get(body, "path") ?? ""
+
+    if3 len(fpath) == 0 {
+        record_op("info", T_FALSE)
+        return {
+            "ok": false,
+            "error": "path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Pure NovaLang: use tmedia_img.nova info micro-tool (zero Python)
+    let img_raw = run_img_tool("info \"" + fpath + "\"")
+    let img_result = json_decode(trim(img_raw))
+
+    let img_ok = dict_get(img_result, "ok") ?? false
+    if3 img_ok == false {
+        record_op("info", T_FALSE)
+        return {
+            "ok": false,
+            "path": fpath,
+            "error": dict_get(img_result, "error") ?? "image read failed",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let width      = dict_get(img_result, "width") ?? 0
+    let height     = dict_get(img_result, "height") ?? 0
+    let format_val = dict_get(img_result, "format") ?? "UNKNOWN"
+    let mode_val   = dict_get(img_result, "mode") ?? "RGB"
+    let size_bytes = dict_get(img_result, "size_bytes") ?? 0
+
+    let re     = calc_reynolds_pixels(width, height)
+    let regime = flow_regime(re)
+
+    record_op("info", T_TRUE)
+    return {
+        "ok": true,
+        "path": fpath,
+        "width": width,
+        "height": height,
+        "format": format_val,
+        "mode": mode_val,
+        "size_bytes": size_bytes,
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 2: POST /tmedia/convert
+// Convert between image formats via PIL
+// Body: {input_path: "...", output_path: "..."}
+// Handles RGBA->RGB for JPEG targets automatically
+// Trit: +1=converted, 0=same format (soft pass), -1=error
+// ===========================================================================
+fn handle_convert(body) {
+    let input_path  = dict_get(body, "input_path") ?? ""
+    let output_path = dict_get(body, "output_path") ?? ""
+
+    if3 len(input_path) == 0 {
+        record_op("convert", T_FALSE)
+        return {
+            "ok": false,
+            "error": "input_path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output_path) == 0 {
+        record_op("convert", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output_path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Pure NovaLang: use tmedia_img.nova convert micro-tool (zero Python)
+    let conv_raw = run_img_tool("convert \"" + input_path + "\" \"" + output_path + "\"")
+    let conv_result = json_decode(trim(conv_raw))
+
+    let conv_ok = dict_get(conv_result, "ok") ?? false
+    if3 conv_ok == false {
+        record_op("convert", T_FALSE)
+        return {
+            "ok": false,
+            "input_path": input_path,
+            "output_path": output_path,
+            "error": dict_get(conv_result, "error") ?? "conversion failed",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Get output file size
+    let out_size = get_file_size(output_path)
+
+    // Reynolds from output bytes
+    let re     = calc_reynolds_bytes(out_size)
+    let regime = flow_regime(re)
+
+    // Detect if format really changed (compare extension of in vs out)
+    let in_lc     = lower(input_path)
+    let out_lc    = lower(output_path)
+    let conv_trit = T_TRUE
+    if3 in_lc == out_lc {
+        conv_trit = T_MAYBE
+    }
+
+    record_op("convert", conv_trit)
+    return {
+        "ok": true,
+        "input_path": input_path,
+        "output_path": output_path,
+        "output_size_bytes": out_size,
+        "reynolds": re,
+        "regime": regime,
+        "trit": conv_trit,
+        "char": bt_one(conv_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 3: POST /tmedia/thumbnail
+// Generate thumbnail via PIL (LANCZOS resampling, aspect-ratio preserved)
+// Body: {path: "...", width: N, height: N, output_path: "..."}
+// Trit: +1=shrunk, 0=already fits, -1=error
+// ===========================================================================
+fn handle_thumbnail(body) {
+    let fpath       = dict_get(body, "path") ?? ""
+    let width       = dict_get(body, "width") ?? 128
+    let height      = dict_get(body, "height") ?? 128
+    let output_path = dict_get(body, "output_path") ?? ""
+
+    if3 len(fpath) == 0 {
+        record_op("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "error": "path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output_path) == 0 {
+        record_op("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output_path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 width <= 0 {
+        width = 128
+    }
+    if3 height <= 0 {
+        height = 128
+    }
+    // Clamp to sane max
+    if3 width > 4096 {
+        width = 4096
+    }
+    if3 height > 4096 {
+        height = 4096
+    }
+
+    let w_str = str(width)
+    let h_str = str(height)
+
+    // Pure NovaLang: use tmedia_img.nova thumbnail micro-tool (zero Python)
+    let thumb_raw = run_img_tool("thumbnail \"" + fpath + "\" " + w_str + " " + h_str + " \"" + output_path + "\"")
+    let thumb_result = json_decode(trim(thumb_raw))
+
+    let thumb_ok = dict_get(thumb_result, "ok") ?? false
+    if3 thumb_ok == false {
+        record_op("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "path": fpath,
+            "output_path": output_path,
+            "target_width": width,
+            "target_height": height,
+            "error": dict_get(thumb_result, "error") ?? "thumbnail failed",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let orig_w = dict_get(thumb_result, "original_width") ?? 0
+    let orig_h = dict_get(thumb_result, "original_height") ?? 0
+
+    // Output dimensions (approximate from target since tool doesn't return exact)
+    let out_w = width
+    let out_h = height
+    if3 orig_w > 0 {
+        if3 orig_w <= width {
+            if3 orig_h <= height {
+                out_w = orig_w
+                out_h = orig_h
+            }
+        }
+    }
+
+    // Get output file size
+    let out_size = get_file_size(output_path)
+
+    // Trit: +1 if actually shrunk, 0 if already fit within bounds
+    let thumb_trit = T_TRUE
+    if3 out_w == orig_w {
+        if3 out_h == orig_h {
+            thumb_trit = T_MAYBE
+        }
+    }
+
+    let re     = calc_reynolds_pixels(out_w, out_h)
+    let regime = flow_regime(re)
+
+    record_op("thumbnail", thumb_trit)
+    return {
+        "ok": true,
+        "path": fpath,
+        "output_path": output_path,
+        "target_width": width,
+        "target_height": height,
+        "original_width": orig_w,
+        "original_height": orig_h,
+        "output_width": out_w,
+        "output_height": out_h,
+        "output_size_bytes": out_size,
+        "reynolds": re,
+        "regime": regime,
+        "trit": thumb_trit,
+        "char": bt_one(thumb_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 4: POST /tmedia/audio-info
+// Get audio file metadata via ffprobe (fallback: basic file stats)
+// Body: {path: "C:\\path\\to\\audio.mp3"}
+// Trit: +1=full info (ffprobe), 0=basic info (fallback), -1=error
+// ===========================================================================
+fn handle_audio_info(body) {
+    let fpath = dict_get(body, "path") ?? ""
+
+    if3 len(fpath) == 0 {
+        record_op("audioinfo", T_FALSE)
+        return {
+            "ok": false,
+            "error": "path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Pure NovaLang: shell-based file checks (zero Python)
+    let win_path = escape_path(fpath)
+
+    // Check file exists first
+    let exist_check = trim(shell("if exist \"" + win_path + "\" (echo yes) else (echo no)"))
+    if3 contains(exist_check, "no") {
+        record_op("audioinfo", T_FALSE)
+        return {
+            "ok": false,
+            "path": fpath,
+            "error": "File not found",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Try ffprobe first (returns JSON with full audio metadata)
+    let ffprobe_cmd = "ffprobe -v quiet -print_format json -show_format -show_streams \"" + fpath + "\""
+    let ffprobe_result = trim(shell(ffprobe_cmd))
+
+    // Check if ffprobe worked (result should contain "format" key)
+    if3 contains(ffprobe_result, "format_name") {
+        // ffprobe succeeded -- parse JSON with NovaLang builtins (zero Python)
+        let ff_data = json_decode(ffprobe_result)
+        let ff_fmt = dict_get(ff_data, "format") ?? {}
+        let ff_streams = dict_get(ff_data, "streams") ?? []
+
+        // Find audio stream
+        let ff_astream = {}
+        let si = 0
+        while3 si < len(ff_streams) {
+            let stream = ff_streams[si]
+            if3 dict_get(stream, "codec_type") ?? "" == "audio" {
+                ff_astream = stream
+                si = len(ff_streams)
+            }
+            si = si + 1
+        }
+
+        let dur_str  = str(dict_get(ff_fmt, "duration") ?? "0")
+        let size_str = str(dict_get(ff_fmt, "size") ?? "0")
+        let br_str   = str(dict_get(ff_fmt, "bit_rate") ?? "0")
+        let fmt_str  = dict_get(ff_fmt, "format_name") ?? ""
+        let cod_str  = dict_get(ff_astream, "codec_name") ?? ""
+        let sr_str   = dict_get(ff_astream, "sample_rate") ?? ""
+        let ch_str   = str(dict_get(ff_astream, "channels") ?? 0)
+
+        let file_size  = to_int(size_str)
+        let re     = calc_reynolds_bytes(file_size)
+        let regime = flow_regime(re)
+
+        record_op("audioinfo", T_TRUE)
+        return {
+            "ok": true,
+            "path": fpath,
+            "source": "ffprobe",
+            "duration_s": dur_str,
+            "size_bytes": file_size,
+            "bit_rate_bps": br_str,
+            "format": fmt_str,
+            "codec": cod_str,
+            "sample_rate": sr_str,
+            "channels": ch_str,
+            "reynolds": re,
+            "regime": regime,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Fallback: basic file info only (no ffprobe available) -- pure NovaLang
+    let file_size2 = get_file_size(fpath)
+
+    // Extract basename and extension with NovaLang string ops
+    let normalized = replace(fpath, "\\", "/")
+    let path_parts = split(normalized, "/")
+    let name_str = path_parts[len(path_parts) - 1]
+    let ext_parts = split(name_str, ".")
+    let ext_str = ""
+    if3 len(ext_parts) > 1 {
+        ext_str = ext_parts[len(ext_parts) - 1]
+    }
+
+    if3 file_size2 == 0 {
+        record_op("audioinfo", T_FALSE)
+        return {
+            "ok": false,
+            "path": fpath,
+            "error": "Could not read file size",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let re2        = calc_reynolds_bytes(file_size2)
+    let regime2    = flow_regime(re2)
+
+    record_op("audioinfo", T_MAYBE)
+    return {
+        "ok": true,
+        "path": fpath,
+        "source": "basic_stat",
+        "filename": name_str,
+        "extension": ext_str,
+        "size_bytes": file_size2,
+        "note": "ffprobe not available; install ffprobe for full audio metadata",
+        "reynolds": re2,
+        "regime": regime2,
+        "trit": T_MAYBE,
+        "char": bt_one(T_MAYBE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 5: POST /tmedia/doc-gen
+// Generate a document from markdown text or a markdown file
+// Body: {text: "...", output_path: "...", format: "html"|"text"}
+//   OR: {path: "C:\\file.md", output_path: "...", format: "html"|"text"}
+// Trit: +1=generated, 0=empty input, -1=error
+// ===========================================================================
+fn handle_doc_gen(body) {
+    let text_val    = dict_get(body, "text") ?? ""
+    let path_val    = dict_get(body, "path") ?? ""
+    let output_path = dict_get(body, "output_path") ?? ""
+    let fmt         = dict_get(body, "format") ?? "html"
+
+    if3 len(output_path) == 0 {
+        record_op("docgen", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output_path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Determine markdown source
+    let md_path   = ""
+    let is_temp   = false
+    let input_src = ""
+
+    if3 len(path_val) > 0 {
+        // Check file exists (pure NovaLang, zero Python)
+        let win_check = escape_path(path_val)
+        let check_res = trim(shell("if exist \"" + win_check + "\" (echo exists) else (echo missing)"))
+        if3 contains(check_res, "missing") {
+            record_op("docgen", T_FALSE)
+            return {
+                "ok": false,
+                "error": "Markdown file not found: " + path_val,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+        md_path   = path_val
+        is_temp   = false
+        input_src = "file"
+    }
+
+    if3 len(path_val) == 0 {
+        if3 len(text_val) == 0 {
+            record_op("docgen", T_MAYBE)
+            return {
+                "ok": true,
+                "note": "No text or path provided; nothing to generate",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "runtime": "novalang"
+            }
+        }
+        // Write text to a temp .md file
+        let tmp = tmp_path("docgen", "md")
+        nova_write(tmp, text_val)
+        md_path   = tmp
+        is_temp   = true
+        input_src = "text"
+    }
+
+    let fmt_lc = lower(fmt)
+
+    if3 fmt_lc == "text" {
+        // For text output: read markdown and strip syntax with NovaLang
+        let md_src = read_file(md_path)
+        // Simple markdown syntax stripping
+        let txt = md_src
+        // Remove heading markers
+        let txt_lines = split(txt, "\n")
+        let clean_lines = []
+        let cli = 0
+        while3 cli < len(txt_lines) {
+            let tl = txt_lines[cli]
+            // Strip leading # marks
+            while3 starts_with(tl, "#") {
+                tl = slice(tl, 1, len(tl))
+            }
+            tl = trim(tl)
+            clean_lines = append(clean_lines, tl)
+            cli = cli + 1
+        }
+        let clean_text = ""
+        let cli2 = 0
+        while3 cli2 < len(clean_lines) {
+            if3 cli2 > 0 {
+                clean_text = clean_text + "\n"
+            }
+            clean_text = clean_text + clean_lines[cli2]
+            cli2 = cli2 + 1
+        }
+        // Remove bold markers
+        clean_text = replace(clean_text, "**", "")
+        clean_text = replace(clean_text, "__", "")
+        nova_write(output_path, clean_text)
+    }
+
+    if3 fmt_lc != "text" {
+        // For HTML output: use tmarkdown.nova render (pure NovaLang, zero Python)
+        let render_cmd = "C:/NovaX/novalang.exe C:/NovaX/tools/tmarkdown.nova render \"" + md_path + "\""
+        let render_raw = trim(nova_run(render_cmd, PY_TIMEOUT))
+        let render_result = json_decode(render_raw)
+        let html_body = dict_get(render_result, "html") ?? ""
+
+        // Wrap in full HTML document with styling
+        let full_html = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Generated Document</title>"
+        full_html = full_html + "<style>body{font-family:sans-serif;max-width:900px;margin:2em auto;line-height:1.6;color:#222}"
+        full_html = full_html + "h1,h2,h3{color:#1a1a6e}pre{background:#f4f4f4;padding:1em;border-radius:4px;overflow-x:auto}"
+        full_html = full_html + "code{background:#f0f0f0;padding:0.1em 0.3em;border-radius:2px}"
+        full_html = full_html + "blockquote{border-left:4px solid #ccc;padding-left:1em;color:#555}</style></head><body>"
+        full_html = full_html + html_body + "</body></html>"
+        nova_write(output_path, full_html)
+    }
+
+    if3 is_temp == true {
+        cleanup_temp(md_path)
+    }
+
+    let out_size    = get_file_size(output_path)
+    let out_chars   = out_size
+    let re          = calc_reynolds_bytes(out_size)
+    let regime      = flow_regime(re)
+
+    record_op("docgen", T_TRUE)
+    return {
+        "ok": true,
+        "output_path": output_path,
+        "format": fmt,
+        "input_source": input_src,
+        "output_size_bytes": out_size,
+        "output_chars": out_chars,
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 6: POST /tmedia/cheat
+// Generate a cheat sheet image from a title + list of items via PIL ImageDraw
+// Body: {title: "...", items: ["item1","item2",...], output_path: "..."}
+// Trit: +1=generated, 0=empty items, -1=error
+// ===========================================================================
+fn handle_cheat(body) {
+    let title       = dict_get(body, "title") ?? "Cheat Sheet"
+    let items       = dict_get(body, "items") ?? []
+    let output_path = dict_get(body, "output_path") ?? ""
+
+    if3 len(output_path) == 0 {
+        record_op("cheat", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output_path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let item_count = len(items)
+
+    if3 item_count == 0 {
+        record_op("cheat", T_MAYBE)
+        return {
+            "ok": true,
+            "note": "No items provided; nothing to render",
+            "output_path": output_path,
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Pure NovaLang: write data JSON then use tmedia_img.nova cheat (SVG output, zero Python)
+    let data_path = "C:/NovaX/temp/cheat_data.json"
+
+    // Build JSON content for the data file
+    let items_json = "["
+    let i = 0
+    while3 i < item_count {
+        let item = str(dict_get(items, i) ?? "")
+        let safe_item = replace(item, "\"", "\\\"")
+        if3 i > 0 {
+            items_json = items_json + ","
+        }
+        items_json = items_json + "\"" + safe_item + "\""
+        i = i + 1
+    }
+    items_json = items_json + "]"
+
+    let safe_title = replace(title, "\"", "\\\"")
+    let data_json  = "{\"title\":\"" + safe_title + "\",\"items\":" + items_json + "}"
+    nova_write(data_path, data_json)
+
+    // Use tmedia_img.nova cheat to generate SVG
+    let cheat_raw = run_img_tool("cheat \"" + output_path + "\"")
+    cleanup_temp(data_path)
+
+    let cheat_result = json_decode(trim(cheat_raw))
+    let cheat_ok = dict_get(cheat_result, "ok") ?? false
+
+    if3 cheat_ok == false {
+        record_op("cheat", T_FALSE)
+        return {
+            "ok": false,
+            "error": dict_get(cheat_result, "error") ?? "cheat generation failed",
+            "output_path": output_path,
+            "title": title,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let out_w  = dict_get(cheat_result, "width") ?? 0
+    let out_h  = dict_get(cheat_result, "height") ?? 0
+    let out_sz = get_file_size(output_path)
+    let re     = calc_reynolds_pixels(out_w, out_h)
+    let regime = flow_regime(re)
+
+    record_op("cheat", T_TRUE)
+    return {
+        "ok": true,
+        "output_path": output_path,
+        "title": title,
+        "item_count": item_count,
+        "image_width": out_w,
+        "image_height": out_h,
+        "output_size_bytes": out_sz,
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 7: POST /tmedia/manifest
+// Generate a media manifest for a directory: lists all media files with metadata
+// Body: {path: "C:\\path\\to\\dir"}
+// Trit: +1=found media, 0=empty dir, -1=error
+// ===========================================================================
+fn handle_manifest(body) {
+    let dir_path = dict_get(body, "path") ?? ""
+
+    if3 len(dir_path) == 0 {
+        record_op("manifest", T_FALSE)
+        return {
+            "ok": false,
+            "error": "path parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Pure NovaLang: use tmedia_img.nova manifest micro-tool (zero Python)
+    let win_dir = escape_path(dir_path)
+
+    // Check directory exists
+    let exist_res = trim(shell("if exist \"" + win_dir + "\" (echo yes) else (echo no)"))
+    if3 contains(exist_res, "no") {
+        record_op("manifest", T_FALSE)
+        return {
+            "ok": false,
+            "path": dir_path,
+            "error": "Directory not found",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Run manifest via micro-tool
+    let manifest_raw = run_img_tool("manifest \"" + dir_path + "\"")
+    let manifest_data = json_decode(trim(manifest_raw))
+
+    let manifest_ok = dict_get(manifest_data, "ok") ?? false
+    if3 manifest_ok == false {
+        record_op("manifest", T_FALSE)
+        return {
+            "ok": false,
+            "path": dir_path,
+            "error": dict_get(manifest_data, "error") ?? "manifest scan failed",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let total_count = dict_get(manifest_data, "file_count") ?? 0
+    let total_bytes = dict_get(manifest_data, "total_bytes") ?? 0
+    let bytype_res  = json_encode(dict_get(manifest_data, "by_type") ?? {})
+    let sample_res  = dict_get(manifest_data, "sample_files_json") ?? "[]"
+    let re          = calc_reynolds_bytes(total_bytes)
+    let regime      = flow_regime(re)
+
+    let manifest_trit = T_TRUE
+    if3 total_count == 0 {
+        manifest_trit = T_MAYBE
+    }
+
+    record_op("manifest", manifest_trit)
+    return {
+        "ok": true,
+        "path": dir_path,
+        "file_count": total_count,
+        "total_bytes": total_bytes,
+        "by_type_json": bytype_res,
+        "sample_files_json": sample_res,
+        "note": "sample_files_json and by_type_json are JSON strings; parse client-side",
+        "reynolds": re,
+        "regime": regime,
+        "trit": manifest_trit,
+        "char": bt_one(manifest_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// GET /health -- Standard health endpoint
+// ===========================================================================
+fn health() {
+    let uptime    = time() - stat_t0
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        self_trit = T_TRUE
+    }
+
+    // Check tmedia_img.nova micro-tool availability (pure NovaLang, zero Python)
+    let img_probe = trim(shell("C:/NovaX/novalang.exe C:/NovaX/tools/tmedia_img.nova info C:/NovaX/nova_tmedia_service.nova 2>NUL"))
+    let img_ok = true
+    let img_ver = "novalang-native"
+    if3 len(img_probe) < 5 {
+        img_ok = false
+        img_ver = "tmedia_img.nova unavailable"
+    }
+
+    let counters = {"strong": stat_trit_true, "partial": stat_trit_maybe, "failed": stat_trit_false}
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, counters)
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "imaging_available", img_ok)
+    resp = dict_set(resp, "imaging_version", img_ver)
+    resp = dict_set(resp, "self_trit", self_trit)
+    resp = dict_set(resp, "char", bt_one(self_trit))
+    resp = dict_set(resp, "uptime_s", uptime)
+    return resp
+}
+
+// ===========================================================================
+// GET /tmedia/status -- Full service status with per-tool counters
+// ===========================================================================
+fn tmedia_status() {
+    let uptime = time() - stat_t0
+
+    // Reynolds from total false ops (error pressure)
+    let re = stat_trit_false * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    // System trit
+    let sys_trit = T_TRUE
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    let by_tool = {}
+    by_tool = dict_set(by_tool, "info",      by_tool_info)
+    by_tool = dict_set(by_tool, "convert",   by_tool_convert)
+    by_tool = dict_set(by_tool, "thumbnail", by_tool_thumbnail)
+    by_tool = dict_set(by_tool, "audioinfo", by_tool_audioinfo)
+    by_tool = dict_set(by_tool, "docgen",    by_tool_docgen)
+    by_tool = dict_set(by_tool, "cheat",     by_tool_cheat)
+    by_tool = dict_set(by_tool, "manifest",  by_tool_manifest)
+
+    // Check imaging micro-tool (pure NovaLang, zero Python)
+    let img_probe2 = trim(shell("C:/NovaX/novalang.exe C:/NovaX/tools/tmedia_img.nova info C:/NovaX/nova_tmedia_service.nova 2>NUL"))
+    let pil_ok = true
+    let pil_ver = "novalang-native (tmedia_img.nova)"
+    if3 len(img_probe2) < 5 {
+        pil_ok = false
+        pil_ver = "unavailable"
+    }
+
+    // Check magick (for convert/thumbnail ops)
+    let magick_check = trim(shell("where magick 2>NUL"))
+    let cv_ok = false
+    let cv_ver = "not installed (install ImageMagick for convert/thumbnail)"
+    if3 len(magick_check) > 3 {
+        cv_ok = true
+        cv_ver = "magick available"
+    }
+
+    // Check tmarkdown.nova (replaced python-markdown)
+    let md_probe = trim(shell("C:/NovaX/novalang.exe C:/NovaX/tools/tmarkdown.nova stats C:/NovaX/nova_tmedia_service.nova 2>NUL"))
+    let md_ok = true
+    let md_ver = "novalang-native (tmarkdown.nova)"
+    if3 len(md_probe) < 5 {
+        md_ok = false
+        md_ver = "unavailable"
+    }
+
+    // Check ffprobe
+    let ff_check = trim(shell("ffprobe -version 2>NUL"))
+    let ff_ok = false
+    if3 contains(lower(ff_check), "ffprobe version") {
+        ff_ok = true
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "total_ops": stat_ops,
+        "by_tool": by_tool,
+        "trits": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        },
+        "libraries": {
+            "pil_available": pil_ok,
+            "pil_version": pil_ver,
+            "opencv_available": cv_ok,
+            "opencv_version": cv_ver,
+            "markdown_available": md_ok,
+            "markdown_version": md_ver,
+            "ffprobe_available": ff_ok
+        },
+        "reynolds": re,
+        "regime": regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "n_s_mapping": {
+            "media_flow": "velocity_field",
+            "file_bytes": "flow_velocity",
+            "transition_rate": "viscosity",
+            "entropy": "turbulent_energy"
+        },
+        "supported_formats": {
+            "image": ["png","jpg","jpeg","gif","bmp","webp","tiff","ico"],
+            "audio": ["mp3","wav","flac","ogg","aac","m4a","wma","opus"],
+            "video": ["mp4","avi","mkv","mov","wmv","flv","webm","m4v"],
+            "doc":   ["pdf","md","txt","html","htm","rtf","docx","doc"]
+        },
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE
+    }
+}
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+troute(server, "GET",  "/health",           "health")
+troute(server, "GET",  "/tmedia/status",    "tmedia_status")
+troute(server, "POST", "/tmedia/info",      "handle_info")
+troute(server, "POST", "/tmedia/convert",   "handle_convert")
+troute(server, "POST", "/tmedia/thumbnail", "handle_thumbnail")
+troute(server, "POST", "/tmedia/audio-info","handle_audio_info")
+troute(server, "POST", "/tmedia/doc-gen",   "handle_doc_gen")
+troute(server, "POST", "/tmedia/cheat",     "handle_cheat")
+troute(server, "POST", "/tmedia/manifest",  "handle_manifest")
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[TMedia] NovaX Ternary Media Processor v" + VERSION + " on port " + str(PORT))
+print("[TMedia] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT) + " (H7)")
+print("[TMedia] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TMedia] Reynolds boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TMedia] N-S: media_flow=velocity_field | file_bytes=flow_velocity | entropy=turbulent_energy")
+print("[TMedia] Backend: tmedia_img.nova + tmarkdown.nova (pure NovaLang, zero Python)")
+print("[TMedia] Temp dir: " + TMP_DIR + " | timeout: " + str(PY_TIMEOUT) + "s (H13)")
+print("[TMedia] Routes:")
+print("[TMedia]   GET  /health")
+print("[TMedia]   GET  /tmedia/status")
+print("[TMedia]   POST /tmedia/info         -- Image header parsing (PNG/JPEG/BMP/GIF)")
+print("[TMedia]   POST /tmedia/convert      -- Image conversion via magick/ffmpeg")
+print("[TMedia]   POST /tmedia/thumbnail    -- Thumbnail via magick/ffmpeg")
+print("[TMedia]   POST /tmedia/audio-info   -- ffprobe metadata (fallback: file stat)")
+print("[TMedia]   POST /tmedia/doc-gen      -- Markdown->HTML/text via tmarkdown.nova")
+print("[TMedia]   POST /tmedia/cheat        -- Cheat sheet SVG (pure NovaLang)")
+print("[TMedia]   POST /tmedia/manifest     -- Directory media inventory + Reynolds class")
+print("[TMedia] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

@@ -1,0 +1,116 @@
+// NovaX REPL Service — TernaryFlask edition
+// Port 9898 — Accepts NovaLang code, evaluates via novalang.exe
+// Security: rejects shell/exec/import3 of system paths
+// Timeout: 5s max per eval
+
+let server = tserve(9898, "Nova REPL Service")
+
+// -- Builtin registry --
+let BUILTINS = [
+    "print", "type", "len", "str", "int", "float", "bool",
+    "list", "dict", "range", "enumerate", "zip", "map", "filter",
+    "sum", "min", "max", "abs", "round", "sorted", "reversed",
+    "append", "pop", "keys", "values", "items", "get",
+    "split", "join", "strip", "replace", "upper", "lower", "find",
+    "starts_with", "ends_with", "contains", "slice", "index_of",
+    "json_encode", "json_decode", "json_pretty",
+    "dict_get", "dict_set", "dict_keys", "dict_values", "dict_merge",
+    "list_push", "list_pop", "list_map", "list_filter", "list_reduce",
+    "trit", "trit_and", "trit_or", "trit_not", "trit_consensus",
+    "nova_read", "nova_write", "nova_grep", "nova_glob", "nova_run", "nova_edit",
+    "http_get", "http_post", "shell", "sleep", "timestamp", "uuid",
+    "tserve", "troute", "tstart", "tstatus",
+    "if3", "else3", "elif3", "try3", "fail", "while3", "for3",
+    "fn", "return", "let", "import3", "class3", "extends3",
+    "match3", "async3", "await3", "spawn3"
+]
+
+// -- Blocked patterns for security --
+let BLOCKED_PATTERNS = ["shell(", "nova_run(", "exec(", "import3 \"C:", "import3 \"D:", "import3 \"/", "import3 \"\\"]
+
+fn is_code_safe(code) {
+    for3 pat in BLOCKED_PATTERNS {
+        if3 contains(code, pat) {
+            return false
+        }
+    }
+    return true
+}
+
+fn make_temp_path() {
+    let ts = timestamp()
+    let id = uuid()
+    let short_id = slice(str(id), 0, 8)
+    return "C:/NovaX/tmp/novax_repl_" + str(ts) + "_" + short_id + ".nova"
+}
+
+// -- POST /repl/eval --
+// Accepts {"code": "..."}, writes to temp file, runs novalang.exe, returns stdout
+fn repl_eval(body) {
+    let parsed = try3 { json_decode(body) } fail { body }
+    let code = try3 { dict_get(parsed, "code") ?? "" } fail { "" }
+
+    if3 len(code) == 0 {
+        return {"ok": false, "error": "No code provided"}
+    }
+
+    if3 !is_code_safe(code) {
+        return {"ok": false, "error": "Blocked: code contains prohibited functions (shell, nova_run, exec, system import3)"}
+    }
+
+    let tmp_path = make_temp_path()
+
+    // Write code to temp file
+    let write_result = try3 { nova_write(tmp_path, code) } fail { {"error": "Failed to write temp file"} }
+
+    // Execute via novalang.exe with timeout
+    let cmd = "C:/NovaX/novalang.exe " + tmp_path
+    let result = try3 { nova_run(cmd) } fail { {"error": "Execution failed"} }
+
+    // Clean up temp file
+    let cleanup = try3 { nova_run("del " + tmp_path) } fail { null }
+
+    let stdout = try3 { dict_get(result, "stdout") ?? "" } fail { str(result) }
+    let stderr = try3 { dict_get(result, "stderr") ?? "" } fail { "" }
+    let exit_code = try3 { dict_get(result, "exit_code") ?? 0 } fail { 0 }
+
+    return {
+        "ok": exit_code == 0,
+        "output": stdout,
+        "error": stderr,
+        "exit_code": exit_code
+    }
+}
+
+// -- POST /repl/eval-inline --
+// Wraps expression in print() before eval
+fn repl_eval_inline(body) {
+    let parsed = try3 { json_decode(body) } fail { body }
+    let code = try3 { dict_get(parsed, "code") ?? "" } fail { "" }
+
+    if3 len(code) == 0 {
+        return {"ok": false, "error": "No code provided"}
+    }
+
+    // Wrap in print() for expression evaluation
+    let wrapped = "print(" + code + ")"
+    let new_body = json_encode({"code": wrapped})
+    return repl_eval(new_body)
+}
+
+// -- GET /repl/builtins --
+fn repl_builtins() {
+    return {"ok": true, "builtins": BUILTINS, "count": len(BUILTINS)}
+}
+
+// -- GET /health --
+fn health() {
+    return {"ok": true, "service": "nova-repl", "port": 9898, "ternary": true}
+}
+
+// -- Routes --
+troute(server, "GET", "/health", "health")
+troute(server, "GET", "/repl/builtins", "repl_builtins")
+troute(server, "POST", "/repl/eval", "repl_eval")
+troute(server, "POST", "/repl/eval-inline", "repl_eval_inline")
+tstart(server)

@@ -1,0 +1,922 @@
+// Nova Nexus v1.0 - Central AI Bridge
+// Port 9882: Connects all 124 models <-> Master Archive <-> Script Portal
+//
+// N-S Mapping:
+//   model_queries    = velocity_field (AI requests flowing through mesh)
+//   script_context   = pressure_term (context enriches/smooths responses)
+//   swarm_fan_out    = Reynolds_boundary (quality ranking by trit thresholds)
+//   service_mesh     = vorticity (peer services propagating state)
+//   registry_scan    = source_term (injection of new model state)
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3  = 3   (ternary base, trit states: -1/0/+1)
+//   H5  = 5   (TZip pack unit, 3^5=243 tryte range)
+//   H7  = 7   (composition unit, 3^7=2187 BLOCK_SIZE)
+//   H13 = 13  (carrier/frame, 13-char IDs)
+
+let PORT = 19882
+let server = tserve(PORT, "Nova Nexus v1.0 - Central AI Bridge")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3    = 3
+let H5    = 5
+let H7    = 7
+let H13   = 13
+let BLOCK = 2187
+
+// -- Ternary States --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Upstream service URLs --
+let OLLAMA = "http://127.0.0.1:11434"
+let HIVE   = "http://127.0.0.1:9881"
+let CLOUD  = "http://127.0.0.1:9878"
+let BRAIN  = "http://127.0.0.1:9990"
+let RELAY  = "http://127.0.0.1:9877"
+let VPN    = "http://127.0.0.1:9880"
+let BRIDGE = "http://127.0.0.1:9999"
+
+// -- Directory paths (ASCII) --
+let SCRIPTS_DIR = "C:/NovaX/master_scripts"
+let ARCHIVE_DIR = "C:/ProgramData/NovaX/app/shell/static"
+let NOVA_DIR    = "C:/NovaX"
+
+// -- Global state for model registry --
+let model_list      = []
+let model_cats      = {}
+let registry_scanned = 0
+
+// -- Global state for script index --
+let scripts_index   = {}
+let archive_index   = {}
+let total_size      = 0
+
+// -- Query counter --
+let query_count = 0
+
+// -- Start timestamp (approximated; NovaLang has no module-level side-effects) --
+let start_ts = 0
+
+// --------------------------------------------------------------------------
+// HELPER: connection trit for a URL
+// Returns T_TRUE(1)=fast, T_MAYBE(0)=slow-or-partial, T_FALSE(-1)=down
+// We use http_get as the liveness probe; trit based on whether response has data.
+// --------------------------------------------------------------------------
+fn connection_trit(url) {
+    let resp = http_get(url + "/health")
+    let ok   = dict_get(resp, "ok") ?? false
+    let port = dict_get(resp, "port") ?? -1
+    let ver  = dict_get(resp, "version") ?? ""
+    if3 ok == true {
+        return T_TRUE
+    } else port > 0 {
+        return T_MAYBE
+    } else len(str(ver)) > 0 {
+        return T_MAYBE
+    } else {
+        return T_FALSE
+    }
+}
+
+// --------------------------------------------------------------------------
+// HELPER: ternary bit-string from list of trits
+// Maps: T_TRUE -> "1", T_MAYBE -> "0", T_FALSE -> "T"
+// --------------------------------------------------------------------------
+fn bt_string(t0, t1, t2, t3, t4, t5, t6) {
+    let s = ""
+    let s = s + str(t0)
+    let s = s + str(t1)
+    let s = s + str(t2)
+    let s = s + str(t3)
+    let s = s + str(t4)
+    let s = s + str(t5)
+    let s = s + str(t6)
+    return s
+}
+
+// --------------------------------------------------------------------------
+// HELPER: trit char for display
+// --------------------------------------------------------------------------
+fn trit_char(t) {
+    if3 t == T_TRUE {
+        return "1"
+    } else t == T_MAYBE {
+        return "0"
+    } else {
+        return "T"
+    }
+}
+
+// --------------------------------------------------------------------------
+// MODEL REGISTRY: scan Ollama for available models
+// Returns {"ok": bool, "count": int}
+// --------------------------------------------------------------------------
+fn registry_scan() {
+    let resp = http_get(OLLAMA + "/api/tags")
+    let ok   = dict_get(resp, "ok") ?? false
+
+    // Try reading "models" array from the response
+    let mlist = dict_get(resp, "models") ?? []
+    let n     = len(mlist)
+
+    let new_list = []
+    let i = 0
+    while3 i < n {
+        let m    = mlist[i]
+        let name = dict_get(m, "name") ?? ""
+        if3 len(name) > 0 {
+            append(new_list, name)
+        }
+        let i = i + 1
+    }
+
+    let model_list     = new_list
+    let registry_scanned = time()
+    let cnt = len(model_list)
+
+    // Re-categorize
+    let model_cats = registry_categorize(model_list)
+
+    return {"ok": true, "count": cnt}
+}
+
+// --------------------------------------------------------------------------
+// MODEL REGISTRY: categorize models by name keywords
+// Returns a dict of category -> list-of-model-names
+// --------------------------------------------------------------------------
+fn registry_categorize(mlist) {
+    let cats = {}
+    dict_set(cats, "code",      [])
+    dict_set(cats, "reasoning", [])
+    dict_set(cats, "creative",  [])
+    dict_set(cats, "math",      [])
+    dict_set(cats, "vision",    [])
+    dict_set(cats, "general",   [])
+    dict_set(cats, "fast",      [])
+
+    let n = len(mlist)
+    let i = 0
+    while3 i < n {
+        let m  = mlist[i]
+        let ml = lower(m)
+
+        // Classify by keyword presence using contains()
+        let is_code = false
+        if3 contains(ml, "code")       { let is_code = true }
+        if3 contains(ml, "coder")      { let is_code = true }
+        if3 contains(ml, "starcoder")  { let is_code = true }
+        if3 contains(ml, "codestral")  { let is_code = true }
+        if3 contains(ml, "codellama")  { let is_code = true }
+
+        let is_math = false
+        if3 contains(ml, "math")       { let is_math = true }
+        if3 contains(ml, "metamath")   { let is_math = true }
+
+        let is_vision = false
+        if3 contains(ml, "llava")      { let is_vision = true }
+        if3 contains(ml, "vision")     { let is_vision = true }
+        if3 contains(ml, "bakllava")   { let is_vision = true }
+
+        let is_fast = false
+        if3 contains(ml, "phi3")       { let is_fast = true }
+        if3 contains(ml, "gemma2")     { let is_fast = true }
+        if3 contains(ml, "tinyllama")  { let is_fast = true }
+
+        let is_creative = false
+        if3 contains(ml, "creative")   { let is_creative = true }
+        if3 contains(ml, "nous")       { let is_creative = true }
+        if3 contains(ml, "neural")     { let is_creative = true }
+        if3 contains(ml, "mixtral")    { let is_creative = true }
+
+        let is_reasoning = false
+        if3 contains(ml, "llama3")     { let is_reasoning = true }
+        if3 contains(ml, "mistral")    { let is_reasoning = true }
+        if3 contains(ml, "qwen")       { let is_reasoning = true }
+        if3 contains(ml, "deepseek")   { let is_reasoning = true }
+
+        // Assign to first matching category (priority order)
+        if3 is_code == true {
+            let bucket = dict_get(cats, "code") ?? []
+            append(bucket, m)
+            dict_set(cats, "code", bucket)
+        } else is_math == true {
+            let bucket = dict_get(cats, "math") ?? []
+            append(bucket, m)
+            dict_set(cats, "math", bucket)
+        } else is_vision == true {
+            let bucket = dict_get(cats, "vision") ?? []
+            append(bucket, m)
+            dict_set(cats, "vision", bucket)
+        } else is_fast == true {
+            let bucket = dict_get(cats, "fast") ?? []
+            append(bucket, m)
+            dict_set(cats, "fast", bucket)
+        } else is_creative == true {
+            let bucket = dict_get(cats, "creative") ?? []
+            append(bucket, m)
+            dict_set(cats, "creative", bucket)
+        } else is_reasoning == true {
+            let bucket = dict_get(cats, "reasoning") ?? []
+            append(bucket, m)
+            dict_set(cats, "reasoning", bucket)
+        } else {
+            let bucket = dict_get(cats, "general") ?? []
+            append(bucket, m)
+            dict_set(cats, "general", bucket)
+        }
+
+        let i = i + 1
+    }
+
+    return cats
+}
+
+// --------------------------------------------------------------------------
+// MODEL REGISTRY: get best N models for a given task
+// Returns a list of model name strings (up to n)
+// --------------------------------------------------------------------------
+fn registry_get_best(task, n) {
+    // Build priority list of categories for each task type
+    // We resolve the list manually since NovaLang has no nested data shortcuts
+    let p0 = "general"
+    let p1 = "reasoning"
+    let p2 = "code"
+
+    if3 task == "code" {
+        let p0 = "code"
+        let p1 = "reasoning"
+        let p2 = "general"
+    } else task == "math" {
+        let p0 = "math"
+        let p1 = "reasoning"
+        let p2 = "code"
+    } else task == "creative" {
+        let p0 = "creative"
+        let p1 = "general"
+        let p2 = "reasoning"
+    } else task == "vision" {
+        let p0 = "vision"
+        let p1 = "general"
+        let p2 = "reasoning"
+    } else task == "fast" {
+        let p0 = "fast"
+        let p1 = "general"
+        let p2 = "reasoning"
+    } else task == "reasoning" {
+        let p0 = "reasoning"
+        let p1 = "general"
+        let p2 = "code"
+    } else {
+        let p0 = "general"
+        let p1 = "reasoning"
+        let p2 = "code"
+    }
+
+    let picks = []
+
+    // Add from p0
+    let b0 = dict_get(model_cats, p0) ?? []
+    let j  = 0
+    while3 j < len(b0) {
+        if3 len(picks) < n {
+            append(picks, b0[j])
+        }
+        let j = j + 1
+    }
+
+    // Add from p1
+    let b1 = dict_get(model_cats, p1) ?? []
+    let j  = 0
+    while3 j < len(b1) {
+        if3 len(picks) < n {
+            append(picks, b1[j])
+        }
+        let j = j + 1
+    }
+
+    // Add from p2
+    let b2 = dict_get(model_cats, p2) ?? []
+    let j  = 0
+    while3 j < len(b2) {
+        if3 len(picks) < n {
+            append(picks, b2[j])
+        }
+        let j = j + 1
+    }
+
+    return picks
+}
+
+// --------------------------------------------------------------------------
+// SCRIPT INDEX: scan scripts and archive directories
+// Populates scripts_index and archive_index dicts
+// Returns {"scripts": int, "archive": int, "total_bytes": int}
+// --------------------------------------------------------------------------
+fn index_scan_all() {
+    // Use nova_read to list directory contents
+    let scripts_raw = nova_read(SCRIPTS_DIR)
+    let archive_raw = nova_read(ARCHIVE_DIR)
+
+    // nova_read returns file content or a list; we capture what we can.
+    // Since NovaLang has no os.walk, we do a shallow index via nova_read
+    // and record the directory-level summary.
+    let sc = 0
+    let ac = 0
+
+    // Reset indexes
+    let scripts_index = {}
+    let archive_index = {}
+    let total_size    = 0
+
+    // Record that scan occurred (nova_read returns raw text or error str)
+    // We cannot enumerate all files with NovaLang builtins alone;
+    // we store a placeholder summary entry to indicate the scan ran.
+    let s_ok = len(str(scripts_raw)) > 0
+    let a_ok = len(str(archive_raw)) > 0
+
+    if3 s_ok {
+        dict_set(scripts_index, "_scanned", {"path": SCRIPTS_DIR, "size": 0, "category": "root", "ext": ""})
+        let sc = 1
+    }
+    if3 a_ok {
+        dict_set(archive_index, "_scanned", {"path": ARCHIVE_DIR, "size": 0, "ext": "", "url": "/static/"})
+        let ac = 1
+    }
+
+    return {"scripts": sc, "archive": ac, "total_bytes": total_size}
+}
+
+// --------------------------------------------------------------------------
+// SCRIPT INDEX: search by query string
+// Returns list of matching entries from scripts_index + archive_index
+// --------------------------------------------------------------------------
+fn index_search(query, limit) {
+    let q       = lower(query)
+    let results = []
+
+    // Search scripts_index
+    let sk = keys(scripts_index)
+    let i  = 0
+    while3 i < len(sk) {
+        let name = sk[i]
+        let info = dict_get(scripts_index, name) ?? {}
+        if3 contains(lower(name), q) {
+            if3 len(results) < limit {
+                let entry = {"name": name, "path": dict_get(info, "path") ?? "", "size": dict_get(info, "size") ?? 0}
+                append(results, entry)
+            }
+        }
+        let i = i + 1
+    }
+
+    // Search archive_index
+    let ak = keys(archive_index)
+    let j  = 0
+    while3 j < len(ak) {
+        let name = ak[j]
+        let info = dict_get(archive_index, name) ?? {}
+        if3 contains(lower(name), q) {
+            if3 len(results) < limit {
+                let entry = {"name": name, "path": dict_get(info, "path") ?? "", "size": dict_get(info, "size") ?? 0, "url": dict_get(info, "url") ?? ""}
+                append(results, entry)
+            }
+        }
+        let j = j + 1
+    }
+
+    return results
+}
+
+// --------------------------------------------------------------------------
+// SCRIPT INDEX: read a file by path (gated to allowed dirs)
+// --------------------------------------------------------------------------
+fn index_read_file(path) {
+    let allowed = false
+    if3 contains(path, "NovaX")       { let allowed = true }
+    if3 contains(path, "master_scripts") { let allowed = true }
+    if3 contains(path, "static")      { let allowed = true }
+
+    if3 allowed == false {
+        return {"ok": false, "error": "Access denied"}
+    } else {
+        let content = nova_read(path)
+        let clen    = len(str(content))
+        if3 clen == 0 {
+            return {"ok": false, "error": "File empty or not found"}
+        } else {
+            // Truncate to 50000 chars via slice on string representation
+            let safe = str(content)
+            if3 len(safe) > 50000 {
+                let safe = slice(safe, 0, 50000)
+            }
+            return {"ok": true, "content": safe, "size": clen}
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// SERVICE MESH: health check all peer services sequentially
+// --------------------------------------------------------------------------
+fn mesh_health_check() {
+    // Service definitions: name, url, port
+    let svc_names = ["bridge",   "brain",   "ollama", "relay",  "cloud",     "hive",    "vpn",  "nexus"]
+    let svc_urls  = [BRIDGE,     BRAIN,     OLLAMA,   RELAY,    CLOUD,       HIVE,      VPN,    "http://127.0.0.1:9882"]
+    let svc_ports = [9999,       9990,      11434,    9877,     9878,        9881,      9880,   9882]
+    let svc_labels = ["Nova Bridge", "Nova Brain", "Ollama LLM", "Nova Relay", "Cloud Router", "Hive Mind", "VPN Core", "Nova Nexus"]
+
+    let results = {}
+    let online  = 0
+    let total   = len(svc_names)
+    let i       = 0
+
+    while3 i < total {
+        let key   = svc_names[i]
+        let url   = svc_urls[i]
+        let port  = svc_ports[i]
+        let label = svc_labels[i]
+
+        let health = http_get(url + "/health")
+        let h_ok   = dict_get(health, "ok") ?? false
+        let h_port = dict_get(health, "port") ?? -1
+        let alive  = false
+
+        if3 h_ok == true {
+            let alive = true
+        } else h_port > 0 {
+            let alive = true
+        } else {
+            let alive = false
+        }
+
+        if3 alive {
+            let online = online + 1
+        }
+
+        let status_str = "offline"
+        if3 alive { let status_str = "online" }
+
+        dict_set(results, key, {
+            "name":      label,
+            "port":      port,
+            "status":    status_str,
+            "connected": alive
+        })
+
+        let i = i + 1
+    }
+
+    let mesh_health_str = str(online) + "/" + str(total)
+
+    return {
+        "services":    results,
+        "online":      online,
+        "total":       total,
+        "mesh_health": mesh_health_str
+    }
+}
+
+// --------------------------------------------------------------------------
+// QUERY ENGINE: query a single Ollama model
+// --------------------------------------------------------------------------
+fn query_model(model, prompt, ctx_path) {
+    let full_prompt = prompt
+
+    // Optionally prepend context from a file
+    if3 len(str(ctx_path)) > 0 {
+        let file_data = index_read_file(ctx_path)
+        let file_ok   = dict_get(file_data, "ok") ?? false
+        if3 file_ok {
+            let file_content = dict_get(file_data, "content") ?? ""
+            let full_prompt  = "CONTEXT:\n=== context ===\n" + str(file_content) + "\n\nQUERY: " + str(prompt)
+        }
+    }
+
+    let payload = {"model": str(model), "prompt": str(full_prompt), "stream": false}
+    let resp    = http_post(OLLAMA + "/api/generate", payload)
+
+    let resp_ok   = dict_get(resp, "ok") ?? false
+    let response  = dict_get(resp, "response") ?? ""
+    let eval_cnt  = dict_get(resp, "eval_count") ?? 0
+    let eval_dur  = dict_get(resp, "eval_duration") ?? 0
+
+    if3 len(str(response)) > 0 {
+        let query_count = query_count + 1
+        return {
+            "ok":           true,
+            "model":        model,
+            "response":     response,
+            "eval_count":   eval_cnt,
+            "eval_duration": eval_dur
+    } else {
+        let err = dict_get(resp, "error") ?? "no response"
+        return {"ok": false, "model": model, "error": str(err)}
+    }
+}
+
+// --------------------------------------------------------------------------
+// QUERY ENGINE: swarm query - sequential fan-out to N best models
+// Ternary quality ranking applied: ratio > 2/H3 -> T_TRUE, < 1/H3 -> T_FALSE
+// --------------------------------------------------------------------------
+}
+fn swarm_query(prompt, task, n_models, ctx_path) {
+    let models = registry_get_best(task, n_models)
+    let nm     = len(models)
+
+    if3 nm == 0 {
+        return {"ok": false, "error": "No models available"}
+    }
+
+    let results  = []
+    let i        = 0
+
+    // Sequential fan-out (NovaLang has no threading)
+    while3 i < nm {
+        let model_name = models[i]
+        let r = query_model(model_name, prompt, ctx_path)
+        append(results, r)
+        let i = i + 1
+    }
+
+    // Filter to successful responses
+    let ok_results  = []
+    let j = 0
+    while3 j < len(results) {
+        let r   = results[j]
+        let rok = dict_get(r, "ok") ?? false
+        if3 rok { append(ok_results, r) }
+        let j = j + 1
+    }
+
+    let nr = len(ok_results)
+    if3 nr == 0 {
+        return {"ok": false, "error": "All models failed"}
+    }
+
+    // Find max response length for ternary ratio
+    let max_len = 0
+    let k = 0
+    while3 k < nr {
+        let rk   = ok_results[k]
+        let rlen = len(str(dict_get(rk, "response") ?? ""))
+        if3 rlen > max_len { let max_len = rlen }
+        let k = k + 1
+    }
+    if3 max_len == 0 { let max_len = 1 }
+
+    // Assign quality trit; find best by (trit, length)
+    let best_model   = ""
+    let best_resp    = ""
+    let best_len     = 0
+    let best_trit    = T_FALSE
+
+    let k = 0
+    while3 k < nr {
+        let rk    = ok_results[k]
+        let rtext = str(dict_get(rk, "response") ?? "")
+        let rlen  = len(rtext)
+
+        // Ternary quality: ratio > 2/3 -> T_TRUE, < 1/3 -> T_FALSE, else T_MAYBE
+        let ratio_num = rlen * H3   // rlen * 3 to avoid float division ambiguity
+        let qtrit = T_MAYBE
+        if3 ratio_num > max_len * 2 {
+            let qtrit = T_TRUE
+        } else ratio_num < max_len {
+            let qtrit = T_FALSE
+        } else {
+            let qtrit = T_MAYBE
+        }
+        dict_set(rk, "quality_trit", qtrit)
+
+        // Track best: prefer higher trit, then longer response
+        let is_better = false
+        if3 qtrit > best_trit {
+            let is_better = true
+        } else qtrit == best_trit {
+            if3 rlen > best_len { let is_better = true }
+        } else {
+            let is_better = false
+        }
+
+        if3 is_better {
+            let best_model  = dict_get(rk, "model") ?? ""
+            let best_resp   = rtext
+            let best_len    = rlen
+            let best_trit   = qtrit
+        }
+
+        let k = k + 1
+    }
+
+    let query_count = query_count + 1
+
+    // Build all_responses summary
+    let all_resp_summary = []
+    let k = 0
+    while3 k < nr {
+        let rk = ok_results[k]
+        append(all_resp_summary, {
+            "model":        dict_get(rk, "model") ?? "",
+            "length":       len(str(dict_get(rk, "response") ?? "")),
+            "quality_trit": dict_get(rk, "quality_trit") ?? T_MAYBE
+        })
+        let k = k + 1
+    }
+
+    return {
+        "ok":               true,
+        "task":             task,
+        "models_queried":   nm,
+        "responses":        nr,
+        "best_model":       best_model,
+        "best_quality_trit": best_trit,
+        "response":         best_resp,
+        "all_responses":    all_resp_summary
+    }
+}
+
+// --------------------------------------------------------------------------
+// QUERY ENGINE: query with script context (auto-load context from index)
+// --------------------------------------------------------------------------
+fn query_with_scripts(prompt, script_query, task) {
+    let ctx_path = ""
+    if3 len(str(script_query)) > 0 {
+        let matches = index_search(script_query, 1)
+        if3 len(matches) > 0 {
+            let first_match = matches[0]
+            let ctx_path    = dict_get(first_match, "path") ?? ""
+        }
+    }
+    return swarm_query(prompt, task, H3, ctx_path)
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: GET /health  (standard NovaX health)
+// --------------------------------------------------------------------------
+fn handle_health(body) {
+    let t_ollama = connection_trit(OLLAMA)
+    let t_hive   = connection_trit(HIVE)
+    let t_cloud  = connection_trit(CLOUD)
+    let t_brain  = connection_trit(BRAIN)
+    let t_relay  = connection_trit(RELAY)
+    let t_vpn    = connection_trit(VPN)
+    let t_bridge = connection_trit(BRIDGE)
+
+    let connected = 0
+    if3 t_ollama >= 0 { let connected = connected + 1 }
+    if3 t_hive   >= 0 { let connected = connected + 1 }
+    if3 t_cloud  >= 0 { let connected = connected + 1 }
+    if3 t_brain  >= 0 { let connected = connected + 1 }
+    if3 t_relay  >= 0 { let connected = connected + 1 }
+    if3 t_vpn    >= 0 { let connected = connected + 1 }
+    if3 t_bridge >= 0 { let connected = connected + 1 }
+
+    return {
+        "ok":      true,
+        "server":  "Nova Nexus",
+        "version": "2.0",
+        "port":    PORT,
+        "ternary": true,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "models":  len(model_list),
+        "scripts": len(keys(scripts_index)),
+        "archive": len(keys(archive_index)),
+        "queries": query_count,
+        "connections": {
+            "ollama":       {"trit": t_ollama,  "char": trit_char(t_ollama)},
+            "hivemind":     {"trit": t_hive,    "char": trit_char(t_hive)},
+            "cloud_router": {"trit": t_cloud,   "char": trit_char(t_cloud)},
+            "brain":        {"trit": t_brain,   "char": trit_char(t_brain)},
+            "relay":        {"trit": t_relay,   "char": trit_char(t_relay)},
+            "vpn":          {"trit": t_vpn,     "char": trit_char(t_vpn)},
+            "bridge":       {"trit": t_bridge,  "char": trit_char(t_bridge)}
+        },
+        "connected":       connected,
+        "total_endpoints": 7
+    }
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: GET /nexus/status  (same as /health for compat)
+// --------------------------------------------------------------------------
+fn handle_status(body) {
+    return handle_health(body)
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: GET /nexus/mesh
+// --------------------------------------------------------------------------
+fn handle_mesh(body) {
+    return mesh_health_check()
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: GET /nexus/models
+// --------------------------------------------------------------------------
+fn handle_models(body) {
+    return {
+        "ok":         true,
+        "count":      len(model_list),
+        "categories": model_cats,
+        "last_scan":  registry_scanned
+    }
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: GET /nexus/scripts
+// --------------------------------------------------------------------------
+fn handle_scripts(body) {
+    // Build by_category summary from scripts_index
+    let by_cat = {}
+    let sk = keys(scripts_index)
+    let i  = 0
+    while3 i < len(sk) {
+        let name = sk[i]
+        let info = dict_get(scripts_index, name) ?? {}
+        let cat  = dict_get(info, "category") ?? "root"
+        let cur  = dict_get(by_cat, cat) ?? 0
+        dict_set(by_cat, cat, cur + 1)
+        let i = i + 1
+    }
+    return {
+        "ok":          true,
+        "count":       len(keys(scripts_index)),
+        "by_category": by_cat,
+        "total_bytes": total_size
+    }
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: GET /nexus/archive
+// --------------------------------------------------------------------------
+fn handle_archive(body) {
+    let ak    = keys(archive_index)
+    let pages = []
+    let i     = 0
+    while3 i < len(ak) {
+        let name = ak[i]
+        let info = dict_get(archive_index, name) ?? {}
+        append(pages, {
+            "name": name,
+            "size": dict_get(info, "size") ?? 0,
+            "url":  dict_get(info, "url") ?? ""
+        })
+        let i = i + 1
+    }
+    return {"ok": true, "count": len(pages), "pages": pages}
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: GET /nexus/search?q=...
+// Body dict carries "q" key (runtime parses query params into body)
+// --------------------------------------------------------------------------
+fn handle_search(body) {
+    let q       = dict_get(body, "q") ?? ""
+    let results = index_search(q, 20)
+    return {"ok": true, "results": results}
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: POST /nexus/scan
+// --------------------------------------------------------------------------
+fn handle_scan(body) {
+    let r1 = registry_scan()
+    let r2 = index_scan_all()
+    return {"ok": true, "models": r1, "index": r2}
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: POST /nexus/query
+// --------------------------------------------------------------------------
+fn handle_query(body) {
+    let prompt   = dict_get(body, "prompt") ?? ""
+    let task     = dict_get(body, "task") ?? "general"
+    let n_req    = int(dict_get(body, "n_models") ?? H3)
+    let script_q = dict_get(body, "script_query") ?? ""
+
+    // Cap at 8 models
+    let n = n_req
+    if3 n > 8 { let n = 8 }
+    if3 n < 1 { let n = 1 }
+
+    if3 len(str(prompt)) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "prompt required"}
+    }
+
+    if3 len(str(script_q)) > 0 {
+        return query_with_scripts(prompt, script_q, task)
+    } else {
+        return swarm_query(prompt, task, n, "")
+    }
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: POST /nexus/query/single
+// --------------------------------------------------------------------------
+fn handle_query_single(body) {
+    let model        = dict_get(body, "model") ?? ""
+    let prompt       = dict_get(body, "prompt") ?? ""
+    let ctx_path     = dict_get(body, "context_file") ?? ""
+
+    if3 len(str(model)) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "model required"}
+    }
+    if3 len(str(prompt)) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "prompt required"}
+    }
+
+    return query_model(model, prompt, ctx_path)
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: POST /nexus/read
+// --------------------------------------------------------------------------
+fn handle_read(body) {
+    let path = dict_get(body, "path") ?? ""
+    if3 len(str(path)) == 0 {
+        return {"ok": false, "error": "path required"}
+    }
+    return index_read_file(path)
+}
+
+// --------------------------------------------------------------------------
+// ROUTE HANDLER: GET /  (dashboard HTML)
+// --------------------------------------------------------------------------
+fn handle_dashboard(body) {
+    // Return minimal JSON dashboard pointer (full HTML not representable in NovaLang)
+    // The orchestrator at :9999 serves the UI; nexus exposes API endpoints.
+    return {
+        "ok":      true,
+        "service": "Nova Nexus",
+        "version": "2.0",
+        "port":    PORT,
+        "dashboard": "http://127.0.0.1:9999/nexus/dashboard",
+        "endpoints": [
+            "GET  /health",
+            "GET  /nexus/status",
+            "GET  /nexus/mesh",
+            "GET  /nexus/models",
+            "GET  /nexus/scripts",
+            "GET  /nexus/archive",
+            "GET  /nexus/search",
+            "POST /nexus/scan",
+            "POST /nexus/query",
+            "POST /nexus/query/single",
+            "POST /nexus/read"
+        ],
+        "ternary":   true,
+        "runtime":   "novalang",
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// --------------------------------------------------------------------------
+// BOOT: initial scan on startup
+// --------------------------------------------------------------------------
+fn boot_scan() {
+    let start_ts = time()
+    let r1 = registry_scan()
+    let r2 = index_scan_all()
+    let mc = dict_get(r1, "count") ?? 0
+}
+    print("[Nexus] Boot scan complete: " + str(mc) + " models, " + str(dict_get(r2, "scripts") ?? 0) + " scripts, " + str(dict_get(r2, "archive") ?? 0) + " archive entries")
+    return T_TRUE
+
+// -- Run boot scan --
+let _boot = boot_scan()
+
+// -- Register routes --
+troute(server, "GET",  "/",                    "handle_dashboard")
+troute(server, "GET",  "/nexus",               "handle_dashboard")
+troute(server, "GET",  "/nexus/dashboard",     "handle_dashboard")
+troute(server, "GET",  "/health",              "handle_health")
+troute(server, "GET",  "/nexus/status",        "handle_status")
+troute(server, "GET",  "/nexus/mesh",          "handle_mesh")
+troute(server, "GET",  "/nexus/models",        "handle_models")
+troute(server, "GET",  "/nexus/scripts",       "handle_scripts")
+troute(server, "GET",  "/nexus/archive",       "handle_archive")
+troute(server, "GET",  "/nexus/search",        "handle_search")
+troute(server, "POST", "/nexus/scan",          "handle_scan")
+troute(server, "POST", "/nexus/query",         "handle_query")
+troute(server, "POST", "/nexus/query/single",  "handle_query_single")
+troute(server, "POST", "/nexus/read",          "handle_read")
+
+// -- Banner --
+print("============================================================")
+print("  NOVA NEXUS v2.0 - Central AI Bridge (NovaLang Runtime)")
+print("  All Models <-> Scripts <-> Archive <-> Services")
+print("============================================================")
+print("[Nexus] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[Nexus] Models loaded: " + str(len(model_list)) + " | Categories: " + str(len(keys(model_cats))))
+print("[Nexus] Scripts indexed: " + str(len(keys(scripts_index))))
+print("[Nexus] Archive indexed: " + str(len(keys(archive_index))))
+print("[Nexus] Upstream: OLLAMA=" + OLLAMA + " HIVE=" + HIVE + " CLOUD=" + CLOUD)
+print("[Nexus] Upstream: BRAIN=" + BRAIN + " RELAY=" + RELAY + " VPN=" + VPN + " BRIDGE=" + BRIDGE)
+print("[Nexus] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13) + " BLOCK=" + str(BLOCK))
+print("[Nexus] Routes: GET /health /nexus/status /nexus/mesh /nexus/models /nexus/scripts /nexus/archive /nexus/search")
+print("[Nexus] Routes: POST /nexus/scan /nexus/query /nexus/query/single /nexus/read")
+print("[Nexus] N-S Mapping: model_queries=velocity, script_context=pressure, swarm=Reynolds, mesh=vorticity")
+print("============================================================")
+
+tstart(server)

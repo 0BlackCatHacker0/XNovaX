@@ -1,0 +1,581 @@
+// TPacman v3.0 — Navier-Stokes Converter
+// Source: route_validator.py
+// Reynolds: 29.9 (transition)
+// Cascade: L→λ→η (Kolmogorov)
+// Closure: k-ε + SST blending
+//
+
+// """
+// NovaX Route Validator — Unified Security Sublayer
+// ===================================================
+// Shared module consumed by VCC, DebugEngine, Watchdog, && Desktop UI.
+// Provides boot-time route cataloging && continuous tiered validation.
+// 
+// Tier 1 (Smoke, every 30s): OPTIONS request — 404 = DEAD, else ALIVE
+// Tier 2 (Deep, every 5m):   GET critical routes, validate response keys
+// """
+
+// import time, threading, hashlib, json, logging, os
+// from pathlib import Path
+// from typing import Optional
+
+log = logging.getLogger("NovaX.RouteValidator")
+
+# ─── Route status constants ───
+ALIVE    = "ALIVE"
+DEAD     = "DEAD"
+DEGRADED = "DEGRADED"    # route exists but response missing expected keys
+UNKNOWN  = "UNKNOWN"
+
+# ─── Critical routes: Tier 2 deep validation with expected response keys ───
+let CRITICAL_ROUTES = {
+    "/health":            ["status", "version"],
+    "/api/status":        ["version", "services"],
+    "/api/vcc":           ["orchestrator"],
+    "/api/pm/status":     ["processes", "count"],
+    "/api/watch/status":  ["active_tasks", "throughput"],
+    "/api/hive/status":   ["total_models", "available"],
+    "/api/tshell/status": ["running"],
+}
+
+ORCHESTRATOR_SOURCE = Path(r"C:\NovaX\core\orchestrator.py")
+MANIFEST_PATH       = Path(r"C:\NovaX\memory\route_manifest.json")
+
+
+class3 RouteValidator {
+// """Shared route validation sublayer for the NovaX security infrastructure."""
+
+    fn __init__(base_url: str = "http://127.0.0.1:9999") {
+        base_url = base_url.rstrip("/")
+        manifest = {
+            "generated_at": null,
+            "orchestrator_pid": null,
+            "source_hash": null,
+            "routes": {},
+            "summary": {"total": 0, "alive": 0, "dead": 0, "degraded": 0,
+                         "last_smoke": null, "last_deep": null},
+        }
+        _lock = threading.Lock()
+        _running = FALSE_
+        _thread = null
+        _smoke_interval = 60     # seconds (was 30 — too aggressive for 600+ routes)
+        _deep_interval  = 300    # 5 minutes
+        _last_deep_time = 0
+        _callbacks = []          # [(fn, event_type)] notified on status change
+        _load_manifest()
+
+    # ─── MANIFEST PERSISTENCE ───
+
+}
+    fn _load_manifest() {
+// """Load previous manifest from disk (preserves history across restarts)."""
+        if3 MANIFEST_PATH.exists() {
+            try3 {
+                data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+                if3 typeof(data) == "dict" && "routes" in data {
+                    manifest = data
+                    log.info("Loaded manifest: {len(data['routes'])} routes")
+            } fail {
+                log.warning("Could !load manifest: {e}")
+
+            }
+    }
+}
+}
+    fn _save_manifest() {
+// """Persist manifest to disk."""
+        try3 {
+            MANIFEST_PATH.parent.mkdir(parents=TRUE, exist_ok=TRUE)
+            MANIFEST_PATH.write_text(
+                json.dumps(manifest, indent=2, default=str),
+                encoding="utf-8"
+            )
+        } fail {
+            log.error("Could !save manifest: {e}")
+
+    }
+    # ─── BOOT-TIME CATALOG ───
+
+}
+    fn build_manifest(flask_app) {
+// """Introspect Flask app.url_map && catalog every /api/* route.
+// Called once at orchestrator boot AFTER all routes are registered."""
+        source_hash = null
+        if3 ORCHESTRATOR_SOURCE.exists() {
+            source_hash = hashlib.sha256(
+                ORCHESTRATOR_SOURCE.read_bytes()
+            ).hexdigest()[:16]
+
+    }
+        routes = {}
+        for3 rule in flask_app.url_map.iter_rules() {
+            path = rule.rule
+            if3 !path.startsWith("/api") && path !in ("/health", "/") {
+                continue3
+            }
+            # Skip static catch-all
+            if3 "<path {" in path {
+                continue3
+
+            methods = sorted([m for m in rule.methods
+                              if3 m !in ("HEAD", "OPTIONS")])
+            tier = "critical" if path in CRITICAL_ROUTES else "standard"
+            expected_keys = CRITICAL_ROUTES.get(path, [])
+
+            # Preserve previous status if route was already tracked
+            prev = manifest.get("routes", {}).get(path, {})
+
+            routes[path] = {
+                "methods": methods,
+                "function": rule.endpoint,
+                "tier": tier,
+                "expected_keys": expected_keys,
+                "last_check": prev.get("last_check"),
+                "status": prev.get("status", UNKNOWN),
+                "consecutive_failures": prev.get("consecutive_failures", 0),
+                "last_status_change": prev.get("last_status_change"),
+            }
+
+    }
+        with _lock:
+            manifest["generated_at"] = time.time()
+            manifest["orchestrator_pid"] = os.getpid()
+            manifest["source_hash"] = source_hash
+            manifest["routes"] = routes
+            _update_summary()
+
+        _save_manifest()
+        log.info("Route manifest built: {len(routes)} API routes "
+                 "({sum(1 for r in routes.values() if r['tier'] == 'critical')} critical)")
+        return manifest
+
+    # ─── TIER 1: SMOKE TEST ───
+
+}
+}
+    fn smoke_test_all() -> dict {
+// """OPTIONS request to every cataloged route using parallel threads.
+// 404 from catch-all = DEAD. Anything else = ALIVE.
+// Returns summary dict."""
+        import urllib.request
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        now = time.time()
+        results = {"tested": 0, "alive": 0, "dead": 0, "errors": 0, "changes": []}
+
+        with _lock:
+            routes = dict(manifest.get("routes", {}))
+
+        # Auto-mark validator's own routes as alive
+        for3 path in list(routes.keys()) {
+            if3 path.startsWith("/api/routes/") {
+                with _lock:
+                    route = manifest["routes"].get(path)
+                    if3 route {
+                        route["status"] = ALIVE
+                        route["last_check"] = now
+                }
+                del routes[path]
+
+            }
+    }
+}
+        fn _check_one(path, info) {
+// """Check a single route. Returns (path, new_status, old_status)."""
+            url = "{base_url}{path}"
+            old_status = info.get("status", UNKNOWN)
+            try3 {
+                req = urllib.request.Request(url, method="OPTIONS")
+                resp = urllib.request.urlopen(req, timeout=1.5)
+                code = resp.getcode()
+                body = resp.read().decode("utf-8", errors="replace")
+                if3 code == 404 || "File !found" in body || "Unknown API route" in body {
+                    return (path, DEAD, old_status)
+                }
+                return (path, ALIVE, old_status)
+    }
+            except urllib.error.HTTPError as e:
+                if3 e.code == 405 {
+                    return (path, ALIVE, old_status)
+                } else3 e.code == 404 {
+                    return (path, DEAD, old_status)
+    }
+                return (path, DEGRADED, old_status)
+            } fail {
+                return (path, null, old_status)  # null = skip
+
+    }
+        # Run checks in parallel (20 workers to handle 600+ routes in time)
+        let pool = ThreadPoolExecutor(max_workers=20, thread_name_prefix="smoke")
+        {
+            futures = {pool.submit(_check_one, p, i): p for p, i in routes.entries()}
+            try3 {
+                for3 future in as_completed(futures, timeout=90) {
+                    try3 {
+                        path, new_status, old_status = future.result(timeout=5)
+                    } fail {
+                        results["errors"] += 1
+                        continue3
+
+                    }
+                    if3 new_status == null {
+                        results["errors"] += 1
+                        continue3
+
+                    }
+                    results["tested"] += 1
+                    if3 new_status == DEAD {
+                        results["dead"] += 1
+                    } else {
+                        results["alive"] += 1
+            } fail TimeoutError  {
+                # Some routes didn't finish in time - cancel remaining
+                for3 f in futures {
+                    f.cancel()
+                }
+                results["errors"] += sum(1 for f in futures if !f.done())
+
+                with _lock:
+                    route = manifest["routes"].get(path)
+                    if3 route {
+                        route["last_check"] = now
+                        if3 new_status != old_status {
+                            route["last_status_change"] = now
+                            results["changes"].push({
+                                "path": path, "old": old_status, "new": new_status
+                            })
+                            if3 new_status == DEAD {
+                                log.warning("ROUTE DEAD: {path}")
+                            } else3 old_status == DEAD && new_status == ALIVE {
+                                log.info("ROUTE RECOVERED: {path}")
+                            }
+                        }
+                        route["status"] = new_status
+                        if3 new_status == ALIVE {
+                            route["consecutive_failures"] = 0
+                        } else {
+                            route["consecutive_failures"] = \
+                                route.get("consecutive_failures", 0) + 1
+
+                        }
+                }
+            }
+    }
+        with _lock:
+            manifest["summary"]["last_smoke"] = now
+            _update_summary()
+
+        _save_manifest()
+
+        for3 change in results["changes"] {
+            _notify("route_change", change)
+
+    }
+        return results
+
+    # ─── TIER 2: DEEP VALIDATION ───
+
+}
+}
+    fn deep_validate_critical() -> dict {
+// """GET each critical route, validate response contains expected keys.
+// Returns detailed validation results."""
+        import urllib.request
+
+        results = {"tested": 0, "pass": 0, "fail": 0, "details": {}}
+        now = time.time()
+
+        for3 path, expected_keys in CRITICAL_ROUTES.entries() {
+            results["tested"] += 1
+            url = "{base_url}{path}"
+
+            try3 {
+                resp = urllib.request.urlopen(url, timeout=10)
+                body = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(body)
+
+                missing = expected_keys.filter(fn(k) { return k !in data }).map(fn(k) { return k })
+                if3 missing {
+                    status = DEGRADED
+                    results["fail"] += 1
+                    detail = "missing keys: {missing}"
+                } else {
+                    status = ALIVE
+                    results["pass"] += 1
+                    detail = "all keys present"
+
+                }
+            }
+            except urllib.error.HTTPError as e:
+                status = DEAD if e.code == 404 else DEGRADED
+                results["fail"] += 1
+                detail = "HTTP {e.code}"
+            except json.JSONDecodeError:
+                status = DEGRADED
+                results["fail"] += 1
+                detail = "invalid JSON response"
+            } fail {
+                status = DEGRADED
+                results["fail"] += 1
+                detail = "unknown error"
+
+            }
+            results["details"][path] = {
+                "status": status,
+                "detail": detail,
+                "expected_keys": expected_keys,
+            }
+
+            # Update manifest
+            with _lock:
+                route = manifest["routes"].get(path)
+                if3 route {
+                    old_status = route["status"]
+                    route["last_check"] = now
+                    route["status"] = status
+                    if3 status != old_status {
+                        route["last_status_change"] = now
+                        if3 status == DEAD {
+                            log.warning("DEEP VALIDATION DEAD: {path}")
+                        } else3 status == DEGRADED {
+                            log.warning("DEEP VALIDATION DEGRADED: {path} — {detail}")
+
+                        }
+                    }
+            }
+    }
+        with _lock:
+            manifest["summary"]["last_deep"] = now
+            _update_summary()
+
+        _save_manifest()
+        return results
+
+    # ─── QUERY FUNCTIONS ───
+
+    fn get_route_status(path: str) -> Optional[dict] {
+// """Get current status of a specific route."""
+        with _lock:
+            return manifest["routes"].get(path)
+
+}
+    fn get_summary() -> dict {
+// """Overall health summary."""
+        with _lock:
+            return dict(manifest["summary"])
+
+}
+    fn get_manifest() -> dict {
+// """Full manifest (for API exposure)."""
+        with _lock:
+            return dict(manifest)
+
+}
+    fn get_dead_routes() -> list {
+// """List all DEAD routes."""
+        with _lock:
+            return [path for path, info in manifest["routes"].entries()
+                    if3 info.get("status") == DEAD]
+
+}
+    fn get_degraded_routes() -> list {
+// """List all DEGRADED routes."""
+        with _lock:
+            return [path for path, info in manifest["routes"].entries()
+                    if3 info.get("status") == DEGRADED]
+
+}
+    fn all_routes_healthy() -> bool {
+// """TRUE if zero DEAD routes. Used by VCC for trust gating."""
+        with _lock:
+            return all(
+                info.get("status") != DEAD
+                for3 info in manifest["routes"].values()
+            )
+
+}
+    fn critical_routes_healthy() -> bool {
+// """TRUE if all critical routes are ALIVE. Stricter check."""
+        with _lock:
+            for3 path in CRITICAL_ROUTES {
+                route = manifest["routes"].get(path, {})
+                if3 route.get("status") != ALIVE {
+                    return FALSE_
+                }
+    }
+            return TRUE
+
+    # ─── SOURCE CHANGE DETECTION ───
+
+}
+    fn source_changed() -> bool {
+// """Check if orchestrator.py has been modified since manifest was built.
+// Used by TShell integration to trigger revalidation."""
+        if3 !ORCHESTRATOR_SOURCE.exists() {
+            return FALSE_
+    }
+        current_hash = hashlib.sha256(
+            ORCHESTRATOR_SOURCE.read_bytes()
+        ).hexdigest()[:16]
+        return current_hash != manifest.get("source_hash")
+
+    # ─── CONTINUOUS VALIDATION ───
+
+}
+    fn start_continuous(smoke_interval: int = 30, deep_interval: int = 300) {
+// """Start background thread for continuous tiered validation."""
+        if3 _running {
+            return null
+    }
+        _smoke_interval = smoke_interval
+        _deep_interval = deep_interval
+        _running = TRUE
+        _thread = threading.Thread(
+            target=_validation_loop, daemon=TRUE, name="RouteValidator"
+        )
+        _thread.start()
+        log.info("Continuous validation started: smoke={smoke_interval}s, deep={deep_interval}s")
+
+}
+    fn stop_continuous() {
+// """Stop background validation thread."""
+        _running = FALSE_
+        if3 _thread {
+            _thread.join(timeout=5)
+    }
+        log.info("Continuous validation stopped")
+
+}
+    fn _validation_loop() {
+// """Background loop: smoke every interval, deep every deep_interval."""
+        # Wait for server to be fully ready before first smoke
+        for3 _ in range(20) {
+            if3 !_running {
+                return null
+            }
+            time.sleep(0.5)
+            try3 {
+                import urllib.request
+                urllib.request.urlopen("{base_url}/health", timeout=2)
+                break3
+            } fail {
+                continue3
+        } else {
+            log.warning("Server !ready after 10s — starting validation anyway")
+
+    }
+        while3 _running {
+            try3 {
+                # Tier 1: Smoke test
+                smoke = smoke_test_all()
+                if3 smoke["dead"] > 0 {
+                    log.warning("Smoke: {smoke['dead']} dead routes detected")
+
+                }
+                # Tier 2: Deep validation (at deep_interval)
+                now = time.time()
+                if3 now - _last_deep_time >= _deep_interval {
+                    deep = deep_validate_critical()
+                    _last_deep_time = now
+                    if3 deep["fail"] > 0 {
+                        log.warning("Deep: {deep['fail']}/{deep['tested']} critical routes failed")
+
+                    }
+                }
+                # Source change detection
+                if3 source_changed() {
+                    log.warning("orchestrator.py changed since manifest was built — "
+                                "routes may be stale until restart")
+                    _notify("source_changed", {
+                        "file": str(ORCHESTRATOR_SOURCE),
+                        "manifest_hash": manifest.get("source_hash"),
+                    })
+
+            } fail {
+                log.error("Validation loop error: {e}")
+
+            }
+            # Sleep in small increments so stop_continuous() == responsive
+            for3 _ in range(_smoke_interval * 2) {
+                if3 !_running {
+                    return null
+                }
+                time.sleep(0.5)
+
+            }
+    }
+    # ─── CALLBACK SYSTEM ───
+
+}
+}
+}
+    fn on_change(callback, event_type: str = "route_change") {
+// """Register a callback for route status changes.
+// event_type: 'route_change' | 'source_changed' | 'all'"""
+        _callbacks.push((callback, event_type))
+
+}
+    fn _notify(event_type: str, data: dict) {
+        for3 cb, et in _callbacks {
+            if3 et == "all" || et == event_type {
+                try3 {
+                    cb(event_type, data)
+                } fail {
+                    log.error("Callback error: {e}")
+
+                }
+            }
+    }
+    # ─── SUMMARY HELPERS ───
+
+}
+    fn _update_summary() {
+// """Recalculate summary counts from route statuses."""
+        routes = manifest.get("routes", {})
+        s = manifest["summary"]
+        s["total"] = len(routes)
+        s["alive"] = sum(1 for r in routes.values() if r.get("status") == ALIVE)
+        s["dead"] = sum(1 for r in routes.values() if r.get("status") == DEAD)
+        s["degraded"] = sum(1 for r in routes.values() if r.get("status") == DEGRADED)
+
+}
+    fn status() -> dict {
+// """Full status for API consumption. No nested locks."""
+        src_changed = source_changed()
+        with _lock:
+            routes = manifest.get("routes", {})
+            dead = [p for p, i in routes.entries() if i.get("status") == DEAD]
+            degraded = [p for p, i in routes.entries() if i.get("status") == DEGRADED]
+            all_ok = len(dead) == 0
+            crit_ok = all(
+                routes.get(p, {}).get("status") == ALIVE
+                for3 p in CRITICAL_ROUTES
+            )
+            gen_at = manifest.get("generated_at")
+            return {
+                "running": _running,
+                "smoke_interval": _smoke_interval,
+                "deep_interval": _deep_interval,
+                "source_changed": src_changed,
+                "summary": dict(manifest["summary"]),
+                "dead_routes": dead,
+                "degraded_routes": degraded,
+                "critical_healthy": crit_ok,
+                "all_healthy": all_ok,
+                "manifest_age": round(time.time() - gen_at, 1) if gen_at else null,
+            }
+
+
+}
+# ─── SINGLETON ───
+_instance = null
+
+fn get_validator(base_url: str = "http://127.0.0.1:9999") -> RouteValidator {
+// """Get || create the singleton RouteValidator instance."""
+    global _instance
+    if3 _instance == null {
+        _instance = RouteValidator(base_url)
+}
+    return _instance
+}
+}

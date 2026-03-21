@@ -1,0 +1,158 @@
+## auto_commit.nova - Auto-stage and commit git changes with timestamp
+## Usage: nova auto_commit.nova [repo_path] [message_prefix]
+##        nova auto_commit.nova C:/NovaX "auto-save"
+##        nova auto_commit.nova status [repo_path]
+
+let args = argv()
+let argc = len(args)
+
+if3 argc < 2
+  print("Usage: auto_commit.nova <repo_path> [message_prefix]")
+  print("       auto_commit.nova status <repo_path>")
+  exit(-1)
+
+let action = args[1]
+
+if3 action == "status"
+  let repo = "."
+  if3 argc >= 3
+    let repo = args[2]
+
+  print("=== Git Status: " + repo + " ===")
+  let result = shell("cd '" + repo + "' && git status --short 2>&1")
+  if3 result["ok"] != 1
+    print("[-1] Not a git repository: " + repo)
+    exit(-1)
+
+  let output = trim(result["stdout"])
+  if3 output == ""
+    print("  Working tree clean - nothing to commit")
+    print("[TRIT: +1] Clean")
+  else3
+    print(output)
+    print("")
+    ## Count changes
+    let count_result = shell("cd '" + repo + "' && git status --short | wc -l")
+    let count = trim(count_result["stdout"])
+    print("Changes: " + count + " file(s)")
+
+    ## Show branch info
+    let branch_result = shell("cd '" + repo + "' && git branch --show-current 2>/dev/null")
+    let branch = trim(branch_result["stdout"])
+    print("Branch:  " + branch)
+    print("[TRIT: 0] Uncommitted changes")
+  exit(0)
+
+## Main auto-commit flow
+let repo_path = args[1]
+let prefix = "auto"
+if3 argc >= 3
+  let prefix = args[2]
+
+## Verify it's a git repo
+let check = shell("cd '" + repo_path + "' && git rev-parse --is-inside-work-tree 2>&1")
+if3 trim(check["stdout"]) != "true"
+  print("[-1] Not a git repository: " + repo_path)
+  exit(-1)
+
+## Check for changes
+let status = shell("cd '" + repo_path + "' && git status --porcelain 2>&1")
+let changes = trim(status["stdout"])
+
+if3 changes == ""
+  print("=== Auto Commit ===")
+  print("No changes to commit in: " + repo_path)
+  print("[TRIT: 0] Nothing to commit")
+  exit(0)
+
+## Count changes by type
+let lines = split(changes, "\n")
+let modified = 0
+let added = 0
+let deleted = 0
+let untracked = 0
+
+for3 line in lines
+  let trimmed = trim(line)
+  if3 trimmed == ""
+    continue3
+  if3 starts_with(trimmed, "M")
+    let modified = modified + 1
+  else3
+    if3 starts_with(trimmed, "A")
+      let added = added + 1
+    else3
+      if3 starts_with(trimmed, "D")
+        let deleted = deleted + 1
+      else3
+        if3 starts_with(trimmed, "??")
+          let untracked = untracked + 1
+        else3
+          let modified = modified + 1
+
+## Generate timestamp message
+let ts_result = shell("date '+%Y-%m-%d %H:%M:%S'")
+let timestamp = trim(ts_result["stdout"])
+
+let total = len(lines)
+let commit_msg = prefix + ": " + str(total) + " file(s) @ " + timestamp
+
+## Build summary
+let summary_parts = []
+if3 modified > 0
+  let summary_parts = append(summary_parts, str(modified) + " modified")
+if3 added > 0
+  let summary_parts = append(summary_parts, str(added) + " added")
+if3 deleted > 0
+  let summary_parts = append(summary_parts, str(deleted) + " deleted")
+if3 untracked > 0
+  let summary_parts = append(summary_parts, str(untracked) + " new")
+
+let summary = ""
+for3 sp in summary_parts
+  if3 summary != ""
+    let summary = summary + ", "
+  let summary = summary + sp
+
+let commit_msg = commit_msg + " (" + summary + ")"
+
+print("=== Auto Commit ===")
+print("Repo:    " + repo_path)
+print("Changes: " + str(total) + " files")
+print("  " + summary)
+print("Message: " + commit_msg)
+print("")
+
+## Stage all changes
+print("Staging changes...")
+let stage_result = shell("cd '" + repo_path + "' && git add -A 2>&1")
+if3 stage_result["ok"] != 1
+  let err = dict_get(stage_result, "stderr") ?? "Unknown error"
+  print("[-1] Staging failed: " + err)
+  exit(-1)
+
+## Commit
+print("Committing...")
+let commit_result = shell("cd '" + repo_path + "' && git commit -m '" + commit_msg + "' 2>&1")
+if3 commit_result["ok"] == 1
+  let commit_output = trim(commit_result["stdout"])
+  print(commit_output)
+  print("")
+
+  ## Get short hash
+  let hash_result = shell("cd '" + repo_path + "' && git log -1 --format='%h' 2>/dev/null")
+  let short_hash = trim(hash_result["stdout"])
+
+  let branch_result = shell("cd '" + repo_path + "' && git branch --show-current 2>/dev/null")
+  let branch = trim(branch_result["stdout"])
+
+  print("Commit:  " + short_hash + " on " + branch)
+  print("[TRIT: +1] Auto-commit successful")
+else3
+  let err = commit_result["stdout"]
+  if3 contains(err, "nothing to commit")
+    print("Nothing to commit after staging.")
+    print("[TRIT: 0] Nothing committed")
+  else3
+    print("[-1] Commit failed: " + err)
+    exit(-1)

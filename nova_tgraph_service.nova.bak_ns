@@ -1,0 +1,980 @@
+// Nova TGraph v1.0 - Ternary Knowledge Graph Service
+// Port 9958: Nodes are concepts/entities/services/files. Edges have ternary weight.
+//
+// Graph Philosophy:
+//   Every connection carries conviction: +1 supports, 0 unknown, -1 contradicts.
+//   Balanced ternary makes contradiction a first-class citizen, not an error.
+//   The graph IS the memory. The weights ARE the trust.
+//
+// N-S Mapping:
+//   nodes       = fluid_particles (identity carriers)
+//   edges       = velocity_field  (directed influence)
+//   BFS depth   = Reynolds_integration_steps
+//   weight +1   = laminar support (coherent flow)
+//   weight  0   = transitional unknown (undetermined)
+//   weight -1   = turbulent contradiction (opposing flow)
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3  -> ternary base (-1, 0, +1)
+//   H5=5  -> TZip pack unit (3^5=243)
+//   H7=7  -> composition/max depth (3^7=2187=BLOCK)
+//   H13=13 -> carrier/frame width (search default, edge cap factor)
+//
+// Reynolds Boundaries:
+//   Re < 27   (H3^3) = laminar    = exact node hit, +1 edges
+//   Re < 125  (H5^3) = transitional = partial match, 0 edges
+//   Re < 343  (H7^3) = turbulent  = contradiction, -1 edges
+//   Re >= 343         = chaotic   = no path found
+//
+// Papers/Foundations:
+//   Knowledge Graphs (Hogan et al., ACM Computing Surveys, 2021)
+//   Balanced ternary arithmetic (Knuth, TAOCP Vol 2, section 4.1)
+//   BFS shortest path (Cormen, CLRS, ch. 22)
+//   Contradiction-tolerant reasoning (Belnap, "A Useful Four-Valued Logic")
+
+let PORT = 9958
+let server = tserve(PORT, "nova-tgraph v1.0 - Ternary Knowledge Graph")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3    = 3
+let H5    = 5
+let H7    = 7
+let H13   = 13
+let BLOCK = 2187
+
+// -- Ternary States --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Graph Limits (N-S Reynolds boundaries) --
+let MAX_NODES          = 2187   // BLOCK = 3^7
+let MAX_EDGES_PER_NODE = 91     // H13 * H7 = 13 * 7
+let MAX_DEPTH          = 7      // H7
+let DEFAULT_SEARCH_LIMIT = 39   // H13 * H3 = 13 * 3
+
+// -- Graph Store --
+// nodes dict: node_id -> {id, type, data, created, edge_count, edges_json}
+// edges_json is a JSON-encoded list of {to, relation, weight} dicts.
+// We store edges as a JSON string to work around NovaLang list-in-dict limits.
+// Each edge entry is a flat dict stored in a parallel flat list per node.
+//
+// Because NovaLang cannot hold nested lists inside dicts natively we maintain
+// a separate parallel dict for each node's edge list:
+//   node_edges : node_id -> JSON-encoded list string   "[{...},{...}]"
+//   nodes      : node_id -> {id, type, data, created}
+let nodes      = {}
+let node_edges = {}    // node_id -> JSON string of edge list
+let node_count = 0
+
+// -- Stats Counters --
+let stat_nodes_created  = 0
+let stat_nodes_updated  = 0
+let stat_edges_created  = 0
+let stat_edges_updated  = 0
+let stat_queries        = 0
+let stat_paths          = 0
+let stat_searches       = 0
+
+// -- Helper: clamp weight to valid trit (-1, 0, +1) --
+fn clamp_weight(w) {
+    let wi = int(w)
+    if wi > 0 {
+        return T_TRUE
+    }
+    if wi < 0 {
+        return T_FALSE
+    }
+    return T_MAYBE
+}
+
+// -- Helper: validate node id (non-empty, <= 200 chars) --
+fn valid_node_id(nid) {
+    if len(nid) == 0 {
+        return T_FALSE
+    }
+    if len(nid) > 200 {
+        return T_FALSE
+    }
+    return T_TRUE
+}
+
+// -- Helper: validate node type --
+fn valid_node_type(ntype) {
+    if ntype == "concept" {
+        return T_TRUE
+    }
+    if ntype == "entity" {
+        return T_TRUE
+    }
+    if ntype == "service" {
+        return T_TRUE
+    }
+    if ntype == "file" {
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+// -- Helper: get edge list for a node (decoded from JSON) --
+fn get_edges(nid) {
+    if dict_has(node_edges, nid) {
+        let raw = dict_get(node_edges, nid, "[]")
+        return json_decode(raw)
+    }
+    return []
+}
+
+// -- Helper: save edge list for a node (encode to JSON) --
+fn save_edges(nid, edge_list) {
+    let raw = json_encode(edge_list)
+    node_edges = dict_set(node_edges, nid, raw)
+}
+
+// -- Helper: build node summary dict --
+fn node_summary(nid) {
+    let n = dict_get(nodes, nid, {})
+    let elist = get_edges(nid)
+    return {
+        "id":         dict_get(n, "id", nid),
+        "type":       dict_get(n, "type", "concept"),
+        "data":       dict_get(n, "data", {}),
+        "edge_count": len(elist),
+        "created":    dict_get(n, "created", 0)
+    }
+}
+
+// -- Helper: tchar for ternary weight display --
+fn tchar(w) {
+    if w > 0 {
+        return "+"
+    }
+    if w < 0 {
+        return "-"
+    }
+    return "~"
+}
+
+// -- BFS Subgraph: collect nodes + edges up to given depth --
+// Returns {"nodes": {...}, "edges": [...]} as a dict.
+// Iterative BFS using flat parallel arrays (queue_ids, queue_depths).
+// Max iterations capped at BLOCK (2187) as a safety valve.
+fn bfs_subgraph(start_id, depth) {
+    if valid_node_id(start_id) == T_FALSE {
+        return {"nodes": {}, "edges": []}
+    }
+    if dict_has(nodes, start_id) == false {
+        return {"nodes": {}, "edges": []}
+    }
+
+    // BFS state: visited dict (id -> depth), queue as two parallel lists
+    let visited      = {}
+    let queue_ids    = []
+    let queue_depths = []
+    let result_nodes = {}
+    let result_edges = []
+
+    let visited      = dict_set(visited, start_id, 0)
+    let queue_ids    = append(queue_ids, start_id)
+    let queue_depths = append(queue_depths, 0)
+
+    let qhead = 0
+    let iters = 0
+
+    while3 qhead < len(queue_ids) {
+        if iters >= BLOCK {
+            let qhead = len(queue_ids)
+        }
+        let iters = iters + 1
+
+        let nid = dict_get(queue_ids, qhead, "")
+        let d   = dict_get(queue_depths, qhead, 0)
+        let qhead = qhead + 1
+
+        // Add to result_nodes
+        let result_nodes = dict_set(result_nodes, nid, node_summary(nid))
+
+        // Traverse edges
+        let elist = get_edges(nid)
+        let ei = 0
+        while3 ei < len(elist) {
+            let edge   = dict_get(elist, ei, {})
+            let target = dict_get(edge, "to", "")
+            let rel    = dict_get(edge, "relation", "related")
+            let wt     = dict_get(edge, "weight", 0)
+
+            // Record edge
+            let erecord = {"from": nid, "to": target, "relation": rel, "weight": wt}
+            let result_edges = append(result_edges, erecord)
+
+            // Enqueue target if not visited and within depth and exists
+            if dict_has(visited, target) == false {
+                if d + 1 <= depth {
+                    if dict_has(nodes, target) {
+                        let visited      = dict_set(visited, target, d + 1)
+                        let queue_ids    = append(queue_ids, target)
+                        let queue_depths = append(queue_depths, d + 1)
+                    }
+                }
+            }
+            let ei = ei + 1
+        }
+    }
+
+    return {"nodes": result_nodes, "edges": result_edges}
+}
+
+// -- BFS Shortest Path: returns path as JSON-encoded list or "" if not found --
+// Uses parallel arrays for visited_from (predecessor map).
+// Max depth bounded by MAX_DEPTH (H7=7).
+fn bfs_path(from_id, to_id) {
+    if dict_has(nodes, from_id) == false {
+        return ""
+    }
+    if dict_has(nodes, to_id) == false {
+        return ""
+    }
+    if from_id == to_id {
+        let p = []
+        let p = append(p, from_id)
+        return json_encode(p)
+    }
+
+    // pred dict: visited node -> its predecessor (or "" for start)
+    let pred        = {}
+    let queue_ids   = []
+    let queue_depths = []
+    let pred        = dict_set(pred, from_id, "__start__")
+    let queue_ids   = append(queue_ids, from_id)
+    let queue_depths = append(queue_depths, 0)
+
+    let qhead   = 0
+    let found   = false
+    let iters   = 0
+
+    while3 qhead < len(queue_ids) {
+        if iters >= BLOCK {
+            let qhead = len(queue_ids)
+        }
+        let iters = iters + 1
+
+        let nid = dict_get(queue_ids, qhead, "")
+        let d   = dict_get(queue_depths, qhead, 0)
+        let qhead = qhead + 1
+
+        if d >= MAX_DEPTH {
+            // skip deeper expansion
+        }
+        if d < MAX_DEPTH {
+            let elist = get_edges(nid)
+            let ei = 0
+            while3 ei < len(elist) {
+                let edge   = dict_get(elist, ei, {})
+                let target = dict_get(edge, "to", "")
+                if dict_has(pred, target) == false {
+                    if dict_has(nodes, target) {
+                        let pred = dict_set(pred, target, nid)
+                        if target == to_id {
+                            let found   = true
+                            let qhead   = len(queue_ids)
+                        }
+                        let queue_ids    = append(queue_ids, target)
+                        let queue_depths = append(queue_depths, d + 1)
+                    }
+                }
+                let ei = ei + 1
+            }
+        }
+    }
+
+    if found == false {
+        return ""
+    }
+
+    // Reconstruct path by walking pred backwards from to_id
+    let path_rev = []
+    let cur = to_id
+    let steps = 0
+    while3 cur != "__start__" {
+        if steps > MAX_DEPTH + 1 {
+            let cur = "__start__"
+        }
+        let path_rev = append(path_rev, cur)
+        let prev = dict_get(pred, cur, "__start__")
+        let cur  = prev
+        let steps = steps + 1
+    }
+
+    // Reverse path_rev into path_fwd
+    let path_fwd = []
+    let ri = len(path_rev) - 1
+    while3 ri >= 0 {
+        let node_at = dict_get(path_rev, ri, "")
+        let path_fwd = append(path_fwd, node_at)
+        let ri = ri - 1
+    }
+
+    return json_encode(path_fwd)
+}
+
+// -- Fuzzy match: does text appear in node id or any string value in data? --
+fn fuzzy_match(text_lower, nid) {
+    let nid_lower = lower(nid)
+    if contains(nid_lower, text_lower) {
+        return T_TRUE
+    }
+    let n = dict_get(nodes, nid, {})
+    let data = dict_get(n, "data", {})
+    let dkeys = keys(data)
+    let ki = 0
+    while3 ki < len(dkeys) {
+        let k = dict_get(dkeys, ki, "")
+        let v = dict_get(data, k, "")
+        let vs = str(v)
+        if contains(lower(vs), text_lower) {
+            return T_TRUE
+        }
+        let ki = ki + 1
+    }
+    return T_FALSE
+}
+
+// -- Route Handlers --
+
+// GET /health and GET /tgraph/health
+fn health() {
+    let ec = 0
+    let nkeys = keys(nodes)
+    let ni = 0
+    while3 ni < len(nkeys) {
+        let nid = dict_get(nkeys, ni, "")
+        let elist = get_edges(nid)
+        let ec = ec + len(elist)
+        let ni = ni + 1
+    }
+    return {
+        "ok":                  true,
+        "service":             "nova-tgraph",
+        "port":                PORT,
+        "version":             "1.0.0",
+        "ternary":             true,
+        "trit":                T_TRUE,
+        "node_count":          node_count,
+        "edge_count":          ec,
+        "max_nodes":           MAX_NODES,
+        "max_edges_per_node":  MAX_EDGES_PER_NODE,
+        "runtime":             "novalang"
+    }
+}
+
+// GET /tgraph/stats
+fn tgraph_stats() {
+    let ec = 0
+    let type_dist   = {}
+    let weight_pos  = 0
+    let weight_zero = 0
+    let weight_neg  = 0
+    let top_ids     = []
+    let top_counts  = []
+
+    let nkeys = keys(nodes)
+    let ni = 0
+    while3 ni < len(nkeys) {
+        let nid   = dict_get(nkeys, ni, "")
+        let n     = dict_get(nodes, nid, {})
+        let elist = get_edges(nid)
+        let ecnt  = len(elist)
+        let ec    = ec + ecnt
+
+        // type distribution
+        let ntype = dict_get(n, "type", "concept")
+        if dict_has(type_dist, ntype) {
+            let old = dict_get(type_dist, ntype, 0)
+            let type_dist = dict_set(type_dist, ntype, old + 1)
+        }
+        if dict_has(type_dist, ntype) == false {
+            let type_dist = dict_set(type_dist, ntype, 1)
+        }
+
+        // weight distribution across this node's edges
+        let ei = 0
+        while3 ei < ecnt {
+            let edge = dict_get(elist, ei, {})
+            let wt   = dict_get(edge, "weight", 0)
+            if wt > 0 {
+                let weight_pos  = weight_pos + 1
+            }
+            if wt < 0 {
+                let weight_neg  = weight_neg + 1
+            }
+            if wt == 0 {
+                let weight_zero = weight_zero + 1
+            }
+            let ei = ei + 1
+        }
+
+        // Track top-7 connected (insertion sort by ecnt into top_ids/top_counts)
+        // Simple approach: always append then sort by ecnt desc, keep 7
+        let top_ids    = append(top_ids, nid)
+        let top_counts = append(top_counts, ecnt)
+
+        let ni = ni + 1
+    }
+
+    // Build most_connected: find top H7 by edge_count (selection scan, max H7 passes)
+    let most_connected = []
+    let used_flags = {}
+    let pass = 0
+    while3 pass < H7 {
+        if pass >= node_count {
+            let pass = H7
+        }
+        if pass < node_count {
+            let best_nid   = ""
+            let best_ec    = -1
+            let ti = 0
+            while3 ti < len(top_ids) {
+                let candidate = dict_get(top_ids, ti, "")
+                let cec       = dict_get(top_counts, ti, 0)
+                if dict_has(used_flags, candidate) == false {
+                    if cec > best_ec {
+                        let best_ec  = cec
+                        let best_nid = candidate
+                    }
+                }
+                let ti = ti + 1
+            }
+            if len(best_nid) > 0 {
+                let used_flags = dict_set(used_flags, best_nid, 1)
+                let n_entry    = dict_get(nodes, best_nid, {})
+                let mc_entry   = {
+                    "id":         best_nid,
+                    "type":       dict_get(n_entry, "type", "concept"),
+                    "edge_count": best_ec
+                }
+                let most_connected = append(most_connected, mc_entry)
+            }
+            let pass = pass + 1
+        }
+    }
+
+    let utilization = 0.0
+    if MAX_NODES > 0 {
+        let utilization = round(node_count / MAX_NODES, 4)
+    }
+
+    return {
+        "ok":                  true,
+        "trit":                T_TRUE,
+        "node_count":          node_count,
+        "edge_count":          ec,
+        "max_nodes":           MAX_NODES,
+        "max_edges_per_node":  MAX_EDGES_PER_NODE,
+        "most_connected":      most_connected,
+        "type_distribution":   type_dist,
+        "weight_distribution": {"+1": weight_pos, "0": weight_zero, "-1": weight_neg},
+        "contradictions":      weight_neg,
+        "utilization":         utilization
+    }
+}
+
+// GET /tgraph/export - full graph as JSON
+fn tgraph_export() {
+    let nodes_out = []
+    let edges_out = []
+    let nkeys = keys(nodes)
+    let ni = 0
+    while3 ni < len(nkeys) {
+        let nid   = dict_get(nkeys, ni, "")
+        let n     = dict_get(nodes, nid, {})
+        let entry = {
+            "id":      dict_get(n, "id", nid),
+            "type":    dict_get(n, "type", "concept"),
+            "data":    dict_get(n, "data", {}),
+            "created": dict_get(n, "created", 0)
+        }
+        let nodes_out = append(nodes_out, entry)
+
+        let elist = get_edges(nid)
+        let ei = 0
+        while3 ei < len(elist) {
+            let edge = dict_get(elist, ei, {})
+            let eout = {
+                "from":     nid,
+                "to":       dict_get(edge, "to", ""),
+                "relation": dict_get(edge, "relation", "related"),
+                "weight":   dict_get(edge, "weight", 0)
+            }
+            let edges_out = append(edges_out, eout)
+            let ei = ei + 1
+        }
+        let ni = ni + 1
+    }
+
+    let seal_input = str(len(nodes_out)) + ":" + str(len(edges_out))
+    let seal_full  = sha256(seal_input)
+    let seal       = slice(seal_full, 0, H13)
+
+    return {
+        "ok":          true,
+        "trit":        T_TRUE,
+        "node_count":  len(nodes_out),
+        "edge_count":  len(edges_out),
+        "nodes":       nodes_out,
+        "edges":       edges_out,
+        "seal":        seal,
+        "exported_at": time()
+    }
+}
+
+// POST /tgraph/node/add - add or update a node
+fn tgraph_node_add(body) {
+    let nid     = dict_get(body, "id", "")
+    let ntype   = dict_get(body, "type", "concept")
+    let ndata   = dict_get(body, "data", {})
+
+    if valid_node_id(nid) == T_FALSE {
+        return {"ok": false, "trit": T_FALSE, "error": "invalid or missing node id"}
+    }
+    if valid_node_type(ntype) == T_FALSE {
+        return {"ok": false, "trit": T_FALSE, "error": "invalid type - must be concept/entity/service/file"}
+    }
+
+    // Update existing node: preserve edges, merge data, update type
+    if dict_has(nodes, nid) {
+        let existing  = dict_get(nodes, nid, {})
+        let old_data  = dict_get(existing, "data", {})
+        // Merge new data keys into old_data
+        let ndkeys = keys(ndata)
+        let ki = 0
+        while3 ki < len(ndkeys) {
+            let k = dict_get(ndkeys, ki, "")
+            let v = dict_get(ndata, k, "")
+            let old_data = dict_set(old_data, k, v)
+            let ki = ki + 1
+        }
+        let existing = dict_set(existing, "type", ntype)
+        let existing = dict_set(existing, "data", old_data)
+        nodes    = dict_set(nodes, nid, existing)
+        stat_nodes_updated = stat_nodes_updated + 1
+        return {"ok": true, "trit": T_TRUE, "action": "updated", "id": nid}
+    }
+
+    // Enforce max node limit
+    if node_count >= MAX_NODES {
+        return {"ok": false, "trit": T_FALSE, "error": "max nodes reached"}
+    }
+
+    // Create new node
+    let new_node = {
+        "id":      nid,
+        "type":    ntype,
+        "data":    ndata,
+        "created": time()
+    }
+    nodes      = dict_set(nodes, nid, new_node)
+    node_edges = dict_set(node_edges, nid, "[]")
+    node_count = node_count + 1
+    stat_nodes_created = stat_nodes_created + 1
+
+    return {"ok": true, "trit": T_TRUE, "action": "created", "id": nid}
+}
+
+// POST /tgraph/edge/add - add a directed edge between nodes
+fn tgraph_edge_add(body) {
+    let from_id  = dict_get(body, "from", "")
+    let to_id    = dict_get(body, "to", "")
+    let relation = dict_get(body, "relation", "related")
+    let w_raw    = dict_get(body, "weight", 0)
+    let weight   = clamp_weight(w_raw)
+
+    if len(from_id) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "missing 'from'"}
+    }
+    if len(to_id) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "missing 'to'"}
+    }
+    if len(relation) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "missing or invalid 'relation'"}
+    }
+
+    if dict_has(nodes, from_id) == false {
+        return {"ok": false, "trit": T_FALSE, "error": "source node not found"}
+    }
+    if dict_has(nodes, to_id) == false {
+        return {"ok": false, "trit": T_FALSE, "error": "target node not found"}
+    }
+
+    // Cap relation length at 100 chars
+    let rel_safe = relation
+    if len(relation) > 100 {
+        let rel_safe = slice(relation, 0, 100)
+    }
+
+    let elist = get_edges(from_id)
+
+    // Check for duplicate edge (same to + relation) - update weight
+    let ei = 0
+    while3 ei < len(elist) {
+        let edge = dict_get(elist, ei, {})
+        let et   = dict_get(edge, "to", "")
+        let er   = dict_get(edge, "relation", "")
+        if et == to_id {
+            if er == rel_safe {
+                let old_w  = dict_get(edge, "weight", 0)
+                let edge   = dict_set(edge, "weight", weight)
+                // Replace edge in list via slice rebuild
+                let new_list = []
+                let ri = 0
+                while3 ri < len(elist) {
+                    if ri == ei {
+                        let new_list = append(new_list, edge)
+                    }
+                    if ri != ei {
+                        let orig = dict_get(elist, ri, {})
+                        let new_list = append(new_list, orig)
+                    }
+                    let ri = ri + 1
+                }
+                save_edges(from_id, new_list)
+                stat_edges_updated = stat_edges_updated + 1
+                return {
+                    "ok":         true,
+                    "trit":       T_TRUE,
+                    "action":     "updated",
+                    "from":       from_id,
+                    "to":         to_id,
+                    "relation":   rel_safe,
+                    "old_weight": old_w,
+                    "weight":     weight
+                }
+            }
+        }
+        let ei = ei + 1
+    }
+
+    // Check edge limit
+    if len(elist) >= MAX_EDGES_PER_NODE {
+        return {"ok": false, "trit": T_FALSE, "error": "max edges per node reached"}
+    }
+
+    // Append new edge
+    let new_edge = {"to": to_id, "relation": rel_safe, "weight": weight}
+    let elist    = append(elist, new_edge)
+    save_edges(from_id, elist)
+    stat_edges_created = stat_edges_created + 1
+
+    return {
+        "ok":       true,
+        "trit":     T_TRUE,
+        "action":   "created",
+        "from":     from_id,
+        "to":       to_id,
+        "relation": rel_safe,
+        "weight":   weight,
+        "char":     tchar(weight)
+    }
+}
+
+// POST /tgraph/query - subgraph around a node to given depth
+fn tgraph_query(body) {
+    stat_queries = stat_queries + 1
+    let nid   = dict_get(body, "node", "")
+    let depth = dict_get(body, "depth", 2)
+
+    if len(nid) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "missing 'node'"}
+    }
+    if dict_has(nodes, nid) == false {
+        return {"ok": false, "trit": T_FALSE, "error": "node not found"}
+    }
+
+    // Clamp depth 1..MAX_DEPTH
+    if depth < 1 {
+        let depth = 1
+    }
+    if depth > MAX_DEPTH {
+        let depth = MAX_DEPTH
+    }
+
+    let result  = bfs_subgraph(nid, depth)
+    let rnodes  = dict_get(result, "nodes", {})
+    let redges  = dict_get(result, "edges", [])
+
+    return {
+        "ok":         true,
+        "trit":       T_TRUE,
+        "root":       nid,
+        "depth":      depth,
+        "node_count": len(keys(rnodes)),
+        "edge_count": len(redges),
+        "nodes":      rnodes,
+        "edges":      redges
+    }
+}
+
+// POST /tgraph/path - shortest path between two nodes
+fn tgraph_path(body) {
+    stat_paths = stat_paths + 1
+    let from_id = dict_get(body, "from", "")
+    let to_id   = dict_get(body, "to", "")
+
+    if len(from_id) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "missing 'from'"}
+    }
+    if len(to_id) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "missing 'to'"}
+    }
+
+    let path_json = bfs_path(from_id, to_id)
+
+    if len(path_json) == 0 {
+        return {
+            "ok":    true,
+            "trit":  T_FALSE,
+            "found": false,
+            "from":  from_id,
+            "to":    to_id,
+            "error": "no path found (nodes missing or unreachable within depth)"
+        }
+    }
+
+    let path = json_decode(path_json)
+
+    // Collect edge weights along the path
+    let path_edges = []
+    let pi = 0
+    while3 pi < len(path) - 1 {
+        let src = dict_get(path, pi, "")
+        let dst = dict_get(path, pi + 1, "")
+        let elist = get_edges(src)
+        let ei = 0
+        while3 ei < len(elist) {
+            let edge = dict_get(elist, ei, {})
+            let et   = dict_get(edge, "to", "")
+            if et == dst {
+                let erecord = {
+                    "from":     src,
+                    "to":       dst,
+                    "relation": dict_get(edge, "relation", "related"),
+                    "weight":   dict_get(edge, "weight", 0),
+                    "char":     tchar(dict_get(edge, "weight", 0))
+                }
+                let path_edges = append(path_edges, erecord)
+                let ei = len(elist)
+            }
+            let ei = ei + 1
+        }
+        let pi = pi + 1
+    }
+
+    // Aggregate path weight: product of trits along path
+    // -1 any => FALSE, 0 any => MAYBE, all +1 => TRUE
+    let aggregate = T_TRUE
+    let ai = 0
+    while3 ai < len(path_edges) {
+        let pe = dict_get(path_edges, ai, {})
+        let w  = dict_get(pe, "weight", 0)
+        if w == T_FALSE {
+            let aggregate = T_FALSE
+            let ai        = len(path_edges)
+        }
+        if w == T_MAYBE {
+            if aggregate == T_TRUE {
+                let aggregate = T_MAYBE
+            }
+        }
+        let ai = ai + 1
+    }
+
+    return {
+        "ok":              true,
+        "trit":            T_TRUE,
+        "found":           true,
+        "from":            from_id,
+        "to":              to_id,
+        "length":          len(path),
+        "path":            path,
+        "edges":           path_edges,
+        "aggregate_weight": aggregate,
+        "aggregate_char":  tchar(aggregate)
+    }
+}
+
+// POST /tgraph/search - fuzzy search nodes by text in id or data values
+fn tgraph_search(body) {
+    stat_searches = stat_searches + 1
+    let text  = dict_get(body, "text", "")
+    let limit = dict_get(body, "limit", DEFAULT_SEARCH_LIMIT)
+
+    if len(text) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "missing or empty 'text'"}
+    }
+
+    if limit < 1 {
+        let limit = 1
+    }
+    if limit > MAX_NODES {
+        let limit = MAX_NODES
+    }
+
+    let text_lower = lower(text)
+    let results    = []
+    let nkeys      = keys(nodes)
+    let ni         = 0
+
+    while3 ni < len(nkeys) {
+        if len(results) >= limit {
+            let ni = len(nkeys)
+        }
+        if len(results) < limit {
+            let nid = dict_get(nkeys, ni, "")
+            if fuzzy_match(text_lower, nid) == T_TRUE {
+                let results = append(results, node_summary(nid))
+            }
+            let ni = ni + 1
+        }
+    }
+
+    let result_trit = T_MAYBE
+    if len(results) > 0 {
+        let result_trit = T_TRUE
+    }
+
+    return {
+        "ok":     true,
+        "trit":   result_trit,
+        "query":  text,
+        "count":  len(results),
+        "results": results
+    }
+}
+
+// POST /tgraph/merge - bulk import nodes and edges (non-destructive)
+fn tgraph_merge(body) {
+    let nodes_in = dict_get(body, "nodes", [])
+    let edges_in = dict_get(body, "edges", [])
+
+    let nc = 0
+    let nu = 0
+    let nf = 0
+    let ec = 0
+    let eu = 0
+    let ef = 0
+
+    // Import nodes first
+    let ni = 0
+    while3 ni < len(nodes_in) {
+        let n = dict_get(nodes_in, ni, {})
+        let r = tgraph_node_add(n)
+        if dict_get(r, "ok", false) {
+            if dict_get(r, "action", "") == "created" {
+                let nc = nc + 1
+            }
+            if dict_get(r, "action", "") == "updated" {
+                let nu = nu + 1
+            }
+        }
+        if dict_get(r, "ok", false) == false {
+            let nf = nf + 1
+        }
+        let ni = ni + 1
+    }
+
+    // Import edges
+    let ei = 0
+    while3 ei < len(edges_in) {
+        let e = dict_get(edges_in, ei, {})
+        let r = tgraph_edge_add(e)
+        if dict_get(r, "ok", false) {
+            if dict_get(r, "action", "") == "created" {
+                let ec = ec + 1
+            }
+            if dict_get(r, "action", "") == "updated" {
+                let eu = eu + 1
+            }
+        }
+        if dict_get(r, "ok", false) == false {
+            let ef = ef + 1
+        }
+        let ei = ei + 1
+    }
+
+    let total_ok   = nc + nu + ec + eu
+    let total_fail = nf + ef
+
+    let result_trit = T_TRUE
+    if total_fail > 0 {
+        if total_ok > 0 {
+            let result_trit = T_MAYBE
+        }
+        if total_ok == 0 {
+            let result_trit = T_FALSE
+        }
+    }
+
+    let ok_flag = false
+    if total_ok > 0 {
+        let ok_flag = true
+    }
+    if total_fail == 0 {
+        let ok_flag = true
+    }
+
+    return {
+        "ok":            ok_flag,
+        "trit":          result_trit,
+        "char":          tchar(result_trit),
+        "nodes_created": nc,
+        "nodes_updated": nu,
+        "nodes_failed":  nf,
+        "edges_created": ec,
+        "edges_updated": eu,
+        "edges_failed":  ef
+    }
+}
+
+// POST /tgraph/import - clear graph and load from JSON (exported format)
+fn tgraph_import(body) {
+    let nodes_in = dict_get(body, "nodes", [])
+    let edges_in = dict_get(body, "edges", [])
+
+    // Clear the graph
+    nodes      = {}
+    node_edges = {}
+    node_count = 0
+
+    // Rebuild via merge
+    let merge_body = {"nodes": nodes_in, "edges": edges_in}
+    let result     = tgraph_merge(merge_body)
+    let result     = dict_set(result, "action", "imported")
+    return result
+}
+
+// -- Register Routes --
+troute(server, "GET",  "/health",          "health")
+troute(server, "GET",  "/tgraph/health",   "health")
+troute(server, "GET",  "/tgraph/stats",    "tgraph_stats")
+troute(server, "GET",  "/tgraph/export",   "tgraph_export")
+troute(server, "POST", "/tgraph/node/add", "tgraph_node_add")
+troute(server, "POST", "/tgraph/edge/add", "tgraph_edge_add")
+troute(server, "POST", "/tgraph/query",    "tgraph_query")
+troute(server, "POST", "/tgraph/path",     "tgraph_path")
+troute(server, "POST", "/tgraph/search",   "tgraph_search")
+troute(server, "POST", "/tgraph/merge",    "tgraph_merge")
+troute(server, "POST", "/tgraph/import",   "tgraph_import")
+
+// -- Startup Banner --
+print("[TGraph] NovaX Ternary Knowledge Graph v1.0.0")
+print("[TGraph] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TGraph] MAX_NODES=" + str(MAX_NODES) + " MAX_EDGES_PER_NODE=" + str(MAX_EDGES_PER_NODE) + " MAX_DEPTH=" + str(MAX_DEPTH))
+print("[TGraph] Edge weights: +1=supports  0=unknown  -1=contradicts")
+print("[TGraph] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13) + " BLOCK=" + str(BLOCK))
+print("[TGraph] N-S Reynolds: <27=laminar <125=transitional <343=turbulent >=343=chaotic")
+print("[TGraph] Routes GET:  /health /tgraph/health /tgraph/stats /tgraph/export")
+print("[TGraph] Routes POST: /tgraph/node/add /tgraph/edge/add /tgraph/query /tgraph/path /tgraph/search /tgraph/merge /tgraph/import")
+print("[TGraph] Search default limit: " + str(DEFAULT_SEARCH_LIMIT) + " (H13*H3=13*3)")
+print("[TGraph] Max body: " + str(BLOCK * H13) + " bytes (BLOCK*H13=2187*13)")
+print("[TGraph] BFS iterations capped at BLOCK=" + str(BLOCK) + " (3^7 safety valve)")
+
+tstart(server)

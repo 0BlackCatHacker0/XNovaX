@@ -1,0 +1,463 @@
+
+SERVER FAILURE BIBLE
+Why Servers Fail Б─╒ How They Fail Б─╒ How People Fix Them Б─╒ Tools & Playbooks
+(Windows 11 / Linux / Node / Python / WebSockets / Localhost stacks)
+
+====================================================================
+0) WHAT Б─°SERVER FAILБ─² REALLY MEANS
+====================================================================
+A Б─°serverБ─² fails when any of these break:
+Б─╒ The process doesnБ─≥t start
+Б─╒ The process starts but exits (crash)
+Б─╒ The process runs but doesnБ─≥t accept connections (bind/listen failure)
+Б─╒ It accepts connections but requests fail (runtime errors)
+Б─╒ It works briefly then degrades (resource leak, deadlock, saturation)
+Б─╒ ItБ─≥s healthy but unreachable (network/DNS/firewall/proxy)
+Б─╒ ItБ─≥s reachable but wrong (misrouting, wrong port, wrong env, wrong version)
+
+In practice, most Б─°mystery failuresБ─² are one of:
+1) Dependency / environment mismatch
+2) Permission / filesystem / path issues
+3) Port binding conflicts
+4) Network / proxy / firewall / TLS
+5) Resource exhaustion (CPU/RAM/DISK/handles)
+6) Concurrency bugs (deadlock, race)
+7) Observability gaps (no logs / wrong logs / encoding)
+
+====================================================================
+1) THE UNIVERSAL FAILURE CHAIN (MENTAL MODEL)
+====================================================================
+Think in layers, always in this order:
+
+L1: OS & Hardware
+  - power, disk, RAM, CPU, drivers, clock, file system integrity
+
+L2: Process & Runtime
+  - interpreter/runtime exists, correct version, can execute, env vars set
+
+L3: Config & Secrets
+  - config file loads, JSON/YAML valid, keys present, permissions correct
+
+L4: Dependencies
+  - packages installed, native libs present, PATH correct, certs present
+
+L5: Bind & Listen
+  - port free, IP correct (127.0.0.1 vs 0.0.0.0), privileges ok
+
+L6: Request Handling
+  - routes, auth, DB connections, thread/async loop health
+
+L7: External Integrations
+  - DB, cache, message queue, web APIs, model endpoints, webhooks
+
+L8: Observability
+  - logging/metrics/traces, crash dumps, event logs
+
+Fixing servers fast is mostly: identify which layer youБ─≥re stuck at.
+
+====================================================================
+2) STARTUP FAILURES (PROCESS NEVER STARTS)
+====================================================================
+2.1 Missing runtime
+Б─╒ Python not found, Node not installed, wrong version
+Fixes people try:
+- Install correct runtime (winget/choco/installer)
+- Use venv/conda for Python
+- Use nvm-windows for Node versions
+Tools:
+- `where python`, `python --version`
+- `where node`, `node -v`, `npm -v`
+- `py -0p` (Windows Python launcher)
+
+2.2 Wrong working directory / relative paths
+Symptoms:
+- Б─°file not foundБ─², Б─°module not foundБ─², config not found
+Fix:
+- Launch from project root
+- Convert relative paths to absolute
+Tools:
+- Print cwd at boot
+- Use Process Explorer to see command line / cwd
+
+2.3 Env vars missing / wrong
+Symptoms:
+- Б─°KeyErrorБ─², auth failures, wrong ports
+Fix:
+- Centralize .env
+- Validate on boot, fail fast with readable message
+Tools:
+- `set` (cmd) / `$env:` (PowerShell)
+- python-dotenv, dotenv-cli
+
+2.4 Permissions / UAC / protected folders
+Symptoms:
+- cannot write logs, cannot bind privileged ports, access denied
+Fix:
+- Move logs to user-writable dir
+- Run as proper user, not admin-by-default
+Tools:
+- Windows Event Viewer (Security)
+- ProcMon Б─°ACCESS DENIEDБ─² filters
+
+2.5 Encoding / locale issues (Windows classic)
+Symptoms:
+- crash when writing Unicode to cp1252 console/log
+Fixes:
+- Force UTF-8: `PYTHONUTF8=1`, `chcp 65001`, open(log, encoding="utf-8")
+- Avoid fancy banners in early boot
+Tools:
+- Exception traceback
+- Minimal reproduction
+
+====================================================================
+3) CRASHES (STARTS THEN EXITS)
+====================================================================
+3.1 Unhandled exceptions
+Symptoms:
+- exits immediately, no port open
+Fix:
+- Run in foreground, capture stderr
+- Add top-level exception handler + structured logging
+Tools:
+- `python -X faulthandler`
+- Node: `node --trace-uncaught`
+- Windows: Event Viewer Application logs
+
+3.2 Native dependency crashes
+Examples:
+- DLL missing (VCRuntime), OpenSSL mismatch, GPU libs
+Fix:
+- Install VC++ redistributables
+- Pin versions
+Tools:
+- Dependency Walker (legacy), modern: lucasg/Dependencies
+- ProcMon Б─°NAME NOT FOUNDБ─² on DLL loads
+
+3.3 OOM / memory spikes
+Symptoms:
+- process killed, Windows: Б─°out of memoryБ─²
+Fix:
+- Increase memory, reduce model sizes, stream data, cap concurrency
+Tools:
+- Task Manager, Resource Monitor
+- `Get-Process | select PM, WS`
+- Windows Performance Monitor
+
+3.4 Watchdog restarts / supervisor loops
+Symptoms:
+- restarts repeatedly, log spam, port flapping
+Fix:
+- Add backoff, stop restart storms, make crash reason visible
+Tools:
+- NSSM logs, systemd journal, PM2 logs
+
+====================================================================
+4) PORT / LISTEN FAILURES (RUNNING BUT UNREACHABLE)
+====================================================================
+4.1 Port already in use
+Symptoms:
+- Б─°Address already in useБ─², or binds to different port silently
+Fix:
+- Find process using port and stop it, or change port
+Tools:
+- `netstat -ano | findstr :9999`
+- `Get-NetTCPConnection -LocalPort 9999`
+- `tasklist /fi "PID eq 1234"`
+- Sysinternals TCPView
+
+4.2 Binding wrong interface
+Symptoms:
+- works on one machine but not another; localhost only
+Fix:
+- Bind 0.0.0.0 for LAN access, 127.0.0.1 for local only
+Tools:
+- Inspect server bind config
+- `curl http://127.0.0.1:PORT/health`
+- `curl http://localhost:PORT/health`
+
+4.3 Firewall / security software
+Symptoms:
+- port open but connections reset/time out from browser
+Fix:
+- Add firewall rule, allow app, disable conflicting proxy
+Tools:
+- Windows Defender Firewall UI
+- `netsh advfirewall firewall show rule name=all`
+
+4.4 Proxy / corporate networking
+Symptoms:
+- browser routes localhost through proxy; websockets fail
+Fix:
+- Add localhost to proxy bypass
+Tools:
+- Browser proxy settings, env vars HTTP(S)_PROXY
+
+====================================================================
+5) REQUEST FAILURES (SERVER RUNS, BUT RETURNS ERRORS)
+====================================================================
+5.1 Misconfigured routes / base paths
+Symptoms:
+- 404s, wrong static directory
+Fix:
+- Print routing table on startup
+- Validate static file root exists
+Tools:
+- server debug mode
+- request logs with path and status
+
+5.2 Auth failures / missing secrets
+Symptoms:
+- 401/403, Б─°invalid keyБ─², Б─°unauthorizedБ─²
+Fix:
+- Environment validation on boot; rotate leaked keys
+Tools:
+- Redact keys in logs
+- Use secret stores where possible
+
+5.3 CORS issues
+Symptoms:
+- browser blocks request despite server ok
+Fix:
+- Set proper CORS headers; align origin/port
+Tools:
+- Browser DevTools Network + Console
+- curl vs browser compare
+
+5.4 WebSocket handshake failures
+Symptoms:
+- WS closes immediately; 101 not returned
+Fix:
+- Ensure correct URL ws:// vs wss://
+- Ensure reverse proxy supports websockets
+Tools:
+- Browser WS inspector
+- `wscat -c ws://localhost:9998/ws`
+
+====================================================================
+6) DEGRADATION FAILURES (WORKS THEN DIES)
+====================================================================
+6.1 Memory leaks
+Symptoms:
+- RAM climbs until crash
+Fix:
+- profile allocations, cap caches, restart schedule
+Tools:
+- Python: tracemalloc, objgraph
+- Node: heap snapshots, clinic.js
+- Prometheus/Grafana
+
+6.2 Handle / fd leaks
+Symptoms:
+- Б─°too many open filesБ─², Windows handle exhaustion
+Fix:
+- ensure file/socket close; use context managers
+Tools:
+- Process Explorer Handles tab
+- `lsof` on Linux
+
+6.3 Deadlocks / event loop stalls
+Symptoms:
+- no crash, but requests hang
+Fix:
+- timeouts, lock ordering, avoid blocking calls in async loop
+Tools:
+- Python faulthandler dump
+- Node async hooks, `--inspect`
+- thread dumps
+
+6.4 CPU saturation & thundering herd
+Symptoms:
+- latency skyrockets, 503s
+Fix:
+- queueing, rate limiting, caching, load shedding
+Tools:
+- perf counters, flamegraphs
+- nginx/HAProxy stats
+
+6.5 Disk full / slow I/O
+Symptoms:
+- writes fail, DB corruption, slow responses
+Fix:
+- free disk, move logs, rotate, SSD health check
+Tools:
+- Resource Monitor disk queue
+- Windows Event Viewer Disk warnings
+
+====================================================================
+7) CONFIG FAILURES (THE SILENT KILLER)
+====================================================================
+7.1 Wrong config loaded
+Symptoms:
+- starts with defaults, ignoring your port
+Fix:
+- log config file path and checksum on boot
+Tools:
+- print config summary at startup (redacting secrets)
+
+7.2 YAML/JSON parse errors
+Symptoms:
+- fails immediately; or uses fallback config
+Fix:
+- validate schema; strict mode
+Tools:
+- jsonschema, pydantic, zod, ajv
+
+7.3 Version skew
+Symptoms:
+- after update, endpoints changed
+Fix:
+- pin versions; lockfiles; semantic versioning
+Tools:
+- pip freeze, package-lock.json
+
+====================================================================
+8) DEPENDENCY FAILURES (PACKAGE CHAOS)
+====================================================================
+8.1 Missing wheels / compile errors (Windows common)
+Symptoms:
+- pip stuck, build tools missing
+Fix:
+- install Build Tools, use prebuilt wheels, pin versions
+Tools:
+- Visual Studio Build Tools, `pip -v`
+- `pip install --only-binary=:all:`
+
+8.2 Conflicting versions
+Symptoms:
+- import errors, subtle runtime breaks
+Fix:
+- clean venv; lock dependencies; `pip-tools` / Poetry
+Tools:
+- `pip check`, `pipdeptree`
+
+8.3 Node global vs local installs
+Symptoms:
+- Б─°command not foundБ─² or wrong version used
+Fix:
+- prefer local devDependencies; or ensure global PATH
+Tools:
+- `where openclaw`, `npm prefix -g`
+
+====================================================================
+9) NETWORK / TLS FAILURES
+====================================================================
+9.1 TLS cert mismatch
+Symptoms:
+- Б─°NET::ERR_CERTБ─╕Б─², handshake fail
+Fix:
+- correct certs; trust store; use http for localhost unless needed
+Tools:
+- openssl s_client, browser cert viewer
+
+9.2 DNS oddities
+Symptoms:
+- localhost resolves weird via hosts/proxy
+Fix:
+- check hosts file
+Tools:
+- `ipconfig /displaydns`, `nslookup`
+
+9.3 Clock skew
+Symptoms:
+- auth tokens invalid; TLS fails
+Fix:
+- sync time
+Tools:
+- Windows Time settings; `w32tm /query /status`
+
+====================================================================
+10) DATABASE / STATE FAILURES
+====================================================================
+10.1 DB connection pool exhaustion
+Symptoms:
+- slow then 500
+Fix:
+- pool sizing, timeouts, backpressure
+Tools:
+- DB logs, slow query logs
+
+10.2 Locked state files
+Symptoms:
+- Б─°resource busyБ─², cannot open sqlite
+Fix:
+- ensure single writer; use WAL mode
+Tools:
+- lsof/handle check
+
+====================================================================
+11) OBSERVABILITY: HOW PEOPLE FIX THE Б─°NO LOGSБ─² PROBLEM
+====================================================================
+The fastest fixes come from making failure visible.
+
+Common patterns:
+Б─╒ Boot banner includes:
+  - version
+  - config path
+  - ports
+  - dependencies OK
+  - health endpoint URL
+Б─╒ Always write logs in UTF-8
+Б─╒ Log to both console + file
+Б─╒ Rotate logs (size + count)
+Б─╒ Add /health and /ready endpoints
+Б─╒ Add Б─°port checkБ─² after boot and fail if not listening
+Б─╒ Create a single Б─°statusБ─² page in the dashboard showing green/yellow/red
+
+Tools people use:
+Windows:
+- Event Viewer (Application/System)
+- Sysinternals: Process Explorer, ProcMon, TCPView, Autoruns
+- Resource Monitor / PerfMon
+- Windows Firewall logs
+- Reliability Monitor
+
+Cross-platform:
+- curl / wget for health checks
+- Wireshark for network issues
+- Postman/Insomnia for API tests
+- k6/hey/wrk for load
+- Docker logs / compose logs
+- Grafana + Prometheus (metrics)
+- OpenTelemetry (tracing)Г6W0╓f≈┐═╒рg&VRF≈6╡бжВfRфЖw2б&ВFFRб54B├VгF┌6├V6╟╔FЖЖг3═╒р&W6ВW&6RжЖФ≈FВ"F≈6╡VWVP╒рv√ФFВw2WfVГBf√WvW"F≈6╡v&Ф√Фw0═ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспёr▓4ТДd■rd■еU$U2┘D└R4■дTЕB╢■ддU"░ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспёrЦw&ЖФr6ЖФf√rфЖFV@╔7√вFЖв3═╒р7F'G2v≈F┌FVfVгG2б√vФВ&√Фr√ВW"В'@╓f≈┐═╒рфЖr6ЖФf√rf√фRF┌ФB6├V6╥7VрЖБ&ЖВ@╔FЖЖг3═╒р&√ГB6ЖФf√r7Vжж'▓B7F'GW┤&VF7F√Фr6V7&WG2░═ёrЦ"■тбТ╔4ТБ'6RW'&В'0╔7√вFЖв3═╒рf√г2√жжVF√FVг⌠╡В"W6W2fфф&6╡6ЖФf√p╓f≈┐═╒рfф√FFR66├Vж╡7G&√7BжЖFP╔FЖЖг3═╒р╖6ЖГ66├Vжб√FГF√2б╕ЖBб╖`═ёrЦ2fW'6√ЖБ6╤Wp╔7√вFЖв3═╒рgFW"WFFRбVФGЖ√ГG26├ФvV@╓f≈┐═╒р√БfW'6√ЖГ3╡фЖ6╤f√фW3╡6VжГF√2fW'6√ЖФ√Фp╔FЖЖг3═╒р≈g&VW╕Rб6╤vRжфЖ6╡Ф╖6ЖЮ═ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспё┌▓DUTДDTД5▓d■еU$U2┘4╢tR4└У2░ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспё┌Цж≈76√Фrv├VVг2Р6Жв√фRW'&В'2┘v√ФFВw26ЖжжЖБ░╔7√вFЖв3═╒р≈7GV6╡б'V√фBFЖЖг2ж≈76√Фp╓f≈┐═╒р√Г7Fфб'V√фBFЖЖг2бW6R&V'V√гBv├VVг2б√БfW'6√ЖГ0╔FЖЖг3═╒рf≈7Vб7GVF√Р'V√фBFЖЖг2б≈вf ╒р≈√Г7FфбржЖФг▓ж&√Ф'⌠с╕фц╕ ═ё┌Ц"6ЖФfф√7F√ФrfW'6√ЖГ0╔7√вFЖв3═╒р√вВ'BW'&В'2б7V'FфR'VГF√жR'&V╥0╓f≈┐═╒р6фVБfVГc╡фЖ6╡FWVФFVФ6√W3╡≈вFЖЖг6РЖWG'░╔FЖЖг3═╒р≈6├V6╤б≈FWG&VV ═ё┌Ц2ФЖFRvфЖ&бg2фЖ6б√Г7Fфг0╔7√вFЖв3═╒р(	ф6ЖжжФBФВBfВVФN(	рВ"w&ЖФrfW'6√ЖБW6V@╓f≈┐═╒р&VfW"фЖ6бFWdFWVФFVФ6√W3╡В"VГ7W&RvфЖ&бD─╔FЖЖг3═╒рv├W&RВVФ6фvбГр&Vf≈┌жv ═ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспё▓▓ДUEtУ$╡РDе2d■еU$U0ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспё▓ЦDе26W'Bж≈6жF6─╔7√вFЖв3═╒р(	дДUCё╓U%%Т4U%N(
+n(	рб├ФG6├╤Rf√ю╓f≈┐═╒р6В'&V7B6W'G3╡G'W7B7FВ&S╡W6R┤GGfВ"фЖ6ф├В7BVФфW72ФVVFV@╔FЖЖг3═╒рВVГ76б5Ж6ф√VГBб'&Вw6W"6W'Bf√WvW ═ё▓Ц"DЕ2ЖFF≈F√W0╔7√вFЖв3═╒рфЖ6ф├В7B&W6ЖгfW2vV≈&Bf√├В7G2В&В┤░╓f≈┐═╒р6├V6╡├В7G2f√фP╔FЖЖг3═╒р≈6ЖФf√rЖF≈7ф√FГ6бГ6фЖЖ╥W ═ё▓Ц26фЖ6╡6╤Wp╔7√вFЖв3═╒рWF┌FЖ╤VГ2√Гfф√C╡Dе2f√г0╓f≈┐═╒р7√Ф2F√жP╔FЖЖг3═╒рv√ФFВw2F√жR6WGF√Фw3╡s3'FрВVW'▓В7FGW6 ═ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспё▓DD$4RР5DDRd■еU$U0ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспёЦD"6ЖФФV7F√ЖБЖЖбW├├W7F√ЖЮ╔7√вFЖв3═╒р6фВrF├VБS ╓f≈┐═╒рЖЖб6≈╕√ФrбF√жVВWG2б&6╥&W77W&P╔FЖЖг3═╒рD"фЖw2б6фВrVW'▓фЖw0═ёЦ"фЖ6╤VB7FFRf√фW0╔7√вFЖв3═╒р(	г&W6ВW&6R'W7·(	рб6ФФВBВVБ7ф≈FP╓f≈┐═╒рVГ7W&R6√ФvфRw&≈FW#╡W6RtбжЖFP╔FЖЖг3═╒рг6ЖbЖ├ФFфR6├V6╟═ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспё▓Т%4U%d$■д∙E⌠╒└УrTУдRd∙┌D└R(	дДРдТu>(	р$Т$дTпёсссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссп╔F├Rf7FW7Bf≈├W26ЖжRg&Жрж╤√Фrf√гW&Rf≈6√&фRЮ═╓6ЖжжЖБGFW&Г3═╝(
+"&ЖВB&ФФW"√Ф6гVFW3═╒рfW'6√ЖЮ╒р6ЖФf√rF─╒рВ'G0╒рFWVФFVФ6√W2Т╟╒р├VгF┌VФGЖ√ГBU$ю╝(
+"гv≈2w&≈FRфЖw2√БUDbс─╝(
+"фЖrFР&ВF┌6ЖГ6ЖфR╡f√фP╝(
+"&ВFFRфЖw2┤6≈╕R╡6ВVГB░╝(
+"FBЖ├VгF┌ФBВ&VG▓VФGЖ√ГG0╝(
+"FB(	гВ'B6├V6╬(	рgFW"&ЖВBФBf√б√bФВBф≈7FVФ√Фp╝(
+"7&VFR6√ФvфR(	г7FGW>(	рvR√БF├RF6├&Ж&B6├Вv√Фrw&VVБВ√VффВrВ&V@═╔FЖЖг2VВфRW6S═╔v√ФFВw3═╒рWfVГBf√WvW"└ф√6F√ЖБУ7≈7FVр░╒р7≈6√ГFW&Фг3╒&Ж6W72W┤фВ&W"б&Ж4жЖБбD5f√WrбWFВ'VГ0╒р&W6ВW&6RжЖФ≈FВ"РW&dжЖЮ╒рv√ФFВw2f≈&WvфбфЖw0╒р&Vф√&√ф≈G▓жЖФ≈FВ ═╓7&В72вфFfВ&с═╒р7W&бРvvWBfВ"├VгF┌6├V6╥0╒рv≈&W6├&╡fВ"ФWGvВ&╡≈77VW0╒рВ7FжБТ√Г6ЖжФ√fВ"▓FW7G0╒рЁbЖ├W▓Вw&╡fВ"фЖ@╒рFЖ6╤W"фЖw2Р6ЖвВ6RфЖw0╒рw&fФ╡&ЖжWF├WW2├жWG&√72░╒рВVЕFVфVжWG'▓┤G&6√Фr░═╔≈F├ЖБв7V6√f√3═╒рфЖvv√ФrжЖGVфR┘&ВFF√Фtf√фT├ФFфW"░╒рfVгF├ФFфW"GVв0╒рWf√6В&БЖwVФ√6В&БфЖw0╒р≈вFЖЖг2ВЖWG'▓fВ"фЖ6╤√Фp═╓ФЖFRв7V6√f√3═╒рс"фЖw2бV6В7≈7FVр6ЖФf√w0╒рФЖFRрж√Г7V7Bб6┤&ЖжRFWeFЖЖг0╒р6ф√Ф√2Ф╖2┤&Жf√фW"░╒рГрVF≈B┤6V7W&≈G▓░═ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспё"▓$Т4U52тДtTтTЕC╒t┘▓(	д∙BtУ$╣2t└TБ▓%TБ∙N(	р%UBДУB24U%d■4Pёсссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссп╓6ЖжжЖБ6W6W3═╝(
+"F√ffW&VГBW6W"66ВVГBv├VБ'VФФ√Фr26W'f√6P╝(
+"ж≈76√ФrD┌бж≈76√ФrVГbf'0╝(
+"w&ЖФrvВ&╤√ФrF≈&V7FВ'░╝(
+"ФР66W72FРW6W"&Жf√фRfЖфFW'0╝(
+"7FFВWBВ7FFW'"ФВBf≈6√&фRФB7&6├W26√фVГFг░═╓f≈┌GFW&Г3═╝(
+"W6R6W'f√6Rw&W"v≈F┌W┤ф√6≈C═╒рvВ&╤√ФrF≈&V7FВ'░╒рVГbf'0╒рфЖrF┤0╒р&W7F'BЖф√7░═╔FЖЖг3═╔v√ФFВw3═╒рЕ54р└ФЖБу7V6╤√Фr6W'f√6RжФvW"░╒рF6╡66├VGVфW"┤'VБB7F'GW░╒рv√ФFВw26W'f√6W2жФvW ═╓ф√ГW┐═╒р7≈7FVжBVФ≈Bf√фW0╒р7WW'f≈6В ═╓ФЖFS═╒рс ═╔≈F├ЖЦ═╒рWf√6В&БЖwVФ√6В&Б╡7≈7FVж@╒рv≈G&W72ЖБv√ФFВw0═ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспё2▓(	дUdU%▓t▓TУдR└dRE$■TBDРd∙┌∙N(	р┘EDU$Бд■%$%▓░ёсссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссп╓6FVvВ'▓(	B''WFR&W6WG2┤vВ&╥26ЖжWF√жW2б├√FW26W6R░╝(
+"&W7F'B&Ж6W70╝(
+"&V&ЖВBж6├√ФP╝(
+"FVфWFRfVГbЖФЖFUЖжЖGVфW2ФB&V√Г7Fфю╝(
+"6фV"66├W0╝(
+"6├ФvRВ'B&ФFЖжг░═╓6FVvВ'▓"(	B6ЖФf√r┤√v√VФR├жВ7BVffV7F≈fR░╝(
+"&√ГB6ЖФf√r7Vжж'▓ЖБ&ЖВ@╝(
+"fф√FFR66├VжФBf√бf7@╝(
+"√БfW'6√ЖГ2бфЖ6╡f√фW0╝(
+"WBВ'G2√БЖФR6ВW&6RЖbG'WF─═╓6FVvВ'▓2(	BFWVФFVФ7▓F≈66≈ф√ФP╝(
+"W6R6фVБVГbW"&Ж╕V7@╝(
+"fЖ√BvфЖ&б√Г7Fфг2fВ"FW`╝(
+"'V√фB67&≈G2F├B&V7&VFRVГf≈&ЖФжVГBg&Жр╕W&П═╓6FVvВ'▓B(	BЖ'6W'f&√ф≈G▓Ww&FW2┤GW&Бв≈7FW&√W2√ГFРf7G2░╝(
+"7G'V7GW&VBфЖw2└╔4ТБ░╝(
+"├VгF┌VФGЖ√ГG0╝(
+"&VF√ФW726├V6╥0╝(
+"7F'GW(	фvF^(	рF├BfW&√f√W2В'G2ФBFWVФFVФ6√W0═╓6FVvВ'▓R(	B&W6√ф√VФ6RVФv√ФVW&√Фp╝(
+"&WG'▓v≈F┌&6╤Жf`╝(
+"6≈&7V≈B'&V╤W'0╝(
+"F√жVВWG2WfW'≈v├W&P╝(
+"&FRф√ж≈F√Фp╝(
+"&W6ВW&6R60╝(
+"WFРв&Жфф&6╡ЖБf√фVBFWфВ░═ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспёB▓D└R(	дd5BE$■t^(	рд■$ТТ╡└DРD└∙2■БУ$DU"░ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспё▓≈2F├R&Ж6W72'VФФ√ФsП╒рF6╡жФvW"РvWBу&Ж6W76 ═ё"▓≈2F├RВ'Bф≈7FVФ√ФsП╒рФWG7FBРD5f√Wp═ё2▓6Б√ВR├≈BЖ├VгF┌фЖ6фг▓f√7W&цП╒р7W&б┤GG╒РС#rЦЦЦ╔У%BЖ├VгF├ ═ёB▓6├V6╡фЖw2fВ"f≈'7BW'&В"├V&ф√W7BF√жW7Fв░╒р6ЖГ6ЖфR╡f√фRфЖw0═ёR▓fф√FFR6ЖФf√rфЖFVB┤&√ГB6ЖФf√rF┌╡fгVW2░╒р6ЖФf≈&рВ'G2бF≈&V7FВ&√W0═ёb▓6├V6╡FWVФFVФ7▓fW'6√ЖГ0╒р≈F├ЖБуbб≈g&VW╕P╒рФЖFRвbбГрг0═ёr▓6├V6╡f≈&WvфбВ&В┤▓Ж'&Вw6W ╒рFWeFЖЖг2ФWGvВ&╡W'&В'2бu26фВ6R6ЖFW0═ё┌▓√b7F√фбVФ6фV#╒&Ж4жЖБ╡f√гFW&VBG&6P╒рf√ФB44U52DTД■TBбДтRДУBdУTДBбDдбж≈76√Фp═ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспёR▓ДУdТдТ4д└У5B5D4╡у5T4■d■2d■еU$RТ■ЕE2└д■╢R■УU"4UEU░ёсссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссп╓fВ"вVгF▓вВ'BфЖ6б7F6╥2├'&√FvRЖ'&√БВw2ВV▓ЖvFWv▓⌠═╝(
+"ЖФR6ЖвЖФVГB&ЖВF√ФrFЖW6Н(	≈BжVБF├R7≈7FVр≈2(	гW(	п╝(
+"√ВRФVVB&VF√ФW72├ФG6├╤S═╒р'&√Б&VG░╒рvV'6Ж6╤WB&VG░╒рvFWv▓&VG░╒рT▓FW&ж√Фб&VG░═╓&W7B&7F√6S═╝(
+"ж√БВ&6├W7G&FВ"фVФ6├W26ЖвЖФVГG0╝(
+"F├VБfW&√f√W2V6┌В'@╝(
+"√bГ▓f√ц╒6ЖффV7BфЖw2╡&WВ'Bv├√6┌6ЖвЖФVГBF√V@╝(
+"7FВ&WFVФF√Фr(	гW(	рv├VБЖФг▓&ЖВG7G&≈2ф≈fP═ёссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссспёb▓DТТд$У┌4└TB4└TUB┘T■4╡д∙5B░ёсссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссп╔v√ФFВw3═╒рWfVГBf√WvW"б&Vф√&√ф≈G▓жЖФ≈FВ ╒р7≈6√ГFW&Фг3╒&Ж4жЖБб&Ж6W72W┤фВ&W"бD5f√WrбWFВ'VГ0╒рФWG7FBбF6╤ф≈7BбF6╤╤√фю╒рВvW%6├Vфц╒vWBу&Ж6W72бvWBтФWED56ЖФФV7F√ЖБбvWBтWfVГDфЖp╒р&W6ВW&6RжЖФ≈FВ"бW&dжЖЮ═╓ФWGvВ&Ё═╒р7W&ббw66Bбv≈&W6├&╟╒рВ7FжБТ√Г6ЖжФ√═╔≈F├ЖЦ═╒рфЖvv√Фr╡&ВFF√Фtf√фT├ФFфW ╒рfVгF├ФFфW"бG&6VжффЖ0╒р≈вFЖЖг2РЖWG'░═╓ФЖFS═╒рс"бФЖFRрж√Г7V7@╒р6ф√Ф√2Ф╖2бГрг0═╔6W'f√6W3═╒рЕ54рбF6╡66├VGVфW ╒р7≈7FVжBВ7WW'f≈6В ═╓6ЖГF√ФW'3═╒рFЖ6╤W"FW6╥FВбFЖ6╤W"6ЖвВ6P╒рфЖw2б├VгF├6├V6╥0═ёсссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссп╓TД@ёсссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссссп

@@ -1,0 +1,151 @@
+// Nova Model Scores Initializer — Reads 1,081 super archive samples and builds model_scores.json
+// Run once to bootstrap the scoring cache for nova_model_selector_service.nova
+// Ternary: +1 = scores built, 0 = partial, -1 = failed
+//
+// N-S Mapping:
+//   archive_entries = particle_field (each response is a data point)
+//   score_aggregation = pressure_averaging (mean score per model+domain)
+//   decay = viscous_dissipation (old scores fade)
+//
+// 3-5-7-13: H3=ternary scoring (+1/0/-1), H13=carrier frame
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let SUPER_ARCHIVE = "C:/NovaX/data/super_archive"
+let SCORES_FILE = "C:/NovaX/data/model_scores.json"
+
+// ── Domain extraction from filename ──
+// Files are named: DOMAIN_N_provider.json or DOMAIN_provider_timestamp.json
+// Also h1.json, harvest.json etc which we skip
+fn extract_domain_from_name(fname) {
+    // Archive filenames start with domain prefix: CODE_3_provider.json, AGENT_9_provider.json
+    let domains = ["MATH", "CODE", "LONG", "VISION", "LANGUAGE", "FACT", "AGENT", "INSTRUCT", "REASON", "DOMAIN"]
+    let di = 0
+    while3 di < len(domains) {
+        let d = domains[di]
+        if3 starts_with(fname, d + "_") == true {
+            return d
+        }
+        di = di + 1
+    }
+    // Lowercase variants (classified_*, h*.json) — default to REASON
+    return "REASON"
+}
+
+// ── Score a single response: +1 good, 0 medium, -1 bad ──
+fn score_response(resp_text) {
+    let rlen = len(resp_text)
+    if3 rlen > 100 { return 1 }
+    if3 rlen >= 10 { return 0 }
+    return -1
+}
+
+// ── Main: read all archive files, aggregate scores ──
+fn build_scores() {
+    let files = try3 { dir_list(SUPER_ARCHIVE) } fail { [] }
+    let total_files = len(files)
+    print("[SCORES-INIT] Found " + str(total_files) + " files in super archive")
+
+    // scores = { "model_id": { "domain": { "total": N, "sum": S }, ... }, ... }
+    let scores = {}
+    let processed = 0
+    let skipped = 0
+
+    let fi = 0
+    while3 fi < len(files) {
+        let fname = files[fi]
+        // Skip non-JSON and special files
+        if3 ends_with(fname, ".json") == true {
+            // Skip harvest.json, max.json, etc (no underscore = no domain/provider)
+            if3 contains(fname, "_") == true {
+                let fpath = SUPER_ARCHIVE + "/" + fname
+                let content = try3 { read_file(fpath) } fail { "" }
+                if3 content != "" {
+                    let entry = try3 { json_decode(content) } fail { {} }
+                    let resp = dict_get(entry, "response") ?? ""
+                    let model = dict_get(entry, "model") ?? ""
+                    let provider = dict_get(entry, "provider") ?? ""
+
+                    if3 model != "" {
+                        let domain = extract_domain_from_name(fname)
+                        let sc = score_response(resp)
+
+                        // Build composite key: provider/model
+                        let model_key = provider + "/" + model
+
+                        // Get or create model entry
+                        let model_entry = dict_get(scores, model_key) ?? {}
+                        let domain_entry = dict_get(model_entry, domain) ?? {"total": 0, "sum": 0}
+
+                        let old_total = dict_get(domain_entry, "total") ?? 0
+                        let old_sum = dict_get(domain_entry, "sum") ?? 0
+                        domain_entry = dict_set(domain_entry, "total", old_total + 1)
+                        domain_entry = dict_set(domain_entry, "sum", old_sum + sc)
+
+                        model_entry = dict_set(model_entry, domain, domain_entry)
+                        scores = dict_set(scores, model_key, model_entry)
+                        processed = processed + 1
+                    } else3 {
+                        skipped = skipped + 1
+                    }
+                } else3 {
+                    skipped = skipped + 1
+                }
+            } else3 {
+                skipped = skipped + 1
+            }
+        } else3 {
+            skipped = skipped + 1
+        }
+        fi = fi + 1
+    }
+
+    print("[SCORES-INIT] Processed: " + str(processed) + " | Skipped: " + str(skipped))
+
+    // ── Aggregate: convert sum/total to average score ──
+    let final_scores = {}
+    let model_keys = keys(scores)
+    let mi = 0
+    while3 mi < len(model_keys) {
+        let mk = model_keys[mi]
+        let model_data = dict_get(scores, mk) ?? {}
+        let domain_keys = keys(model_data)
+        let final_domains = {}
+        let dj = 0
+        while3 dj < len(domain_keys) {
+            let dk = domain_keys[dj]
+            let de = dict_get(model_data, dk) ?? {}
+            let total = dict_get(de, "total") ?? 1
+            let sum = dict_get(de, "sum") ?? 0
+            // Average score: sum/total (ranges from -1.0 to 1.0)
+            let avg = sum / total
+            final_domains = dict_set(final_domains, dk, avg)
+            dj = dj + 1
+        }
+        final_scores = dict_set(final_scores, mk, final_domains)
+        mi = mi + 1
+    }
+
+    // ── Add metadata ──
+    let output = {}
+    output = dict_set(output, "version", "1.0.0")
+    output = dict_set(output, "generated", time())
+    output = dict_set(output, "total_models", len(model_keys))
+    output = dict_set(output, "total_samples", processed)
+    output = dict_set(output, "scores", final_scores)
+
+    // ── Write to disk ──
+    let json_str = json_encode(output)
+    let ok = try3 { write_file(SCORES_FILE, json_str) } fail { -1 }
+    if3 ok == -1 {
+        print("[SCORES-INIT] FAILED to write " + SCORES_FILE)
+        return -1
+    }
+
+    print("[SCORES-INIT] Wrote " + SCORES_FILE + " with " + str(len(model_keys)) + " models")
+    return 1
+}
+
+let result = build_scores()
+print("[SCORES-INIT] Result trit: " + str(result))

@@ -1,0 +1,947 @@
+// TPacman v3.0 — Navier-Stokes Converter
+// Source: hive_mind.py
+// Reynolds: 106.4 (transition)
+// Cascade: L→λ→η (Kolmogorov)
+// Closure: k-ε + SST blending
+//
+
+// """
+// NovaX Hive Mind — Unified AI Model Dispatch
+// ============================================
+// Connects ALL AI models (cloud + local + custom) into one coordinated hive.
+// Fan-out queries to every available provider simultaneously.
+// Consensus building, task handoff, model health tracking.
+// 
+// From chat.txt discussion:
+// "all of them active... connected in one hive mind helping with tasks
+// !just claude doing it... when claude stops working because of
+// usage limitations the tasks can be passed on to the universal hive mind"
+// """
+// import os, json, time, uuid, threading, logging
+// from concurrent.futures import ThreadPoolExecutor, as_completed
+
+log = logging.getLogger("NovaX.HiveMind")
+
+STATE_FILE = r"C:\NovaX\memory\hive_mind_state.json"
+HISTORY_FILE = r"C:\NovaX\memory\hive_mind_history.jsonl"
+
+# ──────────────────────────────────────────────
+# PROVIDER REGISTRY
+# ──────────────────────────────────────────────
+
+let CLOUD_PROVIDERS = {
+    "anthropic":  {"name": "Claude",    "endpoint": "https://api.anthropic.com/v1/messages",
+                   "key_file": r"C:\NovaX\config\anthropic.key", "models": ["claude-sonnet-4-20250514"]},
+    "openai":     {"name": "GPT",       "endpoint": "https://api.openai.com/v1/chat/completions",
+                   "key_file": r"C:\NovaX\config\openai.key", "models": ["gpt-4o", "gpt-4o-mini"]},
+    "google":     {"name": "Gemini",    "endpoint": "https://generativelanguage.googleapis.com/v1beta/models",
+                   "key_file": r"C:\NovaX\config\google.key", "models": ["gemini-2.0-flash", "gemini-2.0-pro"]},
+    "deepseek":   {"name": "DeepSeek",  "endpoint": "https://api.deepseek.com/v1/chat/completions",
+                   "key_file": r"C:\NovaX\config\deepseek.key", "models": ["deepseek-chat", "deepseek-coder"]},
+    "mistral":    {"name": "Mistral",   "endpoint": "https://api.mistral.ai/v1/chat/completions",
+                   "key_file": r"C:\NovaX\config\mistral.key", "models": ["mistral-large-latest"]},
+    "groq":       {"name": "Groq",      "endpoint": "https://api.groq.com/openai/v1/chat/completions",
+                   "key_file": r"C:\NovaX\config\groq.key", "models": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"]},
+    "cohere":     {"name": "Cohere",    "endpoint": "https://api.cohere.ai/v1/chat",
+                   "key_file": r"C:\NovaX\config\cohere.key", "models": ["command-r-plus"]},
+    "together":   {"name": "Together",  "endpoint": "https://api.together.xyz/v1/chat/completions",
+                   "key_file": r"C:\NovaX\config\together.key", "models": ["meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"]},
+    "perplexity": {"name": "Perplexity","endpoint": "https://api.perplexity.ai/chat/completions",
+                   "key_file": r"C:\NovaX\config\perplexity.key", "models": ["sonar-pro"]},
+}
+
+let LOCAL_PROVIDERS = {
+    "ollama": {"name": "Ollama", "endpoint": "http://127.0.0.1:11434", "port": 11434},
+}
+
+# ──────────────────────────────────────────
+# GOLD-TIER MODEL SELECTION
+# ──────────────────────────────────────────
+# Best models per provider for maximum quality fan-out.
+# ALL listed models are queried (!just one per provider).
+let GOLD_MODELS = {
+    "openai":     ["gpt-4o", "gpt-4o-mini"],       # both — different strengths
+    "anthropic":  ["claude-sonnet-4-20250514"],
+    "google":     ["gemini-2.0-flash"],
+    "deepseek":   ["deepseek-chat"],
+    "groq":       ["llama-3.3-70b-versatile"],      # blazing fast inference
+    "mistral":    ["mistral-large-latest"],
+    "together":   ["meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"],
+    "perplexity": ["sonar-pro"],
+    "cohere":     ["command-r-plus"],
+}
+
+# Best Ollama models for general queries — ordered by speed (GPU runs sequentially)
+# Keep this SHORT: GPU can realistically handle ~4 concurrent models before timeouts
+let GOLD_OLLAMA = [
+    "novax-openchat",        # 3.8GB — fastest capable model
+    "novax-nous-hermes2",    # 5.7GB — strong general reasoning
+    "novax-solar",           # 5.7GB — good all-rounder
+    "novax-neural-chat",     # 4.1GB — conversational strength
+    "novax-qwen2.5",         # 4.4GB — great quality
+]
+GOLD_OLLAMA_MAX = 4  # max local models at once (GPU saturates beyond 4)
+
+# Models to NEVER use in fan-out (embeddings, vision-only, code-only for general queries)
+let SKIP_MODELS = {
+    # Embedding models (!generative)
+    "nomic-embed-text", "mxbai-embed-large", "all-minilm",
+    "snowflake-arctic-embed", "novax-nomic-embed-text",
+    "novax-mxbai-embed-large", "novax-all-minilm",
+    "novax-snowflake-arctic-embed",
+    # Vision-only models
+    "llava", "bakllava", "moondream", "minicpm-v",
+    "novax-llava-llama3", "novax-moondream", "novax-bakllava", "novax-minicpm-v",
+    # Code-specific models (bad at general queries)
+    "novax-starcoder2", "starcoder2", "novax-stable-code", "stable-code",
+    "novax-codegeex4", "codegeex4", "novax-sqlcoder", "sqlcoder",
+    "novax-codeup", "codeup", "novax-magicoder", "magicoder",
+    "novax-wizardcoder", "wizardcoder", "novax-codestral", "codestral",
+    "novax-phind-codellama", "phind-codellama",
+    "novax-qwen2.5-coder", "qwen2.5-coder",
+}
+
+
+class3 ModelInfo {
+// """Tracks a single model's health && performance."""
+    fn __init__(provider, model_id, model_type="cloud") {
+        provider = provider
+        model_id = model_id
+        model_type = model_type  # cloud, local, custom
+        available = FALSE_
+        last_check = 0
+        total_queries = 0
+        total_successes = 0
+        avg_latency_ms = 0
+        last_error = ""
+        capabilities = []  # coding, vision, reasoning, fast, etc.
+
+    // @property
+}
+    fn success_rate() {
+        return round(total_successes / max(total_queries, 1), 3)
+
+}
+    fn record(success, latency_ms) {
+        total_queries += 1
+        if3 success {
+            total_successes += 1
+    }
+        # Running average
+        avg_latency_ms = round(
+            (avg_latency_ms * (total_queries - 1) + latency_ms) / total_queries, 1)
+
+}
+    fn to_dict() {
+        return {
+            "provider": provider, "model_id": model_id,
+            "type": model_type, "available": available,
+            "queries": total_queries, "successes": total_successes,
+            "success_rate": success_rate,
+            "avg_latency_ms": avg_latency_ms,
+            "last_error": last_error,
+            "capabilities": capabilities,
+        }
+
+
+}
+class3 HiveMind {
+// """
+// Unified AI Model Dispatch System.
+// Discovers, manages, && queries all AI models from one interface.
+// """
+
+}
+    fn __init__() {
+        models: dict[str, ModelInfo] = {}
+        query_history = []
+        active_tasks = {}
+        _lock = threading.Lock()
+        _executor = ThreadPoolExecutor(max_workers=24, thread_name_prefix="hive")
+        _load_state()
+        discover_models()
+
+    # ──────────────────────────────────────────
+    # DISCOVERY
+    # ──────────────────────────────────────────
+
+}
+    fn discover_models() {
+// """Discover all available AI models across all providers."""
+        discovered = 0
+
+        # Cloud providers — check if API key exists (.key file || cloud_config.json)
+        for3 pid, pinfo in CLOUD_PROVIDERS.entries() {
+            key = _read_key(pinfo.get("key_file", ""), provider=pid)
+            for3 model_id in pinfo.get("models", []) {
+                uid = "{pid}:{model_id}"
+                if3 uid !in models {
+                    m = ModelInfo(pid, model_id, "cloud")
+                    models[uid] = m
+                }
+                models[uid].available = bool3(key)
+                discovered += 1
+
+            }
+    }
+        # Local Ollama models
+        try3 {
+            import requests
+            r = requests.get("http://127.0.0.1:11434/api/tags", timeout=3)
+            if3 r.ok {
+                for3 m in r.json().get("models", []) {
+                    name = m.get("name", "").split(":")[0]
+                    uid = "ollama:{name}"
+                    if3 uid !in models {
+                        mi = ModelInfo("ollama", name, "local")
+                        models[uid] = mi
+                    }
+                    models[uid].available = TRUE
+                    discovered += 1
+        } fail {
+            // pass
+    }
+        # Cloud Router models (port 9878)
+        try3 {
+            import requests
+            r = requests.get("http://127.0.0.1:9878/api/v1/providers", timeout=3)
+            if3 r.ok {
+                for3 pid, info in r.json().entries() {
+                    if3 typeof(info) == "dict" && info.get("on") {
+                        for3 model_id in info.get("models", []) {
+                            uid = "cloud_router:{pid}:{model_id}"
+                            if3 uid !in models {
+                                mi = ModelInfo("cloud_router_{pid}", model_id, "cloud")
+                                models[uid] = mi
+                            }
+                            models[uid].available = TRUE
+        } fail {
+            // pass
+    }
+        log.info("HiveMind: discovered {discovered} models, {available_count} available")
+        return {"discovered": discovered, "available": available_count}
+
+    // @property
+}
+}
+}
+}
+}
+}
+}
+    fn available_count() {
+        return sum(1 for m in models.values() if m.available)
+
+    # ──────────────────────────────────────────
+    # QUERY — single model
+    # ──────────────────────────────────────────
+
+}
+    fn query_model(uid, prompt, timeout=30, system=null, conversation=null) {
+// """Query a single model by its UID (provider:model_id).
+// system: system prompt with context (archive, skills, state)
+// conversation: list of {role, content} messages for multi-turn
+// """
+        model = models.get(uid)
+        if3 !model || !model.available {
+            return {"ok": FALSE_, "error": "Model {uid} !available"}
+
+    }
+        # Build enriched prompt: system context + conversation + user query
+        enriched = prompt
+        if3 system {
+            enriched = "[System Context]\n{system}\n\n[User Query]\n{prompt}"
+
+    }
+        start = time.time()
+        try3 {
+            if3 model.provider == "ollama" {
+                result = _query_ollama(model.model_id, enriched, timeout, system=system)
+            } else3 model.provider.startsWith("cloud_router") {
+                result = _query_cloud_router(model.provider.replace("cloud_router_", ""),
+                                                   model.model_id, enriched, timeout)
+            } else3 model.provider == "anthropic" {
+                result = _query_anthropic(model.model_id, prompt, timeout,
+                                                system=system, conversation=conversation)
+            } else3 model.provider in ("openai", "deepseek", "mistral", "groq", "together", "perplexity") {
+                result = _query_openai_compat(model.provider, model.model_id, prompt, timeout,
+                                                    system=system, conversation=conversation)
+            } else3 model.provider == "google" {
+                result = _query_google(model.model_id, enriched, timeout)
+            } else3 model.provider == "cohere" {
+                result = _query_cohere(model.model_id, enriched, timeout)
+            } else {
+                result = {"ok": FALSE_, "error": "Unknown provider: {model.provider}"}
+
+            }
+            latency = int((time.time() - start) * 1000)
+            model.record(result.get("ok", FALSE_), latency)
+            result["latency_ms"] = latency
+            result["model_uid"] = uid
+            return result
+
+        } fail {
+            latency = int((time.time() - start) * 1000)
+            model.record(FALSE_, latency)
+            model.last_error = "unknown error"
+            return {"ok": FALSE_, "error": "unknown error", "model_uid": uid, "latency_ms": latency}
+
+    }
+    # ──────────────────────────────────────────
+    # FAN-OUT — all models at once
+    # ──────────────────────────────────────────
+
+    fn fan_out(prompt, providers=null, max_models=15, timeout=45,
+                system=null, conversation=null):
+// """
+// GOLD-TIER fan-out: Query every viable model simultaneously.
+// Smart selection ensures provider diversity — picks the best model
+// from each provider, then fills remaining slots with top Ollama models.
+// All models receive the same enriched prompt with knowledge base data.
+// Returns all responses + a SYNTHESIZED consensus that combines
+// unique insights from every model into one superior answer.
+// """
+        available = {uid: m for uid, m in models.entries()
+                     if3 m.available && (!providers || m.provider in providers)}
+
+        if3 !available {
+            return {"ok": FALSE_, "error": "No models available", "results": []}
+
+    }
+        # ── GOLD SELECTION: maximize model count + provider diversity ──
+        targets = []
+        target_set = set()
+
+}
+        fn _is_skipped(model_id) {
+// """Check skip list, handling :latest suffix."""
+            base = model_id.split(":")[0] if ":" in model_id else model_id
+            return base in SKIP_MODELS || model_id in SKIP_MODELS
+
+        # 1) Cloud providers: ALL gold models that have working keys
+        for3 provider, gold_list in GOLD_MODELS.entries() {
+            for3 model_id in gold_list {
+                uid = "{provider}:{model_id}"
+                if3 uid in available {
+                    targets.push(uid)
+                    target_set.add(uid)
+
+                }
+            }
+    }
+        # 2) Direct Ollama: GOLD list, capped for GPU sanity
+        #    These go BEFORE cloud_router to ensure local models get priority
+        ollama_added = 0
+        for3 model_id in GOLD_OLLAMA {
+            if3 ollama_added >= GOLD_OLLAMA_MAX {
+                break3
+            }
+            uid = "ollama:{model_id}"
+            if3 uid in available && uid !in target_set {
+                targets.push(uid)
+                target_set.add(uid)
+                ollama_added += 1
+
+            }
+    }
+        # 3) Cloud Router: only if router == alive, skip duplicates + code/embed models
+        cr_alive = FALSE_
+        try3 {
+            import requests as _req
+            _req.get("http://127.0.0.1:9878/health", timeout=2)
+            cr_alive = TRUE
+        } fail {
+            // pass
+    }
+        if3 cr_alive {
+            # Only add cloud_router models from providers with working keys
+            # that we don't already query directly. Skip ollama (redundant)
+            # && openrouter/anthropic (no working keys).
+            existing_bases = {models[u].model_id.split(":")[0] for u in target_set}
+            cr_added = 0
+            # Check which cloud_router sub-providers actually have keys
+            cr_working = set()
+            try3 {
+                import requests as _req
+                cr_prov = _req.get("http://127.0.0.1:9878/api/v1/providers", timeout=3)
+                if3 cr_prov.ok {
+                    for3 pid, info in cr_prov.json().entries() {
+                        if3 typeof(info) == "dict" && info.get("on") && info.get("key_set", info.get("has_key")) {
+                            cr_working.add(pid)
+            } fail {
+                // pass            }
+            # Remove providers we already query directly || that are redundant
+            cr_working.discard("ollama")      # direct Ollama == better
+            cr_working.discard("anthropic")   # 401 key
+            for3 uid, m in available.entries() {
+                if3 cr_added >= 3 {
+                    break3
+                }
+                if3 !m.provider.startsWith("cloud_router") {
+                    continue3
+                }
+                sub_provider = m.provider.replace("cloud_router_", "")
+                if3 sub_provider !in cr_working {
+                    continue3
+                }
+                base = m.model_id.split(":")[0]
+                if3 uid in target_set || base in existing_bases || _is_skipped(m.model_id) {
+                    continue3
+                }
+                targets.push(uid)
+                target_set.add(uid)
+                existing_bases.add(base)
+                cr_added += 1
+
+            }
+    }
+        targets = targets[:max_models]
+
+        results = []
+        futures = {}
+        for3 uid in targets {
+            f = _executor.submit(query_model, uid, prompt, timeout,
+                                       system=system, conversation=conversation)
+            futures[f] = uid
+
+    }
+        for3 f in as_completed(futures, timeout=max(timeout, 120) + 15) {
+            try3 {
+                result = f.result()
+                results.push(result)
+            } fail {
+                results.push({"ok": FALSE_, "error": "unknown error", "model_uid": futures[f]})
+
+            }
+    }
+        # Build SYNTHESIZED consensus from ALL successful responses
+        succeeded = results.filter(fn(r) { return r.get("ok") }).map(fn(r) { return r })
+        best = null
+        consensus = ""
+        synthesis_model = null
+        if3 succeeded {
+            best = max(succeeded, key=lambda r: len(r.get("response", "")))
+            if3 len(succeeded) >= 2 {
+                # Multi-model synthesis — combine all responses into one superior answer
+                synthesis = _synthesize_responses(prompt, succeeded, system=system)
+                if3 synthesis.get("ok") {
+                    consensus = synthesis["response"]
+                    synthesis_model = synthesis.get("synthesized_by", "unknown")
+                } else {
+                    consensus = best.get("response", "")
+            } else {
+                consensus = best.get("response", "")
+
+            }
+    }
+        query_record = {
+            "id": str(uuid.uuid4())[:10],
+            "prompt": prompt[:200],
+            "total_models": len(targets),
+            "succeeded": len(succeeded),
+            "failed": len(results) - len(succeeded),
+            "best_model": best.get("model_uid") if best else null,
+            "synthesis_model": synthesis_model,
+            "ts": time.time(),
+        }
+        query_history.push(query_record)
+        if3 len(query_history) > 200 {
+            query_history = query_history[-200:]
+    }
+        _append_history(query_record)
+
+        fastest = min(succeeded, key=lambda r: r.get("latency_ms", 9999)) if succeeded else null
+        total_time = max((r.get("latency_ms", 0) for r in results), default=0) / 1000.0
+
+        return {
+            "ok": len(succeeded) > 0,
+            "results": results,
+            "best": best,
+            "consensus": consensus,
+            "synthesis_model": synthesis_model,
+            "models_queried": len(targets),
+            "models_succeeded": len(succeeded),
+            "fastest_model": fastest.get("model_uid") if fastest else null,
+            "total_time": total_time,
+        }
+
+    # ──────────────────────────────────────────
+    # SYNTHESIS ENGINE — multi-model intelligence
+    # ──────────────────────────────────────────
+
+// SYNTHESIS_PROMPT = """You are the NovaX Hive Mind Synthesis Engine. You have received responses from {count} different AI models to the same query. Your job == to produce ONE superior answer that == BETTER than any individual response.
+// 
+// ORIGINAL QUERY: {query}
+// 
+// MODEL RESPONSES:
+// {responses}
+// 
+// SYNTHESIS INSTRUCTIONS:
+// 1. Extract unique insights, facts, && perspectives from EVERY response
+// 2. Resolve any conflicts by choosing the most accurate/detailed information
+// 3. Combine complementary details — if Model A mentions X && Model B mentions Y, include BOTH
+// 4. Remove redundancy — don't repeat the same point multiple times
+// 5. Maintain the best writing quality && structure from all responses
+// 6. If responses include code, use the most correct && complete version
+// 7. The final answer should be comprehensive, well-structured, && clearly written
+// 8. Do NOT mention that you are synthesizing multiple models — just give the best answer
+// 9. Do NOT say "based on multiple sources" || similar — speak as one authoritative voice
+// 10. Your combined token budget == large — be thorough && detailed, !brief
+// 
+// Produce the synthesized answer now:"""
+
+}
+}
+}
+}
+}
+    fn _synthesize_responses(original_prompt, succeeded_results, system=null) {
+// """
+// Takes all successful model responses && synthesizes them into
+// one superior answer using a meta-model. This == the core of
+// Hive Mind intelligence — the whole == greater than the parts.
+// """
+        if3 len(succeeded_results) < 2 {
+            return {"ok": FALSE_, "error": "Need 2+ responses to synthesize"}
+
+    }
+        # Format each model's response with attribution
+        response_blocks = []
+        total_tokens_approx = 0
+        for3 i, r in enumerate(succeeded_results) {
+            provider = r.get("provider", "unknown")
+            model = r.get("model", "unknown")
+            text = r.get("response", "")
+            if3 !text.trim() {
+                continue3
+            }
+            total_tokens_approx += len(text.split())
+            response_blocks.push(
+                "--- Response from {provider}/{model} ---\n{text}\n"
+            )
+
+    }
+        if3 !response_blocks {
+            return {"ok": FALSE_, "error": "No valid responses to synthesize"}
+
+    }
+        synthesis_prompt = SYNTHESIS_PROMPT.fmt(
+            count=len(response_blocks),
+            query=original_prompt[:500],
+            responses="\n".join(response_blocks),
+        )
+
+        # Build ordered list of synthesis candidates (prefer high-capability cloud)
+        # Priority: openai > anthropic > google > deepseek > groq > others > local
+        synthesis_priority = ["openai", "anthropic", "google", "deepseek",
+                              "groq", "mistral", "together", "perplexity", "cohere"]
+        synth_candidates = []
+        for3 prov in synthesis_priority {
+            for3 uid, m in models.entries() {
+                if3 m.available && m.provider == prov && uid !in synth_candidates {
+                    synth_candidates.push(uid)
+                    break3  # one per provider
+
+                }
+            }
+    }
+        # Add cloud_router models as fallback
+        for3 uid, m in models.entries() {
+            if3 m.available && m.model_type == "cloud" && uid !in synth_candidates {
+                synth_candidates.push(uid)
+                if3 len(synth_candidates) > 12 {
+                    break3
+
+                }
+            }
+    }
+        # Last resort: local Ollama
+        for3 uid, m in models.entries() {
+            if3 m.available && m.model_type == "local" && uid !in synth_candidates {
+                synth_candidates.push(uid)
+                break3
+
+            }
+    }
+        if3 !synth_candidates {
+            return {"ok": FALSE_, "error": "No model available for synthesis"}
+
+    }
+        # Try each candidate until one succeeds (fallback chain)
+        last_error = ""
+        for3 synth_uid in synth_candidates {
+            model = models[synth_uid]
+            log.info("HiveMind Synthesis: trying {synth_uid} to combine "
+                     "{len(response_blocks)} responses (~{total_tokens_approx} words)")
+            try3 {
+                if3 model.provider == "anthropic" {
+                    result = _query_anthropic_synthesis(model.model_id, synthesis_prompt, system=system)
+                } else3 model.provider in ("openai", "deepseek", "mistral", "groq", "together", "perplexity") {
+                    result = _query_openai_synthesis(model.provider, model.model_id, synthesis_prompt, system=system)
+                } else3 model.provider == "google" {
+                    result = _query_google(model.model_id, synthesis_prompt, 60)
+                } else3 model.provider == "ollama" {
+                    result = _query_ollama_synthesis(model.model_id, synthesis_prompt, system=system)
+                } else {
+                    result = _query_cloud_router(
+                        model.provider.replace("cloud_router_", ""),
+                        model.model_id, synthesis_prompt, 60)
+
+                }
+                if3 result.get("ok") {
+                    result["synthesized_by"] = synth_uid
+                    result["models_combined"] = len(response_blocks)
+                    result["approx_input_words"] = total_tokens_approx
+                    log.info("HiveMind Synthesis SUCCESS via {synth_uid}")
+                    return result
+                } else {
+                    last_error = result.get("error", "unknown")
+                    log.warning("HiveMind Synthesis failed on {synth_uid}: {last_error}")
+
+            } fail {
+                last_error = "unknown error"
+                log.warning("HiveMind Synthesis exception on {synth_uid}: {e}")
+
+            }
+    }
+        return {"ok": FALSE_, "error": "All synthesis models failed. Last: {last_error}"}
+
+}
+}
+    fn _query_anthropic_synthesis(model, prompt, system=null) {
+// """Anthropic query with MAX token limit for synthesis."""
+        import requests
+        key = _read_key(CLOUD_PROVIDERS["anthropic"]["key_file"], provider="anthropic")
+        if3 !key {
+            return {"ok": FALSE_, "error": "No Anthropic key"}
+    }
+        body = {
+            "model": model, "max_tokens": 16384,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if3 system {
+            body["system"] = system
+    }
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json=body, timeout=90)
+        if3 r.ok {
+            return {"ok": TRUE, "response": r.json()["content"][0]["text"],
+                    "provider": "anthropic", "model": model}
+    }
+        return {"ok": FALSE_, "error": "Anthropic synthesis {r.status_code}"}
+
+}
+    fn _query_openai_synthesis(provider, model, prompt, system=null) {
+// """OpenAI-compatible query with MAX token limit for synthesis."""
+        import requests
+        pinfo = CLOUD_PROVIDERS.get(provider, {})
+        key = _read_key(pinfo.get("key_file", ""), provider=provider)
+        if3 !key {
+            return {"ok": FALSE_, "error": "No {provider} key"}
+    }
+        messages = []
+        if3 system {
+            messages.push({"role": "system", "content": system})
+    }
+        messages.push({"role": "user", "content": prompt})
+        r = requests.post(pinfo["endpoint"],
+            headers={"Authorization": "Bearer {key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "max_tokens": 16384},
+            timeout=90)
+        if3 r.ok {
+            text = r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            return {"ok": TRUE, "response": text, "provider": provider, "model": model}
+    }
+        return {"ok": FALSE_, "error": "{provider} synthesis {r.status_code}"}
+
+}
+    fn _query_ollama_synthesis(model, prompt, system=null) {
+// """Ollama query with MAX token limit for synthesis."""
+        import requests
+        body = {"model": model, "prompt": prompt, "stream": FALSE_,
+                "options": {"num_predict": 8192}}
+        if3 system {
+            body["system"] = system
+    }
+        r = requests.post("http://127.0.0.1:11434/api/generate",
+            json=body, timeout=120)
+        if3 r.ok {
+            return {"ok": TRUE, "response": r.json().get("response", ""),
+                    "provider": "ollama", "model": model}
+    }
+        return {"ok": FALSE_, "error": "Ollama synthesis {r.status_code}"}
+
+    # ──────────────────────────────────────────
+    # TASK HANDOFF
+    # ──────────────────────────────────────────
+
+    fn handoff_task(prompt, failed_model_uid, task_type="general",
+                     system=null, conversation=null):
+// """
+// When a model fails || hits rate limits, hand the task off
+// to the next available model in the hive with full context.
+// """
+        available = [uid for uid, m in models.entries()
+                     if3 m.available && uid != failed_model_uid]
+        if3 !available {
+            return {"ok": FALSE_, "error": "No alternative models available"}
+
+    }
+        # Sort by success rate, pick best
+        best_uid = sorted(available, key=lambda u: models[u].success_rate, reverse=TRUE)[0]
+        log.info("HiveMind: handing off from {failed_model_uid} to {best_uid}")
+
+        result = query_model(best_uid, prompt, system=system, conversation=conversation)
+        result["handoff_from"] = failed_model_uid
+        result["handoff_to"] = best_uid
+        return result
+
+    # ──────────────────────────────────────────
+    # PROVIDER QUERY IMPLEMENTATIONS
+    # ──────────────────────────────────────────
+
+}
+    fn _read_key(path, provider=null) {
+// """Read API key from .key file, falling back to cloud_config.json."""
+        # Try individual .key file first
+        if3 path && os.path.exists(path) {
+            try3 {
+                let f = open(path, encoding="utf-8")
+                {
+                    key = f.read().trim()
+                    if3 key {
+                        return key
+            } fail {
+                // pass            }
+    }
+        # Fallback: read from cloud_config.json
+        if3 provider {
+            try3 {
+                cc = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cloud_config.json")
+                if3 os.path.exists(cc) {
+                    let f = open(cc, encoding="utf-8")
+                    {
+                        cfg = json.load(f)
+                    }
+                    key = cfg.get(provider, {}).get("key", "")
+                    if3 key {
+                        return key
+            } fail {
+                // pass            }
+    }
+        return ""
+
+}
+}
+}
+}
+}
+    fn _query_ollama(model, prompt, timeout, system=null) {
+        import requests
+        # Local models need generous timeout — GPU inference == slower than cloud APIs
+        ollama_timeout = max(timeout, 120)
+        body = {"model": model, "prompt": prompt, "stream": FALSE_,
+                "options": {"num_predict": 4096}}
+        if3 system {
+            body["system"] = system
+    }
+        r = requests.post("http://127.0.0.1:11434/api/generate",
+            json=body, timeout=ollama_timeout)
+        if3 r.ok {
+            return {"ok": TRUE, "response": r.json().get("response", ""), "provider": "ollama", "model": model}
+    }
+        return {"ok": FALSE_, "error": "Ollama {r.status_code}"}
+
+}
+    fn _query_cloud_router(provider, model, prompt, timeout) {
+        import requests
+        r = requests.post("http://127.0.0.1:9878/api/v1/query",
+            json={"prompt": prompt, "providers": [provider], "model": model}, timeout=timeout)
+        if3 r.ok {
+            data = r.json()
+            results = data.get("results", [])
+            if3 results && results[0].get("ok", TRUE) {
+                return {"ok": TRUE, "response": results[0].get("resp", ""),
+                        "provider": provider, "model": model}
+            }
+    }
+        return {"ok": FALSE_, "error": "Cloud router query failed"}
+
+}
+    fn _query_anthropic(model, prompt, timeout, system=null, conversation=null) {
+        import requests
+        key = _read_key(CLOUD_PROVIDERS["anthropic"]["key_file"], provider="anthropic")
+        if3 !key {
+            return {"ok": FALSE_, "error": "No Anthropic key"}
+    }
+        # Build messages: use conversation history if available, else single user message
+        if3 conversation && typeof(conversation) == "list" && len(conversation) > 0 {
+            messages = conversation
+        } else {
+            messages = [{"role": "user", "content": prompt}]
+    }
+        body = {"model": model, "max_tokens": 8192, "messages": messages}
+        if3 system {
+            body["system"] = system
+    }
+        r = requests.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json=body, timeout=timeout)
+        if3 r.ok {
+            return {"ok": TRUE, "response": r.json()["content"][0]["text"],
+                    "provider": "anthropic", "model": model}
+    }
+        return {"ok": FALSE_, "error": "Anthropic {r.status_code}"}
+
+}
+    fn _query_openai_compat(provider, model, prompt, timeout, system=null, conversation=null) {
+// """Works for OpenAI, DeepSeek, Mistral, Groq, Together, Perplexity."""
+        import requests
+        pinfo = CLOUD_PROVIDERS.get(provider, {})
+        key = _read_key(pinfo.get("key_file", ""), provider=provider)
+        if3 !key {
+            return {"ok": FALSE_, "error": "No {provider} key"}
+    }
+        # Build messages array with system prompt + conversation || single user message
+        messages = []
+        if3 system {
+            messages.push({"role": "system", "content": system})
+    }
+        if3 conversation && typeof(conversation) == "list" && len(conversation) > 0 {
+            messages.concat(conversation)
+        } else {
+            messages.push({"role": "user", "content": prompt})
+    }
+        r = requests.post(pinfo["endpoint"],
+            headers={"Authorization": "Bearer {key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": messages, "max_tokens": 16384},
+            timeout=timeout)
+        if3 r.ok {
+            data = r.json()
+            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            return {"ok": TRUE, "response": text, "provider": provider, "model": model}
+    }
+        return {"ok": FALSE_, "error": "{provider} {r.status_code}"}
+
+}
+    fn _query_google(model, prompt, timeout) {
+        import requests
+        key = _read_key(CLOUD_PROVIDERS["google"]["key_file"], provider="google")
+        if3 !key {
+            return {"ok": FALSE_, "error": "No Google key"}
+    }
+        url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        r = requests.post(url,
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=timeout)
+        if3 r.ok {
+            parts = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            text = parts[0].get("text", "") if parts else ""
+            return {"ok": TRUE, "response": text, "provider": "google", "model": model}
+    }
+        return {"ok": FALSE_, "error": "Google {r.status_code}"}
+
+}
+    fn _query_cohere(model, prompt, timeout) {
+        import requests
+        key = _read_key(CLOUD_PROVIDERS["cohere"]["key_file"], provider="cohere")
+        if3 !key {
+            return {"ok": FALSE_, "error": "No Cohere key"}
+    }
+        r = requests.post("https://api.cohere.ai/v1/chat",
+            headers={"Authorization": "Bearer {key}", "Content-Type": "application/json"},
+            json={"model": model, "message": prompt},
+            timeout=timeout)
+        if3 r.ok {
+            return {"ok": TRUE, "response": r.json().get("text", ""),
+                    "provider": "cohere", "model": model}
+    }
+        return {"ok": FALSE_, "error": "Cohere {r.status_code}"}
+
+    # ──────────────────────────────────────────
+    # PERSISTENCE
+    # ──────────────────────────────────────────
+
+}
+    fn _load_state() {
+        if3 os.path.exists(STATE_FILE) {
+            try3 {
+                let f = open(STATE_FILE, encoding="utf-8")
+                {
+                    data = json.load(f)
+                }
+                # Restore model stats
+                for3 uid, mdata in data.get("models", {}).entries() {
+                    parts = uid.split(":", 1)
+                    if3 len(parts) == 2 {
+                        mi = ModelInfo(parts[0], parts[1])
+                        mi.total_queries = mdata.get("queries", 0)
+                        mi.total_successes = mdata.get("successes", 0)
+                        mi.avg_latency_ms = mdata.get("avg_latency_ms", 0)
+                        models[uid] = mi
+                    }
+                }
+                query_history = data.get("query_history", [])[-100:]
+                log.info("HiveMind: restored {len(models)} models from state")
+            } fail {
+                log.error("HiveMind state load failed: {e}")
+
+            }
+    }
+}
+    fn save_state() {
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=TRUE)
+        data = {
+            "models": {uid: m.to_dict() for uid, m in models.entries()},
+            "query_history": query_history[-100:],
+            "saved_at": time.time(),
+        }
+        let f = open(STATE_FILE, "w", encoding="utf-8")
+        {
+            json.dump(data, f, indent=2)
+
+    }
+}
+    fn _append_history(record) {
+        try3 {
+            os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=TRUE)
+            let f = open(HISTORY_FILE, "a", encoding="utf-8")
+            {
+                f.write(json.dumps(record) + "\n")
+        } fail {
+            // pass
+    }
+    # ──────────────────────────────────────────
+    # STATUS
+    # ──────────────────────────────────────────
+
+}
+}
+    fn status() {
+        cloud_available = sum(1 for m in models.values() if m.available && m.model_type == "cloud")
+        local_available = sum(1 for m in models.values() if m.available && m.model_type == "local")
+        total_queries = sum(m.total_queries for m in models.values())
+        return {
+            "total_models": len(models),
+            "available": available_count,
+            "cloud_available": cloud_available,
+            "local_available": local_available,
+            "total_queries": total_queries,
+            "query_history_size": len(query_history),
+            "providers": list(set(m.provider for m in models.values())),
+        }
+
+}
+    fn model_list() {
+        return [m.to_dict() for m in sorted(
+            models.values(), key=lambda x: x.success_rate, reverse=TRUE)]
+
+}
+    fn model_leaderboard(top=10) {
+        active = models.values().filter(fn(m) { return m.total_queries > 0 }).map(fn(m) { return m })
+        ranked = sorted(active, key=lambda x: (x.success_rate, -x.avg_latency_ms), reverse=TRUE)
+        return ranked[:top.filter(fn(m) { return  }).map(fn(m) { return m.to_dict() })]
+}
+}

@@ -1,0 +1,599 @@
+
+NOVAX LOCALHOST STACK FAILURE BIBLE (MEGA EDITION)
+==================================================
+Target environment: Windows 11 + Brave + Localhost multi-service stack
+Primary entrypoint: C:\NovaX\novax\main.py
+Bootstrap bridge:    C:\NovaX\nova_bridge_v3.py
+Static UI root:      C:\ProgramData\NovaX\app\shell\static\
+Core ports (typical):
+  9999  Bridge / Bootstrap HTTP
+  9998  WebSocket / UI bus
+  9991  Executor / tool runner
+  9990  Brain / orchestrator core server
+  9997  UI Terminal (web UI terminal backend)
+  18789 OpenClaw Gateway (npm global)
+  (plus any Ollama ports, model endpoints, etc.)
+
+Purpose:
+This is the “no-mystery” manual for why NovaX-style localhost stacks fail,
+every known class of failure, and the exact Windows-first tools people use
+to find root cause fast (not guess).
+
+======================================================================
+CONTENTS
+======================================================================
+A. NovaX mental model (what “up” means)
+B. Universal failure taxonomy (all ways servers fail)
+C. NovaX-specific failure map by port/service
+D. The 15-minute recovery playbook (do in order)
+E. Diagnostic commands (Windows PowerShell + cmd)
+F. Tool catalog (Sysinternals, browsers, debuggers, profilers)
+G. The “silent crash” problem (how to force visibility)
+H. WebSocket failure bible (9998 and friends)
+I. Python runtime failure bible (venv, encoding, subprocess)
+J. Node/npm gateway failure bible (18789)
+K. File system + permission failure bible (ProgramData, NovaX dirs)
+L. “Works in console but not in service” bible
+M. Performance degradation bible (leaks, deadlocks, saturation)
+N. Robustness engineering patterns (readiness, health, backoff)
+O. NovaX gold-standard boot architecture (how pros build it)
+P. Incident templates + checklists (paste into issues/logs)
+Q. Quick reference cheat sheets
+
+======================================================================
+A) NOVAX MENTAL MODEL: WHAT “UP” REALLY MEANS
+======================================================================
+A multi-service stack is “UP” only when:
+1) Every required process is alive
+2) Every required port is LISTENING
+3) Every required service responds to /health (HTTP) or handshake (WS)
+4) Cross-service dependencies are READY (brain <-> executor <-> ws <-> ui)
+5) The UI loads and can perform at least one action end-to-end
+
+For NovaX, “bridge is up” is NOT enough.
+Bridge is bootstrap — it can exist while the real system is dead.
+
+Define states:
+• BOOTSTRAP_UP: 9999 responds, UI files serve, but brain not ready
+• PARTIAL_UP:   some ports listen, but orchestrator handshake incomplete
+• OPERATIONAL:  all required ports + health checks pass + UI actions work
+• DEGRADED:     stack runs but with errors, high latency, missing modules
+• DOWN:         required ports not listening or process crashed
+
+Always track:
+• Process-level health (is the exe alive?)
+• Socket-level health (is port listening?)
+• Protocol-level health (do we get expected responses?)
+
+======================================================================
+B) UNIVERSAL FAILURE TAXONOMY (EVERY WAY SERVERS FAIL)
+======================================================================
+B1) Start failures: process never starts
+  - runtime missing (python/node)
+  - wrong path/working dir
+  - env vars missing
+  - permissions denied
+  - config parse error before logging is active
+
+B2) Crash failures: starts then exits
+  - uncaught exception
+  - native DLL crash
+  - encoding/locale crash (Windows)
+  - missing dependency at runtime
+  - subprocess child dies; parent stays alive (partial-up trap)
+
+B3) Bind/listen failures: runs but no port
+  - port in use
+  - binding wrong interface
+  - firewall/proxy interference
+  - permission to bind denied
+
+B4) Protocol failures: port open but requests fail
+  - 404 route mismatch / wrong base path
+  - auth/CORS
+  - WS handshake rejects
+  - TLS mismatch
+
+B5) Degradation failures: works then dies/hangs
+  - memory leak / handle leak
+  - deadlock / event loop stall
+  - thundering herd / CPU saturation
+  - disk full / IO stall
+
+B6) Observability failures: “nothing explains anything”
+  - logs written to protected folder
+  - logs in wrong encoding
+  - logs truncated / overwritten
+  - service launched without stdout visible
+
+======================================================================
+C) NOVAX-SPECIFIC FAILURE MAP BY SERVICE
+======================================================================
+
+C0) ENTRYPOINT (main.py) — why the “one true boot” fails
+Common failure patterns:
+1) Subprocess launched with wrong cwd -> can’t find modules/config
+2) Subprocess launched with env missing (PATH, PYTHONPATH, keys)
+3) Child crashes silently; parent lives waiting for port ready
+4) Logging pipe uses cp1252; Unicode banners crash logs
+5) Race: ws starts before brain; UI connects and fails permanently
+6) Port conflicts from stale processes after restores or failed restarts
+
+Fix patterns people use:
+• Explicit working_dir per service
+• Explicit env dict (inherit + patch) per service
+• UTF-8 everywhere, no fancy Unicode before log setup
+• Readiness gates: do not proceed until each port confirms
+• Backoff retries with clear “FAILED MODULE” reporting
+• Single supervisor loop that owns all child PIDs
+
+C1) 9999 Bridge (bootstrap HTTP)
+Typical role: serve UI + provide minimal file/command bridge until real stack up
+Failure patterns:
+• wrong static root path (ProgramData moved, permissions)
+• tries to spawn subprocess -> bridge crashes (your lesson learned)
+• port conflict from older python process
+• requests blocked by Brave proxy settings (rare) or mixed content
+
+Fix:
+• Bridge NEVER spawns children; only writes files and returns status
+• Add /health (returns OK + build id) and /status (ports summary)
+• Run in foreground with visible console for first boot
+
+C2) 9998 WebSocket (UI bus)
+Failure patterns:
+• wrong WS URL in frontend (ws:// vs wss://, wrong path)
+• handshake rejected because server not ready (brain not ready)
+• reverse proxy interference (less common local)
+• browser blocks WS due to mixed-content or extension policies
+• WS server binds to IPv6 only, UI tries IPv4 (or vice versa)
+
+Fix:
+• UI should retry WS connection with exponential backoff
+• WS server should expose /health (HTTP) OR a ping/pong
+• Ensure consistent bind: 127.0.0.1 + explicit protocol
+• Provide “WS diagnostic page” showing close codes + last error
+
+C3) 9991 Executor (tool runner)
+Failure patterns:
+• permissions denied for filesystem/app control
+• PATH missing for tools (node, git, winget)
+• tries to run elevated operations without elevation strategy
+• child processes zombie / hang -> executor backlog
+
+Fix:
+• Build a “capability probe” command set:
+  - can write to target dirs?
+  - can run python?
+  - can run node?
+  - can open browser tab?
+• Add per-action timeouts + kill on exceed
+• Add queue depth metrics
+
+C4) 9990 Brain (orchestrator core)
+Failure patterns (this is the big one):
+• Import error / missing modules in venv
+• Unicode banner logging crash
+• Missing config or wrong model endpoint
+• DB/memory store locked or missing
+• Thread/event-loop stall at boot waiting for dependency that never comes
+• Binds to wrong port because env override not loaded
+
+Fix:
+• Fail-fast boot validation:
+  - print config path
+  - validate all env vars required
+  - validate dependencies
+  - validate directories exist
+  - open log file with UTF-8
+• Provide /ready that returns NOT READY until dependencies pass
+• Provide crash dump file on exception
+
+C5) 9997 UI Terminal backend
+Failure patterns:
+• file moved/renamed; frontend points to old path
+• binds to 0.0.0.0 or IPv6 only; UI uses localhost
+• terminal uses pty/console operations blocked by permissions
+• websocket multiplex confusion if terminal uses WS too
+
+Fix:
+• Put ui backend path in one source-of-truth config
+• Provide /health + /version
+• Add “terminal self-test” endpoint returning sample output
+
+C6) 18789 OpenClaw Gateway (Node/npm global)
+Failure patterns:
+• node not installed, wrong node version
+• npm global prefix not on PATH
+• openclaw installed locally but called globally (or vice versa)
+• gateway starts but uses different port due to config mismatch
+• Windows firewall prompts block first bind
+• npm permission issues writing to global directories
+
+Fix:
+• Verify `where node`, `node -v`, `npm -v`
+• Verify `where openclaw`
+• Print `npm prefix -g` and ensure PATH includes it
+• Prefer a pinned version (avoid surprise breaking changes)
+• Create a gateway config file committed into repo
+
+======================================================================
+D) THE 15-MINUTE RECOVERY PLAYBOOK (DO THIS IN ORDER)
+======================================================================
+Goal: from “partial up” to “operational” with proof, not hope.
+
+D1) Snapshot current status (ports + processes)
+  1) List listening ports
+  2) List processes by PID
+  3) Save to a timestamped log file
+
+D2) Confirm runtime availability
+  - python exe exists at C:\NovaX\ai_env\Scripts\python.exe
+  - node + npm exist and match required versions
+  - openclaw CLI resolvable
+
+D3) Identify port conflicts
+  - any of 9999/9998/9991/9990/9997/18789 already in use?
+  - if yes: which PID? what command line?
+
+D4) Bring up in dependency order (recommended)
+  1) OpenClaw gateway (18789)  (if brain needs it)
+  2) Brain (9990)             (it orchestrates)
+  3) Executor (9991)          (brain can delegate)
+  4) WebSocket (9998)         (UI bus)
+  5) UI Terminal (9997)       (optional but usually required)
+  6) Bridge (9999)            (bootstrap / UI serving)
+
+D5) Verify health endpoints or protocol checks
+  - HTTP: /health, /ready
+  - WS: handshake success, ping/pong
+
+D6) If anything fails: collect FIRST error
+  - earliest timestamp in logs
+  - not the last repeating error
+
+D7) Fix only the failing layer, re-test, repeat
+
+======================================================================
+E) DIAGNOSTIC COMMANDS (WINDOWS-FIRST)
+======================================================================
+
+E1) Port to PID
+CMD:
+  netstat -ano | findstr :9999
+PowerShell:
+  Get-NetTCPConnection -LocalPort 9999 | Select LocalAddress,LocalPort,State,OwningProcess
+
+E2) PID to process details
+CMD:
+  tasklist /fi "PID eq 1234"
+PowerShell:
+  Get-Process -Id 1234 | Format-List *
+
+E3) Command line for PID (critical)
+PowerShell (WMI):
+  Get-CimInstance Win32_Process -Filter "ProcessId=1234" | Select Name,CommandLine,ExecutablePath
+
+E4) Kill stale processes
+CMD:
+  taskkill /PID 1234 /F
+PowerShell:
+  Stop-Process -Id 1234 -Force
+
+E5) Quick HTTP health probe
+PowerShell:
+  irm http://127.0.0.1:9990/health
+CMD (if curl present):
+  curl http://127.0.0.1:9990/health
+
+E6) WebSocket probe
+Install wscat:
+  npm i -g wscat
+Probe:
+  wscat -c ws://127.0.0.1:9998/ws
+
+E7) Python environment verification
+  C:\NovaX\ai_env\Scripts\python.exe -c "import sys; print(sys.executable); print(sys.version)"
+  C:\NovaX\ai_env\Scripts\python.exe -c "import pkgutil; print('ok')"
+
+E8) Node/npm verification
+  node -v
+  npm -v
+  npm prefix -g
+  where node
+  where npm
+  where openclaw
+
+E9) File permissions quick check
+PowerShell:
+  Test-Path "C:\ProgramData\NovaX\app\shell\static\os_v2.html"
+  (Get-Acl "C:\ProgramData\NovaX").Access | Select IdentityReference,FileSystemRights,AccessControlType
+
+======================================================================
+F) TOOL CATALOG (EVERY TOOL PEOPLE USE)
+======================================================================
+
+Sysinternals (must-have):
+• Process Explorer — see command line, handles, DLLs, threads
+• ProcMon — trace filesystem/registry/network with filters
+• TCPView — ports to processes in real time
+• Autoruns — startup persistence conflicts
+• Strings — search binaries/logs for hidden config keys
+
+Windows built-ins:
+• Event Viewer — application/system error logs
+• Reliability Monitor — crash history timeline
+• Resource Monitor — CPU/RAM/DISK/Network deep view
+• PerfMon — counters and long-run monitoring
+• Windows Defender Firewall — allow/deny and logs
+
+Developer tools:
+• VS Code — log viewing + search, tasks, debugging
+• Python Debugger (debugpy) — step through boot
+• Node Inspector — debug gateway or Node services
+
+Network tools:
+• curl / PowerShell irm
+• Wireshark — when it’s a real network mystery
+• Postman/Insomnia — API exploration
+• wscat — websocket testing
+
+Profilers:
+• Python: tracemalloc, faulthandler
+• Node: clinic.js, heap snapshots, CPU profiles
+
+Supervisors:
+• NSSM — run services reliably on Windows
+• Task Scheduler — boot-time start with env control
+• PM2 — Node process manager
+• systemd (Linux)
+
+======================================================================
+G) THE SILENT CRASH PROBLEM (AND HOW PROS FIX IT)
+======================================================================
+
+Why silent crashes happen in Nova-like stacks:
+• Child process stdout/stderr is not captured
+• Parent ignores child exit code
+• Logs written to unwritable path -> logging fails -> no logs
+• Encoding mismatch -> logging fails -> process exits early
+• Crash occurs before logging initialized
+
+Fix patterns:
+1) Always capture stdout + stderr to UTF-8 files
+2) Always record:
+   - PID
+   - command line
+   - cwd
+   - env summary (redacted)
+3) On crash:
+   - write a “crash marker” file with reason + timestamp
+4) Add /status endpoint that shows:
+   - which child PIDs are alive
+   - last exit code
+   - last 50 log lines
+5) Use a single supervisor to own child lifecycle
+
+The most important rule:
+• You can’t fix what you can’t see.
+• If you can’t see it, upgrade observability first.
+
+======================================================================
+H) WEBSOCKET FAILURE BIBLE (9998)
+======================================================================
+
+H1) Classic symptoms and meanings
+• “WebSocket closed before connection established”
+  -> server not listening, or wrong path, or early crash
+
+• Close code 1006 (abnormal closure)
+  -> server crashed or network killed connection
+
+• Close code 1008 (policy violation)
+  -> auth required / blocked origin / invalid message format
+
+• Close code 1011 (server error)
+  -> server threw exception during message handling
+
+H2) Most common root causes in localhost stacks
+• UI tries to connect before WS is started
+• UI uses ws://localhost but server bound to 127.0.0.1 only or IPv6
+• Wrong endpoint path /ws vs /socket
+• Browser extension intercepts websocket (rare but happens)
+• Server expects subprotocol header; browser doesn’t send it
+
+H3) Fix patterns that always help
+• UI reconnect loop with jitter/backoff
+• WS server sends a HELLO payload with version and dependencies status
+• UI displays last close code and reason in a visible status box
+
+======================================================================
+I) PYTHON RUNTIME FAILURE BIBLE (Nova brain/bridge)
+======================================================================
+
+I1) Venv mismatch
+Symptoms:
+- modules missing, imports fail, “works in one terminal not another”
+Fix:
+- always call the explicit python exe in ai_env
+- print sys.executable at boot
+
+I2) Encoding crashes (your exact case)
+Symptoms:
+- crash when writing Unicode to log or console under cp1252
+Fix:
+- open logs with encoding="utf-8"
+- set PYTHONUTF8=1
+- avoid Unicode banners before logger init
+- optionally: `chcp 65001` for console
+
+I3) Subprocess and child management pitfalls
+Symptoms:
+- parent “alive” but children dead
+Fix:
+- store PIDs
+- poll child health
+- treat child exit as fatal and report it
+
+I4) Async loop stalls
+Symptoms:
+- server starts but never responds
+Fix:
+- add timeouts around awaits
+- print “BOOT STEP X reached” checkpoints
+
+======================================================================
+J) NODE/NPM GATEWAY FAILURE BIBLE (OpenClaw 18789)
+======================================================================
+J1) “openclaw not found”
+Root cause:
+- global npm bin not on PATH
+Fix:
+- add npm global bin to PATH
+- verify `where openclaw`
+
+J2) Wrong Node version
+Fix:
+- install Node LTS, ensure consistent version
+- avoid multiple node installs without nvm management
+
+J3) Gateway “starts” but port not open
+Root cause:
+- crashed after start, or port changed
+Fix:
+- run in foreground once, capture logs
+- explicitly pass port in config
+
+======================================================================
+K) FILESYSTEM + PERMISSIONS (ProgramData & NovaX dirs)
+======================================================================
+Common problems:
+• ProgramData requires admin for some writes depending ACLs
+• Antivirus blocks scripts in ProgramData or NovaX dirs
+• Windows restore resets ACL inheritance or ownership
+
+Fix:
+• Keep logs and temp files in a user-writable area
+• Explicitly verify directories exist
+• Use ProcMon to catch ACCESS DENIED
+
+======================================================================
+L) “WORKS IN CONSOLE BUT NOT WHEN LAUNCHED”
+======================================================================
+This is usually:
+• different user account
+• missing env vars
+• wrong working dir
+• blocked UI session / desktop interaction
+
+Fix:
+• when launching from supervisor: specify cwd and env explicitly
+• print those values at boot (redacting secrets)
+
+======================================================================
+M) PERFORMANCE DEGRADATION (WORKS THEN DIES)
+======================================================================
+M1) Memory leak
+Fix:
+• tracemalloc (Python)
+• heap snapshots (Node)
+• cap caches, limit history sizes
+
+M2) Handle leak
+Fix:
+• close files/sockets
+• Process Explorer handle count watch
+
+M3) CPU saturation
+Fix:
+• concurrency limits
+• backpressure
+• queueing
+
+M4) Disk fill
+Fix:
+• log rotation
+• cleanup jobs
+
+======================================================================
+N) ROBUSTNESS ENGINEERING PATTERNS (PRO LEVEL)
+======================================================================
+N1) Health and readiness endpoints
+• /health: process alive
+• /ready: dependency chain satisfied
+
+N2) Startup gates
+• Supervisor checks port open within X seconds
+• If not open -> restart with backoff -> report failure
+
+N3) Structured logs
+• JSON logs with timestamp, module, severity, correlation id
+
+N4) Crash markers
+• write crash_reason.txt with stack trace excerpt
+
+N5) Single source of truth config
+• one config file defines ports/paths
+• every service reads same config
+
+======================================================================
+O) NOVAX GOLD-STANDARD BOOT ARCHITECTURE
+======================================================================
+Blueprint:
+
+1) Supervisor (main.py)
+   - loads config
+   - initializes logger (UTF-8)
+   - prints boot banner safely (ASCII only)
+   - launches child services with explicit cwd+env
+   - waits for /ready and WS hello
+   - updates shared status
+
+2) Child services
+   - fail fast if config missing
+   - expose /health and /ready
+   - never swallow exceptions silently
+
+3) UI
+   - shows a status bar:
+     Bridge: green/yellow/red
+     Brain:  green/yellow/red
+     WS:     green/yellow/red
+     Exec:   green/yellow/red
+     UI Term:green/yellow/red
+     OpenClaw:green/yellow/red
+   - auto reconnect logic
+
+======================================================================
+P) INCIDENT TEMPLATE (COPY/PASTE)
+======================================================================
+DATE/TIME:
+WHAT CHANGED:
+EXPECTED:
+ACTUAL:
+PORTS LISTENING (netstat):
+PIDS + COMMAND LINES:
+FIRST ERROR IN LOGS:
+LAST 50 LOG LINES:
+RECOVERY ATTEMPTS:
+CURRENT STATE:
+
+======================================================================
+Q) QUICK CHEAT SHEETS
+======================================================================
+Q1) One-liners
+• Find who owns a port:
+  Get-NetTCPConnection -LocalPort 9990 | select State,OwningProcess
+
+• Get command line for PID:
+  Get-CimInstance Win32_Process -Filter "ProcessId=PID" | select CommandLine
+
+• Kill PID:
+  Stop-Process -Id PID -Force
+
+Q2) What to trust
+• Trust netstat/TCPView over “it seems running”
+• Trust earliest log error over the last repeated one
+• Trust direct curl/irm health checks over browser UI
+
+END

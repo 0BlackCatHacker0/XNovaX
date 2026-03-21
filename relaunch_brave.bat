@@ -1,0 +1,1 @@
+@echo off\r\necho Closing Brave...\r\ntaskkill /IM brave.exe /F >nul 2^>^&1\r\ntimeout /t 3 /nobreak >nul\r\necho Relaunching with Speech API...\r\nstart "" "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe" --enable-features=WebSpeechAPI http://localhost:9999/static/voice_terminal.html\r\nexit\r\n

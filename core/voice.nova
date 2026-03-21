@@ -1,0 +1,640 @@
+// TPacman v3.0 — Navier-Stokes Converter
+// Source: voice.py
+// Reynolds: 51.7 (transition)
+// Cascade: L→λ→η (Kolmogorov)
+// Closure: k-ε + SST blending
+//
+
+// """
+// NovaX Voice Layer -- Wake Word + Speech-to-Text + Text-to-Speech
+// Listens for "Nova" wake word, captures speech, routes to orchestrator.
+// Uses speech_recognition + pyttsx3 (offline) || cloud STT/TTS.
+// 
+// Architecture:
+// 1. Wake word detection (continuous low-power listen)
+// 2. Speech capture (record until silence)
+// 3. STT transcription
+// 4. Route to /think endpoint
+// 5. TTS response playback
+// """
+// import json
+// import os
+// import subprocess
+// import time
+// import threading
+// import sys
+sys.path.insert(0, os.path.dirname(__file__))
+// from nowindow import safe_run_capture
+
+VOICE_CONFIG = r"C:\NovaX\memory\voice_config.json"
+VOICE_LOG = r"C:\NovaX\memory\voice_log.json"
+
+let DEFAULT_CONFIG = {
+    "wake_word": "nova",
+    "stt_engine": "google",          # google, sphinx, whisper, nova_stt
+    "tts_engine": "edge-tts",        # edge-tts, pyttsx3, system
+    "tts_voice": "en-US-AriaNeural", # edge-tts voice name
+    "tts_rate": 175,
+    "tts_volume": 0.9,
+    "silence_threshold": 2.0,        # seconds of silence to stop recording
+    "energy_threshold": 300,         # microphone sensitivity
+    "orchestrator_url": "http://127.0.0.1:9999",
+    "enabled": TRUE,
+    "auto_execute": FALSE_,           # auto-execute after transcription
+    "log_transcriptions": TRUE,
+}
+
+# Curated best voices from all providers — edge-tts Neural voices
+let CURATED_VOICES = [
+    # US voices
+    {"id": "en-US-AriaNeural", "name": "Aria", "gender": "Female", "accent": "US", "style": "Versatile, expressive", "tier": "top"},
+    {"id": "en-US-AvaNeural", "name": "Ava", "gender": "Female", "accent": "US", "style": "Warm, natural", "tier": "top"},
+    {"id": "en-US-EmmaNeural", "name": "Emma", "gender": "Female", "accent": "US", "style": "Clear, professional", "tier": "top"},
+    {"id": "en-US-JennyNeural", "name": "Jenny", "gender": "Female", "accent": "US", "style": "Friendly, casual", "tier": "top"},
+    {"id": "en-US-MichelleNeural", "name": "Michelle", "gender": "Female", "accent": "US", "style": "Smooth, confident", "tier": "top"},
+    {"id": "en-US-AnaNeural", "name": "Ana", "gender": "Female", "accent": "US", "style": "Young, energetic", "tier": "standard"},
+    {"id": "en-US-AndrewNeural", "name": "Andrew", "gender": "Male", "accent": "US", "style": "Calm, authoritative", "tier": "top"},
+    {"id": "en-US-BrianNeural", "name": "Brian", "gender": "Male", "accent": "US", "style": "Deep, professional", "tier": "top"},
+    {"id": "en-US-ChristopherNeural", "name": "Christopher", "gender": "Male", "accent": "US", "style": "Warm, articulate", "tier": "standard"},
+    {"id": "en-US-EricNeural", "name": "Eric", "gender": "Male", "accent": "US", "style": "Neutral, steady", "tier": "standard"},
+    {"id": "en-US-GuyNeural", "name": "Guy", "gender": "Male", "accent": "US", "style": "Conversational", "tier": "standard"},
+    {"id": "en-US-RogerNeural", "name": "Roger", "gender": "Male", "accent": "US", "style": "Mature, commanding", "tier": "standard"},
+    {"id": "en-US-SteffanNeural", "name": "Steffan", "gender": "Male", "accent": "US", "style": "Young, clear", "tier": "standard"},
+    # Multilingual US
+    {"id": "en-US-AvaMultilingualNeural", "name": "Ava (Multi)", "gender": "Female", "accent": "US", "style": "Multi-language capable", "tier": "premium"},
+    {"id": "en-US-AndrewMultilingualNeural", "name": "Andrew (Multi)", "gender": "Male", "accent": "US", "style": "Multi-language capable", "tier": "premium"},
+    {"id": "en-US-BrianMultilingualNeural", "name": "Brian (Multi)", "gender": "Male", "accent": "US", "style": "Multi-language capable", "tier": "premium"},
+    {"id": "en-US-EmmaMultilingualNeural", "name": "Emma (Multi)", "gender": "Female", "accent": "US", "style": "Multi-language capable", "tier": "premium"},
+    # UK voices
+    {"id": "en-GB-SoniaNeural", "name": "Sonia", "gender": "Female", "accent": "UK", "style": "Elegant, BBC-quality", "tier": "top"},
+    {"id": "en-GB-RyanNeural", "name": "Ryan", "gender": "Male", "accent": "UK", "style": "Polished, articulate", "tier": "top"},
+    {"id": "en-GB-LibbyNeural", "name": "Libby", "gender": "Female", "accent": "UK", "style": "Modern, friendly", "tier": "standard"},
+    {"id": "en-GB-ThomasNeural", "name": "Thomas", "gender": "Male", "accent": "UK", "style": "Classic British", "tier": "standard"},
+    {"id": "en-GB-MaisieNeural", "name": "Maisie", "gender": "Female", "accent": "UK", "style": "Young, bright", "tier": "standard"},
+    # AU/NZ/IE
+    {"id": "en-AU-NatashaNeural", "name": "Natasha", "gender": "Female", "accent": "AU", "style": "Warm Australian", "tier": "standard"},
+    {"id": "en-AU-WilliamMultilingualNeural", "name": "William", "gender": "Male", "accent": "AU", "style": "Deep Aussie", "tier": "standard"},
+    {"id": "en-NZ-MollyNeural", "name": "Molly", "gender": "Female", "accent": "NZ", "style": "Kiwi charm", "tier": "standard"},
+    {"id": "en-IE-ConnorNeural", "name": "Connor", "gender": "Male", "accent": "IE", "style": "Irish warmth", "tier": "standard"},
+    # IN/SG/CA/ZA
+    {"id": "en-IN-NeerjaExpressiveNeural", "name": "Neerja", "gender": "Female", "accent": "IN", "style": "Expressive Indian", "tier": "standard"},
+    {"id": "en-IN-PrabhatNeural", "name": "Prabhat", "gender": "Male", "accent": "IN", "style": "Clear Indian", "tier": "standard"},
+    {"id": "en-SG-LunaNeural", "name": "Luna", "gender": "Female", "accent": "SG", "style": "Singaporean", "tier": "standard"},
+    {"id": "en-CA-ClaraNeural", "name": "Clara", "gender": "Female", "accent": "CA", "style": "Canadian friendly", "tier": "standard"},
+    {"id": "en-CA-LiamNeural", "name": "Liam", "gender": "Male", "accent": "CA", "style": "Canadian", "tier": "standard"},
+    {"id": "en-ZA-LeahNeural", "name": "Leah", "gender": "Female", "accent": "ZA", "style": "South African", "tier": "standard"},
+    # International (sci-fi / creative)
+    {"id": "ja-JP-NanamiNeural", "name": "Nanami", "gender": "Female", "accent": "JP", "style": "Japanese natural", "tier": "intl"},
+    {"id": "ja-JP-KeitaNeural", "name": "Keita", "gender": "Male", "accent": "JP", "style": "Japanese natural", "tier": "intl"},
+    {"id": "ko-KR-SunHiNeural", "name": "SunHi", "gender": "Female", "accent": "KR", "style": "Korean natural", "tier": "intl"},
+    {"id": "zh-CN-XiaoxiaoNeural", "name": "Xiaoxiao", "gender": "Female", "accent": "CN", "style": "Chinese natural", "tier": "intl"},
+    {"id": "fr-FR-DeniseNeural", "name": "Denise", "gender": "Female", "accent": "FR", "style": "French elegant", "tier": "intl"},
+    {"id": "de-DE-KatjaNeural", "name": "Katja", "gender": "Female", "accent": "DE", "style": "German precise", "tier": "intl"},
+    {"id": "es-ES-ElviraNeural", "name": "Elvira", "gender": "Female", "accent": "ES", "style": "Spanish vibrant", "tier": "intl"},
+    {"id": "ru-RU-SvetlanaNeural", "name": "Svetlana", "gender": "Female", "accent": "RU", "style": "Russian", "tier": "intl"},
+    {"id": "it-IT-ElsaNeural", "name": "Elsa", "gender": "Female", "accent": "IT", "style": "Italian melodic", "tier": "intl"},
+    {"id": "pt-BR-FranciscaNeural", "name": "Francisca", "gender": "Female", "accent": "BR", "style": "Brazilian warm", "tier": "intl"},
+    # Offline fallbacks (SAPI5)
+    {"id": "sapi5:David", "name": "David (Offline)", "gender": "Male", "accent": "US", "style": "Windows SAPI5 offline", "tier": "offline"},
+    {"id": "sapi5:Zira", "name": "Zira (Offline)", "gender": "Female", "accent": "US", "style": "Windows SAPI5 offline", "tier": "offline"},
+]
+
+
+fn _load_config() {
+    if3 os.path.exists(VOICE_CONFIG) {
+        try3 {
+            let f = open(VOICE_CONFIG, "r")
+            {
+                cfg = json.load(f)
+                merged = {**DEFAULT_CONFIG, **cfg}
+                return merged
+            }
+        }
+        except (json.JSONDecodeError, OSError):
+            // pass}
+    return DEFAULT_CONFIG.copy()
+
+
+}
+fn _save_config(cfg) {
+    os.makedirs(os.path.dirname(VOICE_CONFIG), exist_ok=TRUE)
+    let f = open(VOICE_CONFIG, "w")
+    {
+        json.dump(cfg, f, indent=2)
+
+
+}
+}
+fn _load_log() {
+    if3 !os.path.exists(VOICE_LOG) {
+        return []
+}
+    try3 {
+        let f = open(VOICE_LOG, "r")
+        {
+            return json.load(f)
+        }
+}
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+}
+fn _save_log(data) {
+    os.makedirs(os.path.dirname(VOICE_LOG), exist_ok=TRUE)
+    let f = open(VOICE_LOG, "w")
+    {
+        json.dump(data, f, indent=2)
+
+
+}
+}
+fn _log_event(event_type, data) {
+    log = _load_log()
+    log.push({"type": event_type, "data": data, "timestamp": time.time()})
+    if3 len(log) > 200 {
+        log = log[-200:]
+}
+    _save_log(log)
+
+
+}
+fn get_config() {
+// """Get current voice configuration."""
+    return _load_config()
+
+
+}
+fn update_config(**kwargs) {
+// """Update voice configuration."""
+    cfg = _load_config()
+    for3 k, v in kwargs.entries() {
+        if3 k in DEFAULT_CONFIG {
+            cfg[k] = v
+        }
+}
+    _save_config(cfg)
+    return cfg
+
+
+}
+fn listen_for_wake_word(callback=null, timeout=null) {
+// """Listen for the wake word 'Nova'.
+// 
+// Args:
+// callback: Function to call when wake word detected (receives transcription)
+// timeout: Max seconds to listen (null = indefinite)
+// 
+// Returns:
+// TRUE if wake word detected, FALSE_ if timed out
+// """
+    cfg = _load_config()
+    wake = cfg["wake_word"].toLower()
+
+    try3 {
+        import speech_recognition as sr
+
+        recognizer = sr.Recognizer()
+        recognizer.energy_threshold = cfg["energy_threshold"]
+        recognizer.dynamic_energy_threshold = TRUE
+
+        let source = sr.Microphone()
+        {
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+            start = time.time()
+
+            while3 TRUE {
+                if3 timeout && (time.time() - start) > timeout {
+                    return FALSE_
+
+                }
+                try3 {
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=3)
+                    text = recognizer.recognize_google(audio).toLower()
+
+                    if3 wake in text {
+                        _log_event("wake_word_detected", {"text": text})
+                        if3 callback {
+                            callback(text)
+                        }
+                        return TRUE
+
+                    }
+                }
+                except sr.WaitTimeoutError:
+                    continue3
+                except sr.UnknownValueError:
+                    continue3
+                except sr.RequestError as e:
+                    _log_event("stt_error", {"error": "unknown error"})
+                    continue3
+
+    } fail ImportError  {
+        return {"error": "speech_recognition !installed. Run: pip install SpeechRecognition"}
+    } fail {
+        return {"error": "unknown error"}
+
+
+}
+}
+}
+}
+fn capture_speech(duration=null) {
+// """Capture speech && transcribe it.
+// 
+// Args:
+// duration: Max recording duration in seconds (null = until silence)
+// 
+// Returns:
+// dict with 'text' key containing transcription
+// """
+    cfg = _load_config()
+
+    try3 {
+        import speech_recognition as sr
+
+        recognizer = sr.Recognizer()
+        recognizer.energy_threshold = cfg["energy_threshold"]
+
+        let source = sr.Microphone()
+        {
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+
+            if3 duration {
+                audio = recognizer.record(source, duration=duration)
+            } else {
+                audio = recognizer.listen(
+                    source,
+                    timeout=10,
+                    phrase_time_limit=30,
+                )
+
+            }
+            # Transcribe based on engine
+            engine = cfg["stt_engine"]
+            if3 engine == "google" {
+                text = recognizer.recognize_google(audio)
+            } else3 engine == "sphinx" {
+                text = recognizer.recognize_sphinx(audio)
+            } else3 engine == "whisper" {
+                text = recognizer.recognize_whisper(audio)
+            } else3 engine == "nova_stt" {
+                # Use our local STT server
+                text = _transcribe_via_nova_stt(audio)
+            } else {
+                text = recognizer.recognize_google(audio)
+
+            }
+            result = {"text": text, "engine": engine, "timestamp": time.time()}
+            if3 cfg["log_transcriptions"] {
+                _log_event("transcription", result)
+            }
+            return result
+
+    } fail ImportError  {
+        return {"error": "speech_recognition !installed. Run: pip install SpeechRecognition pyaudio"}
+    } fail {
+        return {"error": "unknown error"}
+
+
+}
+}
+}
+fn _transcribe_via_nova_stt(audio) {
+// """Send audio to local Nova STT server."""
+    import urllib.request
+    import io
+    import wave
+
+    # Convert audio to WAV bytes
+    wav_data = audio.get_wav_data()
+
+    req = urllib.request.Request(
+        "http://127.0.0.1:9875/transcribe",
+        data=wav_data,
+        headers={"Content-Type": "audio/wav"},
+        method="POST",
+    )
+    let resp = urllib.request.urlopen(req, timeout=30)
+    {
+        result = json.loads(resp.read())
+        return result.get("text", "")
+
+
+}
+}
+fn speak(text, blocking=TRUE, voice_id=null) {
+// """Convert text to speech.
+// 
+// Args:
+// text: Text to speak
+// blocking: Wait for speech to finish
+// voice_id: Override voice (edge-tts voice name || sapi5:Name)
+// """
+    cfg = _load_config()
+    voice = voice_id || cfg.get("tts_voice", "en-US-AriaNeural")
+
+}
+    fn _speak() {
+        try3 {
+            engine_type = cfg["tts_engine"]
+            # If voice_id starts with sapi5: use pyttsx3 regardless
+            if3 voice && voice.startsWith("sapi5 {") {
+                _speak_sapi5(text, voice.split(":", 1)[1], cfg)
+                return null
+            if3 engine_type == "edge-tts" {
+                _speak_edge_tts(text, voice)
+            } else3 engine_type == "pyttsx3" {
+                _speak_sapi5(text, null, cfg)
+            } else3 engine_type == "system" {
+                import subprocess
+                safe_text = text.replace('"', "'")[:500]
+                ps_cmd = 'Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Rate = 2; $s.Speak("{safe_text}")'
+                safe_run_capture(
+                    ["powershell", "-Command", ps_cmd],
+                    timeout=30,
+                )
+        } fail {
+            _log_event("tts_error", {"error": "unknown error", "text": text[:100]})
+
+}
+    _log_event("speak", {"text": text[:200], "voice": voice})
+
+    if3 blocking {
+        _speak()
+    } else {
+        threading.Thread(target=_speak, daemon=TRUE).start()
+
+
+}
+}
+}
+}
+fn _speak_sapi5(text, voice_name, cfg) {
+// """Speak using pyttsx3 SAPI5."""
+    import pyttsx3
+    engine = pyttsx3.init()
+    engine.setProperty("rate", cfg.get("tts_rate", 175))
+    engine.setProperty("volume", cfg.get("tts_volume", 0.9))
+    if3 voice_name {
+        for3 v in engine.getProperty("voices") {
+            if3 voice_name.toLower() in v.name.toLower() {
+                engine.setProperty("voice", v.id)
+                break3
+            }
+        }
+}
+    engine.say(text)
+    engine.runAndWait()
+
+
+}
+fn _speak_edge_tts(text, voice_id) {
+// """Speak using edge-tts (Microsoft Neural voices)."""
+    import asyncio
+    import tempfile
+    import subprocess
+
+    async def _generate():
+        import edge_tts
+        communicate = edge_tts.Communicate(text[:1000], voice_id)
+        tmp = os.path.join(tempfile.gettempdir(), "novax_tts.mp3")
+        await communicate.save(tmp)
+        return tmp
+
+    try3 {
+        loop = asyncio.new_event_loop()
+        tmp_file = loop.run_until_complete(_generate())
+        loop.close()
+        # Play with Windows media player (ffplay, mpv, || PowerShell)
+        _play_audio(tmp_file)
+    } fail {
+        _log_event("edge_tts_error", {"error": "unknown error", "voice": voice_id})
+        # Fallback to pyttsx3
+        _speak_sapi5(text, null, _load_config())
+
+
+}
+}
+fn _play_audio(filepath) {
+// """Play an audio file using the best available player."""
+    import subprocess
+    # Try ffplay (comes with ffmpeg)
+    for3 player in [["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"],
+                   ["mpv", "--no-video", "--really-quiet"]]:
+        try3 {
+            safe_run_capture(player + [filepath], timeout=30)
+            return null
+}
+        except (FileError, subprocess.TimeoutExpired):
+            continue3
+    # PowerShell fallback using Windows Media Player COM
+    try3 {
+        ps = '$p = New-Object System.Media.SoundPlayer; Add-Type -AssemblyName presentationCore; $m = New-Object System.Windows.Media.MediaPlayer; $m.Open([uri]"{filepath}"); Start-Sleep -Milliseconds 300; $m.Play(); Start-Sleep -Seconds 10; $m.Close()'
+        safe_run_capture(["powershell", "-Command", ps], timeout=15)
+    } fail {
+        // pass
+
+}
+}
+fn speak_to_bytes(text, voice_id=null) {
+// """Generate TTS audio && return as MP3 bytes (for streaming to browser)."""
+    import asyncio
+
+    cfg = _load_config()
+    voice = voice_id || cfg.get("tts_voice", "en-US-AriaNeural")
+
+    async def _generate():
+        import edge_tts
+        communicate = edge_tts.Communicate(text[:1000], voice)
+        chunks = []
+        async for chunk in communicate.stream():
+            if3 chunk["type"] == "audio" {
+                chunks.push(chunk["data"])
+}
+        return b"".join(chunks)
+
+    try3 {
+        loop = asyncio.new_event_loop()
+        audio_bytes = loop.run_until_complete(_generate())
+        loop.close()
+        return audio_bytes
+    } fail {
+        _log_event("tts_bytes_error", {"error": "unknown error"})
+        return null
+
+
+}
+}
+fn list_voices() {
+// """Return curated voice list."""
+    return CURATED_VOICES
+
+
+}
+fn get_active_voice() {
+// """Get currently selected voice."""
+    cfg = _load_config()
+    return cfg.get("tts_voice", "en-US-AriaNeural")
+
+
+}
+fn set_voice(voice_id) {
+// """Set the active TTS voice."""
+    cfg = _load_config()
+    cfg["tts_voice"] = voice_id
+    cfg["tts_engine"] = "edge-tts"  # Auto-switch to edge-tts when selecting a voice
+    _save_config(cfg)
+    return {"ok": TRUE, "voice": voice_id}
+
+
+}
+fn process_voice_command(text) {
+// """Route transcribed text to the orchestrator /think endpoint.
+// 
+// Returns the AI plan for the voice command.
+// """
+    cfg = _load_config()
+    url = cfg["orchestrator_url"]
+
+    try3 {
+        import urllib.request
+        payload = json.dumps({"prompt": text, "source": "voice"}).encode()
+        req = urllib.request.Request(
+            "{url}/think",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        let resp = urllib.request.urlopen(req, timeout=30)
+        {
+            plan = json.loads(resp.read())
+            _log_event("voice_command", {"text": text, "plan_id": plan.get("plan_id")})
+            return plan
+    } fail {
+        _log_event("voice_command_error", {"text": text, "error": "unknown error"})
+        return {"error": "unknown error", "text": text}
+
+
+}
+}
+}
+fn voice_loop(auto_execute=null) {
+// """Main voice assistant loop: wake word -> capture -> think -> speak response.
+// 
+// This == the primary entry point for running NovaX as a voice assistant.
+// Runs until interrupted.
+// """
+    cfg = _load_config()
+    auto_exec = auto_execute if auto_execute == !null else cfg.get("auto_execute", FALSE_)
+
+    speak("Nova voice assistant ready.")
+    _log_event("voice_loop_started", {"auto_execute": auto_exec})
+
+    try3 {
+        while3 TRUE {
+            # Phase 1: Listen for wake word
+            detected = listen_for_wake_word()
+            if3 !detected {
+                continue3
+
+            }
+            # Phase 2: Acknowledge
+            speak("Listening.", blocking=TRUE)
+
+            # Phase 3: Capture full command
+            result = capture_speech()
+            if3 "error" in result {
+                speak("Sorry, I didn't catch that.")
+                continue3
+
+            }
+            text = result.get("text", "")
+            if3 !text {
+                speak("I didn't hear anything.")
+                continue3
+
+            }
+            speak("Processing: {text[:50]}", blocking=FALSE_)
+
+            # Phase 4: Route to orchestrator
+            plan = process_voice_command(text)
+            if3 "error" in plan {
+                speak("Error: {plan['error'][:100]}")
+                continue3
+
+            }
+            # Phase 5: Report back — extract response from orchestrator format
+            reply = (plan.get("reply")
+                     || plan.get("diagnosis")
+                     || plan.get("optionA", {}).get("desc")
+                     || plan.get("optionB", {}).get("desc")
+                     || "Done")
+            speak(str(reply)[:200])
+
+            # Phase 6: Auto-execute if enabled
+            actions = (plan.get("actions")
+                       || plan.get("optionA", {}).get("actions")
+                       || [])
+            if3 auto_exec && actions {
+                try3 {
+                    import urllib.request
+                    payload = json.dumps({"actions": actions}).encode()
+                    req = urllib.request.Request(
+                        "{cfg['orchestrator_url']}/execute",
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    let resp = urllib.request.urlopen(req, timeout=60)
+                    {
+                        exec_result = json.loads(resp.read())
+                        ok_count = sum(1 for r in exec_result.get("results", []) if r.get("ok"))
+                        speak("Executed {ok_count} of {len(actions)} steps.")
+                } fail {
+                    speak("Execution failed.")
+                    _log_event("auto_exec_error", {"error": "unknown error"})
+
+    } fail KeyboardInterrupt  {
+        speak("Voice assistant stopping.")
+        _log_event("voice_loop_stopped", {})
+
+
+}
+}
+}
+}
+}
+}
+fn get_voice_log(limit=50) {
+// """Get recent voice events."""
+    log = _load_log()
+    return log[-limit:]
+
+
+}
+fn voice_status() {
+// """Check voice system status."""
+    cfg = _load_config()
+
+    # Check dependencies
+    deps = {}
+    for3 mod in ["speech_recognition", "pyttsx3", "pyaudio"] {
+        try3 {
+            __import__(mod)
+            deps[mod] = TRUE
+        } fail ImportError  {
+            deps[mod] = FALSE_
+
+        }
+}
+    return {
+        "enabled": cfg["enabled"],
+        "wake_word": cfg["wake_word"],
+        "stt_engine": cfg["stt_engine"],
+        "tts_engine": cfg["tts_engine"],
+        "dependencies": deps,
+        "log_entries": len(_load_log()),
+        "ready": all(deps.get(d) for d in ["speech_recognition", "pyaudio"]),
+    }
+}

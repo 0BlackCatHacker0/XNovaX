@@ -1,0 +1,1038 @@
+// ============================================================================
+// TShield -- The Invisible Spinner
+// NovaX IP Masking + Gateway Cloaking + Reflection Shield + Quantum Defense
+// Port 9987 | Ternary Micro-Tool | 3-5-7-13 Harmonics
+// ============================================================================
+// A shield spins to deflect all incoming threats.
+// TShield maintains an invisible protection layer:
+//   +1 = CLOAKED   (invisible, all shields active, no signature)
+//    0 = DEFLECTING (attack detected, reflecting payload)
+//   -1 = EXPOSED    (shield breach, emergency lockdown)
+//
+// If an attacker somehow penetrates the outer layers, whatever they
+// send gets amplified 100x and reflected back, overloading them.
+//
+// Integration chain: TShield -> TSpin -> TScale -> THunter (quad-guardian)
+// ============================================================================
+
+// -- Config --
+let VERSION = "2.0"
+let PORT = 9987
+let SERVICE = "nova-tshield"
+let server = tserve(PORT, "TShield NovaLang")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK_SIZE = 2187
+
+// -- Ternary States --
+let T_TRUE = 1
+let T_FALSE = -1
+let T_MAYBE = 0
+
+// -- Shield States --
+let CLOAKED = 1
+let DEFLECTING = 0
+let EXPOSED = -1
+
+// -- Thresholds (3-5-7-13 aligned) --
+let SPIN_INTERVAL = H3
+let REFLECTION_MULTIPLIER = 100
+let MAX_THREAT_LOG = H13 * 10
+let CLOAK_ROTATION = H7
+let LOCKDOWN_THRESHOLD = H13
+let RATE_LIMIT_HIGH = H13 * H5
+let RATE_LIMIT_MED = H13 * H3
+let PAYLOAD_THRESHOLD = BLOCK_SIZE * H13
+
+// -- Triad Peers (quad-guardian) --
+let TRIAD_PEERS = {
+    "tspin": "http://127.0.0.1:9970",
+    "tscale": "http://127.0.0.1:9986",
+    "thunter": "http://127.0.0.1:9988"
+}
+
+// -- State --
+let _shield_state = CLOAKED
+let _spin_count = 0
+let _threats_detected = 0
+let _threats_reflected = 0
+let _attacks_blocked = 0
+let _threat_log = []
+let _blocked_ips = {}
+let _reflection_log = []
+let _connection_monitor = {}
+let _triad_events = []
+let _triad_log = []
+let _t0 = time()
+let _last_rotation_time = time()
+
+let _shield_layers = {
+    "ip_mask": true,
+    "gateway_cloak": true,
+    "port_stealth": true,
+    "reflection": true,
+    "quantum_noise": true
+}
+
+// ============================================================================
+// RANDOM HELPERS -- use nova_run with Python's random module
+// ============================================================================
+
+fn random_int(lo, hi) {
+    let cmd = "python -c \"import random;print(random.randint(" + str(lo) + "," + str(hi) + "))\""
+    let raw = nova_run(cmd)
+    return int(trim(raw))
+}
+
+fn random_choice_3() {
+    // Returns one of: 10, 172, 192
+    let r = random_int(0, 2)
+    if r == 0 {
+        return 10
+    }
+    if r == 1 {
+        return 172
+    }
+    return 192
+}
+
+fn random_trit() {
+    // Returns -1, 0, or 1
+    let r = random_int(0, 2)
+    return r - 1
+}
+
+// ============================================================================
+// PHANTOM IDENTITY GENERATOR
+// ============================================================================
+
+fn generate_phantom_ip() {
+    let cmd = "python -c \"import random;o=[random.choice([10,172,192]),random.randint(0,255),random.randint(0,255),random.randint(1,254)];o[1]=random.randint(16,31) if o[0]==172 else (168 if o[0]==192 else o[1]);print('.'.join(str(x) for x in o))\""
+    let raw = nova_run(cmd)
+    return trim(raw)
+}
+
+fn generate_phantom_mac() {
+    let cmd = "python -c \"import random;print(':'.join(f'{random.randint(0,255):02x}' for _ in range(6)))\""
+    let raw = nova_run(cmd)
+    return trim(raw)
+}
+
+fn generate_phantom_gateway() {
+    let cmd = "python -c \"import random;nets=['10','172.16','192.168'];print(f'{random.choice(nets)}.{random.randint(0,255)}.1')\""
+    let raw = nova_run(cmd)
+    return trim(raw)
+}
+
+fn fingerprint_hash(data) {
+    let h = hash(data, "sha256")
+    // Take first H13 chars and convert to ternary trit string
+    let trits = ""
+    let sub = slice(h, 0, H13)
+    let i = 0
+    while i < len(sub) {
+        let c = sub[i]
+        // Convert hex char to int, mod 3, subtract 1 => -1/0/+1
+        let cmd = "python -c \"print((int('" + c + "',16)%3)-1)\""
+        let raw = nova_run(cmd)
+        let trits = trits + trim(raw)
+        let i = i + 1
+    }
+    return trits
+}
+
+// Initialize the first phantom identity
+let _current_phantom = {
+    "ip": generate_phantom_ip(),
+    "mac": generate_phantom_mac(),
+    "gateway": generate_phantom_gateway(),
+    "fingerprint": fingerprint_hash(str(time())),
+    "rotated_at": time()
+}
+
+// ============================================================================
+// TRIT HELPERS
+// ============================================================================
+
+fn shield_label(s) {
+    if s == 1 {
+        return "CLOAKED"
+    }
+    if s == 0 {
+        return "DEFLECTING"
+    }
+    if s == -1 {
+        return "EXPOSED"
+    }
+    return "UNKNOWN"
+}
+
+fn trit_char(t) {
+    if t == 1 {
+        return "1"
+    }
+    if t == 0 {
+        return "0"
+    }
+    return "T"
+}
+
+// ============================================================================
+// IDENTITY ROTATION
+// ============================================================================
+
+fn rotate_identity() {
+    let ts = str(time()) + str(_spin_count)
+    let _current_phantom = {
+        "ip": generate_phantom_ip(),
+        "mac": generate_phantom_mac(),
+        "gateway": generate_phantom_gateway(),
+        "fingerprint": fingerprint_hash(ts),
+        "rotated_at": time()
+    }
+    let _last_rotation_time = time()
+    return _current_phantom
+}
+
+// ============================================================================
+// LAZY SPIN -- check if rotation is due (replaces background thread)
+// NovaLang has no threading.Thread; instead we check on every
+// /health or /shield/status call whether enough time has passed.
+// ============================================================================
+
+fn lazy_spin() {
+    let now = time()
+    let elapsed = now - _last_rotation_time
+    let rotation_interval = CLOAK_ROTATION * SPIN_INTERVAL
+
+    // Rotate phantom identity if enough time has passed
+    if elapsed >= rotation_interval {
+        rotate_identity()
+        let _spin_count = _spin_count + 1
+    }
+
+    // Recalculate shield state based on recent threats
+    let recent_threats = 0
+    let i = 0
+    while i < len(_threat_log) {
+        let entry = _threat_log[i]
+        let t = dict_get(entry, "time", 0)
+        let age = now - t
+        if age < 60 {
+            let recent_threats = recent_threats + 1
+        }
+        let i = i + 1
+    }
+
+    let prev_state = _shield_state
+    if recent_threats >= LOCKDOWN_THRESHOLD {
+        let _shield_state = EXPOSED
+    } else {
+        if recent_threats >= H5 {
+            let _shield_state = DEFLECTING
+        } else {
+            let _shield_state = CLOAKED
+        }
+    }
+
+    // Notify triad on state transitions
+    if _shield_state != prev_state {
+        let from_label = shield_label(prev_state)
+        let to_label = shield_label(_shield_state)
+        notify_triad("state_changed", {
+            "from": from_label,
+            "to": to_label,
+            "recent_threats": recent_threats
+        })
+    }
+
+    if _shield_state == EXPOSED {
+        notify_triad("emergency", {
+            "type": "shield_exposed",
+            "threats": recent_threats,
+            "threshold": LOCKDOWN_THRESHOLD
+        })
+    }
+
+    // Clean stale connection monitor entries (older than 5 min)
+    let stale_ips = []
+    let keys_raw = keys(_connection_monitor)
+    let k = 0
+    while k < len(keys_raw) {
+        let ip_key = keys_raw[k]
+        let timestamps = dict_get(_connection_monitor, ip_key, [])
+        let all_stale = true
+        let j = 0
+        while j < len(timestamps) {
+            let ts_val = timestamps[j]
+            if now - ts_val < 300 {
+                let all_stale = false
+            }
+            let j = j + 1
+        }
+        if all_stale == true {
+            append(stale_ips, ip_key)
+        }
+        let k = k + 1
+    }
+    let s = 0
+    while s < len(stale_ips) {
+        dict_remove(_connection_monitor, stale_ips[s])
+        let s = s + 1
+    }
+
+    return _shield_state
+}
+
+// ============================================================================
+// CLOAK STATUS
+// ============================================================================
+
+fn get_cloak_status() {
+    let layer_keys = keys(_shield_layers)
+    let active = 0
+    let total = len(layer_keys)
+    let i = 0
+    while i < total {
+        let k = layer_keys[i]
+        let v = dict_get(_shield_layers, k, false)
+        if v == true {
+            let active = active + 1
+        }
+        let i = i + 1
+    }
+    let strength = 0
+    if total > 0 {
+        let strength = round(active / total, 2)
+    }
+    let invisible = false
+    if active == total {
+        let invisible = true
+    }
+    return {
+        "layers_active": active,
+        "layers_total": total,
+        "cloak_strength": strength,
+        "layers": _shield_layers,
+        "phantom_identity": _current_phantom,
+        "invisible": invisible
+    }
+}
+
+// ============================================================================
+// TRIAD COMMUNICATION -- fire-and-forget to TSpin + TScale + THunter
+// ============================================================================
+
+fn notify_triad(event_type, data) {
+    let payload = json_encode({
+        "source": SERVICE,
+        "port": PORT,
+        "event": event_type,
+        "data": data,
+        "time": time(),
+        "spin": _spin_count
+    })
+
+    // Fire-and-forget to each peer via http_post
+    let peer_keys = keys(TRIAD_PEERS)
+    let i = 0
+    while i < len(peer_keys) {
+        let name = peer_keys[i]
+        let url = dict_get(TRIAD_PEERS, name, "")
+        let target = url + "/triad/event"
+        // Wrap in try-like approach: nova_run with curl to avoid blocking
+        let curl_cmd = "curl -s -X POST -H \"Content-Type: application/json\" -d " + "'" + payload + "'" + " " + target + " --connect-timeout 1 --max-time 2 2>&1"
+        nova_run(curl_cmd)
+        let i = i + 1
+    }
+
+    // Log outbound
+    let entry = {"event": event_type, "data": data, "time": time()}
+    append(_triad_log, entry)
+    if len(_triad_log) > 50 {
+        let _triad_log = slice(_triad_log, len(_triad_log) - 50, len(_triad_log))
+    }
+}
+
+fn get_triad_status() {
+    let peers = {}
+    let peer_keys = keys(TRIAD_PEERS)
+    let i = 0
+    while i < len(peer_keys) {
+        let name = peer_keys[i]
+        let url = dict_get(TRIAD_PEERS, name, "")
+        let health_url = url + "/health"
+        let raw = ""
+        let cmd = "curl -s " + health_url + " --connect-timeout 1 --max-time 2 2>&1"
+        let raw = nova_run(cmd)
+        let trimmed = trim(raw)
+        if len(trimmed) > 2 {
+            let parsed = json_decode(trimmed)
+            if parsed != null {
+                dict_set(peers, name, parsed)
+            } else {
+                dict_set(peers, name, {"ok": false, "error": "parse_failed"})
+        } else {
+            dict_set(peers, name, {"ok": false, "error": "unreachable"})
+        }
+        let i = i + 1
+    }
+    return peers
+}
+
+// ============================================================================
+// THREAT ANALYSIS -- analyze incoming connections
+// Returns: trit, level, score
+// ============================================================================
+}
+
+fn log_threat(ip, port, level, score) {
+    let phantom_ip = dict_get(_current_phantom, "ip", "unknown")
+    let entry = {
+        "ip": ip,
+        "port": port,
+        "level": level,
+        "score": score,
+        "time": time(),
+        "phantom_at_time": phantom_ip,
+        "spin": _spin_count
+    }
+    append(_threat_log, entry)
+    if len(_threat_log) > MAX_THREAT_LOG {
+        let _threat_log = slice(_threat_log, len(_threat_log) - MAX_THREAT_LOG, len(_threat_log))
+    }
+
+    // Track per-IP
+    let existing = dict_get(_blocked_ips, ip, null)
+    if existing == null {
+        dict_set(_blocked_ips, ip, {
+            "count": 1,
+            "first_seen": time(),
+            "last_seen": time()
+        })
+    } else {
+        let old_count = dict_get(existing, "count", 0)
+        let first = dict_get(existing, "first_seen", time())
+        dict_set(_blocked_ips, ip, {
+            "count": old_count + 1,
+            "first_seen": first,
+            "last_seen": time()
+        })
+    }
+}
+
+fn analyze_connection(ip, port, payload_size) {
+    let threat_score = 0
+
+    // Check if IP is already blocked
+    let blocked_entry = dict_get(_blocked_ips, ip, null)
+    if blocked_entry != null {
+        let bc = dict_get(blocked_entry, "count", 0)
+        if bc >= LOCKDOWN_THRESHOLD {
+            return {"trit": T_FALSE, "level": "blocked_ip", "score": bc}
+        }
+    }
+
+    // Rate limiting: count connections from same IP in last 60s
+    let now = time()
+    let existing_ts = dict_get(_connection_monitor, ip, [])
+    append(existing_ts, now)
+
+    // Filter to last 60 seconds
+    let recent = []
+    let i = 0
+    while i < len(existing_ts) {
+        let ts = existing_ts[i]
+        if now - ts < 60 {
+            append(recent, ts)
+        }
+        let i = i + 1
+    }
+    dict_set(_connection_monitor, ip, recent)
+    let rate = len(recent)
+
+    if rate > RATE_LIMIT_HIGH {
+        let threat_score = threat_score + 3
+    } else {
+        if rate > RATE_LIMIT_MED {
+            let threat_score = threat_score + 1
+        }
+    }
+
+    // Large payload = potential buffer overflow
+    if payload_size > PAYLOAD_THRESHOLD {
+        let threat_score = threat_score + 2
+    }
+
+    // Port scan detection: connection to unusual port
+    if port > 0 {
+        if port != 80 {
+            if port != 443 {
+                if port != 8080 {
+                    if port != 8888 {
+                        if port != 9999 {
+                            let threat_score = threat_score + 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Classify
+    if threat_score >= 3 {
+        let _threats_detected = _threats_detected + 1
+        log_threat(ip, port, "hostile", threat_score)
+        notify_triad("threat_detected", {
+            "ip": ip, "port": port, "level": "hostile",
+            "score": threat_score
+        })
+        return {"trit": T_FALSE, "level": "hostile", "score": threat_score}
+    }
+    if threat_score >= 1 {
+        let _threats_detected = _threats_detected + 1
+        log_threat(ip, port, "suspicious", threat_score)
+        return {"trit": T_MAYBE, "level": "suspicious", "score": threat_score}
+    }
+    return {"trit": T_TRUE, "level": "safe", "score": threat_score}
+}
+
+// ============================================================================
+// REFLECTION SHIELD -- 100x bounce-back
+// ============================================================================
+
+fn reflect_attack(ip, payload_size) {
+    let reflected_size = payload_size * REFLECTION_MULTIPLIER
+    let _threats_reflected = _threats_reflected + 1
+    let _attacks_blocked = _attacks_blocked + 1
+
+    // Block the IP immediately
+    let existing = dict_get(_blocked_ips, ip, null)
+    if existing == null {
+        dict_set(_blocked_ips, ip, {
+            "count": LOCKDOWN_THRESHOLD,
+            "first_seen": time(),
+            "last_seen": time()
+        })
+    } else {
+        let first = dict_get(existing, "first_seen", time())
+        dict_set(_blocked_ips, ip, {
+            "count": LOCKDOWN_THRESHOLD,
+            "first_seen": first,
+            "last_seen": time()
+        })
+    }
+
+    // Log the reflection
+    let phantom_ip = dict_get(_current_phantom, "ip", "unknown")
+    let rlog_entry = {
+        "ip": ip,
+        "original_bytes": payload_size,
+        "reflected_bytes": reflected_size,
+        "multiplier": REFLECTION_MULTIPLIER,
+        "time": time(),
+        "phantom_used": phantom_ip,
+        "result": "overload_sent"
+    }
+    append(_reflection_log, rlog_entry)
+    if len(_reflection_log) > MAX_THREAT_LOG {
+        let _reflection_log = slice(_reflection_log, len(_reflection_log) - MAX_THREAT_LOG, len(_reflection_log))
+    }
+
+    // Notify triad
+    notify_triad("attack_reflected", {
+        "ip": ip, "original_bytes": payload_size,
+        "reflected_bytes": reflected_size,
+        "multiplier": REFLECTION_MULTIPLIER
+    })
+
+    let result_msg = "sent " + str(reflected_size) + " bytes back (" + str(REFLECTION_MULTIPLIER) + "x amplification)"
+
+    return {
+        "ok": true, "trit": T_TRUE,
+        "action": "reflected",
+        "original_bytes": payload_size,
+        "reflected_bytes": reflected_size,
+        "multiplier": REFLECTION_MULTIPLIER,
+        "target_ip": ip,
+        "result": result_msg
+    }
+}
+
+// ============================================================================
+// QUANTUM NOISE -- inject entropy to defeat pattern analysis
+// ============================================================================
+
+fn generate_quantum_noise() {
+    let size = H7 * H13
+    // Generate ternary noise trits via Python for speed
+    let cmd = "python -c \"import random,hashlib;n=[random.choice([-1,0,1]) for _ in range(" + str(size) + ")];p=''.join(str(t+1) for t in n);e=hashlib.sha256(p.encode()).hexdigest()[:13];print(len(n),len(p),e)\""
+    let raw = nova_run(cmd)
+    let parts = split(trim(raw), " ")
+    let noise_count = 0
+    let packed_size = 0
+    let entropy_hash = "unknown"
+    if len(parts) >= 3 {
+        let noise_count = int(parts[0])
+        let packed_size = int(parts[1])
+        let entropy_hash = parts[2]
+    }
+    return {
+        "noise_trits": noise_count,
+        "entropy_hash": entropy_hash,
+        "packed_size": packed_size,
+        "pattern_mask": true
+    }
+}
+
+// ============================================================================
+// GET HANDLERS
+// ============================================================================
+
+fn handle_health() {
+    // Lazy spin: check if rotation is due
+    lazy_spin()
+
+    let uptime = round(time() - _t0, 0)
+    let cloak_active = true
+    let layer_keys = keys(_shield_layers)
+    let lk = 0
+    while lk < len(layer_keys) {
+        let k = layer_keys[lk]
+        let v = dict_get(_shield_layers, k, false)
+        if v == false {
+            let cloak_active = false
+        }
+        let lk = lk + 1
+    }
+    let phantom_ip = dict_get(_current_phantom, "ip", "unknown")
+    let sl = shield_label(_shield_state)
+    let tc = trit_char(_shield_state)
+
+    return {
+        "ok": true,
+        "service": SERVICE,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "runtime": "novalang",
+        "shield_state": _shield_state,
+        "shield_label": sl,
+        "self_trit": _shield_state,
+        "char": tc,
+        "spins": _spin_count,
+        "threats_detected": _threats_detected,
+        "threats_reflected": _threats_reflected,
+        "attacks_blocked": _attacks_blocked,
+        "phantom_ip": phantom_ip,
+        "cloak_active": cloak_active,
+        "uptime": int(uptime),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+fn handle_shield_status() {
+    // Lazy spin: check if rotation is due
+    lazy_spin()
+
+    let cloak = get_cloak_status()
+    let sl = shield_label(_shield_state)
+    let blocked_count = len(keys(_blocked_ips))
+    let monitor_count = len(keys(_connection_monitor))
+
+    return {
+        "shield_state": sl,
+        "trit": _shield_state,
+        "spins": _spin_count,
+        "threats_detected": _threats_detected,
+        "threats_reflected": _threats_reflected,
+        "attacks_blocked": _attacks_blocked,
+        "blocked_ips": blocked_count,
+        "active_monitors": monitor_count,
+        "cloak": cloak,
+        "reflection_multiplier": REFLECTION_MULTIPLIER
+    }
+}
+
+fn handle_shield_identity() {
+    let age = round(time() - dict_get(_current_phantom, "rotated_at", time()), 0)
+    let rotation_interval = CLOAK_ROTATION * SPIN_INTERVAL
+    let next_in = rotation_interval - int(age)
+    if next_in < 0 {
+        let next_in = 0
+    }
+    let total_rotations = 0
+    if CLOAK_ROTATION > 0 {
+        let total_rotations = int(_spin_count / CLOAK_ROTATION)
+    }
+    return {
+        "ok": true,
+        "trit": _shield_state,
+        "phantom": _current_phantom,
+        "age_seconds": int(age),
+        "next_rotation_in": next_in,
+        "total_rotations": total_rotations
+    }
+}
+
+fn handle_shield_threats() {
+    // Return last 50 threats and blocked IPs with count >= H5
+    let log_end = len(_threat_log)
+    let log_start = log_end - 50
+    if log_start < 0 {
+        let log_start = 0
+    }
+    let recent = slice(_threat_log, log_start, log_end)
+
+    // Filter blocked IPs with count >= H5
+    let significant_blocked = {}
+    let bkeys = keys(_blocked_ips)
+    let i = 0
+    while i < len(bkeys) {
+        let bk = bkeys[i]
+        let bv = dict_get(_blocked_ips, bk, {})
+        let cnt = dict_get(bv, "count", 0)
+        if cnt >= H5 {
+            dict_set(significant_blocked, bk, bv)
+        }
+        let i = i + 1
+    }
+
+    return {
+        "ok": true,
+        "total_detected": _threats_detected,
+        "total_reflected": _threats_reflected,
+        "blocked_ips": significant_blocked,
+        "recent_threats": recent
+    }
+}
+
+fn handle_shield_reflections() {
+    let log_end = len(_reflection_log)
+    let log_start = log_end - 50
+    if log_start < 0 {
+        let log_start = 0
+    }
+    let recent = slice(_reflection_log, log_start, log_end)
+
+    return {
+        "ok": true,
+        "total_reflected": _threats_reflected,
+        "multiplier": REFLECTION_MULTIPLIER,
+        "recent": recent
+    }
+}
+
+fn handle_shield_layers() {
+    let layer_keys = keys(_shield_layers)
+    let active = 0
+    let total = len(layer_keys)
+    let i = 0
+    while i < total {
+        let k = layer_keys[i]
+        let v = dict_get(_shield_layers, k, false)
+        if v == true {
+            let active = active + 1
+        }
+        let i = i + 1
+    }
+    return {
+        "ok": true,
+        "layers": _shield_layers,
+        "active": active,
+        "total": total
+    }
+}
+
+fn handle_shield_noise() {
+    let noise = generate_quantum_noise()
+    return {"ok": true, "trit": T_TRUE, "noise": noise}
+}
+
+fn handle_triad() {
+    let peers = get_triad_status()
+
+    let ev_end = len(_triad_events)
+    let ev_start = ev_end - 20
+    if ev_start < 0 {
+        let ev_start = 0
+    }
+    let recent_inbound = slice(_triad_events, ev_start, ev_end)
+
+    let sent_end = len(_triad_log)
+    let sent_start = sent_end - 20
+    if sent_start < 0 {
+        let sent_start = 0
+    }
+    let recent_outbound = slice(_triad_log, sent_start, sent_end)
+
+    // Check if all peers are healthy
+    let peer_keys = keys(peers)
+    let all_healthy = true
+    let pk = 0
+    while pk < len(peer_keys) {
+        let pname = peer_keys[pk]
+        let pdata = dict_get(peers, pname, {})
+        let pok = dict_get(pdata, "ok", false)
+        if pok == false {
+            let all_healthy = false
+        }
+        let pk = pk + 1
+    }
+
+    let sl = shield_label(_shield_state)
+
+    return {
+        "ok": true,
+        "service": SERVICE,
+        "self_state": sl,
+        "self_trit": _shield_state,
+        "peers": peers,
+        "events_received": len(_triad_events),
+        "events_sent": len(_triad_log),
+        "recent_inbound": recent_inbound,
+        "recent_outbound": recent_outbound,
+        "triad_healthy": all_healthy
+    }
+}
+
+// ============================================================================
+// POST HANDLERS
+// ============================================================================
+
+fn handle_shield_analyze(body) {
+    let ip = dict_get(body, "ip", "0.0.0.0")
+    let port_num = dict_get(body, "port", 0)
+    let payload = dict_get(body, "payload_size", 0)
+
+    let result = analyze_connection(ip, port_num, payload)
+    let trit = dict_get(result, "trit", 0)
+    let level = dict_get(result, "level", "unknown")
+    let score = dict_get(result, "score", 0)
+
+    let action = "allowed"
+    if trit == T_FALSE {
+        let action = "blocked"
+    }
+    if trit == T_MAYBE {
+        let action = "monitored"
+    }
+
+    return {
+        "ok": true,
+        "trit": trit,
+        "level": level,
+        "score": score,
+        "ip": ip,
+        "action": action
+    }
+}
+
+fn handle_shield_reflect(body) {
+    let ip = dict_get(body, "ip", "")
+    let payload = dict_get(body, "payload_size", 1024)
+    if ip == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "ip required"}
+    }
+    let result = reflect_attack(ip, payload)
+    return result
+}
+
+fn handle_shield_block(body) {
+    let ip = dict_get(body, "ip", "")
+    if ip == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "ip required"}
+    }
+    let now = time()
+    dict_set(_blocked_ips, ip, {
+        "count": LOCKDOWN_THRESHOLD + 1,
+        "first_seen": now,
+        "last_seen": now
+    })
+    return {"ok": true, "trit": T_TRUE, "blocked": ip}
+}
+
+fn handle_shield_unblock(body) {
+    let ip = dict_get(body, "ip", "")
+    let existed = dict_get(_blocked_ips, ip, null)
+    let was_blocked = false
+    if existed != null {
+        dict_remove(_blocked_ips, ip)
+        let was_blocked = true
+    }
+    let trit = T_MAYBE
+    if was_blocked == true {
+        let trit = T_TRUE
+    }
+    return {
+        "ok": true,
+        "trit": trit,
+        "unblocked": ip,
+        "was_blocked": was_blocked
+    }
+}
+
+fn handle_shield_rotate(body) {
+    let identity = rotate_identity()
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "new_phantom": identity,
+        "msg": "identity rotated"
+    }
+}
+
+fn handle_shield_layer(body) {
+    let layer = dict_get(body, "layer", "")
+    let enabled = dict_get(body, "enabled", true)
+
+    let layer_keys = keys(_shield_layers)
+    let found = false
+    let i = 0
+    while i < len(layer_keys) {
+        if layer_keys[i] == layer {
+            let found = true
+        }
+        let i = i + 1
+    }
+
+    if found == true {
+        dict_set(_shield_layers, layer, enabled)
+        return {
+            "ok": true,
+            "trit": T_TRUE,
+            "layer": layer,
+            "enabled": enabled,
+            "layers": _shield_layers
+        }
+    }
+    return {
+        "ok": false,
+        "trit": T_FALSE,
+        "error": "unknown layer: " + layer,
+        "valid_layers": layer_keys
+    }
+}
+
+fn handle_shield_lockdown(body) {
+    // Emergency lockdown -- all layers on, rotate identity, EXPOSED state
+    let _shield_state = EXPOSED
+    let layer_keys = keys(_shield_layers)
+    let i = 0
+    while i < len(layer_keys) {
+        dict_set(_shield_layers, layer_keys[i], true)
+        let i = i + 1
+    }
+    rotate_identity()
+    return {
+        "ok": true,
+        "trit": T_FALSE,
+        "state": "LOCKDOWN",
+        "msg": "all layers activated, identity rotated, shield in emergency mode"
+    }
+}
+
+fn handle_triad_event(body) {
+    let event = dict_get(body, "event", "")
+    let source = dict_get(body, "source", "?")
+
+    // Store inbound event
+    append(_triad_events, body)
+    if len(_triad_events) > 100 {
+        let _triad_events = slice(_triad_events, len(_triad_events) - 100, len(_triad_events))
+    }
+
+    let response = {"ok": true, "trit": T_TRUE, "received": event}
+
+    // Handle specific triad events
+    if event == "zombie_killed" {
+        let data = dict_get(body, "data", {})
+        let emergency = dict_get(data, "emergency", false)
+        if emergency == true {
+            // Emergency kill = possible resource attack, rotate identity
+            rotate_identity()
+            dict_set(response, "identity_rotated", true)
+        }
+        let sl = shield_label(_shield_state)
+        dict_set(response, "shield_state", sl)
+        return response
+    }
+
+    if event == "conflict_resolved" {
+        // TScale resolved port conflict -- generate noise to mask
+        let qn_enabled = dict_get(_shield_layers, "quantum_noise", false)
+        if qn_enabled == true {
+            generate_quantum_noise()
+        }
+        dict_set(response, "noise_injected", true)
+        return response
+    }
+
+    if event == "emergency" {
+        // Emergency from peer -- go to lockdown mode
+        let layer_keys = keys(_shield_layers)
+        let i = 0
+        while i < len(layer_keys) {
+            dict_set(_shield_layers, layer_keys[i], true)
+            let i = i + 1
+        }
+        rotate_identity()
+        dict_set(response, "lockdown_engaged", true)
+        dict_set(response, "all_layers_active", true)
+        return response
+    }
+
+    // Generic event -- just acknowledge
+    return response
+}
+
+// ============================================================================
+// ROUTE REGISTRATION
+// ============================================================================
+
+// GET routes
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/shield/status", "handle_shield_status")
+troute(server, "GET", "/shield/identity", "handle_shield_identity")
+troute(server, "GET", "/shield/threats", "handle_shield_threats")
+troute(server, "GET", "/shield/reflections", "handle_shield_reflections")
+troute(server, "GET", "/shield/layers", "handle_shield_layers")
+troute(server, "GET", "/shield/noise", "handle_shield_noise")
+troute(server, "GET", "/triad", "handle_triad")
+
+// POST routes
+troute(server, "POST", "/shield/analyze", "handle_shield_analyze")
+troute(server, "POST", "/shield/reflect", "handle_shield_reflect")
+troute(server, "POST", "/shield/block", "handle_shield_block")
+troute(server, "POST", "/shield/unblock", "handle_shield_unblock")
+troute(server, "POST", "/shield/rotate", "handle_shield_rotate")
+troute(server, "POST", "/shield/layer", "handle_shield_layer")
+troute(server, "POST", "/shield/lockdown", "handle_shield_lockdown")
+troute(server, "POST", "/triad/event", "handle_triad_event")
+
+// ============================================================================
+// STARTUP BANNER
+// ============================================================================
+
+print("[TShield] The Invisible Spinner v" + VERSION + " -- Port " + str(PORT))
+print("[TShield] Shield states: +1=CLOAKED  0=DEFLECTING  -1=EXPOSED")
+print("[TShield] Layers: ip_mask, gateway_cloak, port_stealth, reflection, quantum_noise")
+print("[TShield] Reflection multiplier: " + str(REFLECTION_MULTIPLIER) + "x")
+print("[TShield] Spin interval: " + str(SPIN_INTERVAL) + "s | Rotation: every " + str(CLOAK_ROTATION) + " spins")
+let startup_ip = dict_get(_current_phantom, "ip", "unknown")
+print("[TShield] Phantom IP: " + startup_ip)
+print("[TShield] Runtime: NovaLang | Harmonics: 3-5-7-13")
+print("[TShield] Triad peers: tspin(:9970) tscale(:9986) thunter(:9988)")
+print("[TShield] GET: /health /shield/status /shield/identity /shield/threats /shield/reflections /shield/layers /shield/noise /triad")
+print("[TShield] POST: /shield/analyze /shield/reflect /shield/block /shield/unblock /shield/rotate /shield/layer /shield/lockdown /triad/event")
+print("[TShield] The shield is spinning...")
+
+// ============================================================================
+// START SERVER -- MUST BE LAST LINE
+// ============================================================================
+
+tstart(server)

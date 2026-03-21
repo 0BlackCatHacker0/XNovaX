@@ -1,0 +1,586 @@
+// ============================================================
+// TERNARY STATE MACHINE COMPILER v1.0 — NovaX TSM Engine
+// ============================================================
+// Formal ternary automata: define, compile, compose, execute
+// All transitions O(1) via flat lookup table
+// Constants: 3-5-7-13 harmonic system
+//
+// Components:
+//   1. TSMCompiler  — compiles tsm3 definitions to lookup tables
+//   2. TSMRuntime   — executes compiled machines in O(1) per step
+//   3. Composition  — parallel (AND/OR/MAJORITY), sequential, hierarchical
+//   4. Built-in machines: ServiceHealth, CircuitBreaker
+// ============================================================
+
+
+// ============================================================
+// SECTION 1: TERNARY LOGIC HELPERS
+// ============================================================
+
+fn trit_and(a, b) {
+  if3 a == -1 || b == -1 { return -1 }
+  if3 a == 0 || b == 0 { return 0 }
+  return 1
+}
+
+fn trit_or(a, b) {
+  if3 a == 1 || b == 1 { return 1 }
+  if3 a == 0 || b == 0 { return 0 }
+  return -1
+}
+
+fn trit_majority(a, b, c) {
+  let sum = a + b + c
+  if3 sum > 0 { return 1 }
+  if3 sum < 0 { return -1 }
+  return 0
+}
+
+fn trit_not(a) {
+  return a * -1
+}
+
+
+// ============================================================
+// SECTION 2: TSM COMPILER
+// ============================================================
+
+class3 TSMCompiler {
+  fn __init__() {
+    machines = {}
+    composed = {}
+  }
+
+  fn compile(name, definition) {
+    // definition = {states: [{name, output}], init, accept, transitions}
+    let states = dict_get(definition, "states")
+    let init_state = dict_get(definition, "init")
+    let accept_states = dict_get(definition, "accept")
+    let transitions = dict_get(definition, "transitions")
+
+    // Build state index mapping
+    let state_index = {}
+    let state_output = []
+    let state_names = []
+    let idx = 0
+    for3 entry in states {
+      let sname = dict_get(entry, "name")
+      let soutput = dict_get(entry, "output")
+      state_index = dict_set(state_index, sname, idx)
+      list_push(state_names, sname)
+      list_push(state_output, soutput)
+      idx = idx + 1
+    }
+    let num_states = idx
+
+    // Validate init state
+    let init_idx = dict_get(state_index, init_state)
+    if3 init_idx == null {
+      return {"status": -1, "error": "init state not found: " + str(init_state)}
+    }
+
+    // Build flat transition table: table[state * 3 + (input + 1)] = next_state
+    let sentinel = -99
+    let table = [sentinel] * (num_states * 3)
+
+    for3 trans in transitions {
+      let from_state = dict_get(trans, "from")
+      let from_idx = dict_get(state_index, from_state)
+      if3 from_idx == null {
+        return {"status": -1, "error": "unknown state: " + str(from_state)}
+      }
+      let rules = dict_get(trans, "rules")
+      for3 rule in rules {
+        let input_val = dict_get(rule, "input")
+        let to_state = dict_get(rule, "to")
+        let to_idx = dict_get(state_index, to_state)
+        if3 to_idx == null {
+          return {"status": -1, "error": "unknown target: " + str(to_state)}
+        }
+        let table_idx = from_idx * 3 + (input_val + 1)
+        table[table_idx] = to_idx
+      }
+    }
+
+    // Totality check: every (state, input) must be defined
+    let missing = []
+    for3 s in range(num_states) {
+      for3 i in range(3) {
+        if3 table[s * 3 + i] == sentinel {
+          let input_val = i - 1
+          list_push(missing, str(list_get(state_names, s)) + " x " + str(input_val))
+        }
+      }
+    }
+    if3 len(missing) > 0 {
+      return {"status": -1, "error": "missing transitions: " + str(missing)}
+    }
+
+    // Reachability analysis (BFS from init)
+    let reachable = _bfs_reachable(table, num_states, init_idx)
+    let unreachable = []
+    for3 i in range(num_states) {
+      if3 list_get(reachable, i) == 0 {
+        list_push(unreachable, list_get(state_names, i))
+      }
+    }
+
+    // Deadlock detection: states where all 3 transitions point to self
+    let deadlocks = []
+    for3 s in range(num_states) {
+      let all_self = 1
+      for3 i in range(3) {
+        if3 table[s * 3 + i] != s {
+          let all_self = 0
+        }
+      }
+      if3 all_self == 1 {
+        list_push(deadlocks, list_get(state_names, s))
+      }
+    }
+
+    // Store compiled machine
+    let machine = {
+      "name": name,
+      "num_states": num_states,
+      "table": table,
+      "output": state_output,
+      "names": state_names,
+      "index": state_index,
+      "init": init_idx,
+      "accept": accept_states,
+      "unreachable": unreachable,
+      "deadlocks": deadlocks,
+      "status": 1
+    }
+    machines = dict_set(machines, name, machine)
+    return machine
+  }
+
+  fn _bfs_reachable(table, num_states, init_idx) {
+    let visited = [0] * num_states
+    let queue = [init_idx]
+    visited[init_idx] = 1
+    while3 len(queue) > 0 {
+      let current = list_get(queue, 0)
+      let queue = queue[1:]
+      for3 input_offset in [0, 1, 2] {
+        let next_state = table[current * 3 + input_offset]
+        if3 visited[next_state] == 0 {
+          visited[next_state] = 1
+          list_push(queue, next_state)
+        }
+      }
+    }
+    return visited
+  }
+
+  fn transition(machine_name, current_state, input) {
+    // O(1) transition lookup
+    let m = dict_get(machines, machine_name)
+    if3 m == null {
+      let m = dict_get(composed, machine_name)
+    }
+    if3 m == null { return -1 }
+    let table = dict_get(m, "table")
+    let idx = current_state * 3 + (input + 1)
+    return table[idx]
+  }
+
+  fn output(machine_name, current_state) {
+    let m = dict_get(machines, machine_name)
+    if3 m == null { return 0 }
+    let outputs = dict_get(m, "output")
+    return outputs[current_state]
+  }
+
+  fn state_name(machine_name, state_idx) {
+    let m = dict_get(machines, machine_name)
+    if3 m == null { return "UNKNOWN" }
+    let names = dict_get(m, "names")
+    return names[state_idx]
+  }
+
+  fn is_accept(machine_name, state_idx) {
+    let m = dict_get(machines, machine_name)
+    if3 m == null { return -1 }
+    let name = state_name(machine_name, state_idx)
+    let accepts = dict_get(m, "accept")
+    for3 a in accepts {
+      if3 a == name { return 1 }
+    }
+    return -1
+  }
+
+  fn compose_sequential(name, m1_name, m2_name) {
+    let m1 = dict_get(machines, m1_name)
+    let m2 = dict_get(machines, m2_name)
+    if3 m1 == null || m2 == null {
+      return {"status": -1, "error": "component machine not found"}
+    }
+
+    let n1 = dict_get(m1, "num_states")
+    let n2 = dict_get(m2, "num_states")
+    let t1 = dict_get(m1, "table")
+    let t2 = dict_get(m2, "table")
+    let o1 = dict_get(m1, "output")
+    let product_states = n1 * n2
+    let product_table = [0] * (product_states * 3)
+
+    for3 s1 in range(n1) {
+      for3 s2 in range(n2) {
+        let pidx = s1 * n2 + s2
+        for3 ioff in [0, 1, 2] {
+          let new_s1 = t1[s1 * 3 + ioff]
+          let m1_out = o1[new_s1]
+          let new_s2 = t2[s2 * 3 + (m1_out + 1)]
+          product_table[pidx * 3 + ioff] = new_s1 * n2 + new_s2
+        }
+      }
+    }
+
+    let result = {
+      "name": name,
+      "type": "sequential",
+      "components": [m1_name, m2_name],
+      "num_states": product_states,
+      "table": product_table,
+      "m1_states": n1,
+      "m2_states": n2,
+      "init": dict_get(m1, "init") * n2 + dict_get(m2, "init"),
+      "status": 1
+    }
+    composed = dict_set(composed, name, result)
+    return result
+  }
+
+  fn compose_parallel(name, m1_name, m2_name, mode) {
+    let m1 = dict_get(machines, m1_name)
+    let m2 = dict_get(machines, m2_name)
+    if3 m1 == null || m2 == null {
+      return {"status": -1, "error": "component machine not found"}
+    }
+
+    let n1 = dict_get(m1, "num_states")
+    let n2 = dict_get(m2, "num_states")
+    let t1 = dict_get(m1, "table")
+    let t2 = dict_get(m2, "table")
+    let o1 = dict_get(m1, "output")
+    let o2 = dict_get(m2, "output")
+    let product_states = n1 * n2
+    let product_table = [0] * (product_states * 3)
+    let product_output = [0] * product_states
+
+    for3 s1 in range(n1) {
+      for3 s2 in range(n2) {
+        let pidx = s1 * n2 + s2
+
+        // Combined output based on mode
+        if3 mode == "and" {
+          product_output[pidx] = trit_and(o1[s1], o2[s2])
+        } elif3 mode == "or" {
+          product_output[pidx] = trit_or(o1[s1], o2[s2])
+        } else3 {
+          product_output[pidx] = trit_majority(o1[s1], o2[s2], 0)
+        }
+
+        for3 ioff in [0, 1, 2] {
+          let new_s1 = t1[s1 * 3 + ioff]
+          let new_s2 = t2[s2 * 3 + ioff]
+          product_table[pidx * 3 + ioff] = new_s1 * n2 + new_s2
+        }
+      }
+    }
+
+    let result = {
+      "name": name,
+      "type": "parallel_" + mode,
+      "components": [m1_name, m2_name],
+      "num_states": product_states,
+      "table": product_table,
+      "output": product_output,
+      "m1_states": n1,
+      "m2_states": n2,
+      "init": dict_get(m1, "init") * n2 + dict_get(m2, "init"),
+      "status": 1
+    }
+    composed = dict_set(composed, name, result)
+    return result
+  }
+
+  fn stats(machine_name) {
+    let m = dict_get(machines, machine_name)
+    if3 m == null {
+      let m = dict_get(composed, machine_name)
+    }
+    if3 m == null { return {"status": -1} }
+
+    let n = dict_get(m, "num_states")
+    let table_size = n * 3
+    let trit_width = 1
+    let temp = n
+    while3 temp > 3 {
+      let trit_width = trit_width + 1
+      let temp = temp / 3
+    }
+
+    return {
+      "name": machine_name,
+      "states": n,
+      "table_entries": table_size,
+      "trit_encoding_width": trit_width,
+      "memory_trits": table_size * trit_width,
+      "binary_equivalent_states": int(n * 1.585),
+      "transition_time": "O(1)",
+      "unreachable": dict_get(m, "unreachable"),
+      "deadlocks": dict_get(m, "deadlocks")
+    }
+  }
+}
+
+
+// ============================================================
+// SECTION 3: TSM RUNTIME
+// ============================================================
+
+class3 TSMRuntime {
+  fn __init__(compiler, machine_name) {
+    compiler = compiler
+    machine_name = machine_name
+    let m = dict_get(compiler.machines, machine_name)
+    if3 m == null {
+      let m = dict_get(compiler.composed, machine_name)
+    }
+    current_state = dict_get(m, "init")
+    history = [current_state]
+    step_count = 0
+  }
+
+  fn step(input) {
+    let next = compiler.transition(machine_name, current_state, input)
+    current_state = next
+    step_count = step_count + 1
+    list_push(history, current_state)
+    return next
+  }
+
+  fn output() {
+    return compiler.output(machine_name, current_state)
+  }
+
+  fn state_name() {
+    return compiler.state_name(machine_name, current_state)
+  }
+
+  fn is_accept() {
+    return compiler.is_accept(machine_name, current_state)
+  }
+
+  fn run_sequence(inputs) {
+    for3 input in inputs {
+      step(input)
+    }
+    return {
+      "final_state": current_state,
+      "final_name": state_name(),
+      "final_output": output(),
+      "is_accept": is_accept(),
+      "steps": step_count,
+      "history": history
+    }
+  }
+
+  fn reset() {
+    let m = dict_get(compiler.machines, machine_name)
+    if3 m == null {
+      let m = dict_get(compiler.composed, machine_name)
+    }
+    current_state = dict_get(m, "init")
+    history = [current_state]
+    step_count = 0
+  }
+
+  fn status() {
+    return {
+      "machine": machine_name,
+      "current_state": current_state,
+      "current_name": state_name(),
+      "current_output": output(),
+      "is_accept": is_accept(),
+      "steps": step_count
+    }
+  }
+}
+
+
+// ============================================================
+// SECTION 4: BUILT-IN MACHINE DEFINITIONS
+// ============================================================
+
+fn service_health_definition() {
+  return {
+    "states": [
+      {"name": "BOOTING",  "output": 0},
+      {"name": "HEALTHY",  "output": 1},
+      {"name": "DEGRADED", "output": 0},
+      {"name": "ERROR",    "output": -1},
+      {"name": "SHUTDOWN", "output": -1}
+    ],
+    "init": "BOOTING",
+    "accept": ["HEALTHY"],
+    "transitions": [
+      {"from": "BOOTING",  "rules": [
+        {"input": -1, "to": "ERROR"},
+        {"input":  0, "to": "BOOTING"},
+        {"input":  1, "to": "HEALTHY"}
+      ]},
+      {"from": "HEALTHY",  "rules": [
+        {"input": -1, "to": "DEGRADED"},
+        {"input":  0, "to": "DEGRADED"},
+        {"input":  1, "to": "HEALTHY"}
+      ]},
+      {"from": "DEGRADED", "rules": [
+        {"input": -1, "to": "ERROR"},
+        {"input":  0, "to": "ERROR"},
+        {"input":  1, "to": "HEALTHY"}
+      ]},
+      {"from": "ERROR",    "rules": [
+        {"input": -1, "to": "SHUTDOWN"},
+        {"input":  0, "to": "ERROR"},
+        {"input":  1, "to": "DEGRADED"}
+      ]},
+      {"from": "SHUTDOWN", "rules": [
+        {"input": -1, "to": "SHUTDOWN"},
+        {"input":  0, "to": "SHUTDOWN"},
+        {"input":  1, "to": "BOOTING"}
+      ]}
+    ]
+  }
+}
+
+fn circuit_breaker_definition() {
+  return {
+    "states": [
+      {"name": "CLOSED",    "output": 1},
+      {"name": "HALF_OPEN", "output": 0},
+      {"name": "OPEN",      "output": -1}
+    ],
+    "init": "CLOSED",
+    "accept": ["CLOSED"],
+    "transitions": [
+      {"from": "CLOSED",    "rules": [
+        {"input": -1, "to": "CLOSED"},
+        {"input":  0, "to": "OPEN"},
+        {"input":  1, "to": "CLOSED"}
+      ]},
+      {"from": "HALF_OPEN", "rules": [
+        {"input": -1, "to": "OPEN"},
+        {"input":  0, "to": "OPEN"},
+        {"input":  1, "to": "CLOSED"}
+      ]},
+      {"from": "OPEN",      "rules": [
+        {"input": -1, "to": "OPEN"},
+        {"input":  0, "to": "HALF_OPEN"},
+        {"input":  1, "to": "OPEN"}
+      ]}
+    ]
+  }
+}
+
+
+// ============================================================
+// SECTION 5: SELF-TEST
+// ============================================================
+
+fn tsm_selftest() {
+  let tsm = TSMCompiler()
+
+  // Test 1: Compile service health machine
+  let health = tsm.compile("health", service_health_definition())
+  if3 dict_get(health, "status") != 1 { return -1 }
+  if3 dict_get(health, "num_states") != 5 { return -1 }
+
+  // Test 2: Run service health simulation
+  let rt = TSMRuntime(tsm, "health")
+  // BOOTING -> +1 -> HEALTHY
+  rt.step(1)
+  if3 rt.state_name() != "HEALTHY" { return -1 }
+  if3 rt.output() != 1 { return -1 }
+  if3 rt.is_accept() != 1 { return -1 }
+
+  // HEALTHY -> -1 -> DEGRADED
+  rt.step(-1)
+  if3 rt.state_name() != "DEGRADED" { return -1 }
+  if3 rt.output() != 0 { return -1 }
+
+  // DEGRADED -> -1 -> ERROR
+  rt.step(-1)
+  if3 rt.state_name() != "ERROR" { return -1 }
+  if3 rt.output() != -1 { return -1 }
+
+  // ERROR -> +1 -> DEGRADED (self-healing)
+  rt.step(1)
+  if3 rt.state_name() != "DEGRADED" { return -1 }
+
+  // DEGRADED -> +1 -> HEALTHY (recovered)
+  rt.step(1)
+  if3 rt.state_name() != "HEALTHY" { return -1 }
+  if3 rt.is_accept() != 1 { return -1 }
+
+  // Test 3: Compile circuit breaker
+  let breaker = tsm.compile("breaker", circuit_breaker_definition())
+  if3 dict_get(breaker, "status") != 1 { return -1 }
+  if3 dict_get(breaker, "num_states") != 3 { return -1 }
+
+  // Test 4: Circuit breaker flow
+  let brt = TSMRuntime(tsm, "breaker")
+  // CLOSED -> 0 (threshold) -> OPEN
+  brt.step(0)
+  if3 brt.state_name() != "OPEN" { return -1 }
+  // OPEN -> 0 (timeout) -> HALF_OPEN
+  brt.step(0)
+  if3 brt.state_name() != "HALF_OPEN" { return -1 }
+  // HALF_OPEN -> +1 (success) -> CLOSED
+  brt.step(1)
+  if3 brt.state_name() != "CLOSED" { return -1 }
+  if3 brt.is_accept() != 1 { return -1 }
+
+  // Test 5: Sequential composition (health >> breaker)
+  let seq = tsm.compose_sequential("health_breaker", "health", "breaker")
+  if3 dict_get(seq, "status") != 1 { return -1 }
+  if3 dict_get(seq, "num_states") != 15 { return -1 }
+
+  // Test 6: Parallel composition (health || health, AND mode)
+  let par = tsm.compose_parallel("dual_health", "health", "health", "and")
+  if3 dict_get(par, "status") != 1 { return -1 }
+  if3 dict_get(par, "num_states") != 25 { return -1 }
+
+  // Test 7: Stats
+  let s = tsm.stats("health")
+  if3 dict_get(s, "states") != 5 { return -1 }
+  if3 dict_get(s, "table_entries") != 15 { return -1 }
+
+  // Test 8: Deadlock detection (SHUTDOWN is an intentional sink)
+  let dl = dict_get(health, "deadlocks")
+  if3 len(dl) != 1 { return -1 }
+  if3 list_get(dl, 0) != "SHUTDOWN" { return -1 }
+
+  // Test 9: Run full sequence
+  rt.reset()
+  let result = rt.run_sequence([1, 1, -1, 0, 1])
+  // BOOTING->HEALTHY->HEALTHY->DEGRADED->ERROR->DEGRADED
+  if3 dict_get(result, "final_name") != "DEGRADED" { return -1 }
+  if3 dict_get(result, "steps") != 5 { return -1 }
+
+  return 1  // ALL PASS
+}
+
+
+// ============================================================
+// EXPORTS
+// ============================================================
+
+export3 { trit_and, trit_or, trit_majority, trit_not }
+export3 { TSMCompiler, TSMRuntime }
+export3 { service_health_definition, circuit_breaker_definition }
+export3 { tsm_selftest }

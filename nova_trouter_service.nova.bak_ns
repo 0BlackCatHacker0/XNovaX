@@ -1,0 +1,1410 @@
+// Nova TRouter v1.0 - Ternary API Gateway/Router (NovaLang port)
+// Port 9963: Smart API gateway that routes requests to the right NovaX service
+//            based on intent classification. Clients no longer need to know
+//            individual service ports; they ask TRouter and it proxies.
+//
+// Features:
+//   - Intent-based routing (keyword classification -> best service)
+//   - Explicit proxy mode (name a service + path, TRouter forwards)
+//   - Dynamic service registration (services announce themselves)
+//   - Service topology / dependency graph
+//   - On-demand health sweep via POST /trouter/sweep (no background thread)
+//   - Reynolds flow regime tracking per-service
+//
+// N-S Mapping:
+//   request_flow    = velocity_field (requests flowing through the gateway)
+//   alive_services  = laminar_particles (stable, reachable)
+//   dead_services   = turbulent_particles (unreachable, chaotic)
+//   Re < H3^3 (27)  = laminar  (healthy gateway, most services up)
+//   Re > H7^3 (343) = turbulent (many dead services, degraded routing)
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3 ternary base  H5=5 TZip pack  H7=7 composition  H13=13 carrier
+//   Health timeout     = H3 seconds
+//   Sweep interval     = H13 seconds (informational, sweep is on-demand)
+//   Proxy timeout      = H13*2 + H3 + 1 = 30 seconds
+//   Max retries        = H3
+//   Max services       = H13*H13 = 169
+
+let PORT = 9963
+let server = tserve(PORT, "TRouter v1.0 - Ternary API Gateway")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+
+// -- Derived Constants --
+let PROXY_TIMEOUT   = 30    // H13*2 + H3 + 1 = 30 seconds
+let HEALTH_TIMEOUT  = 3     // H3: connection timeout for health checks
+let SWEEP_INTERVAL  = 13    // H13: informational, sweep is on-demand here
+let MAX_SERVICES    = 169   // H13*H13: maximum registered services
+let MAX_PROXY_BODY  = 10935 // BLOCK*H5 = 2187*5
+let RE_LAMINAR      = 27    // H3^3: stable gateway boundary
+let RE_TURBULENT    = 343   // H7^3: critical turbulence boundary
+
+// -- Ternary State Values --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Service Registry --
+// Each entry: {port, endpoints, health_status, health_detail, last_check,
+//              registered_at, dynamic, route_count}
+// health_status: 1=ALIVE, 0=DEGRADED/UNKNOWN, -1=DEAD
+let registry = {}
+
+// -- Route Log (last 169 routes for analytics) --
+let route_log = []
+let route_log_max = 169
+
+// -- Global Stats --
+let total_routes    = 0
+let total_proxies   = 0
+let total_sweeps    = 0
+let total_registers = 0
+
+// -- Service Dependency Graph (static) --
+let dep_hivemind    = ["cloud-router", "tbuffer", "tcache"]
+let dep_cloudrouter = []
+let dep_orchestrator = ["hivemind", "cloud-router", "twatch"]
+let dep_novacore    = ["hivemind", "cloud-router"]
+let dep_twatch      = []
+let dep_tbus        = []
+let dep_tresilience = ["twatch", "tbus"]
+let dep_deepstorage = ["tzip"]
+let dep_vault       = ["tzip"]
+let dep_tsecurity   = ["tauth"]
+let dep_tquery      = ["tcache"]
+let dep_tlog        = []
+let dep_tconfig     = []
+let dep_tcache      = []
+let dep_tscheduler  = ["tbus"]
+let dep_tbuffer     = ["tcache"]
+let dep_tnet        = []
+let dep_trouter     = ["twatch"]
+
+// ============================================================================
+// Registry Initialisation
+// ============================================================================
+
+fn init_registry() {
+    // Seed all known default services
+    dict_set(registry, "orchestrator",  {"port": 9999, "endpoints": ["/health", "/api/services/health"], "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "hivemind",      {"port": 9881, "endpoints": ["/health", "/hive/query", "/hive/status"],  "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "cloud-router",  {"port": 9878, "endpoints": ["/health", "/cloud/query"],                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "sentinel",      {"port": 9876, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "nexus",         {"port": 9882, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "deepstorage",   {"port": 9883, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "vault",         {"port": 9884, "endpoints": ["/health", "/vault/lock", "/vault/unlock"], "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tzip",          {"port": 9885, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tbuffer",       {"port": 9886, "endpoints": ["/health", "/tbuffer/query", "/tbuffer/store"], "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "appcontrol",    {"port": 9887, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tsecurity",     {"port": 9888, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tnet",          {"port": 9889, "endpoints": ["/health", "/tnet/fetch", "/tnet/probe"],   "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "novacore",      {"port": 9890, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tintelligence", {"port": 9924, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tbus",          {"port": 9945, "endpoints": ["/health", "/tbus/publish", "/tbus/subscribe"], "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tresilience",   {"port": 9948, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "twatch",        {"port": 9950, "endpoints": ["/health", "/twatch/status"],              "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tcache",        {"port": 9956, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tscheduler",    {"port": 9959, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tlog",          {"port": 9961, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tconfig",       {"port": 9962, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "exec",          {"port": 9877, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "relay",         {"port": 9880, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "cortex",        {"port": 9879, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "stt",           {"port": 9875, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tts",           {"port": 9874, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tquery",        {"port": 9911, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tshell",        {"port": 9905, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tbuild",        {"port": 9907, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tmedia",        {"port": 9908, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tmetrics",      {"port": 9909, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tmesh",         {"port": 9910, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+    dict_set(registry, "tauth",         {"port": 9952, "endpoints": ["/health"],                                 "health_status": 0, "health_detail": "not checked yet", "last_check": 0, "registered_at": 0, "dynamic": false, "route_count": 0})
+}
+
+// ============================================================================
+// Intent Classification
+// ============================================================================
+// Keyword -> service mapping (first best-match wins; more specific first)
+// We scan keywords for each rule and pick the rule with the most keyword hits.
+
+fn classify_intent(intent_text) {
+    // Returns {"service": name, "confidence": trit, "matched": [words]}
+    if3 intent_text == FALSE {
+        return {"service": "orchestrator", "confidence": T_FALSE, "matched": []}
+    } else intent_text == "" {
+        return {"service": "orchestrator", "confidence": T_FALSE, "matched": []}
+    } else {
+        let lw = lower(intent_text)
+
+        // ai / query rules
+        let best_service = "orchestrator"
+        let best_count   = 0
+        let best_matched = []
+
+        // Rule 1: hivemind
+        let m1 = []
+        if contains(lw, "query")    { let m1 = append(m1, "query")    }
+        if contains(lw, "ask")      { let m1 = append(m1, "ask")      }
+        if contains(lw, "ai")       { let m1 = append(m1, "ai")       }
+        if contains(lw, "model")    { let m1 = append(m1, "model")    }
+        if contains(lw, "generate") { let m1 = append(m1, "generate") }
+        if contains(lw, "chat")     { let m1 = append(m1, "chat")     }
+        if contains(lw, "prompt")   { let m1 = append(m1, "prompt")   }
+        if contains(lw, "llm")      { let m1 = append(m1, "llm")      }
+        if len(m1) > best_count {
+            let best_count   = len(m1)
+            let best_service = "hivemind"
+            let best_matched = m1
+        }
+
+        // Rule 2: tquery
+        let m2 = []
+        if contains(lw, "search") { let m2 = append(m2, "search") }
+        if contains(lw, "find")   { let m2 = append(m2, "find")   }
+        if contains(lw, "index")  { let m2 = append(m2, "index")  }
+        if contains(lw, "lookup") { let m2 = append(m2, "lookup") }
+        if len(m2) > best_count {
+            let best_count   = len(m2)
+            let best_service = "tquery"
+            let best_matched = m2
+        }
+
+        // Rule 3: deepstorage
+        let m3 = []
+        if contains(lw, "store")    { let m3 = append(m3, "store")    }
+        if contains(lw, "save")     { let m3 = append(m3, "save")     }
+        if contains(lw, "archive")  { let m3 = append(m3, "archive")  }
+        if contains(lw, "backup")   { let m3 = append(m3, "backup")   }
+        if contains(lw, "compress") { let m3 = append(m3, "compress") }
+        if len(m3) > best_count {
+            let best_count   = len(m3)
+            let best_service = "deepstorage"
+            let best_matched = m3
+        }
+
+        // Rule 4: tcache
+        let m4 = []
+        if contains(lw, "cache")  { let m4 = append(m4, "cache")  }
+        if contains(lw, "buffer") { let m4 = append(m4, "buffer") }
+        if contains(lw, "memo")   { let m4 = append(m4, "memo")   }
+        if len(m4) > best_count {
+            let best_count   = len(m4)
+            let best_service = "tcache"
+            let best_matched = m4
+        }
+
+        // Rule 5: tlog
+        let m5 = []
+        if contains(lw, "log")   { let m5 = append(m5, "log")   }
+        if contains(lw, "error") { let m5 = append(m5, "error") }
+        if contains(lw, "debug") { let m5 = append(m5, "debug") }
+        if contains(lw, "trace") { let m5 = append(m5, "trace") }
+        if contains(lw, "warn")  { let m5 = append(m5, "warn")  }
+        if len(m5) > best_count {
+            let best_count   = len(m5)
+            let best_service = "tlog"
+            let best_matched = m5
+        }
+
+        // Rule 6: tconfig
+        let m6 = []
+        if contains(lw, "config")     { let m6 = append(m6, "config")     }
+        if contains(lw, "setting")    { let m6 = append(m6, "setting")    }
+        if contains(lw, "preference") { let m6 = append(m6, "preference") }
+        if contains(lw, "env")        { let m6 = append(m6, "env")        }
+        if len(m6) > best_count {
+            let best_count   = len(m6)
+            let best_service = "tconfig"
+            let best_matched = m6
+        }
+
+        // Rule 7: twatch
+        let m7 = []
+        if contains(lw, "health")  { let m7 = append(m7, "health")  }
+        if contains(lw, "status")  { let m7 = append(m7, "status")  }
+        if contains(lw, "monitor") { let m7 = append(m7, "monitor") }
+        if contains(lw, "watch")   { let m7 = append(m7, "watch")   }
+        if contains(lw, "alive")   { let m7 = append(m7, "alive")   }
+        if len(m7) > best_count {
+            let best_count   = len(m7)
+            let best_service = "twatch"
+            let best_matched = m7
+        }
+
+        // Rule 8: vault
+        let m8 = []
+        if contains(lw, "encrypt") { let m8 = append(m8, "encrypt") }
+        if contains(lw, "vault")   { let m8 = append(m8, "vault")   }
+        if contains(lw, "secure")  { let m8 = append(m8, "secure")  }
+        if contains(lw, "decrypt") { let m8 = append(m8, "decrypt") }
+        if contains(lw, "lock")    { let m8 = append(m8, "lock")    }
+        if contains(lw, "shred")   { let m8 = append(m8, "shred")   }
+        if len(m8) > best_count {
+            let best_count   = len(m8)
+            let best_service = "vault"
+            let best_matched = m8
+        }
+
+        // Rule 9: tscheduler
+        let m9 = []
+        if contains(lw, "schedule") { let m9 = append(m9, "schedule") }
+        if contains(lw, "cron")     { let m9 = append(m9, "cron")     }
+        if contains(lw, "timer")    { let m9 = append(m9, "timer")    }
+        if contains(lw, "periodic") { let m9 = append(m9, "periodic") }
+        if contains(lw, "job")      { let m9 = append(m9, "job")      }
+        if len(m9) > best_count {
+            let best_count   = len(m9)
+            let best_service = "tscheduler"
+            let best_matched = m9
+        }
+
+        // Rule 10: tnet
+        let m10 = []
+        if contains(lw, "fetch")    { let m10 = append(m10, "fetch")    }
+        if contains(lw, "http")     { let m10 = append(m10, "http")     }
+        if contains(lw, "url")      { let m10 = append(m10, "url")      }
+        if contains(lw, "download") { let m10 = append(m10, "download") }
+        if contains(lw, "curl")     { let m10 = append(m10, "curl")     }
+        if contains(lw, "request")  { let m10 = append(m10, "request")  }
+        if len(m10) > best_count {
+            let best_count   = len(m10)
+            let best_service = "tnet"
+            let best_matched = m10
+        }
+
+        // Rule 11: tbus
+        let m11 = []
+        if contains(lw, "bus")       { let m11 = append(m11, "bus")       }
+        if contains(lw, "event")     { let m11 = append(m11, "event")     }
+        if contains(lw, "publish")   { let m11 = append(m11, "publish")   }
+        if contains(lw, "subscribe") { let m11 = append(m11, "subscribe") }
+        if contains(lw, "pubsub")    { let m11 = append(m11, "pubsub")    }
+        if len(m11) > best_count {
+            let best_count   = len(m11)
+            let best_service = "tbus"
+            let best_matched = m11
+        }
+
+        // Rule 12: tbuild
+        let m12 = []
+        if contains(lw, "build")   { let m12 = append(m12, "build")   }
+        if contains(lw, "compile") { let m12 = append(m12, "compile") }
+        if contains(lw, "make")    { let m12 = append(m12, "make")    }
+        if contains(lw, "bundle")  { let m12 = append(m12, "bundle")  }
+        if len(m12) > best_count {
+            let best_count   = len(m12)
+            let best_service = "tbuild"
+            let best_matched = m12
+        }
+
+        // Rule 13: tsecurity
+        let m13 = []
+        if contains(lw, "security")   { let m13 = append(m13, "security")   }
+        if contains(lw, "auth")       { let m13 = append(m13, "auth")       }
+        if contains(lw, "token")      { let m13 = append(m13, "token")      }
+        if contains(lw, "permission") { let m13 = append(m13, "permission") }
+        if len(m13) > best_count {
+            let best_count   = len(m13)
+            let best_service = "tsecurity"
+            let best_matched = m13
+        }
+
+        // Rule 14: tts
+        let m14 = []
+        if contains(lw, "speech") { let m14 = append(m14, "speech") }
+        if contains(lw, "tts")    { let m14 = append(m14, "tts")    }
+        if contains(lw, "speak")  { let m14 = append(m14, "speak")  }
+        if contains(lw, "voice")  { let m14 = append(m14, "voice")  }
+        if len(m14) > best_count {
+            let best_count   = len(m14)
+            let best_service = "tts"
+            let best_matched = m14
+        }
+
+        // Rule 15: stt
+        let m15 = []
+        if contains(lw, "listen")     { let m15 = append(m15, "listen")     }
+        if contains(lw, "stt")        { let m15 = append(m15, "stt")        }
+        if contains(lw, "transcribe") { let m15 = append(m15, "transcribe") }
+        if contains(lw, "dictate")    { let m15 = append(m15, "dictate")    }
+        if len(m15) > best_count {
+            let best_count   = len(m15)
+            let best_service = "stt"
+            let best_matched = m15
+        }
+
+        // Rule 16: tshell
+        let m16 = []
+        if contains(lw, "shell")    { let m16 = append(m16, "shell")    }
+        if contains(lw, "exec")     { let m16 = append(m16, "exec")     }
+        if contains(lw, "command")  { let m16 = append(m16, "command")  }
+        if contains(lw, "run")      { let m16 = append(m16, "run")      }
+        if contains(lw, "terminal") { let m16 = append(m16, "terminal") }
+        if len(m16) > best_count {
+            let best_count   = len(m16)
+            let best_service = "tshell"
+            let best_matched = m16
+        }
+
+        // Rule 17: tmedia
+        let m17 = []
+        if contains(lw, "media")   { let m17 = append(m17, "media")   }
+        if contains(lw, "image")   { let m17 = append(m17, "image")   }
+        if contains(lw, "video")   { let m17 = append(m17, "video")   }
+        if contains(lw, "audio")   { let m17 = append(m17, "audio")   }
+        if contains(lw, "convert") { let m17 = append(m17, "convert") }
+        if len(m17) > best_count {
+            let best_count   = len(m17)
+            let best_service = "tmedia"
+            let best_matched = m17
+        }
+
+        // Rule 18: tmetrics
+        let m18 = []
+        if contains(lw, "metric")  { let m18 = append(m18, "metric")  }
+        if contains(lw, "measure") { let m18 = append(m18, "measure") }
+        if contains(lw, "gauge")   { let m18 = append(m18, "gauge")   }
+        if contains(lw, "counter") { let m18 = append(m18, "counter") }
+        if len(m18) > best_count {
+            let best_count   = len(m18)
+            let best_service = "tmetrics"
+            let best_matched = m18
+        }
+
+        // Rule 19: tmesh
+        let m19 = []
+        if contains(lw, "mesh")     { let m19 = append(m19, "mesh")     }
+        if contains(lw, "network")  { let m19 = append(m19, "network")  }
+        if contains(lw, "topology") { let m19 = append(m19, "topology") }
+        if contains(lw, "peer")     { let m19 = append(m19, "peer")     }
+        if len(m19) > best_count {
+            let best_count   = len(m19)
+            let best_service = "tmesh"
+            let best_matched = m19
+        }
+
+        // Rule 20: tresilience
+        let m20 = []
+        if contains(lw, "resilience") { let m20 = append(m20, "resilience") }
+        if contains(lw, "retry")      { let m20 = append(m20, "retry")      }
+        if contains(lw, "circuit")    { let m20 = append(m20, "circuit")    }
+        if contains(lw, "fallback")   { let m20 = append(m20, "fallback")   }
+        if len(m20) > best_count {
+            let best_count   = len(m20)
+            let best_service = "tresilience"
+            let best_matched = m20
+        }
+
+        // Compute confidence trit from match count
+        let conf = T_FALSE
+        if best_count >= 2 {
+            let conf = T_TRUE
+        }
+        if best_count == 1 {
+            let conf = T_MAYBE
+        }
+
+        return {"service": best_service, "confidence": conf, "matched": best_matched}
+    }
+}
+
+// ============================================================================
+// Health Check Helper
+// ============================================================================
+
+fn check_health(name, port) {
+    // Returns {"trit": T_TRUE/T_MAYBE/T_FALSE, "detail": string}
+    // Uses http_get to /health endpoint. No TCP-only check in NovaLang.
+    let url = "http://127.0.0.1:" + str(port) + "/health"
+    try3 {
+        let resp = http_get(url, HEALTH_TIMEOUT)
+        // http_get returns response body string on success
+        let trit_val = T_MAYBE
+        let detail   = "responded"
+        try3 {
+            let data = json_decode(resp)
+            let ok_flag = dict_get(data, "ok")
+            if3 ok_flag == true {
+                let trit_val = T_TRUE
+                let detail   = "healthy"
+            } else ok_flag == false {
+                let trit_val = T_MAYBE
+                let detail   = "responding but not ok"
+            } else {
+                let trit_val = T_MAYBE
+                let detail   = "responded but malformed json"
+            }
+        } catch {
+            let trit_val = T_MAYBE
+            let detail   = "responded but malformed json"
+        }
+        return {"trit": trit_val, "detail": detail}
+    } catch {
+        return {"trit": T_FALSE, "detail": "http connect failed"}
+    }
+}
+
+// ============================================================================
+// Proxy Helper
+// ============================================================================
+
+fn proxy_request(port, path, method, body_data, timeout_s) {
+    // Proxy HTTP request to a local service.
+    // Returns {"status": code, "result": dict, "elapsed_ms": int, "trit": T}
+    let url = "http://127.0.0.1:" + str(port) + str(path)
+    let t0  = time()
+
+    try3 {
+        let raw_resp = ""
+        if3 method == "POST" {
+            let payload = json_encode(body_data)
+            let raw_resp = http_post(url, payload, timeout_s)
+        } else method == "PUT" {
+            let payload = json_encode(body_data)
+            let raw_resp = http_post(url, payload, timeout_s)
+        } else {
+            let raw_resp = http_get(url, timeout_s)
+        }
+
+        let elapsed = int((time() - t0) * 1000)
+        let result  = {}
+        try3 {
+            let result = json_decode(raw_resp)
+        } catch {
+            let result = {"raw": str(raw_resp)}
+        }
+
+        // Assume 200 on success from http_get/http_post (they raise on non-2xx)
+        return {"status": 200, "result": result, "elapsed_ms": elapsed, "trit": T_TRUE}
+    } catch {
+        let elapsed = int((time() - t0) * 1000)
+        return {"status": 503, "result": {"error": "service unreachable"}, "elapsed_ms": elapsed, "trit": T_FALSE}
+    }
+}
+
+// ============================================================================
+// Reynolds Scoring
+// ============================================================================
+
+fn calc_reynolds() {
+    // Re = dead_count / total_count * 1000 (dead fraction scaled to 1000)
+    // Re < 27 = laminar, 27..343 = transitional, >343 = turbulent
+    let svc_names = keys(registry)
+    let total     = len(svc_names)
+    if total == 0 {
+        return 0
+    }
+    let dead  = 0
+    let i     = 0
+    while3 i < total {
+        let nm  = svc_names[i]
+        let svc = dict_get(registry, nm)
+        let hs  = dict_get(svc, "health_status")
+        if3 hs == T_FALSE {
+            let dead = dead + 1
+        } else hs == MAYBE {
+            // degraded counts as half - skip for simple Re
+        } else {
+            // alive
+        }
+        let i = i + 1
+    }
+    let re = (dead * 1000) / total
+    return re
+}
+
+fn regime_from_re(re) {
+    if3 re > RE_TURBULENT {
+        return "turbulent"
+    } else re > RE_LAMINAR {
+        return "transitional"
+    } else {
+        return "laminar"
+    }
+}
+
+fn record_route(name) {
+    // Increment route_count on the registry entry
+    let has = dict_has(registry, name)
+    if3 has == true {
+        let svc = dict_get(registry, name)
+        let cnt = dict_get(svc, "route_count")
+        dict_set(svc, "route_count", cnt + 1)
+        dict_set(registry, name, svc)
+    } else has == false {
+        // not found, skip
+    } else {
+        // skip
+    }
+}
+
+// ============================================================================
+// Fallback Finder
+// ============================================================================
+
+fn find_fallback(service_name) {
+    // Tries AI group, storage group, monitor group, then orchestrator.
+    // Returns healthy alternative name or "" if none found.
+
+    // Check AI group
+    let ai_group = ["hivemind", "cloud-router", "novacore", "tintelligence"]
+    let g0len = len(ai_group)
+    let found = ""
+    let i = 0
+    while3 i < g0len {
+        let candidate = ai_group[i]
+        if3 candidate == service_name {
+            // skip self
+        } else candidate == "" {
+            // skip
+        } else {
+            let has = dict_has(registry, candidate)
+            if3 has == true {
+                let svc = dict_get(registry, candidate)
+                let hs  = dict_get(svc, "health_status")
+                if3 hs == T_TRUE {
+                    if found == "" {
+                        let found = candidate
+                    }
+                } else hs == T_MAYBE {
+                    // skip
+                } else {
+                    // skip
+                }
+            } else has == false {
+                // not registered
+            } else {
+                // skip
+            }
+        }
+        let i = i + 1
+    }
+    if found != "" {
+        return found
+    }
+
+    // Check storage group
+    let st_group = ["deepstorage", "tcache", "tbuffer"]
+    let g1len = len(st_group)
+    let i = 0
+    while3 i < g1len {
+        let candidate = st_group[i]
+        if3 candidate == service_name {
+            // skip self
+        } else candidate == "" {
+            // skip
+        } else {
+            let has = dict_has(registry, candidate)
+            if3 has == true {
+                let svc = dict_get(registry, candidate)
+                let hs  = dict_get(svc, "health_status")
+                if3 hs == T_TRUE {
+                    if found == "" {
+                        let found = candidate
+                    }
+                } else hs == T_MAYBE {
+                    // skip
+                } else {
+                    // skip
+                }
+            } else has == false {
+                // skip
+            } else {
+                // skip
+            }
+        }
+        let i = i + 1
+    }
+    if found != "" {
+        return found
+    }
+
+    // Check monitor group
+    let mn_group = ["twatch", "tlog", "tmetrics"]
+    let g2len = len(mn_group)
+    let i = 0
+    while3 i < g2len {
+        let candidate = mn_group[i]
+        if3 candidate == service_name {
+            // skip self
+        } else candidate == "" {
+            // skip
+        } else {
+            let has = dict_has(registry, candidate)
+            if3 has == true {
+                let svc = dict_get(registry, candidate)
+                let hs  = dict_get(svc, "health_status")
+                if3 hs == T_TRUE {
+                    if found == "" {
+                        let found = candidate
+                    }
+                } else hs == T_MAYBE {
+                    // skip
+                } else {
+                    // skip
+                }
+            } else has == false {
+                // skip
+            } else {
+                // skip
+            }
+        }
+        let i = i + 1
+    }
+    if found != "" {
+        return found
+    }
+
+    // Ultimate fallback: orchestrator
+    let has_orch = dict_has(registry, "orchestrator")
+    if3 has_orch == true {
+        let orch = dict_get(registry, "orchestrator")
+        let hs   = dict_get(orch, "health_status")
+        if3 hs == T_TRUE {
+            return "orchestrator"
+        } else hs == T_MAYBE {
+            // degraded
+        } else {
+            // dead
+        }
+    } else has_orch == false {
+        // not in registry
+    } else {
+        // skip
+    }
+
+    return ""
+}
+
+// ============================================================================
+// Endpoint Picker
+// ============================================================================
+
+fn pick_endpoint(endpoints) {
+    // Prefer first non-/health endpoint for functional routing.
+    // endpoints is a list of strings.
+    let n = len(endpoints)
+    let i = 0
+    while3 i < n {
+        let ep = endpoints[i]
+        if ep != "/health" {
+            return ep
+        }
+        let i = i + 1
+    }
+    return "/health"
+}
+
+// ============================================================================
+// Route Handlers
+// ============================================================================
+
+// GET /health
+fn health() {
+    let svc_names = keys(registry)
+    let total     = len(svc_names)
+    let alive     = 0
+    let degraded  = 0
+    let dead      = 0
+    let i         = 0
+    while3 i < total {
+        let nm  = svc_names[i]
+        let svc = dict_get(registry, nm)
+        let hs  = dict_get(svc, "health_status")
+        if3 hs == T_TRUE {
+            let alive = alive + 1
+        } else hs == T_MAYBE {
+            let degraded = degraded + 1
+        } else {
+            let dead = dead + 1
+        }
+        let i = i + 1
+    }
+
+    let re     = calc_reynolds()
+    let regime = regime_from_re(re)
+    let trit   = T_TRUE
+    if3 re > RE_TURBULENT {
+        let trit = T_FALSE
+    } else re > RE_LAMINAR {
+        let trit = T_MAYBE
+    } else {
+        let trit = T_TRUE
+    }
+
+    return {
+        "ok": true,
+        "service": "nova-trouter",
+        "port": PORT,
+        "version": "1.0.0",
+        "ternary": true,
+        "runtime": "novalang",
+        "trit": trit,
+        "reynolds": re,
+        "flow_regime": regime,
+        "services_total":    total,
+        "services_alive":    alive,
+        "services_degraded": degraded,
+        "services_dead":     dead,
+        "routes_handled":    total_routes,
+        "sweep_interval_s":  SWEEP_INTERVAL,
+        "proxy_timeout_s":   PROXY_TIMEOUT,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// GET /trouter/health
+fn trouter_health() {
+    return health()
+}
+
+// POST /trouter/route -- intent-based auto-routing
+fn trouter_route(body) {
+    let intent   = str(dict_get(body, "intent"))
+    let req_data = dict_get(body, "data")
+    let timeout  = PROXY_TIMEOUT
+
+    let raw_timeout = dict_get(body, "timeout")
+    if3 raw_timeout == FALSE {
+        let timeout = PROXY_TIMEOUT
+    } else raw_timeout == 0 {
+        let timeout = PROXY_TIMEOUT
+    } else {
+        let timeout = int(raw_timeout)
+        // clamp: H3..PROXY_TIMEOUT*2
+        if timeout < H3 {
+            let timeout = H3
+        }
+        if timeout > PROXY_TIMEOUT * 2 {
+            let timeout = PROXY_TIMEOUT * 2
+        }
+    }
+
+    if3 intent == "None" {
+        return {"ok": false, "trit": T_FALSE, "error": "intent string required"}
+    } else intent == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "intent string required"}
+    } else {
+        // Classify intent -> target service
+        let cls        = classify_intent(intent)
+        let target     = dict_get(cls, "service")
+        let confidence = dict_get(cls, "confidence")
+        let matched    = dict_get(cls, "matched")
+
+        // Resolve from registry
+        let has_svc = dict_has(registry, target)
+        if3 has_svc == false {
+            return {
+                "ok": false,
+                "trit": T_FALSE,
+                "error": "service not in registry: " + str(target),
+                "intent": intent,
+                "classified_as": target
+            }
+        } else has_svc == true {
+            let svc        = dict_get(registry, target)
+            let svc_port   = dict_get(svc, "port")
+            let hs         = dict_get(svc, "health_status")
+            let endpoints  = dict_get(svc, "endpoints")
+
+            // If service is dead, return MAYBE with fallback
+            if3 hs == T_FALSE {
+                let fb = find_fallback(target)
+                let fb_hint = "no fallback available"
+                if fb != "" {
+                    let fb_hint = "try /trouter/proxy with service=" + str(fb)
+                }
+                return {
+                    "ok": false,
+                    "trit": T_MAYBE,
+                    "error": "service " + str(target) + " is down",
+                    "classified_as": target,
+                    "confidence": confidence,
+                    "matched_keywords": matched,
+                    "fallback": fb,
+                    "suggestion": fb_hint
+                }
+            } else hs == T_MAYBE {
+                // Degraded but try anyway
+            } else {
+                // Healthy
+            }
+
+            // Pick best endpoint
+            let path   = pick_endpoint(endpoints)
+            let method = "GET"
+            let pd     = dict_get(body, "data")
+            if3 pd == FALSE {
+                let method = "GET"
+            } else pd == {} {
+                let method = "GET"
+            } else {
+                let method = "POST"
+            }
+
+            let proxy_result = proxy_request(svc_port, path, method, req_data, timeout)
+            let p_status     = dict_get(proxy_result, "status")
+            let p_result     = dict_get(proxy_result, "result")
+            let p_elapsed    = dict_get(proxy_result, "elapsed_ms")
+            let p_trit       = dict_get(proxy_result, "trit")
+
+            record_route(target)
+            total_routes = total_routes + 1
+
+            // Log entry (cap route_log at route_log_max)
+            let log_entry = {
+                "intent": intent,
+                "target": target,
+                "port": svc_port,
+                "path": path,
+                "status": p_status,
+                "elapsed_ms": p_elapsed,
+                "ts": time()
+            }
+            let route_log = append(route_log, log_entry)
+            if len(route_log) > route_log_max {
+                let route_log = slice(route_log, 1, len(route_log))
+            }
+
+            let re     = calc_reynolds()
+            let regime = regime_from_re(re)
+
+            return {
+                "ok": p_status < 400,
+                "trit": p_trit,
+                "routed_to": target,
+                "port": svc_port,
+                "path": path,
+                "confidence": confidence,
+                "matched_keywords": matched,
+                "status_code": p_status,
+                "elapsed_ms": p_elapsed,
+                "reynolds": re,
+                "flow_regime": regime,
+                "response": p_result
+        } else {
+            return {"ok": false, "trit": T_FALSE, "error": "registry lookup failed"}
+        }
+    }
+}
+
+// POST /trouter/proxy -- explicit service proxy
+}
+fn trouter_proxy(body) {
+    let svc_name = str(dict_get(body, "service"))
+    let path     = "/health"
+    let method   = "GET"
+    let timeout  = PROXY_TIMEOUT
+
+    let raw_path = dict_get(body, "path")
+    if3 raw_path == FALSE {
+        let path = "/health"
+    } else raw_path == "" {
+        let path = "/health"
+    } else {
+        let path = str(raw_path)
+    }
+
+    let raw_method = dict_get(body, "method")
+    if3 raw_method == FALSE {
+        let method = "GET"
+    } else raw_method == "" {
+        let method = "GET"
+    } else {
+        let method = upper(str(raw_method))
+    }
+
+    let raw_timeout = dict_get(body, "timeout")
+    if3 raw_timeout == FALSE {
+        let timeout = PROXY_TIMEOUT
+    } else raw_timeout == 0 {
+        let timeout = PROXY_TIMEOUT
+    } else {
+        let timeout = int(raw_timeout)
+        if timeout < H3 {
+            let timeout = H3
+        }
+        if timeout > PROXY_TIMEOUT * 2 {
+            let timeout = PROXY_TIMEOUT * 2
+        }
+    }
+
+    let proxy_body = dict_get(body, "body")
+
+    if3 svc_name == "None" {
+        return {"ok": false, "trit": T_FALSE, "error": "service name required"}
+    } else svc_name == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "service name required"}
+    } else {
+        // Validate method
+        let valid_method = false
+        if3 method == "GET"    { let valid_method = true }
+        else method == "POST"  { let valid_method = true }
+        else method == "PUT"   { let valid_method = true }
+        else method == "PATCH" { let valid_method = true }
+        else method == "DELETE" { let valid_method = true }
+        else {
+            let valid_method = false
+        }
+        if3 valid_method == false {
+            return {"ok": false, "trit": T_FALSE, "error": "unsupported method: " + str(method)}
+        } else valid_method == true {
+            // Ensure path starts with /
+            let first_char = slice(path, 0, 1)
+            if3 first_char == "/" {
+                // ok
+            } else first_char == "" {
+                let path = "/" + str(path)
+            } else {
+                let path = "/" + str(path)
+            }
+
+            // Resolve service - exact match first
+            let has_svc = dict_has(registry, svc_name)
+            let svc     = FALSE
+            let resolved_name = svc_name
+            if3 has_svc == true {
+                let svc = dict_get(registry, svc_name)
+            } else has_svc == false {
+                // Fuzzy match: scan registry keys for substring match
+                let svc_names = keys(registry)
+                let klen      = len(svc_names)
+                let ki        = 0
+                while3 ki < klen {
+                    let candidate = svc_names[ki]
+                    let lc_name  = lower(svc_name)
+                    let lc_cand  = lower(candidate)
+                    if3 contains(lc_cand, lc_name) {
+                        if3 svc == FALSE {
+                            let svc = dict_get(registry, candidate)
+                            let resolved_name = candidate
+                        } else svc == T_MAYBE {
+                            // already found
+                        } else {
+                            // already found
+                        }
+                    } else contains(lc_name, lc_cand) {
+                        if3 svc == FALSE {
+                            let svc = dict_get(registry, candidate)
+                            let resolved_name = candidate
+                        } else svc == T_MAYBE {
+                            // already found
+                        } else {
+                            // already found
+                    } else {
+                        // no match
+                    }
+                    let ki = ki + 1
+            } else {
+                // skip
+            }
+
+            if3 svc == FALSE {
+                let avail_keys = keys(registry)
+                return {
+                    "ok": false,
+                    "trit": T_FALSE,
+                    "error": "service not found: " + str(svc_name),
+                    "available_count": len(avail_keys)
+                }
+            } else svc == T_MAYBE {
+                return {"ok": false, "trit": T_FALSE, "error": "service lookup ambiguous"}
+            } else {
+                let svc_port = dict_get(svc, "port")
+                let hs       = dict_get(svc, "health_status")
+
+                if3 hs == T_FALSE {
+                    return {
+                        "ok": false,
+                        "trit": T_MAYBE,
+                        "error": "service " + str(resolved_name) + " appears down",
+                        "health_status": hs,
+                        "last_check": dict_get(svc, "last_check")
+                    }
+                } else hs == T_MAYBE {
+                    // degraded but try
+                } else {
+                    // healthy
+                }
+
+                let proxy_result = proxy_request(svc_port, path, method, proxy_body, timeout)
+                let p_status     = dict_get(proxy_result, "status")
+                let p_result     = dict_get(proxy_result, "result")
+                let p_elapsed    = dict_get(proxy_result, "elapsed_ms")
+                let p_trit       = dict_get(proxy_result, "trit")
+
+                record_route(resolved_name)
+                total_proxies = total_proxies + 1
+
+                let re     = calc_reynolds()
+                let regime = regime_from_re(re)
+
+                return {
+                    "ok": p_status < 400,
+                    "trit": p_trit,
+                    "service": resolved_name,
+                    "port": svc_port,
+                    "path": path,
+                    "method": method,
+                    "status_code": p_status,
+                    "elapsed_ms": p_elapsed,
+                    "reynolds": re,
+                    "flow_regime": regime,
+                    "response": p_result
+        } else {
+            return {"ok": false, "trit": T_FALSE, "error": "method validation failed"}
+        }
+    }
+}
+
+// GET /trouter/services -- list all registered services
+}
+}
+}
+}
+fn trouter_services() {
+    let svc_names = keys(registry)
+    let total     = len(svc_names)
+    let alive     = 0
+    let degraded  = 0
+    let dead      = 0
+    let services  = {}
+    let i         = 0
+
+    while3 i < total {
+        let nm   = svc_names[i]
+        let svc  = dict_get(registry, nm)
+        let hs   = dict_get(svc, "health_status")
+        let hd   = dict_get(svc, "health_detail")
+        let lc   = dict_get(svc, "last_check")
+        let eps  = dict_get(svc, "endpoints")
+        let dyn  = dict_get(svc, "dynamic")
+        let rc   = dict_get(svc, "route_count")
+        let port = dict_get(svc, "port")
+
+        let hchar = "?"
+        if3 hs == T_TRUE  { let hchar = "+" }
+        else hs == T_FALSE { let hchar = "-" }
+        else               { let hchar = "0" }
+
+        if3 hs == T_TRUE  { let alive    = alive + 1    }
+        else hs == T_MAYBE { let degraded = degraded + 1 }
+        else               { let dead     = dead + 1     }
+
+        dict_set(services, nm, {
+            "port":          port,
+            "health_status": hs,
+            "health_char":   hchar,
+            "health_detail": hd,
+            "last_check":    lc,
+            "endpoints":     eps,
+            "dynamic":       dyn,
+            "route_count":   rc
+        })
+        let i = i + 1
+    }
+
+    let summary_trit = T_TRUE
+    if dead > total / 2 {
+        let summary_trit = T_FALSE
+    }
+    if alive == 0 {
+        let summary_trit = T_FALSE
+    }
+    if dead > 0 {
+        if summary_trit == T_TRUE {
+            let summary_trit = T_MAYBE
+        }
+    }
+
+    return {
+        "ok": true,
+        "trit": summary_trit,
+        "total":    total,
+        "alive":    alive,
+        "degraded": degraded,
+        "dead":     dead,
+        "services": services
+    }
+}
+
+// GET /trouter/topology -- service dependency graph
+fn trouter_topology() {
+    let svc_names = keys(registry)
+    let total     = len(svc_names)
+    let nodes     = []
+    let edges     = []
+    let i         = 0
+
+    while3 i < total {
+        let nm   = svc_names[i]
+        let svc  = dict_get(registry, nm)
+        let hs   = dict_get(svc, "health_status")
+        let port = dict_get(svc, "port")
+        let hchar = "?"
+        if3 hs == T_TRUE  { let hchar = "+" }
+        else hs == T_FALSE { let hchar = "-" }
+        else               { let hchar = "0" }
+
+        let nodes = append(nodes, {
+            "id":     nm,
+            "port":   port,
+            "health": hs,
+            "char":   hchar
+        })
+        let i = i + 1
+    }
+
+    // Add static dependency edges
+    // hivemind depends on: cloud-router, tbuffer, tcache
+    let edges = append(edges, {"from": "hivemind",      "to": "cloud-router", "type": "depends_on"})
+    let edges = append(edges, {"from": "hivemind",      "to": "tbuffer",      "type": "depends_on"})
+    let edges = append(edges, {"from": "hivemind",      "to": "tcache",       "type": "depends_on"})
+    // orchestrator depends on: hivemind, cloud-router, twatch
+    let edges = append(edges, {"from": "orchestrator",  "to": "hivemind",     "type": "depends_on"})
+    let edges = append(edges, {"from": "orchestrator",  "to": "cloud-router", "type": "depends_on"})
+    let edges = append(edges, {"from": "orchestrator",  "to": "twatch",       "type": "depends_on"})
+    // novacore depends on: hivemind, cloud-router
+    let edges = append(edges, {"from": "novacore",      "to": "hivemind",     "type": "depends_on"})
+    let edges = append(edges, {"from": "novacore",      "to": "cloud-router", "type": "depends_on"})
+    // tresilience depends on: twatch, tbus
+    let edges = append(edges, {"from": "tresilience",   "to": "twatch",       "type": "depends_on"})
+    let edges = append(edges, {"from": "tresilience",   "to": "tbus",         "type": "depends_on"})
+    // deepstorage depends on: tzip
+    let edges = append(edges, {"from": "deepstorage",   "to": "tzip",         "type": "depends_on"})
+    // vault depends on: tzip
+    let edges = append(edges, {"from": "vault",         "to": "tzip",         "type": "depends_on"})
+    // tsecurity depends on: tauth
+    let edges = append(edges, {"from": "tsecurity",     "to": "tauth",        "type": "depends_on"})
+    // tquery depends on: tcache
+    let edges = append(edges, {"from": "tquery",        "to": "tcache",       "type": "depends_on"})
+    // tscheduler depends on: tbus
+    let edges = append(edges, {"from": "tscheduler",    "to": "tbus",         "type": "depends_on"})
+    // tbuffer depends on: tcache
+    let edges = append(edges, {"from": "tbuffer",       "to": "tcache",       "type": "depends_on"})
+    // trouter depends on: twatch
+    let edges = append(edges, {"from": "trouter",       "to": "twatch",       "type": "depends_on"})
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "nodes": nodes,
+        "edges": edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges)
+    }
+}
+
+// POST /trouter/register -- dynamic service registration
+fn trouter_register(body) {
+    let svc_name = str(dict_get(body, "name"))
+    let svc_port = dict_get(body, "port")
+    let endpoints = dict_get(body, "endpoints")
+
+    if3 svc_name == "None" {
+        return {"ok": false, "trit": T_FALSE, "error": "service name required"}
+    } else svc_name == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "service name required"}
+    } else {
+        let clean_name = lower(svc_name)
+
+        if3 svc_port == FALSE {
+            return {"ok": false, "trit": T_FALSE, "error": "valid port (1-65535) required"}
+        } else svc_port == 0 {
+            return {"ok": false, "trit": T_FALSE, "error": "valid port (1-65535) required"}
+        } else {
+            let port_int = int(svc_port)
+            if3 port_int < 1 {
+                return {"ok": false, "trit": T_FALSE, "error": "valid port (1-65535) required"}
+            } else port_int > 65535 {
+                return {"ok": false, "trit": T_FALSE, "error": "valid port (1-65535) required"}
+            } else {
+                // Validate endpoints (default to ["/health"] if missing)
+                let safe_eps = ["/health"]
+                if3 endpoints == FALSE {
+                    let safe_eps = ["/health"]
+                } else endpoints == [] {
+                    let safe_eps = ["/health"]
+                } else {
+                    let safe_eps = endpoints
+                    // Ensure /health is in the list
+                    if3 contains(json_encode(safe_eps), "/health") {
+                        // already present
+                    } else contains(json_encode(safe_eps), "/health") == false {
+                        let safe_eps = append(["/health"], safe_eps)
+                    } else {
+                        // ok
+                    }
+                }
+
+                // Check max services capacity
+                let current_count = len(keys(registry))
+                let already_exists = dict_has(registry, clean_name)
+                if3 current_count >= MAX_SERVICES {
+                    if3 already_exists == false {
+                        return {
+                            "ok": false,
+                            "trit": T_FALSE,
+                            "error": "max services reached: " + str(MAX_SERVICES)
+                        }
+                    } else already_exists == true {
+                        // Updating existing - allowed even at capacity
+                    } else {
+                        // skip
+                    }
+                } else current_count < MAX_SERVICES {
+                    // capacity available
+                } else {
+                    // skip
+                }
+
+                let action_str = "registered"
+                if3 already_exists == true {
+                    let action_str = "updated"
+                } else already_exists == false {
+                    let action_str = "registered"
+                } else {
+                    let action_str = "registered"
+                }
+
+                let now = time()
+                dict_set(registry, clean_name, {
+                    "port":          port_int,
+                    "endpoints":     safe_eps,
+                    "health_status": T_MAYBE,
+                    "health_detail": "just registered, not checked yet",
+                    "last_check":    0,
+                    "registered_at": now,
+                    "dynamic":       true,
+                    "route_count":   0
+                })
+
+                // Immediate health check
+                let hc     = check_health(clean_name, port_int)
+                let h_trit = dict_get(hc, "trit")
+                let h_det  = dict_get(hc, "detail")
+                let now2   = time()
+                let svc_entry = dict_get(registry, clean_name)
+                dict_set(svc_entry, "health_status", h_trit)
+                dict_set(svc_entry, "health_detail", h_det)
+                dict_set(svc_entry, "last_check",    now2)
+                dict_set(registry, clean_name, svc_entry)
+
+                total_registers = total_registers + 1
+
+                let hchar = "?"
+                if3 h_trit == T_TRUE  { let hchar = "+" }
+                else h_trit == T_FALSE { let hchar = "-" }
+                else                   { let hchar = "0" }
+
+                return {
+                    "ok": true,
+                    "trit": h_trit,
+                    "action": action_str,
+                    "service": clean_name,
+                    "port": port_int,
+                    "endpoints": safe_eps,
+                    "health_status": h_trit,
+                    "health_char":   hchar,
+                    "health_detail": h_det
+                }
+            }
+        }
+    }
+}
+
+// POST /trouter/sweep -- on-demand health sweep of all registered services
+fn trouter_sweep() {
+    let svc_names = keys(registry)
+    let total     = len(svc_names)
+    let alive     = 0
+    let degraded  = 0
+    let dead      = 0
+    let results   = {}
+    let i         = 0
+
+    while3 i < total {
+        let nm   = svc_names[i]
+        let svc  = dict_get(registry, nm)
+        let port = dict_get(svc, "port")
+        let hc   = check_health(nm, port)
+        let h_trit = dict_get(hc, "trit")
+        let h_det  = dict_get(hc, "detail")
+        let now    = time()
+
+        dict_set(svc, "health_status", h_trit)
+        dict_set(svc, "health_detail", h_det)
+        dict_set(svc, "last_check",    now)
+        dict_set(registry, nm, svc)
+
+        if3 h_trit == T_TRUE  { let alive    = alive + 1    }
+        else h_trit == T_MAYBE { let degraded = degraded + 1 }
+        else                   { let dead     = dead + 1     }
+
+        let hchar = "?"
+        if3 h_trit == T_TRUE  { let hchar = "+" }
+        else h_trit == T_FALSE { let hchar = "-" }
+        else                   { let hchar = "0" }
+
+        dict_set(results, nm, {"trit": h_trit, "char": hchar, "detail": h_det, "port": port})
+        let i = i + 1
+    }
+
+    total_sweeps = total_sweeps + 1
+
+    let sweep_trit = T_TRUE
+    if dead >= H3 {
+        let sweep_trit = T_FALSE
+    }
+    if dead > 0 {
+        if dead < H3 {
+            let sweep_trit = T_MAYBE
+        }
+    }
+
+    return {
+        "ok": true,
+        "trit": sweep_trit,
+        "total":    total,
+        "alive":    alive,
+        "degraded": degraded,
+        "dead":     dead,
+        "sweep_number": total_sweeps,
+        "results":  results,
+        "runtime":  "novalang",
+        "ternary":  true
+    }
+}
+
+// ============================================================================
+// Boot: seed registry, register routes
+// ============================================================================
+
+init_registry()
+
+let svc_count = len(keys(registry))
+
+troute(server, "GET",  "/health",             "health")
+troute(server, "GET",  "/trouter/health",     "trouter_health")
+troute(server, "POST", "/trouter/route",      "trouter_route")
+troute(server, "POST", "/trouter/proxy",      "trouter_proxy")
+troute(server, "GET",  "/trouter/services",   "trouter_services")
+troute(server, "GET",  "/trouter/topology",   "trouter_topology")
+troute(server, "POST", "/trouter/register",   "trouter_register")
+troute(server, "POST", "/trouter/sweep",      "trouter_sweep")
+
+print("[TRouter] NovaLang TRouter v1.0 - Ternary API Gateway")
+print("[TRouter] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TRouter] Registry seeded with " + str(svc_count) + " default services")
+print("[TRouter] H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TRouter] Proxy timeout: " + str(PROXY_TIMEOUT) + "s | Health timeout: " + str(HEALTH_TIMEOUT) + "s")
+print("[TRouter] Max services: " + str(MAX_SERVICES) + " (H13^2) | RE_LAM=" + str(RE_LAMINAR) + " RE_TUR=" + str(RE_TURBULENT))
+print("[TRouter] NOTE: No background thread - sweep is on-demand via POST /trouter/sweep")
+print("[TRouter] Routes: /health, /trouter/health, /trouter/route, /trouter/proxy, /trouter/services, /trouter/topology, /trouter/register, /trouter/sweep")
+
+tstart(server)

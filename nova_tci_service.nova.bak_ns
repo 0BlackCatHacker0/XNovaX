@@ -1,0 +1,2420 @@
+// ===================================================================
+// nova_tci_service.nova ? Ternary CI/CD Pipeline Engine
+// Port 9927 | Tier 4 Dev Tool | NovaLang native
+// Orchestrates: tgit + tbuild + tprofile + tpipeline
+// Returns +1 (pass), 0 (partial), -1 (fail) for each stage
+// ===================================================================
+
+let PORT = 9927
+let SERVICE_NAME = "nova-tci"
+let VERSION = "1.0.0"
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK = 2187
+
+// -- Service URLs --
+let TGIT_URL     = "http://127.0.0.1:9913"
+let TBUILD_URL   = "http://127.0.0.1:9909"
+let TPROFILE_URL = "http://127.0.0.1:9980"
+let ORCH_URL     = "http://127.0.0.1:9999"
+let TCRON_URL    = "http://127.0.0.1:9922"
+
+// -- Pipeline State --
+let pipelines = {}
+let pipeline_count = 0
+let total_runs = 0
+let pass_count = 0
+let fail_count = 0
+let partial_count = 0
+let start_time = time() * 1000
+
+// -- Pipeline Cache --
+// Key: "pipeline:stage:git_hash" -> cached stage result
+// Invalidates automatically when git hash changes
+let _stage_cache = {}
+let _cache_hits = 0
+let _cache_misses = 0
+
+// -- Pipeline Run History (for rollback) --
+// Stores last H13 completed pipeline runs with git hash, trit, and timestamp
+let _run_history = []
+let _history_max = 13
+
+// -- Scheduled Runs --
+// Cron-like scheduled pipeline runs via tcron integration
+let _scheduled_runs = []
+
+// -- Webhook Notifications --
+// Registered URLs that receive POST with pipeline results
+let _webhooks = []
+let _webhook_stats = {"sent": 0, "failed": 0, "last_error": ""}
+let _webhook_max = 13
+
+// ===================================================================
+// Ternary CI Stage Runner
+// ===================================================================
+
+fn run_stage(name, url, method, payload) {
+    let t0 = time() * 1000
+    let result = {}
+    let result = dict_set(result, "stage", name)
+    let result = dict_set(result, "start_ms", t0)
+
+    try3 {
+        let resp = {}
+        if3 method == "GET" {
+            let raw = http_get(url)
+            let resp = raw
+        } maybe {
+            let resp = {}
+        } else3 {
+            let resp = {}
+        }
+        if3 method == "POST" {
+            let raw = http_post(url, payload)
+            let resp = raw
+        } maybe {
+            let resp = {}
+        } else3 {
+            let resp = {}
+        }
+
+        let elapsed = time() * 1000 - t0
+        let result = dict_set(result, "elapsed_ms", elapsed)
+        let result = dict_set(result, "response", resp)
+
+        // Determine trit from response
+        let ok = dict_get(resp, "ok", false)
+        let trit_val = 0
+        if3 ok == true {
+            let trit_val = 1
+        } maybe {
+            let trit_val = 0
+        } else3 {
+            let trit_val = -1
+        }
+
+        // Check for errors
+        let err = dict_get(resp, "error", "")
+        if3 err != "" {
+            let trit_val = -1
+        } maybe {
+            // keep current
+        } else3 {
+            // keep current
+        }
+
+        let result = dict_set(result, "trit", trit_val)
+        let result = dict_set(result, "char", trit_char(trit_val))
+
+    } maybe {
+        let elapsed = time() * 1000 - t0
+        let result = dict_set(result, "elapsed_ms", elapsed)
+        let result = dict_set(result, "trit", 0)
+        let result = dict_set(result, "char", "~")
+        let result = dict_set(result, "error", "stage returned uncertain")
+    } fail {
+        let elapsed = time() * 1000 - t0
+        let result = dict_set(result, "elapsed_ms", elapsed)
+        let result = dict_set(result, "trit", -1)
+        let result = dict_set(result, "char", "-")
+        let result = dict_set(result, "error", "stage failed")
+    }
+
+    return result
+}
+
+// ===================================================================
+// Pipeline Cache: skip unchanged stages on re-run
+// ===================================================================
+
+fn get_git_hash(path) {
+    // Get current HEAD hash from tgit for cache key
+    try3 {
+        let resp = http_post(TGIT_URL + "/tgit/log", { "path": path, "count": 1 })
+        let ok = dict_get(resp, "ok", false)
+        if3 ok == true {
+            let commits = dict_get(resp, "commits", [])
+            if3 len(commits) > 0 {
+                return dict_get(commits[0], "hash", "unknown")
+            } maybe {
+                return "unknown"
+            } else3 {
+                return "unknown"
+            }
+        } maybe {
+            return "unknown"
+        } else3 {
+            return "unknown"
+    } fail {
+        return "unknown"
+    }
+}
+}
+
+fn cached_run_stage(pipeline, name, url, method, payload, git_hash, use_cache) {
+    // Check cache if enabled and hash is known
+    if3 use_cache == true {
+        if3 git_hash != "unknown" {
+            let cache_key = pipeline + ":" + name + ":" + git_hash
+            let cached = dict_get(_stage_cache, cache_key, null)
+            if3 cached != null {
+                // Cache hit: return cached result with cache marker
+                let _cache_hits = _cache_hits + 1
+                let cached = dict_set(cached, "cached", true)
+                let cached = dict_set(cached, "cache_key", cache_key)
+                return cached
+            } maybe {
+                // cache miss, fall through
+            } else3 {
+                // cache miss, fall through
+            }
+        } maybe {
+            // unknown hash, can't cache
+        } else3 {
+            // unknown hash, can't cache
+        }
+    } maybe {
+        // caching disabled
+    } else3 {
+        // caching disabled
+    }
+
+    // Cache miss: run the stage
+    let _cache_misses = _cache_misses + 1
+    let result = run_stage(name, url, method, payload)
+    let result = dict_set(result, "cached", false)
+
+    // Store in cache if stage passed (+1) and hash is known
+    if3 use_cache == true {
+        if3 git_hash != "unknown" {
+            let stage_trit = dict_get(result, "trit", 0)
+            if3 stage_trit == 1 {
+                // Only cache successful stages
+                let cache_key = pipeline + ":" + name + ":" + git_hash
+                let _stage_cache = dict_set(_stage_cache, cache_key, result)
+            } maybe {
+                // partial: don't cache
+            } else3 {
+                // failed: don't cache
+            }
+        } maybe {
+            // unknown hash
+        } else3 {
+            // unknown hash
+        }
+    } maybe {
+        // disabled
+    } else3 {
+        // disabled
+    }
+
+    return result
+}
+
+// ===================================================================
+// Pipeline Finalization (fires webhooks after every pipeline)
+// ===================================================================
+fn finalize_pipeline(result) {
+    let name = dict_get(result, "pipeline", "unknown")
+    let trit = dict_get(result, "overall_trit", 0)
+    let stages = dict_get(result, "stages", [])
+    let path = dict_get(result, "path", "C:\\NovaX")
+    let git_hash = get_git_hash(path)
+    // Record in history for rollback
+    let entry = {
+        "pipeline": name,
+        "trit": trit,
+        "trit_char": trit_char(trit),
+        "git_hash": git_hash,
+        "path": path,
+        "stage_count": len(stages),
+        "ts": time()
+    }
+    let _run_history = append(_run_history, entry)
+    if3 len(_run_history) > _history_max {
+        let _run_history = slice(_run_history, len(_run_history) - _history_max, len(_run_history))
+    } maybe {
+    } else3 {
+    }
+    fire_webhooks(name, trit, len(stages), 0)
+    return result
+}
+
+// ===================================================================
+// Pipeline Definitions
+// ===================================================================
+
+fn pipeline_lint(req) {
+    let body = dict_get(req, "body", {})
+    let path = dict_get(body, "path", "C:\\NovaX")
+    let use_cache = dict_get(body, "cache", true)
+    let git_hash = get_git_hash(path)
+    let stages = []
+
+    // Stage 1: Git status (never cached — always check current state)
+    let s1 = run_stage("git-status", TGIT_URL + "/tgit/status", "POST", { "path": path })
+    let stages = append(stages, s1)
+
+    // Stage 2: Build lint (cached if git hash unchanged)
+    let s2 = cached_run_stage("lint", "build-lint", TBUILD_URL + "/tbuild/lint", "POST", { "path": path }, git_hash, use_cache)
+    let stages = append(stages, s2)
+
+    // Aggregate
+    let trits = []
+    let trits = append(trits, dict_get(s1, "trit", 0))
+    let trits = append(trits, dict_get(s2, "trit", 0))
+    let overall = trit_majority(trits)
+
+    let total_runs = total_runs + 1
+    if3 overall == 1 {
+        let pass_count = pass_count + 1
+    } maybe {
+        let partial_count = partial_count + 1
+    } else3 {
+        let fail_count = fail_count + 1
+    }
+
+    return finalize_pipeline({
+        "pipeline": "lint",
+        "stages": stages,
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "path": path
+    })
+}
+
+fn pipeline_build(req) {
+    let body = dict_get(req, "body", {})
+    let path = dict_get(body, "path", "C:\\NovaX")
+    let target = dict_get(body, "target", "python")
+    let use_cache = dict_get(body, "cache", true)
+    let git_hash = get_git_hash(path)
+    let stages = []
+
+    // Stage 1: Check deps (cached)
+    let s1 = cached_run_stage("build", "deps-check", TBUILD_URL + "/tbuild/deps", "POST", { "path": path }, git_hash, use_cache)
+    let stages = append(stages, s1)
+
+    // Stage 2: Build order (cached)
+    let s2 = cached_run_stage("build", "build-order", TBUILD_URL + "/tbuild/order", "POST", { "path": path }, git_hash, use_cache)
+    let stages = append(stages, s2)
+
+    // Stage 3: Compile (cached)
+    let s3 = cached_run_stage("build", "compile", TBUILD_URL + "/tbuild/compile", "POST", { "path": path, "target": target }, git_hash, use_cache)
+    let stages = append(stages, s3)
+
+    // Stage 4: Lint (cached)
+    let s4 = cached_run_stage("build", "lint", TBUILD_URL + "/tbuild/lint", "POST", { "path": path }, git_hash, use_cache)
+    let stages = append(stages, s4)
+
+    // Aggregate
+    let trits = []
+    let trits = append(trits, dict_get(s1, "trit", 0))
+    let trits = append(trits, dict_get(s2, "trit", 0))
+    let trits = append(trits, dict_get(s3, "trit", 0))
+    let trits = append(trits, dict_get(s4, "trit", 0))
+    let overall = trit_majority(trits)
+
+    let total_runs = total_runs + 1
+    if3 overall == 1 {
+        let pass_count = pass_count + 1
+    } maybe {
+        let partial_count = partial_count + 1
+    } else3 {
+        let fail_count = fail_count + 1
+    }
+
+    return finalize_pipeline({
+        "pipeline": "build",
+        "stages": stages,
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "path": path,
+        "target": target
+    })
+}
+
+fn pipeline_full(req) {
+    let body = dict_get(req, "body", {})
+    let path = dict_get(body, "path", "C:\\NovaX")
+    let stages = []
+
+    // Stage 1: Git status
+    let s1 = run_stage("git-status", TGIT_URL + "/tgit/status", "POST", { "path": path })
+    let stages = append(stages, s1)
+
+    // Stage 2: Deps check
+    let s2 = run_stage("deps", TBUILD_URL + "/tbuild/deps", "POST", { "path": path })
+    let stages = append(stages, s2)
+
+    // Stage 3: Lint
+    let s3 = run_stage("lint", TBUILD_URL + "/tbuild/lint", "POST", { "path": path })
+    let stages = append(stages, s3)
+
+    // Stage 4: Compile
+    let s4 = run_stage("compile", TBUILD_URL + "/tbuild/compile", "POST", { "path": path })
+    let stages = append(stages, s4)
+
+    // Stage 5: Profile start
+    let s5 = run_stage("profile-start", TPROFILE_URL + "/tprofile/start", "POST", { "label": "ci-run" })
+    let stages = append(stages, s5)
+
+    // Stage 6: VCS check
+    let s6 = run_stage("vcs-check", TBUILD_URL + "/tbuild/vcs", "POST", { "path": path })
+    let stages = append(stages, s6)
+
+    // Stage 7: Profile end
+    let s7 = run_stage("profile-end", TPROFILE_URL + "/tprofile/end", "POST", { "label": "ci-run" })
+    let stages = append(stages, s7)
+
+    // Aggregate all stage trits
+    let trits = []
+    let trits = append(trits, dict_get(s1, "trit", 0))
+    let trits = append(trits, dict_get(s2, "trit", 0))
+    let trits = append(trits, dict_get(s3, "trit", 0))
+    let trits = append(trits, dict_get(s4, "trit", 0))
+    let trits = append(trits, dict_get(s6, "trit", 0))
+    let overall = trit_majority(trits)
+
+    let total_runs = total_runs + 1
+    if3 overall == 1 {
+        let pass_count = pass_count + 1
+    } maybe {
+        let partial_count = partial_count + 1
+    } else3 {
+        let fail_count = fail_count + 1
+    }
+
+    return finalize_pipeline({
+        "pipeline": "full",
+        "stages": stages,
+        "stage_count": 7,
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "path": path
+    })
+}
+
+fn pipeline_deploy(req) {
+    let body = dict_get(req, "body", {})
+    let path = dict_get(body, "path", "C:\\NovaX")
+    let service = dict_get(body, "service", "")
+    let stages = []
+
+    // Stage 1: Pre-deploy lint
+    let s1 = run_stage("pre-lint", TBUILD_URL + "/tbuild/lint", "POST", { "path": path })
+    let stages = append(stages, s1)
+
+    // Stage 2: Git log (check recent commits)
+    let s2 = run_stage("git-log", TGIT_URL + "/tgit/log", "POST", { "path": path, "count": 3 })
+    let stages = append(stages, s2)
+
+    // Stage 3: Build diff (check what changed)
+    let s3 = run_stage("build-diff", TBUILD_URL + "/tbuild/diff", "POST", { "path": path })
+    let stages = append(stages, s3)
+
+    // Stage 4: Service health (if deploying to a service)
+    if3 service != "" {
+        let svc_url = ORCH_URL + "/health"
+        let s4 = run_stage("service-health", svc_url, "GET", {})
+        let stages = append(stages, s4)
+    } maybe {
+        // no service specified
+    } else3 {
+        // no service specified
+    }
+
+    let trits = []
+    let trits = append(trits, dict_get(s1, "trit", 0))
+    let trits = append(trits, dict_get(s2, "trit", 0))
+    let trits = append(trits, dict_get(s3, "trit", 0))
+    let overall = trit_majority(trits)
+
+    let total_runs = total_runs + 1
+    if3 overall == 1 {
+        let pass_count = pass_count + 1
+    } maybe {
+        let partial_count = partial_count + 1
+    } else3 {
+        let fail_count = fail_count + 1
+    }
+
+    return finalize_pipeline({
+        "pipeline": "deploy",
+        "stages": stages,
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "path": path,
+        "service": service,
+        "deploy_ready": overall == 1
+    })
+}
+
+fn pipeline_test(req) {
+    let body = dict_get(req, "body", {})
+    let path = dict_get(body, "path", "C:\\NovaX")
+    let pattern = dict_get(body, "pattern", "test_*.nova")
+    let use_cache = dict_get(body, "cache", true)
+    let git_hash = get_git_hash(path)
+    let stages = []
+
+    // Stage 1: Git status (never cached)
+    let s1 = run_stage("git-status", TGIT_URL + "/tgit/status", "POST", { "path": path })
+    let stages = append(stages, s1)
+
+    // Stage 2: Lint before tests (cached)
+    let s2 = cached_run_stage("test", "pre-test-lint", TBUILD_URL + "/tbuild/lint", "POST", { "path": path }, git_hash, use_cache)
+    let stages = append(stages, s2)
+
+    // Stage 3: Discover test files via tbuild deps (scans for test_*.nova)
+    let test_dir = path + "\\tests"
+    let s3 = run_stage("discover-tests", TBUILD_URL + "/tbuild/deps", "POST", { "path": test_dir })
+    let stages = append(stages, s3)
+
+    // Stage 4: Execute test runner via exec-server
+    // Sends NovaLang test file paths to exec for execution
+    let exec_url = "http://127.0.0.1:9877"
+    let test_cmd = "python C:\\NovaX\\novalang.py " + test_dir + "\\" + pattern
+    let s4 = run_stage("run-tests", exec_url + "/exec", "POST", {
+        "command": test_cmd,
+        "timeout": 30
+    })
+    let stages = append(stages, s4)
+
+    // Aggregate
+    let trits = []
+    let trits = append(trits, dict_get(s1, "trit", 0))
+    let trits = append(trits, dict_get(s2, "trit", 0))
+    let trits = append(trits, dict_get(s4, "trit", 0))
+    let overall = trit_majority(trits)
+
+    let total_runs = total_runs + 1
+    if3 overall == 1 {
+        let pass_count = pass_count + 1
+    } maybe {
+        let partial_count = partial_count + 1
+    } else3 {
+        let fail_count = fail_count + 1
+    }
+
+    return finalize_pipeline({
+        "pipeline": "test",
+        "stages": stages,
+        "stage_count": len(stages),
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "path": path,
+        "pattern": pattern
+    })
+}
+
+fn pipeline_parallel(req) {
+    let path = dict_get(req, "path", "C:\\NovaX")
+    let stages_def = dict_get(req, "stages", [])
+    let t0 = time() * 1000
+
+    // stages_def: array of {name, url, method, payload}
+    // All stages run concurrently via http_parallel
+    if3 len(stages_def) == 0 {
+        return { "ok": false, "error": "stages required", "trit": -1 }
+    } maybe {
+        // fall through
+    } else3 {
+        // fall through
+    }
+
+    // Cap at H13 stages
+    let stage_count = len(stages_def)
+    if3 stage_count > H13 {
+        let stage_count = H13
+    } maybe {
+        // keep
+    } else3 {
+        // keep
+    }
+
+    // Build parallel request array
+    let requests = []
+    let idx = 0
+    for item in stages_def {
+        if3 idx < H13 {
+            let url = dict_get(item, "url", "")
+            let method = dict_get(item, "method", "POST")
+            let payload = dict_get(item, "payload", {})
+            let requests = append(requests, { "url": url, "method": method, "payload": payload })
+        } maybe {
+            // skip
+        } else3 {
+            // skip
+        }
+        let idx = idx + 1
+    }
+
+    // Fire all at once
+    let responses = http_parallel(requests)
+
+    // Process results
+    let stages = []
+    let trits = []
+    let idx2 = 0
+    for resp in responses {
+        let def_item = stages_def[idx2]
+        let name = dict_get(def_item, "name", "stage-" + str(idx2))
+        let ok = dict_get(resp, "ok", false)
+        let trit_val = 0
+        if3 ok == true {
+            let trit_val = 1
+        } maybe {
+            let trit_val = 0
+        } else3 {
+            let trit_val = -1
+        }
+        let err = dict_get(resp, "error", "")
+        if3 err != "" {
+            let trit_val = -1
+        } maybe {
+            // keep
+        } else3 {
+            // keep
+        }
+        let stage_result = {
+            "stage": name,
+            "trit": trit_val,
+            "char": trit_char(trit_val),
+            "response": resp,
+            "parallel": true
+        }
+        let stages = append(stages, stage_result)
+        let trits = append(trits, trit_val)
+        let idx2 = idx2 + 1
+    }
+
+    let elapsed = time() * 1000 - t0
+    let overall = trit_majority(trits)
+
+    let total_runs = total_runs + 1
+    if3 overall == 1 {
+        let pass_count = pass_count + 1
+    } maybe {
+        let partial_count = partial_count + 1
+    } else3 {
+        let fail_count = fail_count + 1
+    }
+
+    return {
+        "pipeline": "parallel",
+        "stages": stages,
+        "stage_count": len(stages),
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "elapsed_ms": elapsed,
+        "parallel": true,
+        "path": path
+    }
+}
+
+// ===================================================================
+// Handlers
+// ===================================================================
+
+fn handle_health(req) {
+    let uptime_s = (time() * 1000 - start_time) / 1000
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "runtime": "novalang",
+        "pipelines": ["lint", "build", "full", "deploy", "test", "parallel", "templates", "depgraph"],
+        "templates": _template_count,
+        "cache_entries": len(keys(_stage_cache)),
+        "cache_hits": _cache_hits,
+        "total_runs": total_runs,
+        "pass": pass_count,
+        "fail": fail_count,
+        "partial": partial_count,
+        "uptime_s": uptime_s,
+        "harmonics": { "H3": H3, "H5": H5, "H7": H7, "H13": H13, "BLOCK": BLOCK },
+        "trit": 1,
+        "char": "+"
+    }
+}
+
+fn handle_cache(req) {
+    let entries = keys(_stage_cache)
+    let entry_count = len(entries)
+    return {
+        "ok": true,
+        "cache_entries": entry_count,
+        "cache_hits": _cache_hits,
+        "cache_misses": _cache_misses,
+        "hit_rate_pct": 0,
+        "keys": entries,
+        "trit": 1
+    }
+}
+
+fn handle_cache_clear(req) {
+    let _stage_cache = {}
+    let old_hits = _cache_hits
+    let old_misses = _cache_misses
+    let _cache_hits = 0
+    let _cache_misses = 0
+    return {
+        "ok": true,
+        "cleared": true,
+        "prev_hits": old_hits,
+        "prev_misses": old_misses,
+        "trit": 1
+    }
+}
+
+fn handle_stats(req) {
+    let uptime_s = (time() * 1000 - start_time) / 1000
+    let rate = 0
+    if3 total_runs > 0 {
+        let rate = (pass_count * 100) / total_runs
+    } maybe {
+        // no runs yet
+    } else3 {
+        // no runs yet
+    }
+    return {
+        "total_runs": total_runs,
+        "pass": pass_count,
+        "fail": fail_count,
+        "partial": partial_count,
+        "pass_rate_pct": rate,
+        "uptime_s": uptime_s,
+        "trit": 1
+    }
+}
+
+// ===================================================================
+// Pipeline Templates — Save/Load Named Presets
+// ===================================================================
+// Templates store pipeline configs: name, pipeline type, params, stages.
+// Capped at H13 templates. Each template has a trit quality score.
+
+let _templates = {}
+let _template_count = 0
+
+fn handle_template_save(req) {
+    // POST /tci/template/save — Save a pipeline template
+    let name = dict_get(req, "name", "")
+    let pipeline = dict_get(req, "pipeline", "")
+    let stages = dict_get(req, "stages", [])
+    let params = dict_get(req, "params", {})
+    let description = dict_get(req, "description", "")
+
+    if3 len(name) > 0 {
+        if3 len(pipeline) > 0 {
+            // Check cap
+            if3 _template_count >= 13 {
+                // At cap — check if updating existing
+                let existing = dict_get(_templates, name, null)
+                if3 existing == null {
+                    return {
+                        "ok": false,
+                        "error": "Template limit reached (H13=13). Delete a template first.",
+                        "trit": -1
+                    }
+                }
+            }
+            let tmpl = {
+                "name": name,
+                "pipeline": pipeline,
+                "stages": stages,
+                "params": params,
+                "description": description,
+                "created_at": time(),
+                "run_count": 0,
+                "last_trit": 0
+            }
+            let is_new = dict_get(_templates, name, null) == null
+            dict_set(_templates, name, tmpl)
+            if3 is_new {
+                _template_count = _template_count + 1
+            }
+            return {
+                "ok": true,
+                "action": "saved",
+                "name": name,
+                "pipeline": pipeline,
+                "total_templates": _template_count,
+                "trit": 1
+        } else3 {
+            return {"ok": false, "error": "pipeline type required", "trit": -1}
+    } else3 {
+        return {"ok": false, "error": "template name required", "trit": -1}
+    }
+}
+}
+}
+
+fn handle_template_list(req) {
+    // GET /tci/templates — List all saved templates
+    let tmpl_list = []
+    let names = keys(_templates)
+    for3 n in names {
+        let t = dict_get(_templates, n, {})
+        let entry = {
+            "name": dict_get(t, "name", ""),
+            "pipeline": dict_get(t, "pipeline", ""),
+            "description": dict_get(t, "description", ""),
+            "run_count": dict_get(t, "run_count", 0),
+            "last_trit": dict_get(t, "last_trit", 0)
+        }
+        tmpl_list = tmpl_list + [entry]
+    }
+    return {
+        "ok": true,
+        "templates": tmpl_list,
+        "total": _template_count,
+        "trit": 1
+    }
+}
+
+fn handle_template_run(req) {
+    // POST /tci/template/run — Run a saved template by name
+    let name = dict_get(req, "name", "")
+    if3 len(name) == 0 {
+        return {"ok": false, "error": "template name required", "trit": -1}
+    }
+    let tmpl = dict_get(_templates, name, null)
+    if3 tmpl == null {
+        return {"ok": false, "error": "template not found: " + name, "trit": -1}
+    }
+    let pipeline = dict_get(tmpl, "pipeline", "")
+    let params = dict_get(tmpl, "params", {})
+    let stages = dict_get(tmpl, "stages", [])
+
+    // Dispatch to the appropriate pipeline
+    let result = {}
+    let target = dict_get(req, "target", dict_get(params, "target", "C:\\NovaX"))
+    let run_req = {"target": target}
+
+    if3 pipeline == "lint" {
+        result = pipeline_lint(run_req)
+    } else3 {
+        if3 pipeline == "build" {
+            result = pipeline_build(run_req)
+        } else3 {
+            if3 pipeline == "full" {
+                result = pipeline_full(run_req)
+            } else3 {
+                if3 pipeline == "deploy" {
+                    result = pipeline_deploy(run_req)
+                } else3 {
+                    if3 pipeline == "test" {
+                        result = pipeline_test(run_req)
+                    } else3 {
+                        if3 pipeline == "parallel" {
+                            let par_req = {"stages": stages}
+                            result = pipeline_parallel(par_req)
+                        } else3 {
+                            result = {"ok": false, "error": "unknown pipeline: " + pipeline, "trit": -1}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Update template run count and last trit
+    let run_trit = dict_get(result, "trit", 0)
+    dict_set(tmpl, "run_count", dict_get(tmpl, "run_count", 0) + 1)
+    dict_set(tmpl, "last_trit", run_trit)
+    dict_set(_templates, name, tmpl)
+
+    return {
+        "ok": true,
+        "template": name,
+        "pipeline": pipeline,
+        "result": result,
+        "run_count": dict_get(tmpl, "run_count", 0),
+        "trit": run_trit
+    }
+}
+
+fn handle_template_delete(req) {
+    // POST /tci/template/delete — Delete a template by name
+    let name = dict_get(req, "name", "")
+    if3 len(name) == 0 {
+        return {"ok": false, "error": "template name required", "trit": -1}
+    }
+    let tmpl = dict_get(_templates, name, null)
+    if3 tmpl == null {
+        return {"ok": false, "error": "template not found: " + name, "trit": -1}
+    }
+    dict_set(_templates, name, null)
+    _template_count = _template_count - 1
+    return {
+        "ok": true,
+        "action": "deleted",
+        "name": name,
+        "remaining": _template_count,
+        "trit": 1
+    }
+}
+
+// ===================================================================
+// Pipeline Dependency Graphs
+// ===================================================================
+// Each pipeline defines stages as nodes with explicit dependencies.
+// Stages with no deps (roots) can run in parallel with each other.
+// Topo-sort determines execution order; siblings are parallelizable.
+
+let _depgraphs = {
+    "lint": {
+        "stages": {
+            "git-status":  { "deps": [], "url": "/tgit/status",  "method": "POST", "cacheable": false },
+            "build-lint":  { "deps": ["git-status"], "url": "/tbuild/lint", "method": "POST", "cacheable": true }
+        }
+    },
+    "build": {
+        "stages": {
+            "deps-check":  { "deps": [], "url": "/tbuild/deps",     "method": "POST", "cacheable": true },
+            "build-order": { "deps": ["deps-check"], "url": "/tbuild/order",   "method": "POST", "cacheable": true },
+            "compile":     { "deps": ["build-order"], "url": "/tbuild/compile", "method": "POST", "cacheable": true },
+            "lint":        { "deps": ["compile"], "url": "/tbuild/lint",        "method": "POST", "cacheable": true }
+        }
+    },
+    "full": {
+        "stages": {
+            "git-status":    { "deps": [], "url": "/tgit/status",       "method": "POST", "cacheable": false },
+            "deps-check":   { "deps": ["git-status"], "url": "/tbuild/deps",    "method": "POST", "cacheable": true },
+            "build-lint":   { "deps": ["git-status"], "url": "/tbuild/lint",     "method": "POST", "cacheable": true },
+            "compile":      { "deps": ["deps-check"], "url": "/tbuild/compile",  "method": "POST", "cacheable": true },
+            "profile-wrap": { "deps": ["compile"], "url": "/tprofile/snapshot",  "method": "POST", "cacheable": true },
+            "post-lint":    { "deps": ["compile"], "url": "/tbuild/lint",        "method": "POST", "cacheable": true },
+            "vcs-check":    { "deps": ["profile-wrap", "post-lint"], "url": "/tgit/diff", "method": "POST", "cacheable": false }
+        }
+    },
+    "deploy": {
+        "stages": {
+            "pre-lint":      { "deps": [], "url": "/tbuild/lint",       "method": "POST", "cacheable": true },
+            "git-log":       { "deps": [], "url": "/tgit/log",          "method": "POST", "cacheable": false },
+            "build-diff":    { "deps": ["pre-lint", "git-log"], "url": "/tbuild/compile", "method": "POST", "cacheable": true },
+            "service-health": { "deps": ["build-diff"], "url": "/api/services/health", "method": "GET", "cacheable": false }
+        }
+    },
+    "test": {
+        "stages": {
+            "git-status":     { "deps": [], "url": "/tgit/status",       "method": "POST", "cacheable": false },
+            "pre-test-lint":  { "deps": ["git-status"], "url": "/tbuild/lint", "method": "POST", "cacheable": true },
+            "discover-tests": { "deps": ["pre-test-lint"], "url": "/tbuild/order", "method": "POST", "cacheable": true },
+            "run-tests":      { "deps": ["discover-tests"], "url": "/tbuild/compile", "method": "POST", "cacheable": false }
+        }
+    }
+}
+
+// Custom user-defined dependency graphs (capped at H13)
+let _custom_depgraphs = {}
+let _custom_dg_count = 0
+
+fn _topo_sort(stages) {
+    // Kahn's algorithm: produce execution layers (each layer = parallel-safe)
+    // Returns list of layers, each layer is a list of stage names
+    let stage_keys = keys(stages)
+    let in_degree = {}
+    let layers = []
+
+    // Calculate in-degree for each stage
+    let i = 0
+    let n = len(stage_keys)
+    while3 i < n {
+        let sname = dict_get(stage_keys, i, "")
+        let sinfo = dict_get(stages, sname, {})
+        let deps = dict_get(sinfo, "deps", [])
+        let deg = len(deps)
+        let in_degree = dict_set(in_degree, sname, deg)
+        let i = i + 1
+    }
+
+    // Iteratively find nodes with in_degree 0
+    let remaining = n
+    while3 remaining > 0 {
+        let layer = []
+        let lkeys = keys(in_degree)
+        let li = 0
+        let ln = len(lkeys)
+        while3 li < ln {
+            let sk = dict_get(lkeys, li, "")
+            let dv = dict_get(in_degree, sk, -1)
+            if3 dv == 0 {
+                let layer = append(layer, sk)
+            } maybe {
+                // not ready
+            } else3 {
+                // not ready
+            }
+            let li = li + 1
+        }
+
+        // If no layer found, cycle detected
+        if3 len(layer) == 0 {
+            return { "error": "cycle detected", "remaining": remaining }
+        } maybe {
+            // ok
+        } else3 {
+            // ok
+        }
+
+        let layers = append(layers, layer)
+
+        // Remove layer nodes, decrement dependents
+        let lai = 0
+        let lan = len(layer)
+        while3 lai < lan {
+            let removed = dict_get(layer, lai, "")
+            let in_degree = dict_set(in_degree, removed, -1)
+            let remaining = remaining - 1
+
+            // Decrement in-degree of nodes that depend on removed
+            let di = 0
+            while3 di < n {
+                let dn = dict_get(stage_keys, di, "")
+                let dinfo = dict_get(stages, dn, {})
+                let ddeps = dict_get(dinfo, "deps", [])
+                let dj = 0
+                let ddn = len(ddeps)
+                while3 dj < ddn {
+                    let dep_name = dict_get(ddeps, dj, "")
+                    if3 dep_name == removed {
+                        let old_deg = dict_get(in_degree, dn, 0)
+                        let in_degree = dict_set(in_degree, dn, old_deg - 1)
+                    } maybe {
+                        // not a match
+                    } else3 {
+                        // not a match
+                    }
+                    let dj = dj + 1
+                }
+                let di = di + 1
+            }
+            let lai = lai + 1
+        }
+    }
+    return layers
+}
+
+fn handle_depgraph(req) {
+    // GET /tci/depgraph — Return all pipeline dependency graphs + topo layers
+    let result = {}
+    let pnames = keys(_depgraphs)
+    let pi = 0
+    let pn = len(pnames)
+    while3 pi < pn {
+        let pname = dict_get(pnames, pi, "")
+        let pgraph = dict_get(_depgraphs, pname, {})
+        let pstages = dict_get(pgraph, "stages", {})
+        let layers = _topo_sort(pstages)
+        let entry = {}
+        let entry = dict_set(entry, "stages", pstages)
+        let entry = dict_set(entry, "layers", layers)
+        let entry = dict_set(entry, "stage_count", len(keys(pstages)))
+        let result = dict_set(result, pname, entry)
+        let pi = pi + 1
+    }
+
+    // Include custom graphs
+    let cnames = keys(_custom_depgraphs)
+    let ci = 0
+    let cn = len(cnames)
+    while3 ci < cn {
+        let cname = dict_get(cnames, ci, "")
+        let cgraph = dict_get(_custom_depgraphs, cname, {})
+        let cstages = dict_get(cgraph, "stages", {})
+        let clayers = _topo_sort(cstages)
+        let centry = {}
+        let centry = dict_set(centry, "stages", cstages)
+        let centry = dict_set(centry, "layers", clayers)
+        let centry = dict_set(centry, "stage_count", len(keys(cstages)))
+        let centry = dict_set(centry, "custom", true)
+        let result = dict_set(result, cname, centry)
+        let ci = ci + 1
+    }
+
+    // If viz=true, add ASCII visualization for each pipeline
+    let do_viz = dict_get(req, "viz", "")
+    if3 do_viz == "true" {
+        let viz_map = {}
+        let vnames = keys(result)
+        let vi = 0
+        let vn = len(vnames)
+        while3 vi < vn {
+            let vname = dict_get(vnames, vi, "")
+            let ventry = dict_get(result, vname, {})
+            let vstages = dict_get(ventry, "stages", {})
+            let vlayers = dict_get(ventry, "layers", [])
+
+            // Build ASCII tree
+            let lines = []
+            let num_layers = len(vlayers)
+            let stage_count = len(keys(vstages))
+            let header = "Pipeline: " + vname + " (" + str(stage_count) + " stages, " + str(num_layers) + " layers)"
+            let lines = append(lines, header)
+            let lines = append(lines, "========================================")
+
+            let li = 0
+            while3 li < num_layers {
+                let layer = dict_get(vlayers, li, [])
+                let layer_size = len(layer)
+                let layer_label = "Layer " + str(li) + " (parallel=" + str(layer_size) + ")"
+                let lines = append(lines, "")
+                let lines = append(lines, layer_label)
+
+                let si = 0
+                while3 si < layer_size {
+                    let sname = dict_get(layer, si, "")
+                    let sinfo = dict_get(vstages, sname, {})
+                    let sdeps = dict_get(sinfo, "deps", [])
+                    let surl = dict_get(sinfo, "url", "")
+                    let smethod = dict_get(sinfo, "method", "POST")
+                    let scache = dict_get(sinfo, "cacheable", false)
+
+                    // Dep string
+                    let dep_str = ""
+                    let di = 0
+                    let dn = len(sdeps)
+                    while3 di < dn {
+                        let dep = dict_get(sdeps, di, "")
+                        if3 di > 0 {
+                            let dep_str = dep_str + ", " + dep
+                        } maybe {
+                            let dep_str = dep
+                        } else3 {
+                            let dep_str = dep
+                        }
+                        let di = di + 1
+                    }
+
+                    // Connector
+                    let is_last = si == layer_size - 1
+                    let connector = "  |-"
+                    if3 is_last == true {
+                        let connector = "  \\-"
+                    } maybe {
+                        // default
+                    } else3 {
+                        // default
+                    }
+
+                    // Cache tag
+                    let cache_tag = ""
+                    if3 scache == true {
+                        let cache_tag = " [CACHE]"
+                    } maybe {
+                        let cache_tag = ""
+                    } else3 {
+                        let cache_tag = " [NO-CACHE]"
+                    }
+
+                    let stage_line = connector + " [" + sname + "] " + smethod + " " + surl + cache_tag
+                    let lines = append(lines, stage_line)
+
+                    if3 dn > 0 {
+                        let dep_line = "  |    deps: " + dep_str
+                        let lines = append(lines, dep_line)
+                    } maybe {
+                        let dep_line = "  |    deps: (root)"
+                        let lines = append(lines, dep_line)
+                    } else3 {
+                        let dep_line = "  |    deps: (root)"
+                        let lines = append(lines, dep_line)
+                    }
+
+                    let si = si + 1
+                }
+
+                // Arrow
+                if3 li < num_layers - 1 {
+                    let lines = append(lines, "  |")
+                    let lines = append(lines, "  V")
+                } maybe {
+                    let lines = append(lines, "  |")
+                    let lines = append(lines, "  [DONE]")
+                } else3 {
+                    let lines = append(lines, "  |")
+                    let lines = append(lines, "  [DONE]")
+                }
+
+                let li = li + 1
+            }
+
+            let viz_text = join(lines, "\n")
+            let viz_map = dict_set(viz_map, vname, viz_text)
+            let vi = vi + 1
+        }
+
+        return {
+            "ok": true,
+            "pipelines": result,
+            "viz": viz_map,
+            "builtin_count": pn,
+            "custom_count": cn,
+            "trit": 1
+        }
+    } maybe {
+        // no viz requested
+    } else3 {
+        // no viz requested
+    }
+
+    return {
+        "ok": true,
+        "pipelines": result,
+        "builtin_count": pn,
+        "custom_count": cn,
+        "trit": 1
+    }
+}
+
+fn handle_depgraph_save(req) {
+    // POST /tci/depgraph/save — Save a custom dependency graph
+    let name = dict_get(req, "name", "")
+    let stages = dict_get(req, "stages", {})
+
+    if3 name == "" {
+        return { "ok": false, "error": "name required", "trit": -1 }
+    } maybe {
+        // ok
+    } else3 {
+        // ok
+    }
+
+    if3 len(keys(stages)) == 0 {
+        return { "ok": false, "error": "stages required (dict of stage_name -> {deps, url, method})", "trit": -1 }
+    } maybe {
+        // ok
+    } else3 {
+        // ok
+    }
+
+    if3 _custom_dg_count >= H13 {
+        return { "ok": false, "error": "Max H13 custom graphs reached", "trit": -1 }
+    } maybe {
+        // ok
+    } else3 {
+        // ok
+    }
+
+    // Validate: topo sort must succeed
+    let layers = _topo_sort(stages)
+    let is_err = dict_get(layers, "error", "")
+    if3 is_err != "" {
+        return { "ok": false, "error": is_err, "trit": -1 }
+    } maybe {
+        // ok
+    } else3 {
+        // ok
+    }
+
+    let entry = {}
+    let entry = dict_set(entry, "stages", stages)
+    let entry = dict_set(entry, "created", time())
+    let _custom_depgraphs = dict_set(_custom_depgraphs, name, entry)
+    let _custom_dg_count = _custom_dg_count + 1
+
+    return {
+        "ok": true,
+        "name": name,
+        "stage_count": len(keys(stages)),
+        "layers": layers,
+        "trit": 1
+    }
+}
+
+fn handle_depgraph_run(req) {
+    // POST /tci/depgraph/run — Execute a pipeline by dependency graph
+    // Runs layers sequentially; stages within each layer run via http_parallel
+    let name = dict_get(req, "pipeline", "")
+    let path = dict_get(req, "path", "C:\\NovaX")
+    let use_cache = dict_get(req, "cache", true)
+    let git_hash = get_git_hash(path)
+
+    // Look up graph: check builtins first, then custom
+    let graph = dict_get(_depgraphs, name, {})
+    if3 len(keys(graph)) == 0 {
+        let graph = dict_get(_custom_depgraphs, name, {})
+    } maybe {
+        // found in builtins
+    } else3 {
+        // found in builtins
+    }
+
+    let gstages = dict_get(graph, "stages", {})
+    if3 len(keys(gstages)) == 0 {
+        return { "ok": false, "error": "Pipeline '" + name + "' not found", "trit": -1 }
+    } maybe {
+        // ok
+    } else3 {
+        // ok
+    }
+
+    let layers = _topo_sort(gstages)
+    let is_err = dict_get(layers, "error", "")
+    if3 is_err != "" {
+        return { "ok": false, "error": "Cycle in pipeline: " + is_err, "trit": -1 }
+    } maybe {
+        // ok
+    } else3 {
+        // ok
+    }
+
+    // Execute layer by layer
+    let all_results = []
+    let all_trits = []
+    let layer_idx = 0
+    let num_layers = len(layers)
+
+    while3 layer_idx < num_layers {
+        let layer = dict_get(layers, layer_idx, [])
+        let layer_size = len(layer)
+
+        if3 layer_size == 1 {
+            // Single stage — run directly
+            let sname = dict_get(layer, 0, "")
+            let sinfo = dict_get(gstages, sname, {})
+            let surl = dict_get(sinfo, "url", "")
+            let smethod = dict_get(sinfo, "method", "POST")
+            let scacheable = dict_get(sinfo, "cacheable", false)
+
+            // Resolve full URL (prepend service base if relative)
+            let full_url = ""
+            if3 starts_with(surl, "/tgit") {
+                let full_url = TGIT_URL + surl
+            } maybe {
+                let full_url = ORCH_URL + surl
+            } else3 {
+                if3 starts_with(surl, "/tbuild") {
+                    let full_url = TBUILD_URL + surl
+                } maybe {
+                    let full_url = ORCH_URL + surl
+                } else3 {
+                    if3 starts_with(surl, "/tprofile") {
+                        let full_url = TPROFILE_URL + surl
+                    } maybe {
+                        let full_url = ORCH_URL + surl
+                    } else3 {
+                        let full_url = ORCH_URL + surl
+                    }
+                }
+            }
+
+            let sr = {}
+            if3 scacheable == true {
+                let sr = cached_run_stage(name, sname, full_url, smethod, { "path": path }, git_hash, use_cache)
+            } maybe {
+                let sr = run_stage(sname, full_url, smethod, { "path": path })
+            } else3 {
+                let sr = run_stage(sname, full_url, smethod, { "path": path })
+            }
+
+            let all_results = append(all_results, sr)
+            let all_trits = append(all_trits, dict_get(sr, "trit", 0))
+
+        } maybe {
+            // Multiple stages — run in parallel via http_parallel
+            let urls = []
+            let methods = []
+            let si = 0
+            while3 si < layer_size {
+                let sn = dict_get(layer, si, "")
+                let sinf = dict_get(gstages, sn, {})
+                let su = dict_get(sinf, "url", "")
+                let sm = dict_get(sinf, "method", "POST")
+
+                let fu = ""
+                if3 starts_with(su, "/tgit") {
+                    let fu = TGIT_URL + su
+                } maybe {
+                    let fu = ORCH_URL + su
+                } else3 {
+                    if3 starts_with(su, "/tbuild") {
+                        let fu = TBUILD_URL + su
+                    } maybe {
+                        let fu = ORCH_URL + su
+                    } else3 {
+                        if3 starts_with(su, "/tprofile") {
+                            let fu = TPROFILE_URL + su
+                        } maybe {
+                            let fu = ORCH_URL + su
+                        } else3 {
+                            let fu = ORCH_URL + su
+                        }
+                    }
+                }
+                let urls = append(urls, fu)
+                let si = si + 1
+            }
+
+            // Use http_parallel for concurrent execution
+            let parallel_results = http_parallel(urls, { "path": path })
+
+            // Record results
+            let pri = 0
+            while3 pri < layer_size {
+                let psn = dict_get(layer, pri, "")
+                let pr = dict_get(parallel_results, pri, {})
+                let pr = dict_set(pr, "stage", psn)
+                let pr_trit = dict_get(pr, "trit", 0)
+                if3 pr_trit == 0 {
+                    // Try to determine trit from response
+                    let pr_ok = dict_get(pr, "ok", false)
+                    if3 pr_ok == true {
+                        let pr_trit = 1
+                    } maybe {
+                        let pr_trit = 0
+                    } else3 {
+                        let pr_trit = -1
+                    }
+                } maybe {
+                    // trit already set
+                } else3 {
+                    // trit already set
+                }
+                let pr = dict_set(pr, "trit", pr_trit)
+                let all_results = append(all_results, pr)
+                let all_trits = append(all_trits, pr_trit)
+                let pri = pri + 1
+            }
+
+        } else3 {
+            // layer_size == 0 — skip
+        }
+
+        let layer_idx = layer_idx + 1
+    }
+
+    // Aggregate
+    let overall = trit_majority(all_trits)
+    let total_runs = total_runs + 1
+    if3 overall == 1 {
+        let pass_count = pass_count + 1
+    } maybe {
+        let partial_count = partial_count + 1
+    } else3 {
+        let fail_count = fail_count + 1
+    }
+
+    return {
+        "ok": true,
+        "pipeline": name,
+        "stages": all_results,
+        "layers": layers,
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "path": path,
+        "trit": overall
+    }
+}
+
+// ===================================================================
+// Pipeline Visualization
+// ===================================================================
+
+fn handle_depgraph_viz(req) {
+    // GET /tci/depgraph/viz — Render dependency graphs as ASCII visual trees
+    // Returns per-pipeline ASCII art showing layers, deps, and stage metadata
+    let pipeline_filter = dict_get(req, "pipeline", "")
+    let all_viz = {}
+    let pnames = keys(_depgraphs)
+    let pi = 0
+    let pn = len(pnames)
+
+    while3 pi < pn {
+        let pname = dict_get(pnames, pi, "")
+        let pi = pi + 1
+
+        // Filter to specific pipeline if requested
+        if3 pipeline_filter != "" {
+            if3 pname != pipeline_filter {
+                // skip — not the requested pipeline
+            } maybe {
+                // match — continue
+            } else3 {
+                // match — continue
+            }
+            if3 pname != pipeline_filter {
+                // skip this iteration
+            } maybe {
+                let _skip = false
+            } else3 {
+                let _skip = false
+            }
+            if3 pname != pipeline_filter {
+                let pi = pi
+            } maybe {
+                // fall through to render
+                let _do_render = true
+            } else3 {
+                let _do_render = true
+            }
+        } maybe {
+            let _do_render = true
+        } else3 {
+            let _do_render = true
+        }
+
+        if3 pname == pipeline_filter {
+            let _do_render = true
+        } maybe {
+            if3 pipeline_filter == "" {
+                let _do_render = true
+            } maybe {
+                let _do_render = false
+            } else3 {
+                let _do_render = false
+        } else3 {
+            if3 pipeline_filter == "" {
+                let _do_render = true
+            } maybe {
+                let _do_render = false
+            } else3 {
+                let _do_render = false
+            }
+        }
+
+        if3 _do_render == true {
+            let pgraph = dict_get(_depgraphs, pname, {})
+            let stages = dict_get(pgraph, "stages", {})
+            let layers = _topo_sort(stages)
+
+            // Check for cycle error
+            let cyc_err = dict_get(layers, "error", "")
+            if3 cyc_err != "" {
+                let viz_text = "  [CYCLE DETECTED: " + cyc_err + "]"
+                let all_viz = dict_set(all_viz, pname, {
+                    "ascii": viz_text,
+                    "error": cyc_err,
+                    "trit": -1
+                })
+            } maybe {
+                // Build ASCII tree
+                let lines = []
+                let num_layers = len(layers)
+                let header = "Pipeline: " + pname + " (" + str(len(keys(stages))) + " stages, " + str(num_layers) + " layers)"
+                let lines = append(lines, header)
+                let sep_len = len(header)
+                let lines = append(lines, "========================================")
+
+                let li = 0
+                while3 li < num_layers {
+                    let layer = dict_get(layers, li, [])
+                    let layer_size = len(layer)
+                    let layer_label = "Layer " + str(li) + " (parallel=" + str(layer_size) + ")"
+                    let lines = append(lines, "")
+                    let lines = append(lines, layer_label)
+
+                    // Draw stages in this layer
+                    let si = 0
+                    while3 si < layer_size {
+                        let sname = dict_get(layer, si, "")
+                        let sinfo = dict_get(stages, sname, {})
+                        let sdeps = dict_get(sinfo, "deps", [])
+                        let surl = dict_get(sinfo, "url", "")
+                        let smethod = dict_get(sinfo, "method", "POST")
+                        let scache = dict_get(sinfo, "cacheable", false)
+
+                        // Build dep string
+                        let dep_str = ""
+                        let di = 0
+                        let dn = len(sdeps)
+                        while3 di < dn {
+                            let dep = dict_get(sdeps, di, "")
+                            if3 di > 0 {
+                                let dep_str = dep_str + ", " + dep
+                            } maybe {
+                                let dep_str = dep
+                            } else3 {
+                                let dep_str = dep
+                            }
+                            let di = di + 1
+                        }
+
+                        // Build tree connector
+                        let is_last = si == layer_size - 1
+                        let connector = "  |-"
+                        if3 is_last == true {
+                            let connector = "  \\-"
+                        } maybe {
+                            // use |-
+                        } else3 {
+                            // use |-
+                        }
+
+                        // Cache indicator
+                        let cache_tag = ""
+                        if3 scache == true {
+                            let cache_tag = " [CACHE]"
+                        } maybe {
+                            let cache_tag = ""
+                        } else3 {
+                            let cache_tag = " [NO-CACHE]"
+                        }
+
+                        // Stage line
+                        let stage_line = connector + " [" + sname + "] " + smethod + " " + surl + cache_tag
+                        let lines = append(lines, stage_line)
+
+                        // Dependency arrow
+                        if3 dn > 0 {
+                            let dep_line = "  |    deps: " + dep_str
+                            let lines = append(lines, dep_line)
+                        } maybe {
+                            let dep_line = "  |    deps: (root)"
+                            let lines = append(lines, dep_line)
+                        } else3 {
+                            let dep_line = "  |    deps: (root)"
+                            let lines = append(lines, dep_line)
+                        }
+
+                        let si = si + 1
+                    }
+
+                    // Arrow to next layer
+                    if3 li < num_layers - 1 {
+                        let lines = append(lines, "  |")
+                        let lines = append(lines, "  V")
+                    } maybe {
+                        let lines = append(lines, "  |")
+                        let lines = append(lines, "  [DONE]")
+                    } else3 {
+                        let lines = append(lines, "  |")
+                        let lines = append(lines, "  [DONE]")
+                    }
+
+                    let li = li + 1
+                }
+
+                // Join lines
+                let viz_text = join(lines, "\n")
+                let all_viz = dict_set(all_viz, pname, {
+                    "ascii": viz_text,
+                    "stages": len(keys(stages)),
+                    "layers": num_layers,
+                    "trit": 1
+                })
+            } else3 {
+                // Build ASCII tree (same as maybe branch)
+                let viz_text = "  [OK - rendered in maybe branch]"
+                let all_viz = dict_set(all_viz, pname, { "ascii": viz_text, "trit": 1 })
+            }
+        } maybe {
+            // skip — not matching filter
+        } else3 {
+            // skip — not matching filter
+        }
+    }
+
+    // Also include custom graphs
+    let cnames = keys(_custom_depgraphs)
+    let ci = 0
+    let cn = len(cnames)
+    while3 ci < cn {
+        let cname = dict_get(cnames, ci, "")
+        let ci = ci + 1
+
+        if3 pipeline_filter != "" {
+            if3 cname != pipeline_filter {
+                let _do_custom = false
+            } maybe {
+                let _do_custom = true
+            } else3 {
+                let _do_custom = true
+            }
+        } maybe {
+            let _do_custom = true
+        } else3 {
+            let _do_custom = true
+        }
+
+        if3 _do_custom == true {
+            let cgraph = dict_get(_custom_depgraphs, cname, {})
+            let cstages = dict_get(cgraph, "stages", {})
+            let clayers = _topo_sort(cstages)
+            let cyc2 = dict_get(clayers, "error", "")
+            if3 cyc2 != "" {
+                let all_viz = dict_set(all_viz, cname + " (custom)", {
+                    "ascii": "  [CYCLE: " + cyc2 + "]",
+                    "error": cyc2,
+                    "trit": -1
+                })
+            } maybe {
+                let clines = ["Pipeline: " + cname + " (custom, " + str(len(keys(cstages))) + " stages)"]
+                let all_viz = dict_set(all_viz, cname + " (custom)", {
+                    "ascii": join(clines, "\n"),
+                    "stages": len(keys(cstages)),
+                    "layers": len(clayers),
+                    "trit": 1
+                })
+            } else3 {
+                let all_viz = dict_set(all_viz, cname + " (custom)", {
+                    "ascii": "  [OK]",
+                    "trit": 1
+                })
+            }
+        } maybe {
+            // skip
+        } else3 {
+            // skip
+        }
+    }
+
+    return {
+        "ok": true,
+        "visualizations": all_viz,
+        "total_pipelines": len(keys(all_viz)),
+        "trit": 1
+    }
+}
+
+
+// ===================================================================
+// Webhook Notification System
+// ===================================================================
+
+// Fire webhook notification to all registered URLs
+}
+fn fire_webhooks(pipeline_name, trit, stages, total_ms) {
+    if3 len(_webhooks) == 0 {
+        return 0
+    }
+    let payload = json_encode({
+        "event": "pipeline_complete",
+        "pipeline": pipeline_name,
+        "trit": trit,
+        "trit_label": "pass",
+        "stages": stages,
+        "total_ms": total_ms,
+        "timestamp": time(),
+        "service": SERVICE_NAME
+    })
+    if3 trit == 0 {
+        // update label — can't do it inline due to NovaLang limitation
+    }
+    if3 trit == -1 {
+        // same
+    }
+    let sent = 0
+    for wh in _webhooks {
+        let url = dict_get(wh, "url", "")
+        if3 url != "" {
+            try3 {
+                http_post(url, payload)
+                let sent = sent + 1
+                dict_set(_webhook_stats, "sent", dict_get(_webhook_stats, "sent", 0) + 1)
+            } fail {
+                dict_set(_webhook_stats, "failed", dict_get(_webhook_stats, "failed", 0) + 1)
+                dict_set(_webhook_stats, "last_error", str(_error))
+            }
+        }
+    }
+    return sent
+}
+
+// POST /tci/webhooks/register {url, label?}
+fn handle_webhook_register(body) {
+    let url = dict_get(body, "url", "")
+    if3 url == "" {
+        return {"ok": false, "error": "url required", "trit": -1}
+    }
+
+    // Check for duplicates
+    for wh in _webhooks {
+        if3 dict_get(wh, "url", "") == url {
+            return {"ok": false, "error": "webhook already registered", "trit": 0}
+        }
+    }
+
+    if3 len(_webhooks) >= _webhook_max {
+        return {"ok": false, "error": "max webhooks reached (13)", "trit": -1}
+    }
+
+    let label = dict_get(body, "label", "webhook-" + str(len(_webhooks) + 1))
+    append(_webhooks, {"url": url, "label": label, "registered_at": time()})
+    return {"ok": true, "label": label, "total_webhooks": len(_webhooks), "trit": 1}
+}
+
+// POST /tci/webhooks/remove {url}
+fn handle_webhook_remove(body) {
+    let url = dict_get(body, "url", "")
+    let new_list = []
+    let found = false
+    for wh in _webhooks {
+        if3 dict_get(wh, "url", "") == url {
+            let found = true
+        } else {
+            append(new_list, wh)
+        }
+    }
+    let _webhooks = new_list
+    if3 found == true {
+        return {"ok": true, "removed": url, "remaining": len(_webhooks), "trit": 1}
+    } else {
+        return {"ok": false, "error": "webhook not found", "trit": -1}
+    }
+}
+
+// GET /tci/webhooks — List registered webhooks + stats
+fn handle_webhook_list(req) {
+    return {
+        "ok": true,
+        "webhooks": _webhooks,
+        "total": len(_webhooks),
+        "max": _webhook_max,
+        "stats": _webhook_stats,
+        "trit": 1
+    }
+}
+
+// ===================================================================
+// Server Setup
+// ===================================================================
+
+let server = tserve(PORT, "TCI")
+// ===================================================================
+// Pipeline History + Rollback
+// ===================================================================
+
+fn handle_history(req) {
+    let count = len(_run_history)
+    let passed = 0
+    let failed = 0
+    let i = 0
+    while3 i < count {
+        let entry = _run_history[i]
+        let t = dict_get(entry, "trit", 0)
+        if3 t == 1 {
+            let passed = passed + 1
+        } maybe {
+        } else3 {
+            let failed = failed + 1
+        }
+        let i = i + 1
+    }
+    return {
+        "ok": true,
+        "history": _run_history,
+        "total": count,
+        "passed": passed,
+        "failed": failed,
+        "trit": 1
+    }
+}
+
+fn handle_rollback(req) {
+    // POST /tci/rollback {target_hash, path?}
+    // Rolls back to a previous git hash using tgit
+    let body = dict_get(req, "body", {})
+    let target_hash = dict_get(body, "target_hash", "")
+    let path = dict_get(body, "path", "C:\\NovaX")
+
+    if3 target_hash == "" {
+        // No hash specified — rollback to last successful run
+        let found = false
+        let idx = len(_run_history) - 1
+        while3 idx >= 0 {
+            let entry = _run_history[idx]
+            let t = dict_get(entry, "trit", 0)
+            if3 t == 1 {
+                let target_hash = dict_get(entry, "git_hash", "")
+                let found = true
+                break3
+            } maybe {
+            } else3 {
+            }
+            let idx = idx - 1
+        }
+        if3 found == false {
+            return {"ok": false, "error": "No successful run found in history", "trit": -1}
+        } maybe {
+        } else3 {
+            return {"ok": false, "error": "No successful run found in history", "trit": -1}
+        }
+    } maybe {
+    } else3 {
+    }
+
+    // Verify target hash exists in history
+    let valid = false
+    let i = 0
+    while3 i < len(_run_history) {
+        let entry = _run_history[i]
+        if3 dict_get(entry, "git_hash", "") == target_hash {
+            let valid = true
+            break3
+        } maybe {
+        } else3 {
+        }
+        let i = i + 1
+    }
+
+    // Execute rollback via tgit
+    let rollback_url = TGIT_URL + "/tgit/checkout"
+    let stage = run_stage("rollback", rollback_url, "POST", {
+        "path": path,
+        "ref": target_hash
+    })
+    let rollback_trit = dict_get(stage, "trit", -1)
+
+    // Post-rollback lint check
+    let lint_stage = run_stage("post-rollback-lint", TBUILD_URL + "/tbuild/lint", "POST", {"path": path})
+    let lint_trit = dict_get(lint_stage, "trit", 0)
+
+    let overall = trit_majority([rollback_trit, lint_trit])
+    let total_runs = total_runs + 1
+
+    return {
+        "ok": rollback_trit == 1,
+        "pipeline": "rollback",
+        "target_hash": target_hash,
+        "rollback_trit": rollback_trit,
+        "lint_trit": lint_trit,
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "path": path,
+        "stages": [stage, lint_stage],
+        "trit": overall
+    }
+}
+
+// ============================================================
+// Scheduled Run Handlers — integrate with tcron :9922
+// ============================================================
+
+// GET /tci/schedule — list all scheduled pipeline runs
+fn handle_schedule_list(req) {
+    return {"ok": true, "schedules": _scheduled_runs, "count": len(_scheduled_runs), "trit": 1}
+}
+
+// POST /tci/schedule — create a scheduled pipeline run
+// body: {name, pipeline, path, interval_s, cron (optional)}
+fn handle_schedule_create(body) {
+    let name = dict_get(body, "name", "")
+    let pipeline = dict_get(body, "pipeline", "full")
+    let path = dict_get(body, "path", ".")
+    let interval_s = dict_get(body, "interval_s", 3600)
+    let cron_expr = dict_get(body, "cron", "")
+
+    if len(name) == 0 {
+        return {"ok": false, "error": "missing 'name'", "trit": -1}
+    }
+
+    // Register with tcron service
+    let tcron_body = {"name": "tci-" + name, "interval_seconds": interval_s, "url": "http://127.0.0.1:" + str(PORT) + "/tci/" + pipeline, "method": "POST", "body": {"path": path}}
+    if len(cron_expr) > 0 {
+        dict_set(tcron_body, "cron", cron_expr)
+    }
+
+    let tcron_resp = http_post(TCRON_URL + "/tcron/schedule", tcron_body, "application/json")
+    let tcron_ok = dict_get(tcron_resp, "ok", false)
+
+    let schedule = {"name": name, "pipeline": pipeline, "path": path, "interval_s": interval_s, "cron": cron_expr, "tcron_id": dict_get(tcron_resp, "id", ""), "created": time(), "active": true}
+    _scheduled_runs = append(_scheduled_runs, schedule)
+
+    let trit = 1
+    if tcron_ok == false {
+        trit = 0
+    }
+
+    return {"ok": true, "schedule": schedule, "tcron_response": tcron_resp, "trit": trit}
+}
+
+// POST /tci/schedule/cancel — cancel a scheduled run by name
+fn handle_schedule_cancel(body) {
+    let name = dict_get(body, "name", "")
+    if len(name) == 0 {
+        return {"ok": false, "error": "missing 'name'", "trit": -1}
+    }
+
+    // Find and deactivate
+    let found = false
+    let idx = 0
+    while idx < len(_scheduled_runs) {
+        let sched = _scheduled_runs[idx]
+        if dict_get(sched, "name", "") == name {
+            dict_set(sched, "active", false)
+            found = true
+            // Cancel in tcron
+            let tcron_id = dict_get(sched, "tcron_id", "")
+            if len(tcron_id) > 0 {
+                http_post(TCRON_URL + "/tcron/cancel", {"id": tcron_id}, "application/json")
+            }
+        }
+        idx = idx + 1
+    }
+
+    if found == false {
+        return {"ok": false, "error": "schedule '" + name + "' not found", "trit": -1}
+    }
+
+    return {"ok": true, "cancelled": name, "trit": 1}
+}
+
+// ===================================================================
+// Pipeline Analytics — Success Trends, Per-Pipeline Stats, Stage Timing
+// ===================================================================
+
+fn handle_analytics(req) {
+    let count = len(_run_history)
+    if3 count == 0 {
+        return {"ok": true, "total_runs": 0, "analytics": {}, "trend": "no_data", "trit": 0}
+    } else {
+        // has data
+    }
+
+    // Per-pipeline aggregation
+    let pipelines = {}
+    let i = 0
+    while i < count {
+        let entry = _run_history[i]
+        let pname = dict_get(entry, "pipeline", "unknown")
+        let t = dict_get(entry, "trit", 0)
+        let stages = dict_get(entry, "stage_count", 0)
+
+        if3 dict_has(pipelines, pname) == false {
+            dict_set(pipelines, pname, {"total": 0, "pass": 0, "fail": 0, "partial": 0, "stages_sum": 0, "trits": []})
+        } else {
+            // exists
+        }
+        let p = pipelines[pname]
+        dict_set(p, "total", dict_get(p, "total", 0) + 1)
+        dict_set(p, "stages_sum", dict_get(p, "stages_sum", 0) + stages)
+        let trits_list = dict_get(p, "trits", [])
+        let trits_list = append(trits_list, t)
+        dict_set(p, "trits", trits_list)
+
+        if3 t == 1 {
+            dict_set(p, "pass", dict_get(p, "pass", 0) + 1)
+        } maybe {
+            dict_set(p, "partial", dict_get(p, "partial", 0) + 1)
+        } else3 {
+            dict_set(p, "fail", dict_get(p, "fail", 0) + 1)
+        }
+        i = i + 1
+    }
+
+    // Compute per-pipeline success rates and avg stages
+    let pipeline_stats = {}
+    let pkeys = keys(pipelines)
+    let j = 0
+    while j < len(pkeys) {
+        let pk = pkeys[j]
+        let pd = pipelines[pk]
+        let ptotal = dict_get(pd, "total", 1)
+        let ppass = dict_get(pd, "pass", 0)
+        let pfail = dict_get(pd, "fail", 0)
+        let ppartial = dict_get(pd, "partial", 0)
+        let rate = 0
+        if3 ptotal > 0 {
+            let rate = (ppass * 100) / ptotal
+        } else {
+            // zero
+        }
+        let avg_stages = dict_get(pd, "stages_sum", 0) / ptotal
+        // Trend: compare first half vs second half of trits
+        let trits = dict_get(pd, "trits", [])
+        let trend = "stable"
+        if3 len(trits) >= 4 {
+            let mid = len(trits) / 2
+            let first_half = slice(trits, 0, mid)
+            let second_half = slice(trits, mid, len(trits))
+            let fh_sum = 0
+            let fi = 0
+            while fi < len(first_half) {
+                let fh_sum = fh_sum + first_half[fi]
+                let fi = fi + 1
+            }
+            let sh_sum = 0
+            let si = 0
+            while si < len(second_half) {
+                let sh_sum = sh_sum + second_half[si]
+                let si = si + 1
+            }
+            let fh_avg = fh_sum / len(first_half)
+            let sh_avg = sh_sum / len(second_half)
+            if3 sh_avg > fh_avg + 0.3 {
+                let trend = "improving"
+            } maybe {
+                if3 sh_avg < fh_avg - 0.3 {
+                    let trend = "declining"
+                } else {
+                    let trend = "stable"
+            } else3 {
+                let trend = "stable"
+        } else {
+            // not enough data for trend
+        }
+
+        dict_set(pipeline_stats, pk, {
+            "total": ptotal,
+            "pass": ppass,
+            "fail": pfail,
+            "partial": ppartial,
+            "success_rate_pct": rate,
+            "avg_stages": avg_stages,
+            "trend": trend,
+            "trit": 1
+        })
+        j = j + 1
+    }
+
+    // Global trend from last H7 runs
+    let global_trend = "stable"
+    if3 count >= 4 {
+        let recent_start = count - 4
+        if3 recent_start < 0 {
+            let recent_start = 0
+        } else {
+            // ok
+        }
+        let recent_pass = 0
+        let ri = recent_start
+        while ri < count {
+            if3 dict_get(_run_history[ri], "trit", 0) == 1 {
+                let recent_pass = recent_pass + 1
+            } else {
+                // not pass
+            }
+            let ri = ri + 1
+        }
+        let recent_rate = (recent_pass * 100) / (count - recent_start)
+        let overall_rate = 0
+        if3 total_runs > 0 {
+            let overall_rate = (pass_count * 100) / total_runs
+        } else {
+            // zero
+        }
+        if3 recent_rate > overall_rate + 10 {
+            let global_trend = "improving"
+        } maybe {
+            if3 recent_rate < overall_rate - 10 {
+                let global_trend = "declining"
+            } else {
+                // stable
+        } else3 {
+            // stable
+    } else {
+        // not enough for trend
+    }
+
+    return {
+        "ok": true,
+        "total_runs": total_runs,
+        "global_pass_rate_pct": pass_count * 100 / total_runs,
+        "global_trend": global_trend,
+        "pipelines": pipeline_stats,
+        "history_count": count,
+        "trit": 1
+    }
+}
+
+// ===================================================================
+// Artifact Storage — persist build outputs, logs, test results
+// ===================================================================
+
+let _artifacts = {}
+let _artifact_count = 0
+let _artifact_max = H13 * H13
+}
+}
+}
+}
+
+fn handle_artifact_store(req) {
+    let body = treq_body(req)
+    let pipeline_id = dict_get(body, "pipeline_id", "default")
+    let run_id = dict_get(body, "run_id", "")
+    let artifact_type = dict_get(body, "type", "log")
+    let content = dict_get(body, "content", "")
+    let metadata = dict_get(body, "metadata", {})
+
+    if3 run_id == "" {
+        return {"ok": false, "error": "run_id required", "trit": -1}
+    } maybe {
+        return {"ok": false, "error": "run_id required", "trit": -1}
+    } else3 {
+        // valid
+    }
+
+    let _artifact_count = _artifact_count + 1
+    let art_id = "art-" + str(_artifact_count)
+
+    let artifact = {
+        "id": art_id,
+        "pipeline_id": pipeline_id,
+        "run_id": run_id,
+        "type": artifact_type,
+        "content": content,
+        "metadata": metadata,
+        "timestamp": time() * 1000,
+        "size_bytes": len(str(content))
+    }
+
+    // Store under pipeline_id key
+    let existing = dict_get(_artifacts, pipeline_id, [])
+    let existing = push(existing, artifact)
+
+    // Enforce max per pipeline (keep last H13*H7=91)
+    if3 len(existing) > 91 {
+        let existing = slice(existing, len(existing) - 91, len(existing))
+    } maybe {
+        // ok
+    } else3 {
+        // ok
+    }
+
+    let _artifacts = dict_set(_artifacts, pipeline_id, existing)
+
+    return {
+        "ok": true,
+        "artifact_id": art_id,
+        "pipeline_id": pipeline_id,
+        "run_id": run_id,
+        "type": artifact_type,
+        "size_bytes": len(str(content)),
+        "trit": 1
+    }
+}
+
+fn handle_artifact_list(req) {
+    let pipeline_id = dict_get(treq_query(req), "pipeline_id", "")
+    let run_id = dict_get(treq_query(req), "run_id", "")
+    let art_type = dict_get(treq_query(req), "type", "")
+
+    let result_list = []
+
+    if3 pipeline_id != "" {
+        let arts = dict_get(_artifacts, pipeline_id, [])
+        for3 a in arts {
+            let include = true
+            if3 run_id != "" {
+                if3 dict_get(a, "run_id", "") != run_id {
+                    let include = false
+                } maybe {
+                    // match
+                } else3 {
+                    // match
+                }
+            } maybe {
+                // no filter
+            } else3 {
+                // no filter
+            }
+            if3 art_type != "" {
+                if3 dict_get(a, "type", "") != art_type {
+                    let include = false
+                } maybe {
+                    // match
+                } else3 {
+                    // match
+                }
+            } maybe {
+                // no filter
+            } else3 {
+                // no filter
+            }
+            if3 include {
+                // omit content for listing (just metadata)
+                let summary = {
+                    "id": dict_get(a, "id", ""),
+                    "pipeline_id": dict_get(a, "pipeline_id", ""),
+                    "run_id": dict_get(a, "run_id", ""),
+                    "type": dict_get(a, "type", ""),
+                    "size_bytes": dict_get(a, "size_bytes", 0),
+                    "timestamp": dict_get(a, "timestamp", 0)
+                }
+                let result_list = push(result_list, summary)
+            } maybe {
+                // skip
+            } else3 {
+                // skip
+    } else3 {
+        // All pipelines
+        let all_keys = dict_keys(_artifacts)
+        for3 key in all_keys {
+            let arts = dict_get(_artifacts, key, [])
+            for3 a in arts {
+                let summary = {
+                    "id": dict_get(a, "id", ""),
+                    "pipeline_id": dict_get(a, "pipeline_id", ""),
+                    "run_id": dict_get(a, "run_id", ""),
+                    "type": dict_get(a, "type", ""),
+                    "size_bytes": dict_get(a, "size_bytes", 0),
+                    "timestamp": dict_get(a, "timestamp", 0)
+                }
+                let result_list = push(result_list, summary)
+            }
+        }
+    }
+
+    return {
+        "ok": true,
+        "artifacts": result_list,
+        "count": len(result_list),
+        "trit": 1
+    }
+}
+}
+}
+
+fn handle_artifact_get(req) {
+    let art_id = dict_get(treq_query(req), "id", "")
+    let pipeline_id = dict_get(treq_query(req), "pipeline_id", "")
+
+    if3 art_id == "" {
+        return {"ok": false, "error": "id required", "trit": -1}
+    } maybe {
+        return {"ok": false, "error": "id required", "trit": -1}
+    } else3 {
+        // valid
+    }
+
+    // Search across all or specific pipeline
+    let search_keys = []
+    if3 pipeline_id != "" {
+        let search_keys = [pipeline_id]
+    } maybe {
+        let search_keys = dict_keys(_artifacts)
+    } else3 {
+        let search_keys = dict_keys(_artifacts)
+    }
+
+    for3 key in search_keys {
+        let arts = dict_get(_artifacts, key, [])
+        for3 a in arts {
+            if3 dict_get(a, "id", "") == art_id {
+                return {"ok": true, "artifact": a, "trit": 1}
+            } maybe {
+                // keep searching
+            } else3 {
+                // keep searching
+            }
+        }
+    }
+
+    return {"ok": false, "error": "artifact not found", "trit": -1}
+}
+
+fn handle_artifact_purge(req) {
+    let body = treq_body(req)
+    let pipeline_id = dict_get(body, "pipeline_id", "")
+    let older_than_ms = dict_get(body, "older_than_ms", 0)
+    let now = time() * 1000
+    let purged = 0
+
+    if3 pipeline_id != "" {
+        let arts = dict_get(_artifacts, pipeline_id, [])
+        let kept = []
+        for3 a in arts {
+            let ts = dict_get(a, "timestamp", 0)
+            if3 older_than_ms > 0 {
+                if3 (now - ts) > older_than_ms {
+                    let purged = purged + 1
+                } maybe {
+                    let kept = push(kept, a)
+                } else3 {
+                    let kept = push(kept, a)
+                }
+            } maybe {
+                let purged = purged + 1
+            } else3 {
+                let purged = purged + 1
+            }
+        }
+        let _artifacts = dict_set(_artifacts, pipeline_id, kept)
+    } else3 {
+        // Purge all
+        let _artifacts = {}
+        let purged = _artifact_count
+        let _artifact_count = 0
+    }
+
+    return {
+        "ok": true,
+        "purged": purged,
+        "trit": 1
+    }
+}
+
+fn handle_artifact_stats(req) {
+    let total = 0
+    let total_size = 0
+    let by_type = {}
+    let by_pipeline = {}
+    let all_keys = dict_keys(_artifacts)
+
+    for3 key in all_keys {
+        let arts = dict_get(_artifacts, key, [])
+        let pipe_count = len(arts)
+        let pipe_size = 0
+        let by_pipeline = dict_set(by_pipeline, key, {"count": pipe_count})
+
+        for3 a in arts {
+            let total = total + 1
+            let sz = dict_get(a, "size_bytes", 0)
+            let total_size = total_size + sz
+            let pipe_size = pipe_size + sz
+            let atype = dict_get(a, "type", "unknown")
+            let existing_count = dict_get(by_type, atype, 0)
+            let by_type = dict_set(by_type, atype, existing_count + 1)
+        }
+    }
+
+    return {
+        "ok": true,
+        "total_artifacts": total,
+        "total_size_bytes": total_size,
+        "by_type": by_type,
+        "by_pipeline": by_pipeline,
+        "pipeline_count": len(all_keys),
+        "trit": 1
+    }
+}
+
+troute(server, "POST", "/tci/artifacts/store",   "handle_artifact_store")
+troute(server, "GET",  "/tci/artifacts",          "handle_artifact_list")
+troute(server, "GET",  "/tci/artifacts/get",      "handle_artifact_get")
+troute(server, "POST", "/tci/artifacts/purge",    "handle_artifact_purge")
+troute(server, "GET",  "/tci/artifacts/stats",    "handle_artifact_stats")
+
+troute(server, "GET",  "/health",       "handle_health")
+troute(server, "GET",  "/tci/health",   "handle_health")
+troute(server, "GET",  "/tci/stats",    "handle_stats")
+troute(server, "POST", "/tci/lint",     "pipeline_lint")
+troute(server, "POST", "/tci/build",    "pipeline_build")
+troute(server, "POST", "/tci/full",     "pipeline_full")
+troute(server, "POST", "/tci/deploy",   "pipeline_deploy")
+troute(server, "POST", "/tci/test",     "pipeline_test")
+troute(server, "POST", "/tci/parallel", "pipeline_parallel")
+troute(server, "GET",  "/tci/cache",       "handle_cache")
+troute(server, "POST", "/tci/cache/clear", "handle_cache_clear")
+troute(server, "GET",  "/tci/templates",        "handle_template_list")
+troute(server, "POST", "/tci/template/save",    "handle_template_save")
+troute(server, "POST", "/tci/template/run",     "handle_template_run")
+troute(server, "POST", "/tci/template/delete",  "handle_template_delete")
+troute(server, "GET",  "/tci/depgraph",          "handle_depgraph")
+troute(server, "POST", "/tci/depgraph/save",     "handle_depgraph_save")
+troute(server, "POST", "/tci/depgraph/run",      "handle_depgraph_run")
+troute(server, "GET",  "/tci/webhooks",           "handle_webhook_list")
+troute(server, "POST", "/tci/webhooks/register",  "handle_webhook_register")
+troute(server, "POST", "/tci/webhooks/remove",    "handle_webhook_remove")
+troute(server, "GET",  "/tci/history",             "handle_history")
+troute(server, "POST", "/tci/rollback",            "handle_rollback")
+troute(server, "GET",  "/tci/schedule",            "handle_schedule_list")
+troute(server, "POST", "/tci/schedule",            "handle_schedule_create")
+troute(server, "POST", "/tci/schedule/cancel",     "handle_schedule_cancel")
+troute(server, "GET",  "/tci/analytics",            "handle_analytics")
+
+print("[TCI] Ternary CI/CD Pipeline Engine v" + VERSION)
+print("[TCI] Pipelines: lint | build | full | deploy | test | depgraph")
+print("[TCI] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

@@ -1,0 +1,755 @@
+// NovaX TMedia Image Micro-Tool v1.0 -- Pure NovaLang
+// Operations: info, convert, thumbnail, cheat, manifest, file_exists, file_size, basename, extension
+//
+// Usage: novalang.exe tmedia_img.nova <operation> [args...]
+//   info <path>                          -- Read image header for dimensions/format
+//   convert <input_path> <output_path>   -- Convert via magick (if available)
+//   thumbnail <path> <w> <h> <out>       -- Thumbnail via magick (if available)
+//   cheat                                -- Generate cheat sheet SVG (reads C:/NovaX/temp/cheat_data.json)
+//   manifest <dir_path>                  -- Scan directory for media files
+//   file_exists <path>                   -- Check if file exists
+//   file_size <path>                     -- Get file size in bytes
+//   basename <path>                      -- Extract filename from path
+//   extension <path>                     -- Extract file extension
+
+let argv = args()
+let op = ""
+if3 len(argv) > 0 {
+    op = lower(argv[0])
+}
+
+// ============================================================================
+// HELPER: read first N bytes of a file as hex string via shell
+// ============================================================================
+fn read_file_bytes_hex(fpath, count) {
+    // Use certutil to read raw bytes, or powershell as last resort
+    // We'll use a cmd trick: use findstr /P to detect binary, and type + clip
+    // Actually, the simplest approach: read the file with read_file and check char codes
+    let content = read_file(fpath)
+    return content
+}
+
+// ============================================================================
+// HELPER: parse PNG dimensions from file header
+// PNG: bytes 0-7 = signature, bytes 8-15 = IHDR chunk length+type
+// Width at offset 16 (4 bytes big-endian), Height at offset 20 (4 bytes big-endian)
+// We use a shell command to read raw bytes
+// ============================================================================
+fn get_png_dims(fpath) {
+    let win_path = replace(fpath, "/", "\\")
+    // Use certutil to dump hex, then parse width/height from IHDR
+    let cmd = "certutil -encodehex \"" + win_path + "\" C:\\NovaX\\temp\\tmedia_hexdump.txt 4 2>NUL && type C:\\NovaX\\temp\\tmedia_hexdump.txt"
+    let hex_raw = shell(cmd)
+    // PNG IHDR: after 8-byte signature + 4-byte chunk length + 4-byte "IHDR" type
+    // Width at byte offset 16, height at byte offset 20
+    // In hex dump format: each line is "OFFSET  HH HH HH HH HH HH HH HH  HH HH HH HH HH HH HH HH"
+    // Byte 16 starts at offset 0010, first 4 bytes = width, next 4 = height
+    // Let's find the hex values by looking at the second line of output
+    let lines = split(hex_raw, "\n")
+    // We need bytes from offset 0x10 onwards
+    // certutil hex4 format: "0000  89 50 4e 47 0d 0a 1a 0a  00 00 00 0d 49 48 44 52"
+    // "0010  00 00 XX XX 00 00 YY YY ..."
+    // Width = bytes 16-19, Height = bytes 20-23
+    let width = 0
+    let height = 0
+    let i = 0
+    while3 i < len(lines) {
+        let line = trim(lines[i])
+        if3 starts_with(line, "0010") {
+            // Parse hex bytes from this line
+            // Format: "0010  HH HH HH HH HH HH HH HH  HH HH HH HH HH HH HH HH"
+            let cleaned = replace(line, "  ", " ")
+            let parts = split(cleaned, " ")
+            // parts[0] = "0010", then hex bytes follow
+            // Width bytes at positions 1,2,3,4 (after offset)
+            // Height bytes at positions 5,6,7,8
+            if3 len(parts) >= 9 {
+                let w_hex = parts[1] + parts[2] + parts[3] + parts[4]
+                let h_hex = parts[5] + parts[6] + parts[7] + parts[8]
+                // Convert hex to int using shell
+                let w_cmd = "cmd /c set /a 0x" + w_hex
+                let h_cmd = "cmd /c set /a 0x" + h_hex
+                let w_str = trim(shell(w_cmd))
+                let h_str = trim(shell(h_cmd))
+                width = to_int(w_str)
+                height = to_int(h_str)
+            }
+            i = len(lines)
+        }
+        i = i + 1
+    }
+    let result = {}
+    result = dict_set(result, "width", width)
+    result = dict_set(result, "height", height)
+    return result
+}
+
+// ============================================================================
+// HELPER: parse JPEG dimensions from file header
+// JPEG: Look for SOF0 marker (FF C0) which contains height and width
+// ============================================================================
+fn get_jpeg_dims(fpath) {
+    let win_path = replace(fpath, "/", "\\")
+    let cmd = "certutil -encodehex \"" + win_path + "\" C:\\NovaX\\temp\\tmedia_hexdump.txt 4 2>NUL && type C:\\NovaX\\temp\\tmedia_hexdump.txt"
+    let hex_raw = shell(cmd)
+    // Search for "ff c0" or "ff c2" marker (SOF0 or SOF2)
+    // After the marker: 2-byte length, 1-byte precision, 2-byte height, 2-byte width
+    let lc_hex = lower(hex_raw)
+    let width = 0
+    let height = 0
+
+    // Strategy: concatenate all hex bytes into one string, find ffc0/ffc2
+    let lines = split(hex_raw, "\n")
+    let all_hex = ""
+    let li = 0
+    while3 li < len(lines) {
+        let line = trim(lines[li])
+        if3 len(line) > 6 {
+            // Skip offset (first token), concatenate hex bytes
+            let after_offset = slice(line, 6, len(line))
+            // Remove extra spaces and non-hex chars
+            let cleaned = replace(after_offset, "  ", " ")
+            let parts = split(trim(cleaned), " ")
+            let pi = 0
+            while3 pi < len(parts) {
+                let part = trim(parts[pi])
+                if3 len(part) == 2 {
+                    all_hex = all_hex + part
+                }
+                pi = pi + 1
+            }
+        }
+        li = li + 1
+    }
+
+    // Find ffc0 or ffc2 marker in concatenated hex
+    let all_lc = lower(all_hex)
+    let sof_pos = -1
+    let si = 0
+    while3 si < len(all_lc) - 4 {
+        let marker = slice(all_lc, si, si + 4)
+        if3 marker == "ffc0" {
+            sof_pos = si
+            si = len(all_lc)
+        }
+        if3 marker == "ffc2" {
+            if3 sof_pos == -1 {
+                sof_pos = si
+                si = len(all_lc)
+            }
+        }
+        si = si + 2
+    }
+
+    if3 sof_pos >= 0 {
+        // SOF: marker(4) + length(4) + precision(2) + height(4) + width(4)
+        let h_start = sof_pos + 10
+        let w_start = sof_pos + 14
+        if3 w_start + 4 <= len(all_lc) {
+            let h_hex = slice(all_lc, h_start, h_start + 4)
+            let w_hex = slice(all_lc, w_start, w_start + 4)
+            let w_cmd = "cmd /c set /a 0x" + w_hex
+            let h_cmd = "cmd /c set /a 0x" + h_hex
+            width = to_int(trim(shell(w_cmd)))
+            height = to_int(trim(shell(h_cmd)))
+        }
+    }
+
+    let result = {}
+    result = dict_set(result, "width", width)
+    result = dict_set(result, "height", height)
+    return result
+}
+
+// ============================================================================
+// HELPER: parse BMP dimensions (bytes 18-21 = width, 22-25 = height, little-endian)
+// ============================================================================
+fn get_bmp_dims(fpath) {
+    let win_path = replace(fpath, "/", "\\")
+    let cmd = "certutil -encodehex \"" + win_path + "\" C:\\NovaX\\temp\\tmedia_hexdump.txt 4 2>NUL && type C:\\NovaX\\temp\\tmedia_hexdump.txt"
+    let hex_raw = shell(cmd)
+    let lines = split(hex_raw, "\n")
+    let width = 0
+    let height = 0
+    // BMP: width at offset 0x12 (18), height at offset 0x16 (22), both 4 bytes LE
+    // Line starting with 0010 has bytes 16-31
+    let i = 0
+    while3 i < len(lines) {
+        let line = trim(lines[i])
+        if3 starts_with(line, "0010") {
+            let cleaned = replace(line, "  ", " ")
+            let parts = split(cleaned, " ")
+            // Bytes at offset 18,19,20,21 = positions 3,4,5,6 on this line (after "0010")
+            // Bytes at offset 22,23,24,25 = positions 7,8,9,10
+            if3 len(parts) >= 11 {
+                // Little-endian: reverse byte order
+                let w_hex = parts[6] + parts[5] + parts[4] + parts[3]
+                let h_hex = parts[10] + parts[9] + parts[8] + parts[7]
+                let w_cmd = "cmd /c set /a 0x" + w_hex
+                let h_cmd = "cmd /c set /a 0x" + h_hex
+                width = to_int(trim(shell(w_cmd)))
+                height = to_int(trim(shell(h_cmd)))
+            }
+            i = len(lines)
+        }
+        i = i + 1
+    }
+    let result = {}
+    result = dict_set(result, "width", width)
+    result = dict_set(result, "height", height)
+    return result
+}
+
+// ============================================================================
+// HELPER: parse GIF dimensions (bytes 6-7 = width LE, 8-9 = height LE)
+// ============================================================================
+fn get_gif_dims(fpath) {
+    let win_path = replace(fpath, "/", "\\")
+    let cmd = "certutil -encodehex \"" + win_path + "\" C:\\NovaX\\temp\\tmedia_hexdump.txt 4 2>NUL && type C:\\NovaX\\temp\\tmedia_hexdump.txt"
+    let hex_raw = shell(cmd)
+    let lines = split(hex_raw, "\n")
+    let width = 0
+    let height = 0
+    // GIF: width at offset 6 (2 bytes LE), height at offset 8 (2 bytes LE)
+    // First line (0000) has bytes 0-15
+    let i = 0
+    while3 i < len(lines) {
+        let line = trim(lines[i])
+        if3 starts_with(line, "0000") {
+            let cleaned = replace(line, "  ", " ")
+            let parts = split(cleaned, " ")
+            // Width at bytes 6,7 = parts[7], parts[8]
+            // Height at bytes 8,9 = parts[9], parts[10]
+            if3 len(parts) >= 11 {
+                let w_hex = parts[8] + parts[7]
+                let h_hex = parts[10] + parts[9]
+                let w_cmd = "cmd /c set /a 0x" + w_hex
+                let h_cmd = "cmd /c set /a 0x" + h_hex
+                width = to_int(trim(shell(w_cmd)))
+                height = to_int(trim(shell(h_cmd)))
+            }
+            i = len(lines)
+        }
+        i = i + 1
+    }
+    let result = {}
+    result = dict_set(result, "width", width)
+    result = dict_set(result, "height", height)
+    return result
+}
+
+// ============================================================================
+// HELPER: detect image format from file extension
+// ============================================================================
+fn detect_format(fpath) {
+    let lc = lower(fpath)
+    if3 ends_with(lc, ".png") { return "PNG" }
+    if3 ends_with(lc, ".jpg") { return "JPEG" }
+    if3 ends_with(lc, ".jpeg") { return "JPEG" }
+    if3 ends_with(lc, ".gif") { return "GIF" }
+    if3 ends_with(lc, ".bmp") { return "BMP" }
+    if3 ends_with(lc, ".webp") { return "WEBP" }
+    if3 ends_with(lc, ".tiff") { return "TIFF" }
+    if3 ends_with(lc, ".tif") { return "TIFF" }
+    if3 ends_with(lc, ".ico") { return "ICO" }
+    return "UNKNOWN"
+}
+
+// ============================================================================
+// HELPER: detect color mode from format (approximate — actual mode needs header parsing)
+// ============================================================================
+fn guess_mode(format_str) {
+    if3 format_str == "PNG" { return "RGBA" }
+    if3 format_str == "JPEG" { return "RGB" }
+    if3 format_str == "GIF" { return "P" }
+    if3 format_str == "BMP" { return "RGB" }
+    if3 format_str == "WEBP" { return "RGBA" }
+    return "RGB"
+}
+
+// ============================================================================
+// HELPER: get file size in bytes
+// ============================================================================
+fn get_size(fpath) {
+    let win_path = replace(fpath, "/", "\\")
+    let cmd = "for %I in (\"" + win_path + "\") do @echo %~zI"
+    let result = trim(shell(cmd))
+    if3 len(result) == 0 {
+        return 0
+    }
+    return to_int(result)
+}
+
+// ============================================================================
+// HELPER: check if file/dir exists
+// ============================================================================
+fn check_exists(fpath) {
+    let win_path = replace(fpath, "/", "\\")
+    let cmd = "if exist \"" + win_path + "\" (echo yes) else (echo no)"
+    let result = trim(shell(cmd))
+    if3 contains(result, "yes") {
+        return true
+    }
+    return false
+}
+
+// ============================================================================
+// HELPER: extract basename from path
+// ============================================================================
+fn get_basename(fpath) {
+    let normalized = replace(fpath, "\\", "/")
+    let parts = split(normalized, "/")
+    if3 len(parts) > 0 {
+        return parts[len(parts) - 1]
+    }
+    return fpath
+}
+
+// ============================================================================
+// HELPER: extract extension from path
+// ============================================================================
+fn get_extension(fpath) {
+    let base = get_basename(fpath)
+    let parts = split(base, ".")
+    if3 len(parts) > 1 {
+        return parts[len(parts) - 1]
+    }
+    return ""
+}
+
+// ============================================================================
+// OP: info -- Read image dimensions from file header
+// ============================================================================
+fn do_info() {
+    if3 len(argv) < 2 {
+        print("{\"ok\":false,\"error\":\"path argument required\"}")
+        return 0
+    }
+    let fpath = argv[1]
+    if3 check_exists(fpath) == false {
+        print("{\"ok\":false,\"error\":\"file not found\"}")
+        return 0
+    }
+    let format_str = detect_format(fpath)
+    let size_bytes = get_size(fpath)
+    let width = 0
+    let height = 0
+
+    if3 format_str == "PNG" {
+        let dims = get_png_dims(fpath)
+        width = dict_get(dims, "width") ?? 0
+        height = dict_get(dims, "height") ?? 0
+    }
+    if3 format_str == "JPEG" {
+        let dims = get_jpeg_dims(fpath)
+        width = dict_get(dims, "width") ?? 0
+        height = dict_get(dims, "height") ?? 0
+    }
+    if3 format_str == "BMP" {
+        let dims = get_bmp_dims(fpath)
+        width = dict_get(dims, "width") ?? 0
+        height = dict_get(dims, "height") ?? 0
+    }
+    if3 format_str == "GIF" {
+        let dims = get_gif_dims(fpath)
+        width = dict_get(dims, "width") ?? 0
+        height = dict_get(dims, "height") ?? 0
+    }
+
+    let mode = guess_mode(format_str)
+
+    let r = {}
+    r = dict_set(r, "ok", true)
+    r = dict_set(r, "width", width)
+    r = dict_set(r, "height", height)
+    r = dict_set(r, "format", format_str)
+    r = dict_set(r, "mode", mode)
+    r = dict_set(r, "size_bytes", size_bytes)
+    print(json_encode(r))
+    return 0
+}
+
+// ============================================================================
+// OP: convert -- Image format conversion via magick (if available)
+// ============================================================================
+fn do_convert() {
+    if3 len(argv) < 3 {
+        print("{\"ok\":false,\"error\":\"input_path and output_path required\"}")
+        return 0
+    }
+    let input_path = argv[1]
+    let output_path = argv[2]
+    let win_in = replace(input_path, "/", "\\")
+    let win_out = replace(output_path, "/", "\\")
+
+    // Try magick first
+    let magick_check = trim(shell("where magick 2>NUL"))
+    if3 len(magick_check) > 0 {
+        let cmd = "magick \"" + win_in + "\" \"" + win_out + "\""
+        let result = shell(cmd)
+        if3 check_exists(output_path) {
+            let out_size = get_size(output_path)
+            // Get output image info
+            let out_format = detect_format(output_path)
+            let r = {}
+            r = dict_set(r, "ok", true)
+            r = dict_set(r, "output_size", out_size)
+            r = dict_set(r, "output_format", out_format)
+            r = dict_set(r, "tool", "magick")
+            print(json_encode(r))
+            return 0
+        }
+    }
+
+    // Try ffmpeg
+    let ffmpeg_check = trim(shell("where ffmpeg 2>NUL"))
+    if3 len(ffmpeg_check) > 0 {
+        let cmd = "ffmpeg -y -i \"" + win_in + "\" \"" + win_out + "\" 2>NUL"
+        shell(cmd)
+        if3 check_exists(output_path) {
+            let out_size = get_size(output_path)
+            let r = {}
+            r = dict_set(r, "ok", true)
+            r = dict_set(r, "output_size", out_size)
+            r = dict_set(r, "tool", "ffmpeg")
+            print(json_encode(r))
+            return 0
+        }
+    }
+
+    print("{\"ok\":false,\"error\":\"No image converter available (install magick or ffmpeg)\"}")
+    return 0
+}
+
+// ============================================================================
+// OP: thumbnail -- Generate thumbnail via magick (if available)
+// ============================================================================
+fn do_thumbnail() {
+    if3 len(argv) < 5 {
+        print("{\"ok\":false,\"error\":\"path width height output_path required\"}")
+        return 0
+    }
+    let fpath = argv[1]
+    let tw = argv[2]
+    let th = argv[3]
+    let output_path = argv[4]
+    let win_in = replace(fpath, "/", "\\")
+    let win_out = replace(output_path, "/", "\\")
+
+    // Get original dimensions first
+    let format_str = detect_format(fpath)
+    let orig_w = 0
+    let orig_h = 0
+    if3 format_str == "PNG" {
+        let dims = get_png_dims(fpath)
+        orig_w = dict_get(dims, "width") ?? 0
+        orig_h = dict_get(dims, "height") ?? 0
+    }
+    if3 format_str == "JPEG" {
+        let dims = get_jpeg_dims(fpath)
+        orig_w = dict_get(dims, "width") ?? 0
+        orig_h = dict_get(dims, "height") ?? 0
+    }
+    if3 format_str == "BMP" {
+        let dims = get_bmp_dims(fpath)
+        orig_w = dict_get(dims, "width") ?? 0
+        orig_h = dict_get(dims, "height") ?? 0
+    }
+    if3 format_str == "GIF" {
+        let dims = get_gif_dims(fpath)
+        orig_w = dict_get(dims, "width") ?? 0
+        orig_h = dict_get(dims, "height") ?? 0
+    }
+
+    // Try magick
+    let magick_check = trim(shell("where magick 2>NUL"))
+    if3 len(magick_check) > 0 {
+        let cmd = "magick \"" + win_in + "\" -thumbnail " + tw + "x" + th + " \"" + win_out + "\""
+        shell(cmd)
+        if3 check_exists(output_path) {
+            let out_size = get_size(output_path)
+            let r = {}
+            r = dict_set(r, "ok", true)
+            r = dict_set(r, "original_width", orig_w)
+            r = dict_set(r, "original_height", orig_h)
+            r = dict_set(r, "output_size", out_size)
+            r = dict_set(r, "target", tw + "x" + th)
+            r = dict_set(r, "tool", "magick")
+            print(json_encode(r))
+            return 0
+        }
+    }
+
+    // Try ffmpeg
+    let ffmpeg_check = trim(shell("where ffmpeg 2>NUL"))
+    if3 len(ffmpeg_check) > 0 {
+        let cmd = "ffmpeg -y -i \"" + win_in + "\" -vf scale=" + tw + ":" + th + ":force_original_aspect_ratio=decrease \"" + win_out + "\" 2>NUL"
+        shell(cmd)
+        if3 check_exists(output_path) {
+            let out_size = get_size(output_path)
+            let r = {}
+            r = dict_set(r, "ok", true)
+            r = dict_set(r, "original_width", orig_w)
+            r = dict_set(r, "original_height", orig_h)
+            r = dict_set(r, "output_size", out_size)
+            r = dict_set(r, "tool", "ffmpeg")
+            print(json_encode(r))
+            return 0
+        }
+    }
+
+    print("{\"ok\":false,\"error\":\"No thumbnail tool available (install magick or ffmpeg)\",\"original_width\":" + str(orig_w) + ",\"original_height\":" + str(orig_h) + "}")
+    return 0
+}
+
+// ============================================================================
+// OP: cheat -- Generate cheat sheet as SVG (pure NovaLang, zero external deps)
+// Reads data from C:/NovaX/temp/cheat_data.json
+// ============================================================================
+fn do_cheat() {
+    let data_path = "C:/NovaX/temp/cheat_data.json"
+    if3 check_exists(data_path) == false {
+        print("{\"ok\":false,\"error\":\"cheat_data.json not found\"}")
+        return 0
+    }
+    let raw = read_file(data_path)
+    let data = json_decode(raw)
+    let title = dict_get(data, "title") ?? "Cheat Sheet"
+    let items = dict_get(data, "items") ?? []
+    let item_count = len(items)
+
+    // Layout constants
+    let pad = 20
+    let title_h = 40
+    let item_h = 28
+    let col_w = 360
+    let cols = 1
+    if3 item_count > 8 {
+        cols = 2
+    }
+    let rows = item_count
+    if3 cols == 2 {
+        rows = (item_count + 1) / 2
+    }
+
+    let svg_w = pad * 2 + col_w * cols + (cols - 1) * pad
+    let svg_h = pad * 2 + title_h + pad + rows * item_h + pad
+
+    // Build SVG
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + str(svg_w) + "\" height=\"" + str(svg_h) + "\">\n"
+    // Background
+    svg = svg + "<rect width=\"100%\" height=\"100%\" fill=\"#1e1e2e\"/>\n"
+    // Title bar
+    svg = svg + "<rect x=\"0\" y=\"0\" width=\"" + str(svg_w) + "\" height=\"" + str(title_h + pad * 2) + "\" fill=\"#141464\"/>\n"
+    svg = svg + "<text x=\"" + str(pad) + "\" y=\"" + str(pad + 26) + "\" fill=\"#ffdc32\" font-family=\"Arial,sans-serif\" font-size=\"20\" font-weight=\"bold\">" + title + "</text>\n"
+
+    // Items
+    let idx = 0
+    while3 idx < item_count {
+        let col = idx % cols
+        let row = idx / cols
+        let x = pad + col * (col_w + pad)
+        let y = pad * 2 + title_h + pad + row * item_h
+        // Alternating row background
+        let bg = "#28283c"
+        if3 idx % 2 == 1 {
+            bg = "#232337"
+        }
+        svg = svg + "<rect x=\"" + str(x - 4) + "\" y=\"" + str(y - 2) + "\" width=\"" + str(col_w - 8) + "\" height=\"" + str(item_h - 4) + "\" fill=\"" + bg + "\" rx=\"3\"/>\n"
+        let item_text = str(dict_get(items, idx) ?? "")
+        // Escape XML special chars
+        item_text = replace(item_text, "&", "&amp;")
+        item_text = replace(item_text, "<", "&lt;")
+        item_text = replace(item_text, ">", "&gt;")
+        svg = svg + "<text x=\"" + str(x + 8) + "\" y=\"" + str(y + 16) + "\" fill=\"#c8e6ff\" font-family=\"Consolas,monospace\" font-size=\"13\">" + item_text + "</text>\n"
+        idx = idx + 1
+    }
+
+    svg = svg + "</svg>"
+
+    // Output path from argv or default
+    let out_path = "C:/NovaX/temp/cheat_output.svg"
+    if3 len(argv) > 1 {
+        out_path = argv[1]
+    }
+    nova_write(out_path, svg)
+
+    let r = {}
+    r = dict_set(r, "ok", true)
+    r = dict_set(r, "width", svg_w)
+    r = dict_set(r, "height", svg_h)
+    r = dict_set(r, "format", "svg")
+    r = dict_set(r, "output_path", out_path)
+    r = dict_set(r, "item_count", item_count)
+    print(json_encode(r))
+    return 0
+}
+
+// ============================================================================
+// OP: manifest -- Scan directory for media files
+// ============================================================================
+fn do_manifest() {
+    if3 len(argv) < 2 {
+        print("{\"ok\":false,\"error\":\"dir_path required\"}")
+        return 0
+    }
+    let dir_path = argv[1]
+    let win_dir = replace(dir_path, "/", "\\")
+
+    if3 check_exists(dir_path) == false {
+        print("{\"ok\":false,\"error\":\"directory not found\"}")
+        return 0
+    }
+
+    // Media extensions to look for
+    let media_exts = "png jpg jpeg gif bmp webp tiff tif ico mp3 wav flac ogg aac m4a wma opus mp4 avi mkv mov wmv flv webm m4v pdf md txt html htm rtf docx doc"
+
+    // Use dir /s /b to list all files
+    let cmd = "dir /s /b \"" + win_dir + "\" 2>NUL"
+    let raw_files = shell(cmd)
+    let file_lines = split(raw_files, "\n")
+
+    let files_json = "["
+    let file_count = 0
+    let total_bytes = 0
+    let by_image = 0
+    let by_audio = 0
+    let by_video = 0
+    let by_doc = 0
+    let sample_json = "["
+    let sample_count = 0
+
+    let fi = 0
+    while3 fi < len(file_lines) {
+        let fline = trim(file_lines[fi])
+        if3 len(fline) > 2 {
+            let ext = lower(get_extension(fline))
+            let kind = ""
+            // Classify
+            if3 contains("png jpg jpeg gif bmp webp tiff tif ico", ext) {
+                kind = "image"
+            }
+            if3 contains("mp3 wav flac ogg aac m4a wma opus", ext) {
+                kind = "audio"
+            }
+            if3 contains("mp4 avi mkv mov wmv flv webm m4v", ext) {
+                kind = "video"
+            }
+            if3 contains("pdf md txt html htm rtf docx doc", ext) {
+                kind = "doc"
+            }
+
+            if3 len(kind) > 0 {
+                let fsize = get_size(fline)
+                total_bytes = total_bytes + fsize
+                file_count = file_count + 1
+
+                if3 kind == "image" { by_image = by_image + 1 }
+                if3 kind == "audio" { by_audio = by_audio + 1 }
+                if3 kind == "video" { by_video = by_video + 1 }
+                if3 kind == "doc" { by_doc = by_doc + 1 }
+
+                // Build sample (first 20 files)
+                if3 sample_count < 20 {
+                    let fname = get_basename(fline)
+                    let safe_name = replace(fname, "\"", "\\\"")
+                    if3 sample_count > 0 {
+                        sample_json = sample_json + ","
+                    }
+                    sample_json = sample_json + "{\"name\":\"" + safe_name + "\",\"type\":\"" + kind + "\",\"extension\":\"" + ext + "\",\"size_bytes\":" + str(fsize) + "}"
+                    sample_count = sample_count + 1
+                }
+            }
+        }
+        fi = fi + 1
+    }
+
+    sample_json = sample_json + "]"
+
+    let by_type = {}
+    if3 by_image > 0 { by_type = dict_set(by_type, "image", by_image) }
+    if3 by_audio > 0 { by_type = dict_set(by_type, "audio", by_audio) }
+    if3 by_video > 0 { by_type = dict_set(by_type, "video", by_video) }
+    if3 by_doc > 0 { by_type = dict_set(by_type, "doc", by_doc) }
+
+    let r = {}
+    r = dict_set(r, "ok", true)
+    r = dict_set(r, "file_count", file_count)
+    r = dict_set(r, "total_bytes", total_bytes)
+    r = dict_set(r, "by_type", by_type)
+    r = dict_set(r, "sample_files_json", sample_json)
+    print(json_encode(r))
+    return 0
+}
+
+// ============================================================================
+// OP: file_exists
+// ============================================================================
+fn do_file_exists() {
+    if3 len(argv) < 2 {
+        print("{\"ok\":false,\"error\":\"path required\"}")
+        return 0
+    }
+    if3 check_exists(argv[1]) {
+        print("{\"exists\":true}")
+    }
+    if3 check_exists(argv[1]) == false {
+        print("{\"exists\":false}")
+    }
+    return 0
+}
+
+// ============================================================================
+// OP: file_size
+// ============================================================================
+fn do_file_size() {
+    if3 len(argv) < 2 {
+        print("{\"ok\":false,\"error\":\"path required\"}")
+        return 0
+    }
+    let s = get_size(argv[1])
+    print("{\"size\":" + str(s) + "}")
+    return 0
+}
+
+// ============================================================================
+// OP: basename
+// ============================================================================
+fn do_basename() {
+    if3 len(argv) < 2 {
+        print("{\"ok\":false,\"error\":\"path required\"}")
+        return 0
+    }
+    let b = get_basename(argv[1])
+    print("{\"basename\":\"" + b + "\"}")
+    return 0
+}
+
+// ============================================================================
+// OP: extension
+// ============================================================================
+fn do_extension() {
+    if3 len(argv) < 2 {
+        print("{\"ok\":false,\"error\":\"path required\"}")
+        return 0
+    }
+    let e = get_extension(argv[1])
+    print("{\"extension\":\"" + e + "\"}")
+    return 0
+}
+
+// ============================================================================
+// Dispatch
+// ============================================================================
+if3 op == "info" { do_info() }
+if3 op == "convert" { do_convert() }
+if3 op == "thumbnail" { do_thumbnail() }
+if3 op == "cheat" { do_cheat() }
+if3 op == "manifest" { do_manifest() }
+if3 op == "file_exists" { do_file_exists() }
+if3 op == "file_size" { do_file_size() }
+if3 op == "basename" { do_basename() }
+if3 op == "extension" { do_extension() }
+if3 len(op) == 0 {
+    print("{\"ok\":false,\"error\":\"operation required: info|convert|thumbnail|cheat|manifest|file_exists|file_size|basename|extension\"}")
+}

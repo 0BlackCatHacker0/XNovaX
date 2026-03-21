@@ -1,0 +1,1364 @@
+// NovaX TImage Service v1.0 - Ternary Image Processing (NovaLang)
+// Port 9918: Image operations through ternary-native micro-tools
+//
+// 7 ternary-native image tools on 3-5-7-13 harmonic constants:
+//   1. /timage/info       -- Image metadata (size, format, mode, channels)
+//   2. /timage/resize     -- Resize image (width, height, keep_aspect)
+//   3. /timage/crop       -- Crop image (left, top, right, bottom)
+//   4. /timage/convert    -- Convert format (png->jpg, etc.)
+//   5. /timage/thumbnail  -- Create thumbnail (max_size)
+//   6. /timage/watermark  -- Add text watermark
+//   7. /timage/filter     -- Apply filter (blur, sharpen, grayscale, edge, emboss, contour)
+//
+// N-S Mapping:
+//   pixel_stream         = velocity_field (pixels being processed)
+//   resolution_pressure  = turbulent_energy (image complexity)
+//   Reynolds(image)      = pixel_ops * H5
+//   RE_LAMINAR=27        = small image (low pixel count)
+//   RE_TRANSITION=125    = medium image (moderate pixel ops)
+//   RE_TURBULENT=343     = large image (heavy processing)
+//
+// Endpoints:
+//   GET  /health                -- Health check
+//   GET  /timage/service-status -- Full service status with stats
+//   POST /timage/info           -- Image metadata
+//   POST /timage/resize         -- Resize image
+//   POST /timage/crop           -- Crop image
+//   POST /timage/convert        -- Convert format
+//   POST /timage/thumbnail      -- Create thumbnail
+//   POST /timage/watermark      -- Add text watermark
+//   POST /timage/filter         -- Apply image filter
+
+let PORT = 9918
+let server = tserve(PORT, "TImage v1.0 - Ternary Image Processing")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE     = 2187
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+let TOOLS_COUNT    = 7
+let VERSION        = "1.0.0"
+let SERVICE_NAME   = "nova-timage"
+let PIL_TIMEOUT    = 13
+let DEFAULT_OUTPUT = "C:\\NovaX\\output"
+
+// -- Global Stats --
+let stat_ops         = 0
+let stat_trit_true   = 0
+let stat_trit_maybe  = 0
+let stat_trit_false  = 0
+let stat_t0          = time()
+
+// by_tool counters (one per tool)
+let by_tool_info      = 0
+let by_tool_resize    = 0
+let by_tool_crop      = 0
+let by_tool_convert   = 0
+let by_tool_thumbnail = 0
+let by_tool_watermark = 0
+let by_tool_filter    = 0
+
+// -- Pixel ops cache (path -> last known info) --
+let _image_cache = {}
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_stat(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "info" {
+        by_tool_info = by_tool_info + 1
+    }
+    if3 tool_name == "resize" {
+        by_tool_resize = by_tool_resize + 1
+    }
+    if3 tool_name == "crop" {
+        by_tool_crop = by_tool_crop + 1
+    }
+    if3 tool_name == "convert" {
+        by_tool_convert = by_tool_convert + 1
+    }
+    if3 tool_name == "thumbnail" {
+        by_tool_thumbnail = by_tool_thumbnail + 1
+    }
+    if3 tool_name == "watermark" {
+        by_tool_watermark = by_tool_watermark + 1
+    }
+    if3 tool_name == "filter" {
+        by_tool_filter = by_tool_filter + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: run a python/PIL command with standard timeout
+// Returns stripped output string
+// ===========================================================================
+fn run_pil(cmd) {
+    let raw = nova_run(cmd, PIL_TIMEOUT)
+    let output = strip(str(raw))
+    return output
+}
+
+// ===========================================================================
+// HELPER: check if output indicates an error
+// ===========================================================================
+fn is_pil_error(output) {
+    let lc = lower(output)
+    if3 contains(lc, "traceback") {
+        return true
+    }
+    if3 contains(lc, "error:") {
+        return true
+    }
+    if3 contains(lc, "exception") {
+        return true
+    }
+    if3 contains(lc, "no such file") {
+        return true
+    }
+    if3 contains(lc, "filenotfounderror") {
+        return true
+    }
+    if3 contains(lc, "cannot identify image") {
+        return true
+    }
+    if3 contains(lc, "permission denied") {
+        return true
+    }
+    if3 contains(lc, "oserror") {
+        return true
+    }
+    if3 contains(lc, "ioerror") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: escape a file path for use inside python strings
+// Replace single backslash with double backslash for Windows paths
+// ===========================================================================
+fn escape_path(path) {
+    let escaped = replace(path, "\\", "\\\\")
+    return escaped
+}
+
+// ===========================================================================
+// HELPER: calculate Reynolds number from pixel dimensions
+// N-S: resolution_pressure = turbulent_energy
+// Reynolds = (width * height / BLOCK_SIZE) * H5
+// ===========================================================================
+fn calc_reynolds(width, height) {
+    let pixels = width * height
+    let re = (pixels / BLOCK_SIZE) * H5
+    if3 re > 999 {
+        re = 999
+    }
+    if3 re < 0 {
+        re = 0
+    }
+    return re
+}
+
+// ===========================================================================
+// HELPER: get python executable (prefer ai_env)
+// ===========================================================================
+fn get_python() {
+    return "python"
+}
+
+// ===========================================================================
+// HELPER: count channels from mode string
+// ===========================================================================
+fn mode_channels(mode) {
+    if3 mode == "L" {
+        return 1
+    }
+    if3 mode == "LA" {
+        return 2
+    }
+    if3 mode == "RGB" {
+        return 3
+    }
+    if3 mode == "RGBA" {
+        return 4
+    }
+    if3 mode == "CMYK" {
+        return 4
+    }
+    if3 mode == "P" {
+        return 1
+    }
+    if3 mode == "1" {
+        return 1
+    }
+    if3 mode == "I" {
+        return 1
+    }
+    if3 mode == "F" {
+        return 1
+    }
+    return 3
+}
+
+// ===========================================================================
+// TOOL 1: POST /timage/info
+// Image metadata: size, format, mode, channels, file size
+// Body: {input: "C:\\path\\to\\image.png"}
+// Trit: +1=success, 0=partial info, -1=error/not found
+// ===========================================================================
+fn handle_info(body) {
+    let input = dict_get(body, "input", "")
+
+    // Validate input
+    if3 len(input) == 0 {
+        record_stat("info", T_FALSE)
+        return {
+            "ok": false,
+            "error": "input path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let epath = escape_path(input)
+    let py = get_python()
+
+    // Build python command to get image info
+    let cmd = py + " -c \"from PIL import Image; import json,os; img=Image.open('" + epath + "'); s=os.path.getsize('" + epath + "'); print(json.dumps({'width':img.width,'height':img.height,'format':str(img.format),'mode':str(img.mode),'size_bytes':s}))\""
+
+    let output = run_pil(cmd)
+
+    // Check for error
+    if3 is_pil_error(output) == true {
+        record_stat("info", T_FALSE)
+        return {
+            "ok": false,
+            "input": input,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse JSON output from python
+    // Output format: {"width":N,"height":N,"format":"PNG","mode":"RGB","size_bytes":N}
+    // We need to extract values manually since NovaLang doesn't have json.parse
+    // Use python to output individual fields instead
+    let cmd_w = py + " -c \"from PIL import Image; img=Image.open('" + epath + "'); print(img.width)\""
+    let width_str = run_pil(cmd_w)
+
+    let cmd_h = py + " -c \"from PIL import Image; img=Image.open('" + epath + "'); print(img.height)\""
+    let height_str = run_pil(cmd_h)
+
+    let cmd_f = py + " -c \"from PIL import Image; img=Image.open('" + epath + "'); print(img.format)\""
+    let format_str = run_pil(cmd_f)
+
+    let cmd_m = py + " -c \"from PIL import Image; img=Image.open('" + epath + "'); print(img.mode)\""
+    let mode_str = run_pil(cmd_m)
+
+    let cmd_s = py + " -c \"import os; print(os.path.getsize('" + epath + "'))\""
+    let size_str = run_pil(cmd_s)
+
+    // Check any field for errors
+    if3 is_pil_error(width_str) == true {
+        record_stat("info", T_FALSE)
+        return {
+            "ok": false,
+            "input": input,
+            "error": width_str,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let width = int(strip(width_str))
+    let height = int(strip(height_str))
+    let format_val = strip(format_str)
+    let mode_val = strip(mode_str)
+    let size_bytes = int(strip(size_str))
+    let channels = mode_channels(mode_val)
+
+    // Calculate pixel count and Reynolds
+    let pixel_count = width * height
+    let re = calc_reynolds(width, height)
+    let regime = flow_regime(re)
+
+    // Cache image info
+    let cache_entry = {}
+    dict_set(cache_entry, "width", width)
+    dict_set(cache_entry, "height", height)
+    dict_set(cache_entry, "format", format_val)
+    dict_set(cache_entry, "mode", mode_val)
+    dict_set(cache_entry, "last_check", time())
+    dict_set(_image_cache, input, cache_entry)
+
+    record_stat("info", T_TRUE)
+    return {
+        "ok": true,
+        "input": input,
+        "width": width,
+        "height": height,
+        "format": format_val,
+        "mode": mode_val,
+        "channels": channels,
+        "size_bytes": size_bytes,
+        "pixel_count": pixel_count,
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 2: POST /timage/resize
+// Resize image to target dimensions
+// Body: {input, output, width, height, keep_aspect: true}
+// Trit: +1=resized, 0=same size (no-op), -1=error
+// ===========================================================================
+fn handle_resize(body) {
+    let input = dict_get(body, "input", "")
+    let output = dict_get(body, "output", "")
+    let width = dict_get(body, "width", 0)
+    let height = dict_get(body, "height", 0)
+    let keep_aspect = dict_get(body, "keep_aspect", true)
+
+    // Validate input
+    if3 len(input) == 0 {
+        record_stat("resize", T_FALSE)
+        return {
+            "ok": false,
+            "error": "input path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output) == 0 {
+        record_stat("resize", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 width <= 0 {
+        record_stat("resize", T_FALSE)
+        return {
+            "ok": false,
+            "error": "width must be > 0",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 height <= 0 {
+        record_stat("resize", T_FALSE)
+        return {
+            "ok": false,
+            "error": "height must be > 0",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let epath_in = escape_path(input)
+    let epath_out = escape_path(output)
+    let py = get_python()
+    let w_str = str(width)
+    let h_str = str(height)
+
+    // Build python command based on keep_aspect
+    let cmd = ""
+    if3 keep_aspect == true {
+        // Use thumbnail which maintains aspect ratio
+        cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); img.thumbnail((" + w_str + "," + h_str + "),Image.LANCZOS); img.save('" + epath_out + "'); print(str(img.width)+'x'+str(img.height))\""
+    }
+    if3 keep_aspect == false {
+        // Force exact resize (stretches)
+        cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); img=img.resize((" + w_str + "," + h_str + "),Image.LANCZOS); img.save('" + epath_out + "'); print(str(img.width)+'x'+str(img.height))\""
+    }
+
+    let result = run_pil(cmd)
+
+    // Check for error
+    if3 is_pil_error(result) == true {
+        record_stat("resize", T_FALSE)
+        return {
+            "ok": false,
+            "input": input,
+            "output": output,
+            "target_width": width,
+            "target_height": height,
+            "keep_aspect": keep_aspect,
+            "error": result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse result dimensions (format: WxH)
+    let dims = split(strip(result), "x")
+    let final_w = int(dict_get(dims, 0, "0"))
+    let final_h = int(dict_get(dims, 1, "0"))
+
+    // Get original dimensions for comparison
+    let orig_cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); print(str(img.width)+'x'+str(img.height))\""
+    let orig_result = run_pil(orig_cmd)
+    let orig_dims = split(strip(orig_result), "x")
+    let orig_w = int(dict_get(orig_dims, 0, "0"))
+    let orig_h = int(dict_get(orig_dims, 1, "0"))
+
+    // Trit: +1 if resized, 0 if same size (no-op)
+    let resize_trit = T_TRUE
+    if3 final_w == orig_w {
+        if3 final_h == orig_h {
+            resize_trit = T_MAYBE
+        }
+    }
+
+    // Reynolds from pixel operations
+    let re = calc_reynolds(final_w, final_h)
+    let regime = flow_regime(re)
+
+    record_stat("resize", resize_trit)
+    return {
+        "ok": true,
+        "input": input,
+        "output": output,
+        "original_width": orig_w,
+        "original_height": orig_h,
+        "final_width": final_w,
+        "final_height": final_h,
+        "keep_aspect": keep_aspect,
+        "reynolds": re,
+        "regime": regime,
+        "trit": resize_trit,
+        "char": bt_one(resize_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 3: POST /timage/crop
+// Crop image to a bounding box
+// Body: {input, output, left, top, right, bottom}
+// Trit: +1=cropped, 0=full image (no crop needed), -1=error
+// ===========================================================================
+fn handle_crop(body) {
+    let input = dict_get(body, "input", "")
+    let output = dict_get(body, "output", "")
+    let left = dict_get(body, "left", 0)
+    let top = dict_get(body, "top", 0)
+    let right = dict_get(body, "right", 0)
+    let bottom = dict_get(body, "bottom", 0)
+
+    // Validate input
+    if3 len(input) == 0 {
+        record_stat("crop", T_FALSE)
+        return {
+            "ok": false,
+            "error": "input path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output) == 0 {
+        record_stat("crop", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Validate crop box
+    if3 right <= left {
+        record_stat("crop", T_FALSE)
+        return {
+            "ok": false,
+            "error": "right must be > left",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 bottom <= top {
+        record_stat("crop", T_FALSE)
+        return {
+            "ok": false,
+            "error": "bottom must be > top",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let epath_in = escape_path(input)
+    let epath_out = escape_path(output)
+    let py = get_python()
+    let l_str = str(left)
+    let t_str = str(top)
+    let r_str = str(right)
+    let b_str = str(bottom)
+
+    // Build python crop command
+    let cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); img=img.crop((" + l_str + "," + t_str + "," + r_str + "," + b_str + ")); img.save('" + epath_out + "'); print(str(img.width)+'x'+str(img.height))\""
+
+    let result = run_pil(cmd)
+
+    // Check for error
+    if3 is_pil_error(result) == true {
+        record_stat("crop", T_FALSE)
+        return {
+            "ok": false,
+            "input": input,
+            "output": output,
+            "crop_box": {"left": left, "top": top, "right": right, "bottom": bottom},
+            "error": result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse result dimensions
+    let dims = split(strip(result), "x")
+    let crop_w = int(dict_get(dims, 0, "0"))
+    let crop_h = int(dict_get(dims, 1, "0"))
+
+    // Get original dimensions for comparison
+    let orig_cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); print(str(img.width)+'x'+str(img.height))\""
+    let orig_result = run_pil(orig_cmd)
+    let orig_dims = split(strip(orig_result), "x")
+    let orig_w = int(dict_get(orig_dims, 0, "0"))
+    let orig_h = int(dict_get(orig_dims, 1, "0"))
+
+    // Trit: +1 if cropped smaller, 0 if same as original
+    let crop_trit = T_TRUE
+    if3 crop_w == orig_w {
+        if3 crop_h == orig_h {
+            crop_trit = T_MAYBE
+        }
+    }
+
+    // Reynolds from crop dimensions
+    let re = calc_reynolds(crop_w, crop_h)
+    let regime = flow_regime(re)
+
+    record_stat("crop", crop_trit)
+    return {
+        "ok": true,
+        "input": input,
+        "output": output,
+        "crop_box": {"left": left, "top": top, "right": right, "bottom": bottom},
+        "original_width": orig_w,
+        "original_height": orig_h,
+        "cropped_width": crop_w,
+        "cropped_height": crop_h,
+        "reynolds": re,
+        "regime": regime,
+        "trit": crop_trit,
+        "char": bt_one(crop_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 4: POST /timage/convert
+// Convert image format (determined by output file extension)
+// Body: {input, output}
+// Trit: +1=converted, 0=same format, -1=error
+// ===========================================================================
+fn handle_convert(body) {
+    let input = dict_get(body, "input", "")
+    let output = dict_get(body, "output", "")
+
+    // Validate input
+    if3 len(input) == 0 {
+        record_stat("convert", T_FALSE)
+        return {
+            "ok": false,
+            "error": "input path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output) == 0 {
+        record_stat("convert", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let epath_in = escape_path(input)
+    let epath_out = escape_path(output)
+    let py = get_python()
+
+    // Detect output extension to determine target format
+    let out_lower = lower(output)
+    let needs_rgb_convert = false
+
+    // Check if output is JPEG (requires RGB, can't have alpha)
+    if3 contains(out_lower, ".jpg") {
+        needs_rgb_convert = true
+    }
+    if3 contains(out_lower, ".jpeg") {
+        needs_rgb_convert = true
+    }
+
+    // Get input format for comparison
+    let fmt_cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); print(str(img.format)+'|'+str(img.mode))\""
+    let fmt_result = run_pil(fmt_cmd)
+
+    if3 is_pil_error(fmt_result) == true {
+        record_stat("convert", T_FALSE)
+        return {
+            "ok": false,
+            "input": input,
+            "output": output,
+            "error": fmt_result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let fmt_parts = split(strip(fmt_result), "|")
+    let src_format = dict_get(fmt_parts, 0, "UNKNOWN")
+    let src_mode = dict_get(fmt_parts, 1, "RGB")
+
+    // Build conversion command
+    let cmd = ""
+    if3 needs_rgb_convert == true {
+        // RGBA/P -> RGB for JPEG compatibility
+        cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); "
+        cmd = cmd + "img=img.convert('RGB') if img.mode in ('RGBA','P','LA') else img; "
+        cmd = cmd + "img.save('" + epath_out + "'); print('ok')\""
+    }
+    if3 needs_rgb_convert == false {
+        cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); img.save('" + epath_out + "'); print('ok')\""
+    }
+
+    let result = run_pil(cmd)
+
+    // Check for error
+    if3 is_pil_error(result) == true {
+        record_stat("convert", T_FALSE)
+        return {
+            "ok": false,
+            "input": input,
+            "output": output,
+            "source_format": src_format,
+            "source_mode": src_mode,
+            "error": result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Detect output format
+    let dst_cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_out + "'); print(str(img.format)+'|'+str(img.mode))\""
+    let dst_result = run_pil(dst_cmd)
+    let dst_parts = split(strip(dst_result), "|")
+    let dst_format = dict_get(dst_parts, 0, "UNKNOWN")
+    let dst_mode = dict_get(dst_parts, 1, "RGB")
+
+    // Get output file size
+    let size_cmd = py + " -c \"import os; print(os.path.getsize('" + epath_out + "'))\""
+    let size_result = run_pil(size_cmd)
+    let out_size = int(strip(size_result))
+
+    // Trit: +1 if format changed, 0 if same format
+    let convert_trit = T_TRUE
+    if3 src_format == dst_format {
+        convert_trit = T_MAYBE
+    }
+
+    record_stat("convert", convert_trit)
+    return {
+        "ok": true,
+        "input": input,
+        "output": output,
+        "source_format": src_format,
+        "source_mode": src_mode,
+        "dest_format": dst_format,
+        "dest_mode": dst_mode,
+        "output_size_bytes": out_size,
+        "rgb_converted": needs_rgb_convert,
+        "trit": convert_trit,
+        "char": bt_one(convert_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 5: POST /timage/thumbnail
+// Create thumbnail with max size
+// Body: {input, output, max_size: 128}
+// Trit: +1=thumbnailed, 0=already smaller, -1=error
+// ===========================================================================
+fn handle_thumbnail(body) {
+    let input = dict_get(body, "input", "")
+    let output = dict_get(body, "output", "")
+    let max_size = dict_get(body, "max_size", 128)
+
+    // Validate input
+    if3 len(input) == 0 {
+        record_stat("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "error": "input path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output) == 0 {
+        record_stat("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 max_size <= 0 {
+        max_size = 128
+    }
+
+    // Clamp max_size to sane range
+    if3 max_size > BLOCK_SIZE {
+        max_size = BLOCK_SIZE
+    }
+
+    let epath_in = escape_path(input)
+    let epath_out = escape_path(output)
+    let py = get_python()
+    let s_str = str(max_size)
+
+    // Get original dimensions first
+    let orig_cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); print(str(img.width)+'x'+str(img.height))\""
+    let orig_result = run_pil(orig_cmd)
+
+    if3 is_pil_error(orig_result) == true {
+        record_stat("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "input": input,
+            "output": output,
+            "max_size": max_size,
+            "error": orig_result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let orig_dims = split(strip(orig_result), "x")
+    let orig_w = int(dict_get(orig_dims, 0, "0"))
+    let orig_h = int(dict_get(orig_dims, 1, "0"))
+
+    // Build thumbnail command
+    let cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); img.thumbnail((" + s_str + "," + s_str + "),Image.LANCZOS); img.save('" + epath_out + "'); print(str(img.width)+'x'+str(img.height))\""
+
+    let result = run_pil(cmd)
+
+    // Check for error
+    if3 is_pil_error(result) == true {
+        record_stat("thumbnail", T_FALSE)
+        return {
+            "ok": false,
+            "input": input,
+            "output": output,
+            "max_size": max_size,
+            "error": result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse result dimensions
+    let dims = split(strip(result), "x")
+    let thumb_w = int(dict_get(dims, 0, "0"))
+    let thumb_h = int(dict_get(dims, 1, "0"))
+
+    // Get output file size
+    let size_cmd = py + " -c \"import os; print(os.path.getsize('" + epath_out + "'))\""
+    let size_result = run_pil(size_cmd)
+    let out_size = int(strip(size_result))
+
+    // Trit: +1 if shrunk, 0 if already smaller than max_size
+    let thumb_trit = T_TRUE
+    if3 thumb_w == orig_w {
+        if3 thumb_h == orig_h {
+            thumb_trit = T_MAYBE
+        }
+    }
+
+    // Reynolds from thumbnail dimensions
+    let re = calc_reynolds(thumb_w, thumb_h)
+    let regime = flow_regime(re)
+
+    // Calculate compression ratio
+    let ratio_str = "1.0"
+    if3 orig_w > 0 {
+        if3 orig_h > 0 {
+            let orig_pixels = orig_w * orig_h
+            let thumb_pixels = thumb_w * thumb_h
+            if3 orig_pixels > 0 {
+                let pct = (thumb_pixels * 100) / orig_pixels
+                ratio_str = str(pct)
+            }
+        }
+    }
+
+    record_stat("thumbnail", thumb_trit)
+    return {
+        "ok": true,
+        "input": input,
+        "output": output,
+        "max_size": max_size,
+        "original_width": orig_w,
+        "original_height": orig_h,
+        "thumbnail_width": thumb_w,
+        "thumbnail_height": thumb_h,
+        "output_size_bytes": out_size,
+        "pixel_ratio_pct": ratio_str,
+        "reynolds": re,
+        "regime": regime,
+        "trit": thumb_trit,
+        "char": bt_one(thumb_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 6: POST /timage/watermark
+// Add text watermark to image
+// Body: {input, output, text, position: "bottom-right", opacity: 128,
+//        font_size: 24, color: "white"}
+// Trit: +1=watermarked, 0=empty text (no-op), -1=error
+// ===========================================================================
+fn handle_watermark(body) {
+    let input = dict_get(body, "input", "")
+    let output = dict_get(body, "output", "")
+    let text = dict_get(body, "text", "")
+    let position = dict_get(body, "position", "bottom-right")
+    let opacity = dict_get(body, "opacity", 128)
+    let font_size = dict_get(body, "font_size", 24)
+    let color = dict_get(body, "color", "white")
+
+    // Validate input
+    if3 len(input) == 0 {
+        record_stat("watermark", T_FALSE)
+        return {
+            "ok": false,
+            "error": "input path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output) == 0 {
+        record_stat("watermark", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // If no text, it's a no-op
+    if3 len(text) == 0 {
+        record_stat("watermark", T_MAYBE)
+        return {
+            "ok": true,
+            "input": input,
+            "output": output,
+            "note": "empty watermark text, no changes applied",
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Clamp opacity
+    if3 opacity < 0 {
+        opacity = 0
+    }
+    if3 opacity > 255 {
+        opacity = 255
+    }
+
+    // Clamp font_size
+    if3 font_size < 8 {
+        font_size = 8
+    }
+    if3 font_size > 200 {
+        font_size = 200
+    }
+
+    let epath_in = escape_path(input)
+    let epath_out = escape_path(output)
+    let py = get_python()
+    let opacity_str = str(opacity)
+    let fontsize_str = str(font_size)
+
+    // Build position calculation string for python
+    // position: "top-left", "top-right", "bottom-left", "bottom-right", "center"
+    let pos_calc = ""
+    if3 position == "top-left" {
+        pos_calc = "pos=(10,10)"
+    }
+    if3 position == "top-right" {
+        pos_calc = "tw=d.textlength(txt,font=fnt) if hasattr(d,'textlength') else len(txt)*fs//2; pos=(img.width-tw-10,10)"
+    }
+    if3 position == "bottom-left" {
+        pos_calc = "pos=(10,img.height-fs-10)"
+    }
+    if3 position == "bottom-right" {
+        pos_calc = "tw=d.textlength(txt,font=fnt) if hasattr(d,'textlength') else len(txt)*fs//2; pos=(img.width-tw-10,img.height-fs-10)"
+    }
+    if3 position == "center" {
+        pos_calc = "tw=d.textlength(txt,font=fnt) if hasattr(d,'textlength') else len(txt)*fs//2; pos=((img.width-tw)//2,(img.height-fs)//2)"
+    }
+    // Default to bottom-right if unknown
+    if3 len(pos_calc) == 0 {
+        pos_calc = "tw=d.textlength(txt,font=fnt) if hasattr(d,'textlength') else len(txt)*fs//2; pos=(img.width-tw-10,img.height-fs-10)"
+    }
+
+    // Build the python watermark command
+    // Strategy: open image, convert to RGBA, create transparent overlay,
+    // draw text on overlay, composite, save
+    let cmd = py + " -c \""
+    cmd = cmd + "from PIL import Image,ImageDraw,ImageFont; "
+    cmd = cmd + "img=Image.open('" + epath_in + "').convert('RGBA'); "
+    cmd = cmd + "overlay=Image.new('RGBA',img.size,(255,255,255,0)); "
+    cmd = cmd + "d=ImageDraw.Draw(overlay); "
+    cmd = cmd + "fs=" + fontsize_str + "; "
+    cmd = cmd + "txt='" + text + "'; "
+    cmd = cmd + "fnt=ImageFont.load_default(); "
+    cmd = cmd + pos_calc + "; "
+    cmd = cmd + "d.text(pos,txt,font=fnt,fill=(255,255,255," + opacity_str + ")); "
+    cmd = cmd + "img=Image.alpha_composite(img,overlay); "
+    cmd = cmd + "img=img.convert('RGB'); "
+    cmd = cmd + "img.save('" + epath_out + "'); "
+    cmd = cmd + "print(str(img.width)+'x'+str(img.height))"
+    cmd = cmd + "\""
+
+    let result = run_pil(cmd)
+
+    // Check for error
+    if3 is_pil_error(result) == true {
+        record_stat("watermark", T_FALSE)
+        return {
+            "ok": false,
+            "input": input,
+            "output": output,
+            "text": text,
+            "position": position,
+            "error": result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse result dimensions
+    let dims = split(strip(result), "x")
+    let final_w = int(dict_get(dims, 0, "0"))
+    let final_h = int(dict_get(dims, 1, "0"))
+
+    // Get output file size
+    let size_cmd = py + " -c \"import os; print(os.path.getsize('" + epath_out + "'))\""
+    let size_result = run_pil(size_cmd)
+    let out_size = int(strip(size_result))
+
+    // Reynolds from image dimensions
+    let re = calc_reynolds(final_w, final_h)
+    let regime = flow_regime(re)
+
+    record_stat("watermark", T_TRUE)
+    return {
+        "ok": true,
+        "input": input,
+        "output": output,
+        "text": text,
+        "position": position,
+        "opacity": opacity,
+        "font_size": font_size,
+        "width": final_w,
+        "height": final_h,
+        "output_size_bytes": out_size,
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 7: POST /timage/filter
+// Apply image filter
+// Body: {input, output, filter_name: "blur"|"sharpen"|"grayscale"|"edge"|
+//        "emboss"|"contour"}
+// Trit: +1=filtered, 0=unknown filter (no-op), -1=error
+// ===========================================================================
+fn handle_filter(body) {
+    let input = dict_get(body, "input", "")
+    let output = dict_get(body, "output", "")
+    let filter_name = dict_get(body, "filter_name", "")
+
+    // Validate input
+    if3 len(input) == 0 {
+        record_stat("filter", T_FALSE)
+        return {
+            "ok": false,
+            "error": "input path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output) == 0 {
+        record_stat("filter", T_FALSE)
+        return {
+            "ok": false,
+            "error": "output path required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(filter_name) == 0 {
+        record_stat("filter", T_FALSE)
+        return {
+            "ok": false,
+            "error": "filter_name required (blur, sharpen, grayscale, edge, emboss, contour)",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let epath_in = escape_path(input)
+    let epath_out = escape_path(output)
+    let py = get_python()
+    let fname = lower(filter_name)
+
+    // Build the appropriate python command for each filter
+    let cmd = ""
+    let valid_filter = true
+
+    if3 fname == "blur" {
+        cmd = py + " -c \"from PIL import Image,ImageFilter; img=Image.open('" + epath_in + "'); img=img.filter(ImageFilter.BLUR); img.save('" + epath_out + "'); print(str(img.width)+'x'+str(img.height))\""
+    }
+
+    if3 fname == "sharpen" {
+        cmd = py + " -c \"from PIL import Image,ImageFilter; img=Image.open('" + epath_in + "'); img=img.filter(ImageFilter.SHARPEN); img.save('" + epath_out + "'); print(str(img.width)+'x'+str(img.height))\""
+    }
+
+    if3 fname == "grayscale" {
+        // Grayscale uses .convert('L') not ImageFilter
+        cmd = py + " -c \"from PIL import Image; img=Image.open('" + epath_in + "'); img=img.convert('L'); img.save('" + epath_out + "'); print(str(img.width)+'x'+str(img.height))\""
+    }
+
+    if3 fname == "edge" {
+        cmd = py + " -c \"from PIL import Image,ImageFilter; img=Image.open('" + epath_in + "'); img=img.filter(ImageFilter.FIND_EDGES); img.save('" + epath_out + "'); print(str(img.width)+'x'+str(img.height))\""
+    }
+
+    if3 fname == "emboss" {
+        cmd = py + " -c \"from PIL import Image,ImageFilter; img=Image.open('" + epath_in + "'); img=img.filter(ImageFilter.EMBOSS); img.save('" + epath_out + "'); print(str(img.width)+'x'+str(img.height))\""
+    }
+
+    if3 fname == "contour" {
+        cmd = py + " -c \"from PIL import Image,ImageFilter; img=Image.open('" + epath_in + "'); img=img.filter(ImageFilter.CONTOUR); img.save('" + epath_out + "'); print(str(img.width)+'x'+str(img.height))\""
+    }
+
+    // Check if we got a valid filter
+    if3 len(cmd) == 0 {
+        valid_filter = false
+    }
+
+    if3 valid_filter == false {
+        record_stat("filter", T_MAYBE)
+        return {
+            "ok": false,
+            "input": input,
+            "output": output,
+            "filter_name": filter_name,
+            "error": "unknown filter: " + filter_name + " (use blur, sharpen, grayscale, edge, emboss, contour)",
+            "available_filters": ["blur", "sharpen", "grayscale", "edge", "emboss", "contour"],
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "runtime": "novalang"
+        }
+    }
+
+    let result = run_pil(cmd)
+
+    // Check for error
+    if3 is_pil_error(result) == true {
+        record_stat("filter", T_FALSE)
+        return {
+            "ok": false,
+            "input": input,
+            "output": output,
+            "filter_name": fname,
+            "error": result,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse result dimensions
+    let dims = split(strip(result), "x")
+    let final_w = int(dict_get(dims, 0, "0"))
+    let final_h = int(dict_get(dims, 1, "0"))
+
+    // Get output file size
+    let size_cmd = py + " -c \"import os; print(os.path.getsize('" + epath_out + "'))\""
+    let size_result = run_pil(size_cmd)
+    let out_size = int(strip(size_result))
+
+    // Reynolds from image dimensions
+    let re = calc_reynolds(final_w, final_h)
+    let regime = flow_regime(re)
+
+    record_stat("filter", T_TRUE)
+    return {
+        "ok": true,
+        "input": input,
+        "output": output,
+        "filter_name": fname,
+        "width": final_w,
+        "height": final_h,
+        "output_size_bytes": out_size,
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// GET /health -- Standard health endpoint
+// ===========================================================================
+fn health() {
+    let uptime = time() - stat_t0
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        self_trit = T_TRUE
+    }
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "runtime": "novalang",
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "tools": TOOLS_COUNT,
+        "self_trit": self_trit,
+        "char": bt_one(self_trit),
+        "uptime_s": uptime,
+        "quality": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        }
+    }
+}
+
+// ===========================================================================
+// GET /timage/service-status -- Full service status with stats
+// ===========================================================================
+fn timage_service_status() {
+    let uptime = time() - stat_t0
+
+    // Service Reynolds from total false ops
+    let re = stat_trit_false * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    // System trit
+    let sys_trit = T_TRUE
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    let by_tool = {}
+    dict_set(by_tool, "info", by_tool_info)
+    dict_set(by_tool, "resize", by_tool_resize)
+    dict_set(by_tool, "crop", by_tool_crop)
+    dict_set(by_tool, "convert", by_tool_convert)
+    dict_set(by_tool, "thumbnail", by_tool_thumbnail)
+    dict_set(by_tool, "watermark", by_tool_watermark)
+    dict_set(by_tool, "filter", by_tool_filter)
+
+    // Cached images
+    let cached_images = keys(_image_cache)
+
+    // Check PIL availability
+    let py = get_python()
+    let pil_check_cmd = py + " -c \"from PIL import Image; print(Image.__version__)\""
+    let pil_version = run_pil(pil_check_cmd)
+    let pil_ok = true
+    if3 is_pil_error(pil_version) == true {
+        pil_ok = false
+        pil_version = "not installed"
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "total_ops": stat_ops,
+        "by_tool": by_tool,
+        "trits": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        },
+        "cached_images": len(cached_images),
+        "pil_version": strip(pil_version),
+        "pil_available": pil_ok,
+        "reynolds": re,
+        "regime": regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "available_filters": ["blur", "sharpen", "grayscale", "edge", "emboss", "contour"],
+        "watermark_positions": ["top-left", "top-right", "bottom-left", "bottom-right", "center"],
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE
+    }
+}
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+troute(server, "GET",  "/health",                "health")
+troute(server, "GET",  "/timage/service-status",  "timage_service_status")
+troute(server, "POST", "/timage/info",            "handle_info")
+troute(server, "POST", "/timage/resize",          "handle_resize")
+troute(server, "POST", "/timage/crop",            "handle_crop")
+troute(server, "POST", "/timage/convert",         "handle_convert")
+troute(server, "POST", "/timage/thumbnail",       "handle_thumbnail")
+troute(server, "POST", "/timage/watermark",       "handle_watermark")
+troute(server, "POST", "/timage/filter",          "handle_filter")
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[TImage] NovaX Ternary Image Processing v" + VERSION + " on port " + str(PORT))
+print("[TImage] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[TImage] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TImage] Re boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TImage] N-S: pixel_stream=velocity_field | resolution_pressure=turbulent_energy | Re=pixel_ops*H5")
+print("[TImage] PIL timeout: " + str(PIL_TIMEOUT) + "s (H13)")
+print("[TImage] Routes: /health, /timage/service-status")
+print("[TImage]         /timage/info, /timage/resize, /timage/crop, /timage/convert")
+print("[TImage]         /timage/thumbnail, /timage/watermark, /timage/filter")
+print("[TImage] Filters: blur, sharpen, grayscale, edge, emboss, contour")
+print("[TImage] Watermark positions: top-left, top-right, bottom-left, bottom-right, center")
+print("[TImage] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

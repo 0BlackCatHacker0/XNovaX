@@ -1,0 +1,295 @@
+"""
+NovaX OS Integration — SAFE Windows + NovaX Coexistence (v2)
+
+SAFETY GUARANTEES:
+  1. explorer.exe ALWAYS runs — never killed, never replaced
+  2. All startup scripts check for explorer.exe before proceeding
+  3. Kill switch always accessible (desktop shortcut + batch file)
+  4. Clean exit paths — no infinite loops
+  5. Full revert at any takeover level
+
+Features:
+  - Add NovaX to Windows startup (runs on login, alongside explorer)
+  - Create boot task (runs before login, services only)
+  - Auto-launch all services on login
+  - Full revert capability
+"""
+
+import os
+import sys
+import json
+import subprocess
+import time
+import ctypes
+import logging
+
+log = logging.getLogger("NovaX.OSTakeover")
+
+NOVAX_ROOT = r"C:\NovaX"
+MEMORY_DIR = os.path.join(NOVAX_ROOT, "memory")
+TAKEOVER_STATE = os.path.join(MEMORY_DIR, "os_takeover_state.json")
+STARTUP_BAT = os.path.join(NOVAX_ROOT, "installer", "novax_startup.bat")
+
+# Services that should auto-start (all 13 NovaX services)
+NOVAX_SERVICES = [
+    {"name": "NovaX-Orchestrator", "script": "core/orchestrator.py", "port": 9999, "type": "python"},
+    {"name": "NovaX-Brain", "script": "core/brain_server.py", "port": 9990, "type": "python"},
+    {"name": "NovaX-Sentinel", "script": "nova_sentinel.py", "port": 9883, "type": "python"},
+    {"name": "NovaX-Nexus", "script": "nova_nexus.py", "port": 9882, "type": "python"},
+    {"name": "NovaX-Hivemind", "script": "nova_hivemind.py", "port": 9881, "type": "python"},
+    {"name": "NovaX-VPN", "script": "nova_vpn_core.py", "port": 9880, "type": "python"},
+    {"name": "NovaX-CloudRouter", "script": "nova_cloud_router.py", "port": 9878, "type": "python"},
+    {"name": "NovaX-Relay", "script": "nova_relay.js", "port": 9877, "type": "node"},
+    {"name": "NovaX-STT", "script": "nova_stt.py", "port": 9875, "type": "python"},
+    {"name": "NovaX-WebSocket", "script": "ws_server_standalone.py", "port": 9998, "type": "python"},
+]
+
+STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_KEY_NAME = "NovaX"
+
+
+def _load_state():
+    if os.path.exists(TAKEOVER_STATE):
+        try:
+            with open(TAKEOVER_STATE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {"installed": [], "startup_enabled": False, "takeover_level": 0}
+
+
+def _save_state(state):
+    os.makedirs(os.path.dirname(TAKEOVER_STATE), exist_ok=True)
+    with open(TAKEOVER_STATE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════
+# STARTUP REGISTRATION
+# ══════════════════════════════════════════
+
+def _create_startup_script():
+    """Create the SAFE master startup batch that launches all NovaX services.
+
+    SAFETY: Always ensures explorer.exe is running before starting services.
+    Has a bounded wait loop (max 60s) — never loops forever.
+    """
+    os.makedirs(os.path.dirname(STARTUP_BAT), exist_ok=True)
+
+    kill_bat = os.path.join(NOVAX_ROOT, "NovaX_KILL.bat")
+
+    bat = f"""@echo off
+title NovaX_Startup
+cd /d "{NOVAX_ROOT}"
+
+REM ╔══════════════════════════════════════════════════════════╗
+REM ║  NovaX SAFE Startup                                      ║
+REM ║  explorer.exe ALWAYS runs first                          ║
+REM ║  Kill switch: {kill_bat}         ║
+REM ╚══════════════════════════════════════════════════════════╝
+
+REM ── SAFETY: Ensure explorer.exe is running ──
+tasklist /FI "IMAGENAME eq explorer.exe" | find /I "explorer.exe" >nul
+if errorlevel 1 (
+    echo [SAFETY] Starting explorer.exe...
+    start explorer.exe
+    timeout /t 3 /nobreak >nul
+)
+
+REM ── Start NovaX services (hidden, minimized) ──
+start /min "NovaX_Services" python start_all.py 2>nul
+
+REM ── Wait for orchestrator (max 60s, then exit either way) ──
+set /a tries=0
+:wait_loop
+set /a tries+=1
+if %tries% gtr 30 goto done
+timeout /t 2 /nobreak >nul
+curl -s http://localhost:9999/health >nul 2>&1
+if errorlevel 1 goto wait_loop
+
+:done
+REM ── Clean exit — Windows is fully usable ──
+exit /b 0
+"""
+    with open(STARTUP_BAT, "w", encoding="utf-8") as f:
+        f.write(bat)
+    return STARTUP_BAT
+
+
+def enable_startup():
+    """DISABLED — auto-start permanently removed per user request."""
+    return {"ok": False, "error": "Auto-start is permanently disabled. NovaX runs on-demand only."}
+
+
+def disable_startup():
+    """Remove NovaX from Windows startup."""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH,
+                             0, winreg.KEY_SET_VALUE)
+        try:
+            winreg.DeleteValue(key, STARTUP_KEY_NAME)
+        except FileNotFoundError:
+            pass
+        winreg.CloseKey(key)
+
+        state = _load_state()
+        state["startup_enabled"] = False
+        _save_state(state)
+
+        return {"ok": True, "message": "NovaX removed from startup"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def startup_status():
+    """Check if NovaX is in Windows startup."""
+    registered = False
+    reg_value = ""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH,
+                             0, winreg.KEY_READ)
+        try:
+            reg_value, _ = winreg.QueryValueEx(key, STARTUP_KEY_NAME)
+            registered = True
+        except FileNotFoundError:
+            pass
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
+    return {
+        "registered": registered,
+        "registry_value": reg_value,
+        "startup_script_exists": os.path.exists(STARTUP_BAT),
+    }
+
+
+# ══════════════════════════════════════════
+# WINDOWS SCHEDULED TASK (boot-level)
+# ══════════════════════════════════════════
+
+def create_boot_task():
+    """DISABLED — boot task permanently removed per user request."""
+    return {"ok": False, "error": "Boot task is permanently disabled. NovaX runs on-demand only."}
+
+
+def remove_boot_task():
+    """Remove the NovaX boot scheduled task."""
+    try:
+        result = subprocess.run(
+            'schtasks /delete /tn "NovaX_Boot" /f',
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        state = _load_state()
+        state.pop("boot_task", None)
+        _save_state(state)
+        return {"ok": result.returncode == 0}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ══════════════════════════════════════════
+# SERVICE STATUS
+# ══════════════════════════════════════════
+
+def check_services():
+    """Check which NovaX services are currently running (socket-based, like VCC)."""
+    import socket
+    results = []
+    for svc in NOVAX_SERVICES:
+        port = svc["port"]
+        running = False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.5):
+                running = True
+        except (ConnectionRefusedError, OSError, TimeoutError):
+            pass
+        results.append({
+            "name": svc["name"],
+            "port": port,
+            "script": svc["script"],
+            "running": running,
+        })
+    return results
+
+
+# ══════════════════════════════════════════
+# TAKEOVER LEVELS & STATUS
+# ══════════════════════════════════════════
+
+def takeover_status():
+    """Full OS integration status.
+
+    Levels:
+      0 = NovaX runs manually
+      1 = NovaX in Windows startup (runs on login, alongside explorer)
+      2 = NovaX boot task (services start before login)
+      3 = NovaX companion shell (explorer + NovaX both run)
+    """
+    state = _load_state()
+    su = startup_status()
+    services = check_services()
+    running_count = sum(1 for s in services if s["running"])
+
+    # Check shell status (import with proper path)
+    shell = {"is_novax_shell": False, "current_shell": "explorer.exe"}
+    try:
+        installer_dir = os.path.dirname(os.path.abspath(__file__))
+        if installer_dir not in sys.path:
+            sys.path.insert(0, installer_dir)
+        from shell_replace import shell_status
+        shell = shell_status()
+    except ImportError:
+        pass
+
+    # Calculate takeover level
+    level = 0
+    if su["registered"]:
+        level = 1
+    if state.get("boot_task"):
+        level = 2
+    if shell.get("is_novax_shell"):
+        level = 3
+
+    level_labels = {
+        0: "Manual — NovaX runs on demand",
+        1: "Startup — NovaX starts on login (explorer always runs)",
+        2: "Boot — Services start before login (explorer always runs)",
+        3: "Companion Shell — explorer + NovaX Desktop both run",
+    }
+
+    # Safety check: is explorer.exe currently running?
+    explorer_running = False
+    try:
+        output = subprocess.check_output(
+            ["tasklist", "/FI", "IMAGENAME eq explorer.exe"],
+            creationflags=0x08000000, text=True, timeout=5
+        )
+        explorer_running = "explorer.exe" in output.lower()
+    except Exception:
+        pass
+
+    return {
+        "takeover_level": level,
+        "level_label": level_labels.get(level, "Unknown"),
+        "startup": su,
+        "boot_task": bool(state.get("boot_task")),
+        "shell_replaced": shell.get("is_novax_shell", False),
+        "services": services,
+        "services_running": running_count,
+        "services_total": len(NOVAX_SERVICES),
+        "explorer_running": explorer_running,
+        "admin": is_admin(),
+        "kill_switch": os.path.join(NOVAX_ROOT, "NovaX_KILL.bat"),
+        "safety": "explorer.exe always runs at every takeover level",
+    }

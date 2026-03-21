@@ -1,0 +1,404 @@
+// drive_quantize.nova — 5-Layer Drive Quantization Pipeline
+// READ-ONLY scan: analyzes C:\NovaX for deduplication potential
+// 3-5-7-13 harmonic: BLOCK=3^7=2187 bytes per block
+// match3 uses => syntax, try3 uses uncertain/fail3
+
+print("============================================")
+print("  NovaX Drive Quantizer v1.0")
+print("  5-Layer Deduplication Analysis Pipeline")
+print("  Block size: 2187 bytes (3^7)")
+print("============================================")
+print("")
+
+let BLOCK_SIZE = 2187
+let total_files = 0
+let total_bytes = 0
+let total_blocks = 0
+let all_hashes = []
+let all_hash_counts = []
+let file_types = {}
+let code_files = 0
+let config_files = 0
+let weight_files = 0
+let other_files = 0
+
+// ── Layer 1: INGEST — Walk C:\NovaX ─────────────────
+print("[1/5] INGEST — Scanning C:\\NovaX directory tree")
+let scan_ok = FALSE
+let file_list = []
+try3 {
+  // Get all files with sizes using dir /s /b /a-d
+  let walk_cmd = "powershell -NoProfile -Command \"Get-ChildItem -Path 'C:\\NovaX' -Recurse -File -ErrorAction SilentlyContinue | Select-Object FullName,Length,Extension | ConvertTo-Csv -NoTypeInformation\""
+  let walk_raw = shell(walk_cmd)
+  let walk_out = trim(walk_raw)
+  let walk_lines = split(walk_out, "\n")
+
+  // Skip header line (index 0)
+  let wi = 1
+  while3 wi < len(walk_lines) {
+    let wline = trim(walk_lines[wi])
+    if3 cmp3(len(wline), 5) {
+      let file_list = append(file_list, wline)
+      let total_files = total_files + 1
+    } maybe {
+    } else {
+    }
+    let wi = wi + 1
+  }
+
+  print("  Files found: " + str(total_files))
+  let scan_ok = TRUE
+} uncertain {
+  print("  [0] Scan partial")
+  let scan_ok = MAYBE
+} fail3 {
+  print("  [-1] Scan failed")
+  let scan_ok = FALSE
+}
+match3 scan_ok {
+  TRUE => print("  [+1] INGEST COMPLETE")
+  MAYBE => print("  [ 0] PARTIAL INGEST")
+  FALSE => print("  [-1] INGEST FAILED")
+}
+print("")
+
+// ── Layer 2: CLASSIFY — Identify file types ─────────
+print("[2/5] CLASSIFY — Categorizing files")
+let classify_ok = FALSE
+try3 {
+  let ci = 0
+  while3 ci < len(file_list) {
+    let fline = file_list[ci]
+    // CSV format: "FullName","Length","Extension"
+    // Check extension in the line
+    if3 contains(fline, ".nova") {
+      let code_files = code_files + 1
+    } maybe {
+      if3 contains(fline, ".json") {
+        let config_files = config_files + 1
+      } maybe {
+        if3 contains(fline, ".bin") {
+          let weight_files = weight_files + 1
+        } maybe {
+          if3 contains(fline, ".onnx") {
+            let weight_files = weight_files + 1
+          } maybe {
+            if3 contains(fline, ".py") {
+              let code_files = code_files + 1
+            } maybe {
+              if3 contains(fline, ".js") {
+                let code_files = code_files + 1
+              } maybe {
+                if3 contains(fline, ".toml") {
+                  let config_files = config_files + 1
+                } maybe {
+                  if3 contains(fline, ".yaml") {
+                    let config_files = config_files + 1
+                  } maybe {
+                    if3 contains(fline, ".yml") {
+                      let config_files = config_files + 1
+                    } maybe {
+                      let other_files = other_files + 1
+                    } else {
+                      let config_files = config_files + 1
+                    }
+                  } else {
+                    let config_files = config_files + 1
+                  }
+                } else {
+                  let config_files = config_files + 1
+                }
+              } else {
+                let code_files = code_files + 1
+              }
+            } else {
+              let code_files = code_files + 1
+            }
+          } else {
+            let weight_files = weight_files + 1
+          }
+        } else {
+          let weight_files = weight_files + 1
+        }
+      } else {
+        let config_files = config_files + 1
+      }
+    } else {
+      let code_files = code_files + 1
+    }
+    let ci = ci + 1
+  }
+
+  print("  Code files (.nova/.py/.js): " + str(code_files))
+  print("  Config files (.json/.toml/.yaml): " + str(config_files))
+  print("  Weight files (.bin/.onnx): " + str(weight_files))
+  print("  Other files: " + str(other_files))
+  let classify_ok = TRUE
+} uncertain {
+  print("  [0] Classification partial")
+  let classify_ok = MAYBE
+} fail3 {
+  print("  [-1] Classification failed")
+  let classify_ok = FALSE
+}
+match3 classify_ok {
+  TRUE => print("  [+1] CLASSIFICATION COMPLETE")
+  MAYBE => print("  [ 0] PARTIAL CLASSIFICATION")
+  FALSE => print("  [-1] CLASSIFICATION FAILED")
+}
+print("")
+
+// ── Layer 3: HASH — SHA-256 block hashing ───────────
+print("[3/5] HASH — Computing SHA-256 block hashes")
+print("  Block size: " + str(BLOCK_SIZE) + " bytes (3^7)")
+let hash_ok = FALSE
+try3 {
+  // Use PowerShell to compute file hashes and sizes
+  // For dedup analysis we hash entire files (block-level would require reading each file)
+  let hash_cmd = "powershell -NoProfile -Command \"Get-ChildItem -Path 'C:\\NovaX' -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object { $h = (Get-FileHash $_.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue); if($h){ $_.Length.ToString() + '|' + $h.Hash } } | Out-String\""
+  let hash_raw = shell(hash_cmd)
+  let hash_out = trim(hash_raw)
+  let hash_lines = split(hash_out, "\n")
+
+  let hi = 0
+  while3 hi < len(hash_lines) {
+    let hline = trim(hash_lines[hi])
+    if3 cmp3(len(hline), 10) {
+      // Parse size|hash
+      let hparts = split(hline, "|")
+      if3 cmp3(len(hparts), 1) {
+        let fsize_str = trim(hparts[0])
+        let fhash = trim(hparts[1])
+        let fsize = int(fsize_str)
+        let total_bytes = total_bytes + fsize
+
+        // Calculate blocks for this file
+        let file_blocks = floor(fsize / BLOCK_SIZE)
+        if3 cmp3(fsize % BLOCK_SIZE, 0) {
+          let file_blocks = file_blocks + 1
+        } maybe {
+        } else {
+          let file_blocks = file_blocks + 1
+        }
+        let total_blocks = total_blocks + file_blocks
+
+        // Track hash for dedup (file-level dedup)
+        let found_idx = -1
+        let si = 0
+        while3 si < len(all_hashes) {
+          if3 all_hashes[si] == fhash {
+            let found_idx = si
+          } maybe {
+          } else {
+          }
+          let si = si + 1
+        }
+
+        if3 cmp3(found_idx, -1) {
+          // Not found => cmp3(-1, -1) = MAYBE, need exact check
+          if3 found_idx == -1 {
+            // New unique hash
+            let all_hashes = append(all_hashes, fhash)
+            let all_hash_counts = append(all_hash_counts, 1)
+          } maybe {
+          } else {
+            // Duplicate found
+            let all_hash_counts[found_idx] = all_hash_counts[found_idx] + 1
+          }
+        } maybe {
+          // found_idx == -1 exactly
+          let all_hashes = append(all_hashes, fhash)
+          let all_hash_counts = append(all_hash_counts, 1)
+        } else {
+          // Duplicate found
+          let all_hash_counts[found_idx] = all_hash_counts[found_idx] + 1
+        }
+      } maybe {
+      } else {
+      }
+    } maybe {
+    } else {
+    }
+    let hi = hi + 1
+  }
+
+  print("  Files hashed: " + str(total_files))
+  print("  Total bytes scanned: " + str(total_bytes))
+  print("  Total 2187-byte blocks: " + str(total_blocks))
+  print("  Unique file hashes: " + str(len(all_hashes)))
+  let hash_ok = TRUE
+} uncertain {
+  print("  [0] Hashing partial")
+  let hash_ok = MAYBE
+} fail3 {
+  print("  [-1] Hashing failed")
+  let hash_ok = FALSE
+}
+match3 hash_ok {
+  TRUE => print("  [+1] HASHING COMPLETE")
+  MAYBE => print("  [ 0] PARTIAL HASHING")
+  FALSE => print("  [-1] HASHING FAILED")
+}
+print("")
+
+// ── Layer 4: DEDUP — Find duplicate blocks ──────────
+print("[4/5] DEDUP — Analyzing duplicates")
+let dedup_ok = FALSE
+let unique_blocks = 0
+let duplicate_blocks = 0
+let dedup_savings_bytes = 0
+try3 {
+  // Count files with duplicate hashes
+  let dup_files = 0
+  let dup_bytes_saved = 0
+  let di = 0
+  while3 di < len(all_hash_counts) {
+    if3 cmp3(all_hash_counts[di], 1) {
+      // count > 1, this hash has duplicates
+      let extra = all_hash_counts[di] - 1
+      let dup_files = dup_files + extra
+    } maybe {
+      // count == 1, unique
+    } else {
+      // count < 1, should not happen
+    }
+    let di = di + 1
+  }
+
+  // Estimate block-level dedup
+  // unique_blocks = total_blocks from unique files
+  // duplicate_blocks = blocks from duplicate files
+  let unique_files = len(all_hashes)
+  let dup_ratio = 0
+  if3 cmp3(total_files, 0) {
+    let dup_ratio = floor(dup_files * 100 / total_files)
+  } maybe {
+  } else {
+  }
+
+  // Estimate: duplicate blocks proportional to duplicate files
+  if3 cmp3(total_blocks, 0) {
+    if3 cmp3(total_files, 0) {
+      let avg_blocks_per_file = floor(total_blocks / total_files)
+      let duplicate_blocks = dup_files * avg_blocks_per_file
+      let unique_blocks = total_blocks - duplicate_blocks
+      let dedup_savings_bytes = duplicate_blocks * BLOCK_SIZE
+    } maybe {
+    } else {
+    }
+  } maybe {
+  } else {
+  }
+
+  print("  Total files: " + str(total_files))
+  print("  Unique file hashes: " + str(unique_files))
+  print("  Duplicate files: " + str(dup_files))
+  print("  Duplicate ratio: " + str(dup_ratio) + "%")
+  print("  Estimated duplicate blocks: " + str(duplicate_blocks))
+  print("  Estimated savings: " + str(dedup_savings_bytes) + " bytes")
+  let dedup_ok = TRUE
+} uncertain {
+  print("  [0] Dedup analysis partial")
+  let dedup_ok = MAYBE
+} fail3 {
+  print("  [-1] Dedup analysis failed")
+  let dedup_ok = FALSE
+}
+match3 dedup_ok {
+  TRUE => print("  [+1] DEDUP ANALYSIS COMPLETE")
+  MAYBE => print("  [ 0] PARTIAL ANALYSIS")
+  FALSE => print("  [-1] ANALYSIS FAILED")
+}
+print("")
+
+// ── Layer 5: REPORT — Final JSON output ─────────────
+print("[5/5] REPORT — Generating quantization report")
+
+let dedup_pct = 0
+if3 cmp3(total_bytes, 0) {
+  let dedup_pct = floor(dedup_savings_bytes * 100 / total_bytes)
+} maybe {
+} else {
+}
+
+let capacity_mult = 100
+if3 cmp3(dedup_pct, 0) {
+  let effective = 100 - dedup_pct
+  if3 cmp3(effective, 0) {
+    let capacity_mult = floor(10000 / effective)
+  } maybe {
+    let capacity_mult = 100
+  } else {
+    let capacity_mult = 100
+  }
+} maybe {
+  let capacity_mult = 100
+} else {
+  let capacity_mult = 100
+}
+
+// Format as X.XX
+let cap_whole = floor(capacity_mult / 100)
+let cap_frac = capacity_mult % 100
+let cap_str = str(cap_whole) + "."
+if3 cmp3(cap_frac, 10) {
+  let cap_str = cap_str + "0" + str(cap_frac)
+} maybe {
+  let cap_str = cap_str + str(cap_frac)
+} else {
+  let cap_str = cap_str + str(cap_frac)
+}
+
+let json_report = "{\n"
+let json_report = json_report + "  \"quantization_version\": \"1.0\",\n"
+let json_report = json_report + "  \"block_size_bytes\": " + str(BLOCK_SIZE) + ",\n"
+let json_report = json_report + "  \"block_size_note\": \"3^7 = 2187 (ternary harmonic)\",\n"
+let json_report = json_report + "  \"scan_target\": \"C:\\\\NovaX\",\n"
+let json_report = json_report + "  \"file_classification\": {\n"
+let json_report = json_report + "    \"code_files\": " + str(code_files) + ",\n"
+let json_report = json_report + "    \"config_files\": " + str(config_files) + ",\n"
+let json_report = json_report + "    \"weight_files\": " + str(weight_files) + ",\n"
+let json_report = json_report + "    \"other_files\": " + str(other_files) + "\n"
+let json_report = json_report + "  },\n"
+let json_report = json_report + "  \"total_files\": " + str(total_files) + ",\n"
+let json_report = json_report + "  \"total_bytes\": " + str(total_bytes) + ",\n"
+let json_report = json_report + "  \"total_blocks\": " + str(total_blocks) + ",\n"
+let json_report = json_report + "  \"unique_blocks\": " + str(unique_blocks) + ",\n"
+let json_report = json_report + "  \"duplicate_blocks\": " + str(duplicate_blocks) + ",\n"
+let json_report = json_report + "  \"dedup_savings_bytes\": " + str(dedup_savings_bytes) + ",\n"
+let json_report = json_report + "  \"dedup_savings_percent\": " + str(dedup_pct) + ",\n"
+let json_report = json_report + "  \"effective_capacity_multiplier\": " + cap_str + ",\n"
+let json_report = json_report + "  \"ternary_constants\": {\n"
+let json_report = json_report + "    \"base\": 3,\n"
+let json_report = json_report + "    \"tzip\": 5,\n"
+let json_report = json_report + "    \"composition\": 7,\n"
+let json_report = json_report + "    \"carrier\": 13,\n"
+let json_report = json_report + "    \"block\": 2187\n"
+let json_report = json_report + "  }\n"
+let json_report = json_report + "}"
+
+print("")
+print(json_report)
+
+// Save report
+try3 {
+  write_file("C:\\NovaX\\logs\\drive_quantize_report.json", json_report)
+  print("")
+  print("  Report saved: C:\\NovaX\\logs\\drive_quantize_report.json")
+} uncertain {
+  print("  Report save uncertain")
+} fail3 {
+  print("  Could not save report (logs dir may not exist)")
+}
+
+print("")
+print("============================================")
+print("  DRIVE QUANTIZATION SUMMARY")
+print("============================================")
+print("  Files scanned: " + str(total_files))
+print("  Total size: " + str(total_bytes) + " bytes")
+print("  2187-byte blocks: " + str(total_blocks))
+print("  Dedup savings: " + str(dedup_pct) + "%")
+print("  Capacity multiplier: " + cap_str + "x")
+print("  MODE: READ-ONLY (no files modified)")
+print("============================================")

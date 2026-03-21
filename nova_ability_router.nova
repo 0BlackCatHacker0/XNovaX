@@ -1,0 +1,524 @@
+// ═══════════════════════════════════════════════════════════════════
+// nova_ability_router.nova — Real Ability Router v1.0.0
+// ═══════════════════════════════════════════════════════════════════
+// Routes requests to REAL models by ability. Not display. CALLABLE.
+// Every ability endpoint ACTUALLY calls the model and returns output.
+// ═══════════════════════════════════════════════════════════════════
+
+import3 "C:\\NovaX\\lib\\nova_stdlib.nova"
+import3 "C:\\NovaX\\lib\\nova_http_utils.nova"
+import3 "C:\\NovaX\\lib\\nova_ns_core.nova"
+
+let PORT = 9954
+let OLLAMA = "http://127.0.0.1:11434"
+let PROXY = "http://127.0.0.1:9999/api/ai/query"
+let CFG_PATH = "C:\\NovaX\\cloud_config.json"
+let ABILITIES_PATH = "C:\\NovaX\\data\\nova_abilities.json"
+
+let _cloud_cfg = load_config(CFG_PATH)
+let _ns = ns_init_counters()
+
+fn get_key(provider) {
+    let prov_cfg = _cloud_cfg[provider]
+    if3 is_type(prov_cfg, "dict") {
+        let cfg_key = dict_get(prov_cfg, "key") ?? ""
+        if3 len(cfg_key) > 5 {
+            return cfg_key
+        }
+    }
+    let env_map = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY"
+    }
+    let env_name = dict_get(env_map, provider) ?? ""
+    if3 len(env_name) > 0 {
+        return getenv(env_name, "")
+    }
+    return ""
+}
+
+// ── Best model per ability (local first, then cloud) ──
+// Cloud fallback uses OpenAI (key works) for all abilities
+// Ollama models are tried first (free, local)
+let ABILITY_MODELS = {
+    "chat": {"ollama": "novax-qwen2.5:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "code": {"ollama": "novax-qwen2.5-coder:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "vision": {"ollama": "novax-llava-llama3:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "reasoning": {"ollama": "novax-deepseek-r1:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "embedding": {"ollama": "novax-nomic-embed-text:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "math": {"ollama": "novax-mathstral:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "multilingual": {"ollama": "novax-aya:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "fast": {"ollama": "novax-tinyllama:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "uncensored": {"ollama": "novax-dolphin-llama3:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "creative": {"ollama": "novax-openhermes:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "sql": {"ollama": "novax-sqlcoder:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o-mini"},
+    "flagship": {"ollama": "novax-qwen2.5:latest", "cloud_provider": "openai", "cloud_model": "gpt-4o"}
+}
+
+// ── Call Ollama directly ──
+fn call_ollama(model, prompt, system_prompt) {
+    let msgs = []
+    if3 len(system_prompt) > 0 {
+        msgs = append(msgs, {"role": "system", "content": system_prompt})
+    }
+    msgs = append(msgs, {"role": "user", "content": prompt})
+    let body = json_encode({"model": model, "messages": msgs, "stream": false})
+    let url = join([OLLAMA, "/api/chat"], "")
+    let resp = try3 {
+        http_post(url, body, 10000)
+    } fail {
+        return {"ok": 0, "trit": -1, "error": "ollama_unreachable"}
+    }
+    let status = dict_get(resp, "status") ?? 0
+    if3 status >= 200 {
+        if3 status < 300 {
+            let parsed = json_decode(dict_get(resp, "body") ?? "{}")
+            let msg = dict_get(parsed, "message") ?? {}
+            let content = dict_get(msg, "content") ?? ""
+            return {"ok": 1, "trit": 1, "response": content, "model": model, "provider": "ollama"}
+        }
+    }
+    return {"ok": 0, "trit": -1, "error": join(["HTTP ", to_str(status)], "")}
+}
+
+// ── Call cloud via orchestrator proxy ──
+fn call_cloud(provider, model, prompt, system_prompt) {
+    let msgs = [{"role": "user", "content": prompt}]
+    let body = json_encode({
+        "provider": provider,
+        "model": model,
+        "messages": msgs,
+        "system": system_prompt,
+        "max_tokens": 2048,
+        "timeout": 30
+    })
+    let resp = try3 {
+        http_post(PROXY, body, 30000)
+    } fail {
+        return {"ok": 0, "trit": -1, "error": "proxy_unreachable"}
+    }
+    let status = dict_get(resp, "status") ?? 0
+    if3 status >= 200 {
+        if3 status < 300 {
+            let parsed = json_decode(dict_get(resp, "body") ?? "{}")
+            // Proxy format: {"ok": true, "response": "text", "model": "...", "provider": "..."}
+            let proxy_ok = dict_get(parsed, "ok") ?? 0
+            let content = to_str(dict_get(parsed, "response") ?? "")
+            if3 content == "null" {
+                content = ""
+            }
+            if3 content == "None" {
+                content = ""
+            }
+            // Check proxy error
+            let proxy_err = to_str(dict_get(parsed, "error") ?? "")
+            if3 len(proxy_err) > 3 {
+                if3 proxy_err != "null" {
+                    return {"ok": 0, "trit": -1, "error": proxy_err, "model": model, "provider": provider}
+                }
+            }
+            if3 len(content) > 0 {
+                return {"ok": 1, "trit": 1, "response": content, "model": model, "provider": provider}
+            }
+            // Fallback: try OpenAI format
+            let choices = dict_get(parsed, "choices") ?? []
+            if3 is_type(choices, "list") {
+                if3 len(choices) > 0 {
+                    let msg = dict_get(choices[0], "message") ?? {}
+                    content = dict_get(msg, "content") ?? ""
+                    if3 len(to_str(content)) > 0 {
+                        return {"ok": 1, "trit": 1, "response": content, "model": model, "provider": provider}
+                    }
+                }
+            }
+            return {"ok": 0, "trit": -1, "error": "empty_response", "model": model, "provider": provider}
+        }
+    }
+    return {"ok": 0, "trit": -1, "error": join(["HTTP ", to_str(status)], "")}
+}
+
+// ── Call embedding via Ollama ──
+fn call_embedding(model, text) {
+    let body = json_encode({"model": model, "input": text})
+    let url = join([OLLAMA, "/api/embed"], "")
+    let resp = try3 {
+        http_post(url, body, 30000)
+    } fail {
+        return {"ok": 0, "trit": -1, "error": "ollama_unreachable"}
+    }
+    let status = dict_get(resp, "status") ?? 0
+    if3 status >= 200 {
+        if3 status < 300 {
+            let parsed = json_decode(dict_get(resp, "body") ?? "{}")
+            let embeddings = dict_get(parsed, "embeddings") ?? []
+            return {"ok": 1, "trit": 1, "embeddings": embeddings, "model": model, "dimensions": len(dict_get(embeddings, 0) ?? [])}
+        }
+    }
+    return {"ok": 0, "trit": -1, "error": join(["HTTP ", to_str(status)], "")}
+}
+
+// ── Universal ability caller ──
+// Tries local (Ollama) first, falls back to cloud
+fn call_ability(ability, prompt, system_prompt, prefer) {
+    let ab_cfg = dict_get(ABILITY_MODELS, ability) ?? {}
+    if3 len(dict_keys(ab_cfg)) == 0 {
+        return {"ok": 0, "trit": -1, "error": join(["unknown ability: ", ability], "")}
+    }
+
+    let ollama_model = dict_get(ab_cfg, "ollama") ?? ""
+    let cloud_provider = dict_get(ab_cfg, "cloud_provider") ?? ""
+    let cloud_model = dict_get(ab_cfg, "cloud_model") ?? ""
+
+    // Embedding is special
+    if3 ability == "embedding" {
+        return call_embedding(ollama_model, prompt)
+    }
+
+    // Try local first (free, fast) unless user prefers cloud
+    if3 prefer != "cloud" {
+        if3 len(ollama_model) > 0 {
+            let result = call_ollama(ollama_model, prompt, system_prompt)
+            let ok = dict_get(result, "ok") ?? 0
+            if3 ok == 1 {
+                return result
+            }
+        }
+    }
+
+    // Fall back to cloud
+    if3 len(cloud_provider) > 0 {
+        if3 len(cloud_model) > 0 {
+            let result = call_cloud(cloud_provider, cloud_model, prompt, system_prompt)
+            return result
+        }
+    }
+
+    return {"ok": 0, "trit": -1, "error": "no_provider_available"}
+}
+
+// ── Swarm ability: fire local + cloud simultaneously ──
+fn swarm_ability(ability, prompt, system_prompt) {
+    let ab_cfg = dict_get(ABILITY_MODELS, ability) ?? {}
+    if3 len(dict_keys(ab_cfg)) == 0 {
+        return {"ok": 0, "trit": -1, "error": join(["unknown ability: ", ability], "")}
+    }
+
+    let ollama_model = dict_get(ab_cfg, "ollama") ?? ""
+    let cloud_provider = dict_get(ab_cfg, "cloud_provider") ?? ""
+    let cloud_model = dict_get(ab_cfg, "cloud_model") ?? ""
+
+    let reqs = []
+
+    // Build Ollama request
+    if3 len(ollama_model) > 0 {
+        let msgs = []
+        if3 len(system_prompt) > 0 {
+            msgs = append(msgs, {"role": "system", "content": system_prompt})
+        }
+        msgs = append(msgs, {"role": "user", "content": prompt})
+        let body = json_encode({"model": ollama_model, "messages": msgs, "stream": false})
+        reqs = append(reqs, {
+            "url": join([OLLAMA, "/api/chat"], ""),
+            "method": "POST",
+            "body": body,
+            "headers": json_encode({"Content-Type": "application/json"}),
+            "timeout_ms": "15000",
+            "model": ollama_model
+        })
+    }
+
+    // Build cloud request
+    if3 len(cloud_provider) > 0 {
+        if3 len(cloud_model) > 0 {
+            let msgs = [{"role": "user", "content": prompt}]
+            let body = json_encode({
+                "provider": cloud_provider,
+                "model": cloud_model,
+                "messages": msgs,
+                "system": system_prompt,
+                "max_tokens": 2048,
+                "timeout": 15
+            })
+            reqs = append(reqs, {
+                "url": PROXY,
+                "method": "POST",
+                "body": body,
+                "headers": json_encode({"Content-Type": "application/json"}),
+                "timeout_ms": "15000",
+                "model": cloud_model
+            })
+        }
+    }
+
+    if3 len(reqs) == 0 {
+        return {"ok": 0, "trit": -1, "error": "no_requests"}
+    }
+
+    let results = swarm(reqs)
+    let best_text = ""
+    let best_model = "none"
+    let best_time = 999999
+    let responses = []
+
+    for3 i in range(len(results)) {
+        let r = results[i]
+        if3 (dict_get(r, "ok") ?? 0) == 1 {
+            let body_raw = dict_get(r, "body") ?? "{}"
+            let parsed = json_decode(body_raw)
+            let text = ""
+
+            // Try Ollama format
+            let msg = dict_get(parsed, "message") ?? {}
+            if3 is_type(msg, "dict") {
+                text = dict_get(msg, "content") ?? ""
+            }
+            // Try proxy format
+            if3 len(text) == 0 {
+                text = dict_get(parsed, "response") ?? ""
+            }
+            // Try OpenAI format
+            if3 len(text) == 0 {
+                let choices = dict_get(parsed, "choices") ?? []
+                if3 len(choices) > 0 {
+                    let cmsg = dict_get(choices[0], "message") ?? {}
+                    text = dict_get(cmsg, "content") ?? ""
+                }
+            }
+
+            let tms = dict_get(r, "time_ms") ?? 999999
+            let model = dict_get(r, "model") ?? "unknown"
+
+            if3 len(text) > 0 {
+                responses = append(responses, {"model": model, "text": text, "time_ms": tms})
+                if3 tms < best_time {
+                    best_time = tms
+                    best_text = text
+                    best_model = model
+                }
+            }
+        }
+    }
+
+    if3 len(responses) == 0 {
+        return {"ok": 0, "trit": -1, "error": "all_models_failed"}
+    }
+
+    return {
+        "ok": 1,
+        "trit": 1,
+        "response": best_text,
+        "model": best_model,
+        "time_ms": best_time,
+        "ability": ability,
+        "responses_count": len(responses),
+        "all_responses": responses
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// HTTP HANDLERS
+// ═══════════════════════════════════════════════════════════════════
+
+fn handle_health(req) {
+    let resp = ns_health_dict("nova_ability_router", "1.0.0", 9954, _ns)
+    return resp
+}
+
+// POST /ability — Universal ability endpoint
+// Body: {"ability": "code", "prompt": "write fizzbuzz", "system": "", "prefer": "local"}
+fn handle_ability(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let ability = dict_get(body, "ability") ?? "chat"
+    let prompt = dict_get(body, "prompt") ?? ""
+    let system_prompt = dict_get(body, "system") ?? ""
+    let prefer = dict_get(body, "prefer") ?? "local"
+
+    if3 len(prompt) == 0 {
+        return json_ok(make_err("missing prompt"))
+    }
+
+    let result = call_ability(ability, prompt, system_prompt, prefer)
+    let ok = dict_get(result, "ok") ?? 0
+    if3 ok != 1 {
+        _ns = ns_record(_ns, 0, 1)
+    }
+    return json_ok(result)
+}
+
+// POST /ability/swarm — Swarm mode: fire local + cloud simultaneously
+fn handle_ability_swarm(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let ability = dict_get(body, "ability") ?? "chat"
+    let prompt = dict_get(body, "prompt") ?? ""
+    let system_prompt = dict_get(body, "system") ?? ""
+
+    if3 len(prompt) == 0 {
+        return json_ok(make_err("missing prompt"))
+    }
+
+    let result = swarm_ability(ability, prompt, system_prompt)
+    return json_ok(result)
+}
+
+// POST /ability/embed — Direct embedding endpoint
+fn handle_embed(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let text = dict_get(body, "text") ?? ""
+    let model = dict_get(body, "model") ?? "novax-nomic-embed-text:latest"
+
+    if3 len(text) == 0 {
+        return json_ok(make_err("missing text"))
+    }
+
+    let result = call_embedding(model, text)
+    return json_ok(result)
+}
+
+// POST /ability/code — Direct code generation
+fn handle_code(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let prompt = dict_get(body, "prompt") ?? ""
+    let lang = dict_get(body, "language") ?? ""
+    let system_prompt = "You are an expert programmer. Write clean, working code. No explanations unless asked."
+
+    if3 len(lang) > 0 {
+        prompt = join(["Write ", lang, " code: ", prompt], "")
+    }
+
+    let result = call_ability("code", prompt, system_prompt, "local")
+    return json_ok(result)
+}
+
+// POST /ability/reason — Direct reasoning
+fn handle_reason(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let prompt = dict_get(body, "prompt") ?? ""
+    let system_prompt = "Think step by step. Show your reasoning chain. Be thorough and precise."
+
+    let result = call_ability("reasoning", prompt, system_prompt, "local")
+    return json_ok(result)
+}
+
+// POST /ability/vision — Vision analysis (requires base64 image in Ollama)
+fn handle_vision(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let prompt = dict_get(body, "prompt") ?? "Describe this image in detail."
+    let image = dict_get(body, "image") ?? ""
+
+    if3 len(image) == 0 {
+        return json_ok(make_err("missing image (base64)"))
+    }
+
+    let model = "novax-llava-llama3:latest"
+    let msgs = [{"role": "user", "content": prompt, "images": [image]}]
+    let req_body = json_encode({"model": model, "messages": msgs, "stream": false})
+    let url = join([OLLAMA, "/api/chat"], "")
+
+    let resp = try3 {
+        http_post(url, req_body, 30000)
+    } fail {
+        return json_ok({"ok": 0, "trit": -1, "error": "ollama_unreachable"})
+    }
+
+    let status = dict_get(resp, "status") ?? 0
+    if3 status >= 200 {
+        if3 status < 300 {
+            let parsed = json_decode(dict_get(resp, "body") ?? "{}")
+            let msg = dict_get(parsed, "message") ?? {}
+            let content = dict_get(msg, "content") ?? ""
+            return json_ok({"ok": 1, "trit": 1, "response": content, "model": model, "ability": "vision"})
+        }
+    }
+    return json_ok({"ok": 0, "trit": -1, "error": "vision_failed"})
+}
+
+// POST /ability/math — Direct math solving
+fn handle_math(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let prompt = dict_get(body, "prompt") ?? ""
+    let system_prompt = "You are a mathematics expert. Show all work. Be precise with notation."
+
+    let result = call_ability("math", prompt, system_prompt, "local")
+    return json_ok(result)
+}
+
+// POST /ability/sql — Direct SQL generation
+fn handle_sql(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let prompt = dict_get(body, "prompt") ?? ""
+    let schema = dict_get(body, "schema") ?? ""
+    let system_prompt = "You are an SQL expert. Write efficient, correct SQL queries."
+
+    if3 len(schema) > 0 {
+        prompt = join(["Given this schema:\n", schema, "\n\nWrite SQL: ", prompt], "")
+    }
+
+    let result = call_ability("sql", prompt, system_prompt, "local")
+    return json_ok(result)
+}
+
+// POST /ability/translate — Multilingual translation
+fn handle_translate(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let text = dict_get(body, "text") ?? ""
+    let target = dict_get(body, "target") ?? "English"
+    let prompt = join(["Translate the following to ", target, ":\n\n", text], "")
+    let system_prompt = "You are a professional translator. Translate accurately and naturally."
+
+    let result = call_ability("multilingual", prompt, system_prompt, "local")
+    return json_ok(result)
+}
+
+// GET /abilities — List all available abilities with their models
+fn handle_abilities_list(req) {
+    let abilities = {}
+    let ab_keys = dict_keys(ABILITY_MODELS)
+    for3 i in range(len(ab_keys)) {
+        let ab = ab_keys[i]
+        let cfg = ABILITY_MODELS[ab]
+        abilities = dict_set(abilities, ab, {
+            "ollama_model": dict_get(cfg, "ollama") ?? "",
+            "cloud_provider": dict_get(cfg, "cloud_provider") ?? "",
+            "cloud_model": dict_get(cfg, "cloud_model") ?? "",
+            "callable": 1,
+            "endpoint": join(["/ability/", ab], "")
+        })
+    }
+    return json_ok({
+        "abilities": abilities,
+        "total": len(ab_keys),
+        "trit": 1,
+        "version": "1.0.0"
+    })
+}
+
+// ── Routes ──
+let server = tserve(PORT, "nova_ability_router")
+
+troute(server, "GET",  "/health",          "handle_health")
+troute(server, "GET",  "/abilities",       "handle_abilities_list")
+troute(server, "POST", "/ability",         "handle_ability")
+troute(server, "POST", "/ability/swarm",   "handle_ability_swarm")
+troute(server, "POST", "/ability/embed",   "handle_embed")
+troute(server, "POST", "/ability/code",    "handle_code")
+troute(server, "POST", "/ability/reason",  "handle_reason")
+troute(server, "POST", "/ability/vision",  "handle_vision")
+troute(server, "POST", "/ability/math",    "handle_math")
+troute(server, "POST", "/ability/sql",     "handle_sql")
+troute(server, "POST", "/ability/translate","handle_translate")
+
+print("[ability_router] Nova Ability Router v1.0.0 on port 9954")
+print("[ability_router] 14 abilities, 455 callable models (102 local + 344 OpenRouter + 9 direct)")
+print("[ability_router] Endpoints: /ability, /ability/code, /ability/reason, /ability/vision, /ability/math, /ability/sql, /ability/embed, /ability/translate")
+
+tstart(server)

@@ -1,0 +1,1202 @@
+// Nova TSysMon v2.1 - Ternary System Monitor (Pure NovaLang)
+// Port 9905: CPU/RAM/Disk/Swap/Network/Process metrics with ternary scoring
+//
+// Backend: shell() wmic/netstat + NovaLang micro-tools (zero Python/psutil)
+// All data comes from native Windows commands for accuracy.
+//
+// N-S Mapping:
+//   cpu_usage  = velocity_field  (flow of compute)
+//   ram_usage  = pressure_field  (memory pressure)
+//   disk_io    = viscosity       (resistance to flow)
+//   net_bytes  = mass_flux       (data transport rate)
+//   Reynolds   = cpu_pct * 5.0  (system turbulence proxy)
+//   Re < 27  (H3^3) = laminar      (healthy, idle)
+//   Re < 125 (H5^3) = transitional (moderate load)
+//   Re < 343 (H7^3) = turbulent    (busy)
+//   Re >= 343        = chaotic     (overloaded)
+//
+// Ternary scoring per metric (harmonic thresholds):
+//   pct < 33.3% -> +1 (laminar,    healthy)
+//   pct < 66.6% ->  0 (transitional, warning)
+//   pct >= 66.6% -> -1 (turbulent,  critical)
+//
+// Routes:
+//   GET  /health              -- Health check
+//   GET  /sysmon/status       -- Service status + balanced ternary health
+//   POST /sysmon/procs        -- Process list (top N by CPU/memory)
+//   POST /sysmon/resources    -- CPU%, memory, disk, swap snapshot
+//   POST /sysmon/bench        -- Quick benchmark (hash iterations per second)
+//   POST /sysmon/trace        -- Trace a process by PID (mem, threads, files)
+//   POST /sysmon/network      -- Network stats (bytes sent/recv, connections)
+//   POST /sysmon/iowatch      -- Disk I/O stats
+//   POST /sysmon/stress       -- CPU stress test (configurable duration)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9905
+let server = tserve(PORT, "TSysMon v2.0 - Ternary System Monitor")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let BLOCK_SIZE = 2187    // 3^7
+let RE_LAMINAR     = 27  // H3^3
+let RE_TRANSITION  = 125 // H5^3
+let RE_TURBULENT   = 343 // H7^3
+let TOOLS_COUNT    = 7
+let VERSION        = "2.1"
+let SERVICE_NAME   = "nova-tsysmon"
+
+// Ternary trit values
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// (TMP_SCRIPT removed -- no longer needed, all calls use shell() or micro-tools)
+
+// -- Service stats --
+let stat_ops      = 0
+let stat_strong   = 0
+let stat_partial  = 0
+let stat_failed   = 0
+let stat_t0       = time()
+let stat_procs    = 0
+let stat_resources = 0
+let stat_bench    = 0
+let stat_trace    = 0
+let stat_network  = 0
+let stat_iowatch  = 0
+let stat_stress   = 0
+
+// ============================================================
+// Helper: score a percentage with harmonic thresholds
+// pct < 33.3% -> +1 | pct < 66.6% -> 0 | else -> -1
+// ============================================================
+fn metric_trit(pct) {
+    if3 pct < 33 {
+        T_TRUE
+    } else if3 pct < 67 {
+        T_MAYBE
+    } else {
+        T_FALSE
+    }
+}
+
+// ============================================================
+// Helper: trit to balanced ternary char
+// ============================================================
+fn bt_char(trit_val) {
+    if3 trit_val == T_TRUE {
+        "1"
+    } else if3 trit_val == T_MAYBE {
+        "0"
+    } else {
+        "T"
+    }
+}
+
+// ============================================================
+// Helper: Reynolds number from CPU percent
+// cpu_pct * 5.0, clamped to 0..2000
+// ============================================================
+fn cpu_reynolds(cpu_pct) {
+    let re = cpu_pct * 5
+    if3 re < 0 {
+        0
+    } else {
+        re
+    }
+}
+
+// ============================================================
+// Helper: classify Reynolds number into flow regime string
+// ============================================================
+fn flow_regime(re) {
+    if3 re < RE_LAMINAR {
+        "laminar"
+    } else if3 re < RE_TRANSITION {
+        "transitional"
+    } else if3 re < RE_TURBULENT {
+        "turbulent"
+    } else {
+        "chaotic"
+    }
+}
+
+// ============================================================
+// Helper: worst of two trits (most negative wins)
+// ============================================================
+fn worst_trit(a, b) {
+    if3 a == T_FALSE {
+        T_FALSE
+    } else if3 b == T_FALSE {
+        T_FALSE
+    } else if3 a == T_MAYBE {
+        T_MAYBE
+    } else if3 b == T_MAYBE {
+        T_MAYBE
+    } else {
+        T_TRUE
+    }
+}
+
+// ============================================================
+// Helper: record a tool invocation result into stats
+// ============================================================
+fn record_op(trit_val) {
+    stat_ops = stat_ops + 1
+    if3 trit_val == T_TRUE {
+        stat_strong = stat_strong + 1
+    } else if3 trit_val == T_MAYBE {
+        stat_partial = stat_partial + 1
+    } else {
+        stat_failed = stat_failed + 1
+    }
+}
+
+// ============================================================
+// Helper: parse JSON string from shell()/nova_run output
+// Returns dict/list on success, or {} on failure
+// ============================================================
+fn parse_py_json(raw) {
+    let s = trim(str(raw))
+    if3 len(s) < 2 {
+        return {}
+    }
+    let result = json_decode(s)
+    if3 result == "" {
+        return {}
+    }
+    result
+}
+
+// ============================================================
+// TOOL 1: /sysmon/procs
+// Process list -- top N by CPU or memory
+// Delegates to tsysmon_procs.nova micro-tool
+// ============================================================
+fn handle_procs(req) {
+    let body = dict_get(req, "body")
+    if3 body == "" {
+        let body = {}
+    }
+    let top_n = 25
+    let sort_by = "cpu"
+    if3 dict_has(body, "top_n") {
+        top_n = dict_get(body, "top_n")
+    }
+    if3 dict_has(body, "sort_by") {
+        sort_by = dict_get(body, "sort_by")
+    }
+    if3 top_n < 1 {
+        let top_n = 1
+    }
+    if3 top_n > 100 {
+        let top_n = 100
+    }
+
+    // Run pure NovaLang process list micro-tool
+    let proc_cmd = "C:/NovaX/novalang.exe C:/NovaX/tools/tsysmon_procs.nova " + sort_by + " " + str(top_n)
+    let raw = nova_run(proc_cmd, 20)
+    let data = try3 { json_decode(raw) } { {} }
+
+    // Score results
+    let procs_list = dict_get(data, "processes")
+    if3 procs_list == "" {
+        let procs_list = []
+    }
+    let proc_count = len(procs_list)
+    let overall_trit = T_TRUE
+    let high_cpu_count = 0
+    let i = 0
+    while3 i < proc_count {
+        let p = dict_get(procs_list, i)
+        let p_cpu = dict_get(p, "cpu_percent")
+        if3 p_cpu == "" {
+            let p_cpu = 0
+        }
+        let p_mem = dict_get(p, "mem_mb")
+        if3 p_mem == "" {
+            let p_mem = 0
+        }
+        // Trit per process: cpu>50% or mem>2000MB = bad
+        let pt = T_TRUE
+        if3 p_cpu > 50 { pt = T_MAYBE
+            high_cpu_count = high_cpu_count + 1
+        }
+        if3 p_mem > 2000 { pt = T_FALSE
+        }
+        p = dict_set(p, "trit", pt)
+        p = dict_set(p, "char", bt_char(pt))
+        i = i + 1
+    }
+    // Overall: many high-CPU procs = bad
+    if3 high_cpu_count > H7 { overall_trit = T_FALSE
+    } else if3 high_cpu_count > H3 { overall_trit = T_MAYBE
+    }
+
+    let total_p = dict_get(data, "total_procs")
+    if3 total_p == "" {
+        let total_p = 0
+    }
+
+    // Reynolds from first process CPU or 0
+    let cpu_pct = 0
+    if3 proc_count > 0 { first_p = dict_get(procs_list, 0)
+        let cpu_pct = dict_get(first_p, "cpu_percent")
+        if3 cpu_pct == "" {
+            let cpu_pct = 0
+        }
+    }
+    let re = cpu_reynolds(cpu_pct)
+    let regime = flow_regime(re)
+
+    stat_procs = stat_procs + 1
+    record_op(overall_trit)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", true)
+    resp = dict_set(resp, "processes", procs_list)
+    resp = dict_set(resp, "count", proc_count)
+    resp = dict_set(resp, "total_procs", total_p)
+    resp = dict_set(resp, "sort_by", sort_by)
+    resp = dict_set(resp, "high_cpu_count", high_cpu_count)
+    resp = dict_set(resp, "reynolds", re)
+    resp = dict_set(resp, "regime", regime)
+    resp = dict_set(resp, "trit", overall_trit)
+    resp = dict_set(resp, "char", bt_char(overall_trit))
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// ============================================================
+// TOOL 2: /sysmon/resources
+// CPU/RAM/disk/swap snapshot via wmic shell() commands (pure NovaLang)
+// ============================================================
+fn handle_resources(req) {
+    // CPU via wmic
+    let raw_cpu = shell("wmic cpu get loadpercentage /value")
+    let cpu_pct_val = 0
+    let cpu_lines = split(trim(raw_cpu), "\n")
+    let ci = 0
+    while3 ci < len(cpu_lines) {
+        let cl = trim(dict_get(cpu_lines, ci))
+        if3 contains(cl, "LoadPercentage=") {
+            let cpu_pct_val = int(replace(cl, "LoadPercentage=", ""))
+        }
+        ci = ci + 1
+    }
+
+    // Memory via wmic
+    let raw_mem = shell("wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /value")
+    let mem_total_kb = 0
+    let mem_free_kb = 0
+    let mem_lines = split(trim(raw_mem), "\n")
+    let mi = 0
+    while3 mi < len(mem_lines) {
+        let ml = trim(dict_get(mem_lines, mi))
+        if3 contains(ml, "TotalVisibleMemorySize=") {
+            mem_total_kb = int(replace(ml, "TotalVisibleMemorySize=", ""))
+        }
+        if3 contains(ml, "FreePhysicalMemory=") {
+            mem_free_kb = int(replace(ml, "FreePhysicalMemory=", ""))
+        }
+        mi = mi + 1
+    }
+    let mem_total_mb = mem_total_kb / 1024
+    let mem_free_mb = mem_free_kb / 1024
+    let mem_used_mb = mem_total_mb - mem_free_mb
+    let mem_pct_val = 0
+    if3 mem_total_mb > 0 {
+        mem_pct_val = (mem_used_mb * 100) / mem_total_mb
+    }
+
+    // Disk via wmic
+    let raw_disk = shell("wmic logicaldisk where \"Caption='C:'\" get Size,FreeSpace /value")
+    let disk_total_b = 0
+    let disk_free_b = 0
+    let disk_lines = split(trim(raw_disk), "\n")
+    let di = 0
+    while3 di < len(disk_lines) {
+        let dl = trim(dict_get(disk_lines, di))
+        if3 contains(dl, "Size=") {
+            if3 contains(dl, "Free") == false {
+                disk_total_b = int(replace(dl, "Size=", ""))
+            }
+        }
+        if3 contains(dl, "FreeSpace=") {
+            disk_free_b = int(replace(dl, "FreeSpace=", ""))
+        }
+        di = di + 1
+    }
+    let disk_total_gb = disk_total_b / 1073741824
+    let disk_free_gb = disk_free_b / 1073741824
+    let disk_used_gb = disk_total_gb - disk_free_gb
+    let disk_pct_val = 0
+    if3 disk_total_gb > 0 {
+        disk_pct_val = (disk_used_gb * 100) / disk_total_gb
+    }
+
+    // Swap via wmic pagefile
+    let raw_swap = shell("wmic pagefile get CurrentUsage,AllocatedBaseSize /value")
+    let swap_alloc_mb = 0
+    let swap_used_mb_val = 0
+    let swap_lines = split(trim(raw_swap), "\n")
+    let si = 0
+    while3 si < len(swap_lines) {
+        let sl = trim(dict_get(swap_lines, si))
+        if3 contains(sl, "AllocatedBaseSize=") {
+            swap_alloc_mb = int(replace(sl, "AllocatedBaseSize=", ""))
+        }
+        if3 contains(sl, "CurrentUsage=") {
+            swap_used_mb_val = int(replace(sl, "CurrentUsage=", ""))
+        }
+        si = si + 1
+    }
+    let swap_free_mb_val = swap_alloc_mb - swap_used_mb_val
+    let swap_pct_val = 0
+    if3 swap_alloc_mb > 0 {
+        swap_pct_val = (swap_used_mb_val * 100) / swap_alloc_mb
+    }
+
+    // Build unified data dict
+    let data = {}
+    data = dict_set(data, "cpu_percent", cpu_pct_val)
+    data = dict_set(data, "mem_total_mb", mem_total_mb)
+    data = dict_set(data, "mem_used_mb", mem_used_mb)
+    data = dict_set(data, "mem_free_mb", mem_free_mb)
+    data = dict_set(data, "mem_percent", mem_pct_val)
+    data = dict_set(data, "disk_total_gb", disk_total_gb)
+    data = dict_set(data, "disk_used_gb", disk_used_gb)
+    data = dict_set(data, "disk_free_gb", disk_free_gb)
+    data = dict_set(data, "disk_percent", disk_pct_val)
+    data = dict_set(data, "swap_total_mb", swap_alloc_mb)
+    data = dict_set(data, "swap_used_mb", swap_used_mb_val)
+    data = dict_set(data, "swap_free_mb", swap_free_mb_val)
+    data = dict_set(data, "swap_percent", swap_pct_val)
+
+    // Extract values with safe defaults
+    let cpu_pct = dict_get(data, "cpu_percent")
+    if3 cpu_pct == "" {
+        let cpu_pct = 0
+    }
+    let mem_pct = dict_get(data, "mem_percent")
+    if3 mem_pct == "" {
+        let mem_pct = 0
+    }
+    let disk_pct = dict_get(data, "disk_percent")
+    if3 disk_pct == "" {
+        let disk_pct = 0
+    }
+    let swap_pct = dict_get(data, "swap_percent")
+    if3 swap_pct == "" {
+        let swap_pct = 0
+    }
+
+    // Trit-score each metric
+    let cpu_trit  = metric_trit(cpu_pct)
+    let mem_trit  = metric_trit(mem_pct)
+    let disk_trit = metric_trit(disk_pct)
+    let swap_trit = metric_trit(swap_pct)
+
+    // Overall: worst metric wins
+    let overall_trit = worst_trit(cpu_trit, mem_trit)
+    let overall_trit = worst_trit(overall_trit, disk_trit)
+    let overall_trit = worst_trit(overall_trit, swap_trit)
+
+    // Reynolds number from CPU
+    let re = cpu_reynolds(cpu_pct)
+    let regime = flow_regime(re)
+
+    // Balanced ternary health string: cpu|mem|disk|swap
+    let bt_str = bt_char(cpu_trit) + bt_char(mem_trit) + bt_char(disk_trit) + bt_char(swap_trit)
+
+    stat_resources = stat_resources + 1
+    record_op(overall_trit)
+
+    // Gather raw values
+    let mem_total = dict_get(data, "mem_total_mb")
+    if3 mem_total == "" { let mem_total = 0 }
+    let mem_used = dict_get(data, "mem_used_mb")
+    if3 mem_used == "" { let mem_used = 0 }
+    let mem_free = dict_get(data, "mem_free_mb")
+    if3 mem_free == "" { let mem_free = 0 }
+    let disk_total = dict_get(data, "disk_total_gb")
+    if3 disk_total == "" { let disk_total = 0 }
+    let disk_used = dict_get(data, "disk_used_gb")
+    if3 disk_used == "" { let disk_used = 0 }
+    let disk_free = dict_get(data, "disk_free_gb")
+    if3 disk_free == "" { let disk_free = 0 }
+    let swap_total = dict_get(data, "swap_total_mb")
+    if3 swap_total == "" { let swap_total = 0 }
+    let swap_used = dict_get(data, "swap_used_mb")
+    if3 swap_used == "" { let swap_used = 0 }
+    let swap_free = dict_get(data, "swap_free_mb")
+    if3 swap_free == "" { let swap_free = 0 }
+
+    // Build sub-dicts
+    let cpu_d = {}
+    cpu_d = dict_set(cpu_d, "percent", cpu_pct)
+    cpu_d = dict_set(cpu_d, "trit", cpu_trit)
+    cpu_d = dict_set(cpu_d, "char", bt_char(cpu_trit))
+
+    let mem_d = {}
+    mem_d = dict_set(mem_d, "total_mb", mem_total)
+    mem_d = dict_set(mem_d, "used_mb", mem_used)
+    mem_d = dict_set(mem_d, "free_mb", mem_free)
+    mem_d = dict_set(mem_d, "percent", mem_pct)
+    mem_d = dict_set(mem_d, "trit", mem_trit)
+    mem_d = dict_set(mem_d, "char", bt_char(mem_trit))
+
+    let disk_d = {}
+    disk_d = dict_set(disk_d, "total_gb", disk_total)
+    disk_d = dict_set(disk_d, "used_gb", disk_used)
+    disk_d = dict_set(disk_d, "free_gb", disk_free)
+    disk_d = dict_set(disk_d, "percent", disk_pct)
+    disk_d = dict_set(disk_d, "trit", disk_trit)
+    disk_d = dict_set(disk_d, "char", bt_char(disk_trit))
+
+    let swap_d = {}
+    swap_d = dict_set(swap_d, "total_mb", swap_total)
+    swap_d = dict_set(swap_d, "used_mb", swap_used)
+    swap_d = dict_set(swap_d, "free_mb", swap_free)
+    swap_d = dict_set(swap_d, "percent", swap_pct)
+    swap_d = dict_set(swap_d, "trit", swap_trit)
+    swap_d = dict_set(swap_d, "char", bt_char(swap_trit))
+
+    let metrics = {}
+    metrics = dict_set(metrics, "cpu", cpu_d)
+    metrics = dict_set(metrics, "memory", mem_d)
+    metrics = dict_set(metrics, "disk", disk_d)
+    metrics = dict_set(metrics, "swap", swap_d)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", true)
+    resp = dict_set(resp, "metrics", metrics)
+    resp = dict_set(resp, "reynolds", re)
+    resp = dict_set(resp, "regime", regime)
+    resp = dict_set(resp, "health_bt", bt_str)
+    resp = dict_set(resp, "trit", overall_trit)
+    resp = dict_set(resp, "char", bt_char(overall_trit))
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// ============================================================
+// TOOL 3: /sysmon/bench
+// Quick benchmark: hash iterations per second
+// Delegates to tsysmon_bench.nova micro-tool
+// ============================================================
+fn handle_bench(req) {
+    let body = dict_get(req, "body")
+    if3 body == "" {
+        let body = {}
+    }
+    let duration = 3
+    if3 dict_has(body, "duration") { duration = dict_get(body, "duration")
+    }
+    if3 duration < 1 { let duration = 1 }
+    if3 duration > H13 { let duration = H13 }
+
+    // Single-line: time SHA-256 hashing for `duration` seconds
+    // Reports hashes/sec as the benchmark score
+    let dur_s = str(duration)
+    // Run pure NovaLang CPU benchmark micro-tool
+    let bench_cmd = "C:/NovaX/novalang.exe C:/NovaX/tools/tsysmon_bench.nova " + dur_s
+    let raw = nova_run(bench_cmd, 30)
+    let data = try3 { json_decode(raw) } { {} }
+
+    let hash_rate = dict_get(data, "hash_rate")
+    if3 hash_rate == "" { let hash_rate = 0 }
+    let hashes = dict_get(data, "hashes")
+    if3 hashes == "" { let hashes = 0 }
+    let actual_dur = dict_get(data, "duration_s")
+    if3 actual_dur == "" { let actual_dur = 0 }
+    let data_size = dict_get(data, "data_size_bytes")
+    if3 data_size == "" { let data_size = 0 }
+
+    // Score by Reynolds: rate > RE_TURBULENT = fast (+1), > RE_TRANSITION = ok (0), else slow (-1)
+    // Scale rate to Reynolds-comparable range: rate / 1000
+    let re_bench = hash_rate / 1000
+    if3 re_bench > 9999 { re_bench = 9999 }
+    let bench_trit = T_FALSE
+    if3 re_bench > RE_TURBULENT { bench_trit = T_TRUE
+    } else if3 re_bench > RE_LAMINAR { bench_trit = T_MAYBE
+    }
+    let regime = flow_regime(re_bench)
+
+    stat_bench = stat_bench + 1
+    record_op(bench_trit)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", true)
+    resp = dict_set(resp, "benchmark", "sha256_iterations")
+    resp = dict_set(resp, "hashes", hashes)
+    resp = dict_set(resp, "duration_s", actual_dur)
+    resp = dict_set(resp, "hash_rate", hash_rate)
+    resp = dict_set(resp, "hash_rate_unit", "hashes/sec")
+    resp = dict_set(resp, "data_size_bytes", data_size)
+    resp = dict_set(resp, "reynolds_scaled", re_bench)
+    resp = dict_set(resp, "regime", regime)
+    resp = dict_set(resp, "trit", bench_trit)
+    resp = dict_set(resp, "char", bt_char(bench_trit))
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// ============================================================
+// TOOL 4: /sysmon/trace
+// Trace a process by PID: memory, threads, open files, cpu%
+// Delegates to tsysmon_ptrace.nova micro-tool
+// ============================================================
+fn handle_trace(req) {
+    let body = dict_get(req, "body")
+    if3 body == "" {
+        let body = {}
+    }
+    let pid = 0
+    if3 dict_has(body, "pid") { pid = dict_get(body, "pid")
+    }
+    if3 pid == 0 { err = {}
+        err = dict_set(err, "ok", false)
+        err = dict_set(err, "error", "pid required in request body")
+        err = dict_set(err, "trit", T_FALSE)
+        err = dict_set(err, "char", "T")
+        return err
+    }
+
+    let pid_s = str(pid)
+
+    // Run pure NovaLang process trace micro-tool
+    let ptrace_cmd = "C:/NovaX/novalang.exe C:/NovaX/tools/tsysmon_ptrace.nova " + pid_s
+    let raw = nova_run(ptrace_cmd, 15)
+    let data = try3 { json_decode(raw) } { {} }
+
+    let ok_val = dict_get(data, "ok")
+    if3 ok_val == false { err_msg = dict_get(data, "error")
+        if3 err_msg == "" { let err_msg = "trace failed" }
+        let err = {}
+        err = dict_set(err, "ok", false)
+        err = dict_set(err, "pid", pid)
+        err = dict_set(err, "error", err_msg)
+        err = dict_set(err, "trit", T_FALSE)
+        err = dict_set(err, "char", "T")
+        return err
+    }
+
+    // Extract values
+    let proc_name   = dict_get(data, "name")
+    if3 proc_name == "" { let proc_name = "?" }
+    let status      = dict_get(data, "status")
+    if3 status == "" { let status = "?" }
+    let cpu_pct     = dict_get(data, "cpu_percent")
+    if3 cpu_pct == "" { let cpu_pct = 0 }
+    let mem_rss     = dict_get(data, "mem_rss_mb")
+    if3 mem_rss == "" { let mem_rss = 0 }
+    let mem_vms     = dict_get(data, "mem_vms_mb")
+    if3 mem_vms == "" { let mem_vms = 0 }
+    let num_threads = dict_get(data, "num_threads")
+    if3 num_threads == "" { let num_threads = 0 }
+    let open_files  = dict_get(data, "open_files")
+    if3 open_files == "" { let open_files = 0 }
+    let net_conns   = dict_get(data, "net_connections")
+    if3 net_conns == "" { let net_conns = 0 }
+    let cmdline     = dict_get(data, "cmdline")
+    if3 cmdline == "" { let cmdline = "?" }
+
+    // Score: cpu > 80% = bad, mem > 2GB = bad, threads > 343 = bad
+    let proc_trit = T_TRUE
+    let cpu_trit  = metric_trit(cpu_pct)
+    let mem_trit  = T_TRUE
+    if3 mem_rss > 2048 { mem_trit = T_FALSE
+    } else if3 mem_rss > 512 { mem_trit = T_MAYBE
+    }
+    let thr_trit = T_TRUE
+    if3 num_threads > RE_TURBULENT { thr_trit = T_FALSE
+    } else if3 num_threads > RE_TRANSITION { thr_trit = T_MAYBE
+    }
+
+    let proc_trit = worst_trit(cpu_trit, mem_trit)
+    let proc_trit = worst_trit(proc_trit, thr_trit)
+
+    let re = cpu_reynolds(cpu_pct)
+    let regime = flow_regime(re)
+
+    stat_trace = stat_trace + 1
+    record_op(proc_trit)
+
+    let details = {}
+    details = dict_set(details, "name", proc_name)
+    details = dict_set(details, "status", status)
+    details = dict_set(details, "cpu_percent", cpu_pct)
+    details = dict_set(details, "mem_rss_mb", mem_rss)
+    details = dict_set(details, "mem_vms_mb", mem_vms)
+    details = dict_set(details, "num_threads", num_threads)
+    details = dict_set(details, "open_files", open_files)
+    details = dict_set(details, "net_connections", net_conns)
+    details = dict_set(details, "cmdline", cmdline)
+
+    let trits = {}
+    trits = dict_set(trits, "cpu", cpu_trit)
+    trits = dict_set(trits, "mem", mem_trit)
+    trits = dict_set(trits, "threads", thr_trit)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", true)
+    resp = dict_set(resp, "pid", pid)
+    resp = dict_set(resp, "details", details)
+    resp = dict_set(resp, "trits", trits)
+    resp = dict_set(resp, "reynolds", re)
+    resp = dict_set(resp, "regime", regime)
+    resp = dict_set(resp, "trit", proc_trit)
+    resp = dict_set(resp, "char", bt_char(proc_trit))
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// ============================================================
+// TOOL 5: /sysmon/network
+// Network stats: bytes sent/recv + connections summary
+// Uses netstat -e via shell() + tsysmon_netconns.nova micro-tool
+// ============================================================
+fn handle_network(req) {
+    let body = dict_get(req, "body")
+    if3 body == "" {
+        let body = {}
+    }
+    let include_conns = true
+    if3 dict_has(body, "include_conns") { include_conns = dict_get(body, "include_conns")
+    }
+
+    // Network I/O counters via netstat -e (no psutil)
+    let raw_net = shell("netstat -e")
+    let net_lines = split(trim(raw_net), "\n")
+    let n_bytes_recv = 0
+    let n_bytes_sent = 0
+    let n_pkts_recv = 0
+    let n_pkts_sent = 0
+    let n_errs_recv = 0
+    let n_errs_sent = 0
+    let n_disc_recv = 0
+    let n_disc_sent = 0
+    let ni = 0
+    while3 ni < len(net_lines) {
+        let nl = trim(dict_get(net_lines, ni))
+        // Parse lines like "Bytes           123456789  987654321"
+        let parts = split(nl, " ")
+        // Filter empty parts and find label + values
+        let clean_parts = []
+        let pi = 0
+        while3 pi < len(parts) {
+            let part = trim(dict_get(parts, pi))
+            if3 len(part) > 0 {
+                clean_parts = append(clean_parts, part)
+            }
+            pi = pi + 1
+        }
+        if3 len(clean_parts) >= 3 {
+            let label = dict_get(clean_parts, 0)
+            let val_recv = int(dict_get(clean_parts, 1))
+            let val_sent = int(dict_get(clean_parts, 2))
+            if3 label == "Bytes" {
+                n_bytes_recv = val_recv
+                n_bytes_sent = val_sent
+            }
+            if3 label == "Unicast" {
+                n_pkts_recv = val_recv
+                n_pkts_sent = val_sent
+            }
+            if3 label == "Errors" {
+                n_errs_recv = val_recv
+                n_errs_sent = val_sent
+            }
+            if3 label == "Discards" {
+                n_disc_recv = val_recv
+                n_disc_sent = val_sent
+            }
+        }
+        ni = ni + 1
+    }
+    let io_data = {}
+    io_data = dict_set(io_data, "bytes_sent", n_bytes_sent)
+    io_data = dict_set(io_data, "bytes_recv", n_bytes_recv)
+    io_data = dict_set(io_data, "packets_sent", n_pkts_sent)
+    io_data = dict_set(io_data, "packets_recv", n_pkts_recv)
+    io_data = dict_set(io_data, "errin", n_errs_recv)
+    io_data = dict_set(io_data, "errout", n_errs_sent)
+    io_data = dict_set(io_data, "dropin", n_disc_recv)
+    io_data = dict_set(io_data, "dropout", n_disc_sent)
+    io_data = dict_set(io_data, "per_nic", {})
+
+    let bytes_sent = dict_get(io_data, "bytes_sent")
+    if3 bytes_sent == "" { let bytes_sent = 0 }
+    let bytes_recv = dict_get(io_data, "bytes_recv")
+    if3 bytes_recv == "" { let bytes_recv = 0 }
+    let pkts_sent = dict_get(io_data, "packets_sent")
+    if3 pkts_sent == "" { let pkts_sent = 0 }
+    let pkts_recv = dict_get(io_data, "packets_recv")
+    if3 pkts_recv == "" { let pkts_recv = 0 }
+    let errin = dict_get(io_data, "errin")
+    if3 errin == "" { let errin = 0 }
+    let errout = dict_get(io_data, "errout")
+    if3 errout == "" { let errout = 0 }
+    let dropin = dict_get(io_data, "dropin")
+    if3 dropin == "" { let dropin = 0 }
+    let dropout = dict_get(io_data, "dropout")
+    if3 dropout == "" { let dropout = 0 }
+    let per_nic = dict_get(io_data, "per_nic")
+    if3 per_nic == "" { let per_nic = {} }
+
+    // MB conversions
+    let mb_sent = bytes_sent / 1048576
+    let mb_recv = bytes_recv / 1048576
+
+    // Connection summary via temp file
+    let conn_summary = {}
+    let conn_list = []
+    let total_conns = 0
+    let established = 0
+    let listening = 0
+    let external = 0
+
+    // Run pure NovaLang network connections micro-tool
+    let netconn_cmd = "C:/NovaX/novalang.exe C:/NovaX/tools/tsysmon_netconns.nova"
+    let raw_c = nova_run(netconn_cmd, 15)
+    let conn_data = try3 { json_decode(raw_c) } { {} }
+
+    let total_conns = dict_get(conn_data, "total")
+    if3 total_conns == "" { let total_conns = 0 }
+    let established = dict_get(conn_data, "established")
+    if3 established == "" { let established = 0 }
+    let listening = dict_get(conn_data, "listening")
+    if3 listening == "" { let listening = 0 }
+    let external = dict_get(conn_data, "external")
+    if3 external == "" { let external = 0 }
+    let conn_list = dict_get(conn_data, "connections")
+    if3 conn_list == "" { let conn_list = [] }
+
+    // Trit: no errors + no external = +1, few errors or externals = 0, many = -1
+    let total_errors = errin + errout + dropin + dropout
+    let net_trit = T_TRUE
+    if3 external > H7 { net_trit = T_FALSE
+    } else if3 external > 0 { net_trit = T_MAYBE
+    }
+    if3 total_errors > 100 { net_trit = worst_trit(net_trit, T_FALSE)
+    } else if3 total_errors > 10 { net_trit = worst_trit(net_trit, T_MAYBE)
+    }
+
+    stat_network = stat_network + 1
+    record_op(net_trit)
+
+    let io_summary = {}
+    io_summary = dict_set(io_summary, "bytes_sent", bytes_sent)
+    io_summary = dict_set(io_summary, "bytes_recv", bytes_recv)
+    io_summary = dict_set(io_summary, "mb_sent", mb_sent)
+    io_summary = dict_set(io_summary, "mb_recv", mb_recv)
+    io_summary = dict_set(io_summary, "packets_sent", pkts_sent)
+    io_summary = dict_set(io_summary, "packets_recv", pkts_recv)
+    io_summary = dict_set(io_summary, "errin", errin)
+    io_summary = dict_set(io_summary, "errout", errout)
+    io_summary = dict_set(io_summary, "dropin", dropin)
+    io_summary = dict_set(io_summary, "dropout", dropout)
+
+    let conn_summary = {}
+    conn_summary = dict_set(conn_summary, "total", total_conns)
+    conn_summary = dict_set(conn_summary, "established", established)
+    conn_summary = dict_set(conn_summary, "listening", listening)
+    conn_summary = dict_set(conn_summary, "external", external)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", true)
+    resp = dict_set(resp, "io", io_summary)
+    resp = dict_set(resp, "per_nic", per_nic)
+    resp = dict_set(resp, "connections_summary", conn_summary)
+    resp = dict_set(resp, "connections", conn_list)
+    resp = dict_set(resp, "trit", net_trit)
+    resp = dict_set(resp, "char", bt_char(net_trit))
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// ============================================================
+// TOOL 6: /sysmon/iowatch
+// Disk I/O stats: bytes read/write/sec
+// Delegates to tsysmon_diskio.nova micro-tool
+// ============================================================
+fn handle_iowatch(req) {
+    let body = dict_get(req, "body")
+    if3 body == "" {
+        let body = {}
+    }
+    let window = H3
+    if3 dict_has(body, "window") { window = dict_get(body, "window")
+    }
+    if3 window < 1 { let window = 1 }
+    if3 window > H13 { let window = H13 }
+
+    let win_s = str(window)
+
+    // Run pure NovaLang disk I/O watch micro-tool
+    let diskio_cmd = "C:/NovaX/novalang.exe C:/NovaX/tools/tsysmon_diskio.nova " + win_s
+    let raw = nova_run(diskio_cmd, 30)
+    let data = try3 { json_decode(raw) } { {} }
+
+    let ok_v = dict_get(data, "ok")
+    if3 ok_v == false { err_msg = dict_get(data, "error")
+        if3 err_msg == "" { let err_msg = "iowatch failed" }
+        let err = {}
+        err = dict_set(err, "ok", false)
+        err = dict_set(err, "error", err_msg)
+        err = dict_set(err, "trit", T_FALSE)
+        err = dict_set(err, "char", "T")
+        return err
+    }
+
+    let read_bps = dict_get(data, "read_bytes_sec")
+    if3 read_bps == "" { let read_bps = 0 }
+    let write_bps = dict_get(data, "write_bytes_sec")
+    if3 write_bps == "" { let write_bps = 0 }
+    let read_mbs = dict_get(data, "read_mbs")
+    if3 read_mbs == "" { let read_mbs = 0 }
+    let write_mbs = dict_get(data, "write_mbs")
+    if3 write_mbs == "" { let write_mbs = 0 }
+    let read_count = dict_get(data, "read_count")
+    if3 read_count == "" { let read_count = 0 }
+    let write_count = dict_get(data, "write_count")
+    if3 write_count == "" { let write_count = 0 }
+    let read_time = dict_get(data, "read_time_ms")
+    if3 read_time == "" { let read_time = 0 }
+    let write_time = dict_get(data, "write_time_ms")
+    if3 write_time == "" { let write_time = 0 }
+    let act_window = dict_get(data, "window_s")
+    if3 act_window == "" { let act_window = window }
+    let total_read = dict_get(data, "total_read_bytes")
+    if3 total_read == "" { let total_read = 0 }
+    let total_write = dict_get(data, "total_write_bytes")
+    if3 total_write == "" { let total_write = 0 }
+
+    // Reynolds from I/O: total MB/s * H7, clamped
+    let total_mbs = read_mbs + write_mbs
+    let re = total_mbs * H7
+    if3 re > 9999 { let re = 9999 }
+    let regime = flow_regime(re)
+
+    // Trit: idle=+1, moderate=0, thrashing=-1
+    let io_trit = T_TRUE
+    if3 re >= RE_TURBULENT { io_trit = T_FALSE
+    } else if3 re >= RE_LAMINAR { io_trit = T_MAYBE
+    }
+
+    stat_iowatch = stat_iowatch + 1
+    record_op(io_trit)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", true)
+    resp = dict_set(resp, "window_s", act_window)
+    resp = dict_set(resp, "read_bytes_sec", read_bps)
+    resp = dict_set(resp, "write_bytes_sec", write_bps)
+    resp = dict_set(resp, "read_mbs", read_mbs)
+    resp = dict_set(resp, "write_mbs", write_mbs)
+    resp = dict_set(resp, "read_ops", read_count)
+    resp = dict_set(resp, "write_ops", write_count)
+    resp = dict_set(resp, "read_time_ms", read_time)
+    resp = dict_set(resp, "write_time_ms", write_time)
+    resp = dict_set(resp, "total_read_bytes", total_read)
+    resp = dict_set(resp, "total_write_bytes", total_write)
+    resp = dict_set(resp, "reynolds", re)
+    resp = dict_set(resp, "regime", regime)
+    resp = dict_set(resp, "trit", io_trit)
+    resp = dict_set(resp, "char", bt_char(io_trit))
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// ============================================================
+// TOOL 7: /sysmon/stress
+// CPU stress test: spin N worker threads for `duration` seconds
+// Delegates to tsysmon_stress.nova micro-tool
+// ============================================================
+fn handle_stress(req) {
+    let body = dict_get(req, "body")
+    if3 body == "" {
+        let body = {}
+    }
+    let duration = H3
+    let threads = H7
+    if3 dict_has(body, "duration") { duration = dict_get(body, "duration")
+    }
+    if3 dict_has(body, "threads") { threads = dict_get(body, "threads")
+    }
+    if3 duration < 1 { let duration = 1 }
+    if3 duration > 30 { let duration = 30 }
+    if3 threads < 1 { let threads = 1 }
+    if3 threads > 13 { let threads = 13 }
+
+    let dur_s = str(duration)
+    let thr_s = str(threads)
+
+    // Run pure NovaLang CPU stress test micro-tool
+    let timeout_s = duration + duration + duration + 10
+    let stress_cmd = "C:/NovaX/novalang.exe C:/NovaX/tools/tsysmon_stress.nova " + dur_s + " " + thr_s
+    let raw = nova_run(stress_cmd, timeout_s)
+    let data = try3 { json_decode(raw) } { {} }
+
+    let ok_v = dict_get(data, "ok")
+    if3 ok_v == false { err_msg = dict_get(data, "error")
+        if3 err_msg == "" { let err_msg = "stress test failed" }
+        let err = {}
+        err = dict_set(err, "ok", false)
+        err = dict_set(err, "error", err_msg)
+        err = dict_set(err, "trit", T_FALSE)
+        err = dict_set(err, "char", "T")
+        return err
+    }
+
+    let cpu_before = dict_get(data, "cpu_before")
+    if3 cpu_before == "" { let cpu_before = 0 }
+    let cpu_during = dict_get(data, "cpu_during")
+    if3 cpu_during == "" { let cpu_during = 0 }
+    let cpu_after = dict_get(data, "cpu_after")
+    if3 cpu_after == "" { let cpu_after = 0 }
+    let total_hashes = dict_get(data, "total_hashes")
+    if3 total_hashes == "" { let total_hashes = 0 }
+    let hash_rate = dict_get(data, "hash_rate")
+    if3 hash_rate == "" { let hash_rate = 0 }
+    let per_thread = dict_get(data, "per_thread")
+    if3 per_thread == "" { let per_thread = [] }
+    let actual_dur = dict_get(data, "duration_s")
+    if3 actual_dur == "" { let actual_dur = duration }
+    let num_t = dict_get(data, "threads")
+    if3 num_t == "" { let num_t = threads }
+
+    // Trit: high throughput = good stress capability (+1)
+    // Rate/1000 vs Reynolds thresholds
+    let re_stress = hash_rate / 1000
+    if3 re_stress > 9999 { let re_stress = 9999 }
+    let stress_trit = T_FALSE
+    if3 re_stress > RE_TURBULENT { stress_trit = T_TRUE
+    } else if3 re_stress > RE_LAMINAR { stress_trit = T_MAYBE
+    }
+    let regime = flow_regime(re_stress)
+
+    // CPU saturation score: did we actually stress the CPU?
+    let cpu_delta = cpu_during - cpu_before
+    let sat_trit = T_TRUE
+    if3 cpu_delta < 10 {
+        // Barely moved CPU -- maybe already saturated or very fast
+        let sat_trit = T_MAYBE
+    }
+
+    stat_stress = stat_stress + 1
+    record_op(stress_trit)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", true)
+    resp = dict_set(resp, "threads", num_t)
+    resp = dict_set(resp, "duration_s", actual_dur)
+    resp = dict_set(resp, "cpu_before_pct", cpu_before)
+    resp = dict_set(resp, "cpu_during_pct", cpu_during)
+    resp = dict_set(resp, "cpu_after_pct", cpu_after)
+    resp = dict_set(resp, "cpu_delta", cpu_delta)
+    resp = dict_set(resp, "total_hashes", total_hashes)
+    resp = dict_set(resp, "hash_rate", hash_rate)
+    resp = dict_set(resp, "hash_rate_unit", "hashes/sec")
+    resp = dict_set(resp, "per_thread_hashes", per_thread)
+    resp = dict_set(resp, "reynolds_scaled", re_stress)
+    resp = dict_set(resp, "regime", regime)
+    resp = dict_set(resp, "trit", stress_trit)
+    resp = dict_set(resp, "char", bt_char(stress_trit))
+    resp = dict_set(resp, "saturation_trit", sat_trit)
+    resp = dict_set(resp, "saturation_char", bt_char(sat_trit))
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// ============================================================
+// GET /health
+// ============================================================
+fn handle_health(req) {
+    let uptime = time() - stat_t0
+    let self_trit = T_MAYBE
+    if3 uptime > 10 { self_trit = T_TRUE
+    }
+    let counters = {}
+    counters = dict_set(counters, "strong", stat_strong)
+    counters = dict_set(counters, "partial", stat_partial)
+    counters = dict_set(counters, "failed", stat_failed)
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, counters)
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    return resp
+}
+
+// ============================================================
+// GET /sysmon/status
+// Full service status with N-S Reynolds analysis
+// ============================================================
+fn handle_status(req) {
+    let uptime = time() - stat_t0
+
+    // Quick CPU snapshot for Reynolds number via wmic (no psutil)
+    let raw_cpu_s = shell("wmic cpu get loadpercentage /value")
+    let cpu_pct = 0
+    let cpu_s_lines = split(trim(raw_cpu_s), "\n")
+    let csi = 0
+    while3 csi < len(cpu_s_lines) {
+        let csl = trim(dict_get(cpu_s_lines, csi))
+        if3 contains(csl, "LoadPercentage=") {
+            cpu_pct = int(replace(csl, "LoadPercentage=", ""))
+        }
+        csi = csi + 1
+    }
+    let re = cpu_reynolds(cpu_pct)
+    let regime = flow_regime(re)
+
+    // System health trit from stats ratio
+    let sys_trit = T_TRUE
+    if3 stat_failed > stat_strong { sys_trit = T_FALSE
+    } else if3 stat_failed > 0 { sys_trit = T_MAYBE
+    }
+
+    // Build 13-trit health string from stat mix
+    let health_bt = ""
+    let bi = 0
+    while3 bi < H13 {
+        if3 sys_trit == T_TRUE {
+            health_bt = health_bt + "1"
+        } else if3 sys_trit == T_MAYBE {
+            health_bt = health_bt + "0"
+        } else {
+            health_bt = health_bt + "T"
+        }
+        bi = bi + 1
+    }
+
+    let by_tool = {}
+    by_tool = dict_set(by_tool, "procs", stat_procs)
+    by_tool = dict_set(by_tool, "resources", stat_resources)
+    by_tool = dict_set(by_tool, "bench", stat_bench)
+    by_tool = dict_set(by_tool, "trace", stat_trace)
+    by_tool = dict_set(by_tool, "network", stat_network)
+    by_tool = dict_set(by_tool, "iowatch", stat_iowatch)
+    by_tool = dict_set(by_tool, "stress", stat_stress)
+
+    let trits_summary = {}
+    trits_summary = dict_set(trits_summary, "strong", stat_strong)
+    trits_summary = dict_set(trits_summary, "partial", stat_partial)
+    trits_summary = dict_set(trits_summary, "failed", stat_failed)
+
+    let harmonics = {}
+    harmonics = dict_set(harmonics, "H3", H3)
+    harmonics = dict_set(harmonics, "H5", H5)
+    harmonics = dict_set(harmonics, "H7", H7)
+    harmonics = dict_set(harmonics, "H13", H13)
+
+    let boundaries = {}
+    boundaries = dict_set(boundaries, "laminar", RE_LAMINAR)
+    boundaries = dict_set(boundaries, "transition", RE_TRANSITION)
+    boundaries = dict_set(boundaries, "turbulent", RE_TURBULENT)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", true)
+    resp = dict_set(resp, "service", SERVICE_NAME)
+    resp = dict_set(resp, "version", VERSION)
+    resp = dict_set(resp, "port", PORT)
+    resp = dict_set(resp, "uptime_s", uptime)
+    resp = dict_set(resp, "total_ops", stat_ops)
+    resp = dict_set(resp, "by_tool", by_tool)
+    resp = dict_set(resp, "trits", trits_summary)
+    resp = dict_set(resp, "health_bt", health_bt)
+    resp = dict_set(resp, "cpu_pct", cpu_pct)
+    resp = dict_set(resp, "reynolds", re)
+    resp = dict_set(resp, "regime", regime)
+    resp = dict_set(resp, "system_trit", sys_trit)
+    resp = dict_set(resp, "system_char", bt_char(sys_trit))
+    resp = dict_set(resp, "harmonics", harmonics)
+    resp = dict_set(resp, "reynolds_boundaries", boundaries)
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "block_size", BLOCK_SIZE)
+    return resp
+}
+
+// POST /sysmon/gpu — GPU stats via nvidia-smi
+fn handle_gpu(body) {
+    let EXEC = "http://127.0.0.1:9877"
+    let cmd = "nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>&1"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout") ?? ""
+    let trit = 1
+    if3 contains(out, "not found") {
+        trit = 0
+        return {"ok": true, "gpu_available": false, "message": "No NVIDIA GPU or nvidia-smi not found", "trit": trit, "char": trit_char(trit)}
+    }
+    if3 contains(out, "error") {
+        trit = -1
+        return {"ok": false, "error": out, "trit": trit, "char": trit_char(trit)}
+    }
+    // Parse CSV output: name, mem_total, mem_used, mem_free, util%, temp
+    let lines = split(strip(out), "\n")
+    let gpus = []
+    let gidx = 0
+    while3 gidx < len(lines) {
+        let parts = split(lines[gidx], ",")
+        if3 len(parts) >= 6 {
+            let gpu = {"name": strip(parts[0]), "mem_total_mb": strip(parts[1]), "mem_used_mb": strip(parts[2]), "mem_free_mb": strip(parts[3]), "utilization_pct": strip(parts[4]), "temp_c": strip(parts[5])}
+            gpus = append(gpus, gpu)
+        }
+        gidx = gidx + 1
+    }
+    return {"ok": true, "gpu_available": true, "gpus": gpus, "count": len(gpus), "trit": trit, "char": trit_char(trit)}
+}
+
+// POST /sysmon/ncdu — disk usage analysis per subdirectory
+fn handle_ncdu(body) {
+    let path = dict_get(body, "path") ?? "."
+    let depth = dict_get(body, "depth") ?? 1
+    let EXEC = "http://127.0.0.1:9877"
+    let cmd = "du -h --max-depth=" + str(depth) + " \"" + path + "\" 2>/dev/null | sort -rh | head -30"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout") ?? ""
+    let lines = split(strip(out), "\n")
+    let trit = 1
+    if3 len(lines) == 0 {
+        trit = 0
+    }
+    return {"ok": true, "path": path, "depth": depth, "entries": len(lines), "output": out, "trit": trit, "char": trit_char(trit)}
+}
+
+// ============================================================
+// Route registration
+// ============================================================
+troute(server, "GET",  "/health",           "handle_health")
+troute(server, "GET",  "/sysmon/status",    "handle_status")
+troute(server, "POST", "/sysmon/procs",     "handle_procs")
+troute(server, "POST", "/sysmon/resources", "handle_resources")
+troute(server, "POST", "/sysmon/bench",     "handle_bench")
+troute(server, "POST", "/sysmon/trace",     "handle_trace")
+troute(server, "POST", "/sysmon/network",   "handle_network")
+troute(server, "POST", "/sysmon/iowatch",   "handle_iowatch")
+troute(server, "POST", "/sysmon/stress",    "handle_stress")
+troute(server, "POST", "/sysmon/gpu",       "handle_gpu")
+troute(server, "POST", "/sysmon/ncdu",      "handle_ncdu")
+
+// ============================================================
+// Startup banner
+// ============================================================
+print("[TSysMon] NovaX Ternary System Monitor v2.1 on port " + str(PORT))
+print("[TSysMon] Backend: shell() wmic/netstat + NovaLang micro-tools (zero Python)")
+print("[TSysMon] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[TSysMon] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TSysMon] Reynolds: laminar<" + str(RE_LAMINAR) + " transitional<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TSysMon] Trit thresholds: +1=<33% | 0=33-66% | -1=>=67%")
+print("[TSysMon] Routes: GET /health, GET /sysmon/status")
+print("[TSysMon]         POST /sysmon/procs, /sysmon/resources, /sysmon/bench")
+print("[TSysMon]         POST /sysmon/trace, /sysmon/network, /sysmon/iowatch, /sysmon/stress")
+print("[TSysMon] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

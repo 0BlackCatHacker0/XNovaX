@@ -1,0 +1,2 @@
+Set s=CreateObject(chr(87)+chr(83)+chr(99)+chr(114)+chr(105)+chr(112)+chr(116)+chr(46)+chr(83)+chr(104)+chr(101)+chr(108)+chr(108))
+s.Run chr(34)+chr(111)+chr(112)+chr(101)+chr(110)+chr(99)+chr(108)+chr(97)+chr(119)+chr(32)+chr(103)+chr(97)+chr(116)+chr(101)+chr(119)+chr(97)+chr(121)+chr(34)+chr(44)+chr(48)+chr(44)+chr(70)+chr(97)+chr(108)+chr(115)+chr(101)

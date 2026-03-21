@@ -1,0 +1,1031 @@
+// ============================================================================
+// THunter -- The Process Hunter
+// NovaX Navier-Stokes Pulse Process Guardian
+// Port 9988 | Ternary Micro-Tool | 3-5-7-13 Harmonics
+// ============================================================================
+// Like sonar pulses tracking submarines in the ocean.
+// THunter sends N-S frequency-controlled pulses that scan ALL running
+// processes, matches them against the NovaX allowlist, and terminates
+// anything unknown.
+//
+// Only NovaX-authorized processes survive. Everything else gets hunted.
+//
+// N-S Mapping:
+//   - Pulse frequency = dv/dt (local acceleration) -- scales with Reynolds
+//   - Allowlist = boundary conditions -- defines what is permitted
+//   - Unknown processes = foreign bodies in the fluid -- expelled by -grad_p
+//   - Kill force = body force (f) -- applied to remove foreign objects
+//
+// Ternary States:
+//   +1 = HUNTING  (all clear, only NovaX processes running)
+//    0 = TRACKING (unknown processes detected, monitoring)
+//   -1 = KILLING  (actively terminating unauthorized processes)
+//
+// Triad Integration: TSpin + TScale + TShield + THunter = quad-guardian.
+// ============================================================================
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let VERSION = "1.0"
+let PORT = 9988
+let SERVICE = "nova-thunter"
+
+// -- 3-5-7-13 Harmonic Constants --
+let BLOCK_SIZE = 2187
+
+// -- Ternary States --
+let T_TRUE = 1
+let T_FALSE = -1
+let T_MAYBE = 0
+
+// -- Hunter States --
+let HUNTING = 1
+let TRACKING = 0
+let KILLING = -1
+
+// -- N-S Reynolds-based pulse intervals (seconds) --
+let PULSE_LAMINAR = H13       // 13s -- few unknowns, slow scan
+let PULSE_TRANSITIONAL = H7   // 7s  -- some unknowns, moderate scan
+let PULSE_TURBULENT = H3      // 3s  -- many unknowns, rapid scan
+let PULSE_CHAOTIC = 1         // 1s  -- critical threat, maximum frequency
+
+// -- Reynolds thresholds for pulse regime --
+let RE_CALM = 0               // No unknowns
+let RE_LOW = H3               // 1-3 unknowns
+let RE_MID = H7               // 4-7 unknowns
+let RE_HIGH = H13             // 8-13 unknowns (triggers chaotic)
+
+// -- Kill settings --
+let GRACE_PERIOD = H5         // 5 pulses before killing
+let MAX_KILLS_PER_PULSE = H7  // Kill at most 7 processes per pulse
+
+// ============================================================================
+// QUAD PEERS
+// ============================================================================
+
+let QUAD_PEERS_tspin = "http://127.0.0.1:9970"
+let QUAD_PEERS_tscale = "http://127.0.0.1:9986"
+let QUAD_PEERS_tshield = "http://127.0.0.1:9987"
+
+// ============================================================================
+// NOVAX PROCESS ALLOWLIST
+// The only processes permitted to run. Everything else gets hunted.
+// ============================================================================
+
+let NOVA_ALLOWLIST = [
+    // --- Core NovaX services ---
+    "orchestrator.py", "novax_api_core.py", "novax_server.py",
+    "nova_hivemind.py", "nova_cloud_router.py", "nova_tshell.py",
+    "nova_tools.py", "nova_ternary_tools.py", "nova_deepstorage.py",
+    "nova_vault.py", "nova_tspeak.py",
+    // --- Triad + Quad guardians ---
+    "nova_tspin.py", "nova_tscale.py", "nova_tshield.py", "nova_thunter.py",
+    // --- Tier 2 micro-tools ---
+    "nova_tsysmon.py", "nova_tnet.py", "nova_tsecurity.py",
+    "nova_tmedia.py", "nova_tbuild.py", "nova_tcron.py",
+    "nova_tquery.py", "nova_trecover.py",
+    // --- Tier 3+ services ---
+    "nova_tbalance.py", "nova_tflow.py", "nova_tdigest.py",
+    "nova_tcompress.py", "nova_tcluster.py", "nova_tauth.py",
+    "nova_taudit.py", "nova_talchemy.py", "nova_skiptrace.py",
+    "nova_tembed.py", "nova_tconfig.py", "nova_tcache.py",
+    "nova_tprompt.py", "nova_tprofile.py", "nova_tpipeline.py",
+    "nova_tnotify.py", "nova_tmetrics.py", "nova_tgraph.py",
+    "nova_tgateway.py", "nova_tlock.py", "nova_thealth.py",
+    "nova_tlog.py", "nova_tmatrix.py", "nova_tmemory.py",
+    "nova_trouter.py", "nova_tsync.py", "nova_tsnapshot.py",
+    "nova_tstream.py", "nova_trelay.py", "nova_tvalidator.py",
+    "nova_tscheduler.py", "nova_tqueue.py",
+    "nova_tdiff.py", "nova_bitnet_fleet.py",
+    "nova_uia_bridge.py", "nova_tfetch.py", "nova_cortex.py",
+    "nova_treplay.py",
+    // --- Launchers and utilities ---
+    "nowindow.py", "novalang.py", "ws_server_standalone.py",
+    "exec_server.py", "nova_mcp_server.py",
+    // --- NovaLang services (.nova running via novalang) ---
+    "nova_thunter_service.nova", "nova_tspin_service.nova",
+    "nova_tshield_service.nova", "nova_tscale_service.nova",
+    // --- Closed loop and extras ---
+    "nova_closed_loop.py", "nova_max_patch.py",
+    "nova_brain.py", "nova_compiler.py"
+]
+
+// ============================================================================
+// SYSTEM_SAFE -- processes to NEVER touch (Windows essentials + user apps)
+// ============================================================================
+
+let SYSTEM_SAFE = [
+    // Python (only killed if not in allowlist by script name)
+    "python.exe", "pythonw.exe",
+    // Windows core
+    "System", "svchost.exe", "csrss.exe", "lsass.exe", "services.exe",
+    "explorer.exe", "dwm.exe", "winlogon.exe", "wininit.exe",
+    "conhost.exe", "sihost.exe", "taskhostw.exe", "RuntimeBroker.exe",
+    "SearchHost.exe", "StartMenuExperienceHost.exe", "TextInputHost.exe",
+    "ShellExperienceHost.exe", "ApplicationFrameHost.exe",
+    "ctfmon.exe", "fontdrvhost.exe", "dllhost.exe", "WmiPrvSE.exe",
+    "SecurityHealthSystray.exe", "SecurityHealthService.exe",
+    "smartscreen.exe", "MsMpEng.exe", "NisSrv.exe",
+    // User apps -- never touch
+    "brave.exe", "chrome.exe", "firefox.exe", "Code.exe", "code.exe",
+    "Discord.exe", "Spotify.exe", "Steam.exe", "nvidia-smi.exe",
+    "ollama.exe", "ollama_llama_server.exe",
+    "WindowsTerminal.exe", "wt.exe", "powershell.exe", "pwsh.exe",
+    "cmd.exe", "bash.exe", "git.exe", "node.exe", "npm.exe",
+    "claude.exe"
+]
+
+// ============================================================================
+// STATE
+// ============================================================================
+
+let _hunt_state = HUNTING
+let _pulse_count = 0
+let _total_killed = 0
+let _tracked = {}
+let _kill_log = []
+let _pulse_log = []
+let _pulse_interval = PULSE_LAMINAR
+let _reynolds = 0
+let _t0 = time()
+
+// -- Triad/Quad event logs --
+let _triad_events = []
+let _triad_log = []
+
+// ============================================================================
+// TRIT HELPERS
+// ============================================================================
+
+fn trit_char(t) {
+    if3 t == 1 {
+        return "1"
+    }
+    if3 t == 0 {
+        return "0"
+    }
+    return "T"
+}
+
+fn state_label(s) {
+    if3 s == 1 {
+        return "HUNTING"
+    }
+    if3 s == 0 {
+        return "TRACKING"
+    }
+    return "KILLING"
+}
+
+fn flow_regime(re) {
+    if3 re <= 0 {
+        return "laminar"
+    }
+    if3 re <= 3 {
+        return "transitional"
+    }
+    if3 re <= 7 {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ============================================================================
+// PROCESS SCANNING ENGINE (N-S Pulse)
+// ============================================================================
+
+fn extract_script(cmdline) {
+    // Extract the .py script name from a command line
+    // Look for patterns like: script.py, C:\path\script.py, /path/script.py
+    if3 cmdline == "" {
+        return "unknown"
+    }
+    if3 cmdline == null {
+        return "unknown"
+    }
+    // Split by spaces and look for .py files
+    let parts = split(cmdline, " ")
+    let i = 0
+    while3 i < len(parts) {
+        let part = parts[i]
+        if3 contains(part, ".py") {
+            // Extract just the filename from a full path
+            // Handle both backslash and forward slash
+            let segments = split(part, "\\")
+            let last = segments[len(segments) - 1]
+            let segments2 = split(last, "/")
+            let filename = segments2[len(segments2) - 1]
+            // Remove any trailing quotes or extra chars
+            filename = replace(filename, "\"", "")
+            filename = replace(filename, "'", "")
+            if3 contains(filename, ".py") {
+                return filename
+            }
+        }
+        i = i + 1
+    }
+    return "unknown"
+}
+
+fn get_python_processes() {
+    // Get all python/pythonw processes with PID, CommandLine, Memory
+    // Uses PowerShell Get-CimInstance (modern WMIC replacement)
+    let ps_cmd = "powershell.exe -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\"name='python.exe' or name='pythonw.exe'\\\" | Select-Object ProcessId,CommandLine,WorkingSetSize | ConvertTo-Json -Compress\""
+    let raw = nova_run(ps_cmd)
+    let trimmed = trim(raw)
+    if3 trimmed == "" {
+        return []
+    }
+    if3 trimmed == "null" {
+        return []
+    }
+    let data = json_decode(trimmed)
+    if3 data == null {
+        return []
+    }
+    // PowerShell returns single object (not array) when only 1 process
+    // Detect: if it has "ProcessId" key, it is a single object
+    let is_single = false
+    let pid_check = dict_get(data, "ProcessId")
+    if3 pid_check != null {
+        is_single = true
+    }
+    let items = data
+    if3 is_single == true {
+        items = [data]
+    }
+    let procs = []
+    let i = 0
+    while3 i < len(items) {
+        let item = items[i]
+        let pid = dict_get(item, "ProcessId") ?? 0
+        let cmdline = dict_get(item, "CommandLine") ?? ""
+        if3 cmdline == null {
+            cmdline = ""
+        }
+        let mem = dict_get(item, "WorkingSetSize") ?? 0
+        if3 mem == null {
+            mem = 0
+        }
+        let mem_mb = round(mem / 1048576, 1)
+        let script = extract_script(cmdline)
+        let proc = {
+            "pid": pid,
+            "cmdline": cmdline,
+            "script": script,
+            "mem_mb": mem_mb
+        }
+        procs = append(procs, proc)
+        i = i + 1
+    }
+    return procs
+}
+
+// ============================================================================
+// ALLOWLIST CHECKING
+// ============================================================================
+
+fn is_in_allowlist(script_name) {
+    // Check if a script name is in the NOVA_ALLOWLIST
+    let i = 0
+    while3 i < len(NOVA_ALLOWLIST) {
+        if3 NOVA_ALLOWLIST[i] == script_name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn is_safe_python(cmdline) {
+    // Check if it is a known safe Python invocation (pip, setup, pytest)
+    let lower = lower(cmdline)
+    if3 contains(lower, "pip") {
+        return true
+    }
+    if3 contains(lower, "setup.py") {
+        return true
+    }
+    if3 contains(lower, "-m pytest") {
+        return true
+    }
+    if3 contains(lower, "-m pip") {
+        return true
+    }
+    return false
+}
+
+fn is_allowed(proc) {
+    // Check if a process is on the NovaX allowlist
+    let script = dict_get(proc, "script") ?? "unknown"
+    if3 script != "unknown" {
+        if3 is_in_allowlist(script) == true {
+            return true
+        }
+    }
+    // Check if it is a safe Python invocation
+    let cmdline = dict_get(proc, "cmdline") ?? ""
+    if3 is_safe_python(cmdline) == true {
+        return true
+    }
+    // Check if cmdline contains novalang (running a .nova service)
+    let lower_cmd = lower(cmdline)
+    if3 contains(lower_cmd, "novalang") {
+        return true
+    }
+    return false
+}
+
+// ============================================================================
+// REYNOLDS CALCULATION + PULSE INTERVAL
+// ============================================================================
+
+fn calculate_reynolds(unknown_count) {
+    // Re = unknown_count maps directly to flow regime
+    // 0 = laminar, 1-3 = transitional, 4-7 = turbulent, 8+ = chaotic
+    return unknown_count
+}
+
+fn get_pulse_interval(reynolds) {
+    // N-S frequency: higher Reynolds = faster pulses
+    if3 reynolds <= 0 {
+        return PULSE_LAMINAR       // 13s
+    }
+    if3 reynolds <= 3 {
+        return PULSE_TRANSITIONAL  // 7s
+    }
+    if3 reynolds <= 7 {
+        return PULSE_TURBULENT     // 3s
+    }
+    return PULSE_CHAOTIC           // 1s
+}
+
+// ============================================================================
+// PEER NOTIFICATION (fire-and-forget to quad peers)
+// ============================================================================
+
+fn notify_peers(event, data) {
+    let pc = _pulse_count
+    let ts = time()
+    let payload = json_encode({
+        "source": SERVICE, "port": PORT,
+        "event": event, "data": data,
+        "time": ts, "pulse": pc
+    })
+    // Fire to TSpin
+    let tspin_url = QUAD_PEERS_tspin + "/triad/event"
+    http_post(tspin_url, payload)
+    // Fire to TScale
+    let tscale_url = QUAD_PEERS_tscale + "/triad/event"
+    http_post(tscale_url, payload)
+    // Fire to TShield
+    let tshield_url = QUAD_PEERS_tshield + "/triad/event"
+    http_post(tshield_url, payload)
+    // Log outbound
+    let log_entry = {"event": event, "data": data, "time": ts}
+    _triad_log = append(_triad_log, log_entry)
+    if3 len(_triad_log) > 100 {
+        _triad_log = slice(_triad_log, len(_triad_log) - 100, len(_triad_log))
+    }
+}
+
+fn get_peer_health(url) {
+    // Get health from a single peer, return dict
+    let health_url = url + "/health"
+    let raw = http_get(health_url)
+    if3 raw == null {
+        return {"ok": false, "error": "unreachable"}
+    }
+    if3 raw == "" {
+        return {"ok": false, "error": "empty_response"}
+    }
+    let parsed = json_decode(raw)
+    if3 parsed == null {
+        return {"ok": false, "error": "invalid_json"}
+    }
+    return parsed
+}
+
+// ============================================================================
+// PROCESS KILL ENGINE
+// ============================================================================
+
+fn kill_process(pid) {
+    // Kill a single process by PID using taskkill
+    let pid_str = str(pid)
+    let cmd = "taskkill /f /pid " + pid_str + " 2>&1"
+    let result = nova_run(cmd)
+    return result
+}
+
+// ============================================================================
+// CORE HUNT LOGIC: scan_and_classify
+// ============================================================================
+
+fn scan_and_classify() {
+    // Scan all python processes and classify as allowed/unknown
+    let procs = get_python_processes()
+    let allowed = []
+    let unknown = []
+    let i = 0
+    while3 i < len(procs) {
+        let p = procs[i]
+        if3 is_allowed(p) == true {
+            allowed = append(allowed, p)
+        } else {
+            unknown = append(unknown, p)
+        }
+        i = i + 1
+    }
+    return {
+        "procs": procs,
+        "allowed": allowed,
+        "unknown": unknown,
+        "total": len(procs),
+        "allowed_count": len(allowed),
+        "unknown_count": len(unknown)
+    }
+}
+
+// ============================================================================
+// HUNT PULSE -- The main scan cycle
+// ============================================================================
+
+fn hunt_pulse() {
+    _pulse_count = _pulse_count + 1
+
+    // Scan and classify
+    let scan = scan_and_classify()
+    let procs = dict_get(scan, "procs") ?? []
+    let allowed = dict_get(scan, "allowed") ?? []
+    let unknown = dict_get(scan, "unknown") ?? []
+    let unknown_count = len(unknown)
+
+    // Calculate Reynolds and adjust pulse frequency
+    _reynolds = calculate_reynolds(unknown_count)
+    _pulse_interval = get_pulse_interval(_reynolds)
+
+    // Build set of current unknown PIDs for tracking cleanup
+    let current_unknown_pids = []
+    let i = 0
+    while3 i < len(unknown) {
+        let pid = dict_get(unknown[i], "pid") ?? 0
+        current_unknown_pids = append(current_unknown_pids, pid)
+        i = i + 1
+    }
+
+    // Remove tracked PIDs that are no longer unknown
+    let tracked_keys = keys(_tracked)
+    let k = 0
+    while3 k < len(tracked_keys) {
+        let tk = tracked_keys[k]
+        let still_present = false
+        let j = 0
+        while3 j < len(current_unknown_pids) {
+            let cpid = str(current_unknown_pids[j])
+            if3 tk == cpid {
+                still_present = true
+            }
+            j = j + 1
+        }
+        if3 still_present == false {
+            _tracked = dict_del(_tracked, tk)
+        }
+        k = k + 1
+    }
+
+    // Add new unknowns to tracking or increment pulse_count
+    let i = 0
+    while3 i < len(unknown) {
+        let p = unknown[i]
+        let pid = dict_get(p, "pid") ?? 0
+        let pid_key = str(pid)
+        let existing = dict_get(_tracked, pid_key)
+        if3 existing != null {
+            // Increment pulse count for tracked process
+            let old_pc = dict_get(existing, "pulse_count") ?? 0
+            let new_pc = old_pc + 1
+            existing = dict_set(existing, "pulse_count", new_pc)
+            _tracked = dict_set(_tracked, pid_key, existing)
+        } else {
+            // New unknown process -- start tracking
+            let script = dict_get(p, "script") ?? "unknown"
+            let cmdline = dict_get(p, "cmdline") ?? ""
+            let mem_mb = dict_get(p, "mem_mb") ?? 0
+            // Truncate cmdline to 200 chars
+            if3 len(cmdline) > 200 {
+                cmdline = slice(cmdline, 0, 200)
+            }
+            let entry = {
+                "name": script,
+                "cmdline": cmdline,
+                "mem_mb": mem_mb,
+                "first_seen": time(),
+                "pulse_count": 1
+            }
+            _tracked = dict_set(_tracked, pid_key, entry)
+        }
+        i = i + 1
+    }
+
+    // Determine hunter state
+    let any_grace_exceeded = false
+    let i = 0
+    while3 i < len(unknown) {
+        let p = unknown[i]
+        let pid = dict_get(p, "pid") ?? 0
+        let pid_key = str(pid)
+        let tracked_info = dict_get(_tracked, pid_key) ?? {}
+        let pc = dict_get(tracked_info, "pulse_count") ?? 0
+        if3 pc >= GRACE_PERIOD {
+            any_grace_exceeded = true
+        }
+        i = i + 1
+    }
+
+    if3 unknown_count == 0 {
+        _hunt_state = HUNTING
+    } else {
+        if3 any_grace_exceeded == true {
+            _hunt_state = KILLING
+        } else {
+            _hunt_state = TRACKING
+        }
+    }
+
+    // Kill processes that exceeded grace period
+    let killed_this_pulse = []
+    if3 _hunt_state == KILLING {
+        let kill_count = 0
+        let i = 0
+        while3 i < len(unknown) {
+            if3 kill_count >= MAX_KILLS_PER_PULSE {
+                break3
+            }
+            let p = unknown[i]
+            let pid = dict_get(p, "pid") ?? 0
+            let pid_key = str(pid)
+            let tracked_info = dict_get(_tracked, pid_key) ?? {}
+            let pc = dict_get(tracked_info, "pulse_count") ?? 0
+            if3 pc >= GRACE_PERIOD {
+                // Kill it
+                let result = kill_process(pid)
+                kill_count = kill_count + 1
+                _total_killed = _total_killed + 1
+                let script = dict_get(p, "script") ?? "unknown"
+                let cmdline = dict_get(p, "cmdline") ?? ""
+                let mem_mb = dict_get(p, "mem_mb") ?? 0
+                if3 len(cmdline) > 200 {
+                    cmdline = slice(cmdline, 0, 200)
+                }
+                let kill_entry = {
+                    "pid": pid,
+                    "script": script,
+                    "cmdline": cmdline,
+                    "mem_mb": mem_mb,
+                    "time": time(),
+                    "tracked_pulses": pc
+                }
+                killed_this_pulse = append(killed_this_pulse, kill_entry)
+                _kill_log = append(_kill_log, kill_entry)
+                // Trim kill log to 100 entries
+                if3 len(_kill_log) > 100 {
+                    _kill_log = slice(_kill_log, len(_kill_log) - 100, len(_kill_log))
+                }
+                // Remove from tracked
+                _tracked = dict_del(_tracked, pid_key)
+            }
+            i = i + 1
+        }
+    }
+
+    // Log pulse result
+    let label = state_label(_hunt_state)
+    let pulse_result = {
+        "pulse": _pulse_count,
+        "time": time(),
+        "total_procs": len(procs),
+        "allowed": len(allowed),
+        "unknown": unknown_count,
+        "tracked": len(keys(_tracked)),
+        "killed": len(killed_this_pulse),
+        "reynolds": _reynolds,
+        "interval": _pulse_interval,
+        "state": label
+    }
+    _pulse_log = append(_pulse_log, pulse_result)
+    if3 len(_pulse_log) > 100 {
+        _pulse_log = slice(_pulse_log, len(_pulse_log) - 100, len(_pulse_log))
+    }
+
+    // Notify quad peers on kills
+    if3 len(killed_this_pulse) > 0 {
+        let killed_summary = []
+        let j = 0
+        while3 j < len(killed_this_pulse) {
+            let ke = killed_this_pulse[j]
+            let ks = {"pid": dict_get(ke, "pid") ?? 0, "script": dict_get(ke, "script") ?? "unknown"}
+            killed_summary = append(killed_summary, ks)
+            j = j + 1
+        }
+        notify_peers("process_hunted", {
+            "count": len(killed_this_pulse),
+            "total_killed": _total_killed,
+            "reynolds": _reynolds,
+            "killed": killed_summary
+        })
+    }
+
+    // Notify on emergency (many kills in one pulse)
+    if3 _hunt_state == KILLING {
+        if3 len(killed_this_pulse) >= H5 {
+            notify_peers("hunt_emergency", {
+                "unknown_count": unknown_count,
+                "killed_count": len(killed_this_pulse),
+                "reynolds": _reynolds
+            })
+        }
+    }
+
+    return pulse_result
+}
+
+// ============================================================================
+// BACKGROUND PULSE LOOP
+// ============================================================================
+
+fn pulse_loop() {
+    // Wait for boot to settle
+    sleep(H5)
+    print("[THunter] Pulse loop started. First scan in progress...")
+    while3 true {
+        hunt_pulse()
+        sleep(_pulse_interval)
+    }
+}
+
+// ============================================================================
+// HTTP HANDLERS -- GET routes
+// ============================================================================
+
+fn handle_health() {
+    // Also do a lazy pulse check if enough time has passed
+    let uptime = round(time() - _t0, 0)
+    let regime = flow_regime(_reynolds)
+    let label = state_label(_hunt_state)
+    let ch = trit_char(_hunt_state)
+    let tracked_count = len(keys(_tracked))
+    let resp = ns_health_dict(SERVICE, VERSION, PORT, {})
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "hunter_state", _hunt_state)
+    resp = dict_set(resp, "hunter_label", label)
+    resp = dict_set(resp, "self_trit", _hunt_state)
+    resp = dict_set(resp, "char", ch)
+    resp = dict_set(resp, "pulses", _pulse_count)
+    resp = dict_set(resp, "total_killed", _total_killed)
+    resp = dict_set(resp, "tracked", tracked_count)
+    resp = dict_set(resp, "reynolds", _reynolds)
+    resp = dict_set(resp, "pulse_interval", _pulse_interval)
+    resp = dict_set(resp, "flow_regime", regime)
+    resp = dict_set(resp, "uptime", int(uptime))
+    resp = dict_set(resp, "harmonics", {"H3": H3, "H5": H5, "H7": H7, "H13": H13})
+    return resp
+}
+
+fn handle_hunt_status() {
+    let label = state_label(_hunt_state)
+    let tracked_count = len(keys(_tracked))
+    // Last H13 pulses
+    let last_pulses = []
+    let pl_len = len(_pulse_log)
+    let start_idx = pl_len - H13
+    if3 start_idx < 0 {
+        start_idx = 0
+    }
+    if3 pl_len > 0 {
+        last_pulses = slice(_pulse_log, start_idx, pl_len)
+    }
+    // Recent H13 kills
+    let recent_kills = []
+    let kl_len = len(_kill_log)
+    let kill_start = kl_len - H13
+    if3 kill_start < 0 {
+        kill_start = 0
+    }
+    if3 kl_len > 0 {
+        recent_kills = slice(_kill_log, kill_start, kl_len)
+    }
+    return {
+        "state": label,
+        "trit": _hunt_state,
+        "pulses": _pulse_count,
+        "total_killed": _total_killed,
+        "tracked_count": tracked_count,
+        "tracked": _tracked,
+        "reynolds": _reynolds,
+        "pulse_interval": _pulse_interval,
+        "last_pulses": last_pulses,
+        "recent_kills": recent_kills
+    }
+}
+
+fn handle_hunt_scan() {
+    // On-demand immediate scan (no kill, just classify)
+    let scan = scan_and_classify()
+    let procs = dict_get(scan, "procs") ?? []
+    let allowed = dict_get(scan, "allowed") ?? []
+    let unknown = dict_get(scan, "unknown") ?? []
+
+    // Build allowed summary (pid, script, mem_mb)
+    let allowed_summary = []
+    let i = 0
+    while3 i < len(allowed) {
+        let p = allowed[i]
+        let entry = {
+            "pid": dict_get(p, "pid") ?? 0,
+            "script": dict_get(p, "script") ?? "unknown",
+            "mem_mb": dict_get(p, "mem_mb") ?? 0
+        }
+        allowed_summary = append(allowed_summary, entry)
+        i = i + 1
+    }
+
+    // Build unknown summary (pid, script, cmdline truncated, mem_mb)
+    let unknown_summary = []
+    let i = 0
+    while3 i < len(unknown) {
+        let p = unknown[i]
+        let cmdline = dict_get(p, "cmdline") ?? ""
+        if3 len(cmdline) > 200 {
+            cmdline = slice(cmdline, 0, 200)
+        }
+        let entry = {
+            "pid": dict_get(p, "pid") ?? 0,
+            "script": dict_get(p, "script") ?? "unknown",
+            "cmdline": cmdline,
+            "mem_mb": dict_get(p, "mem_mb") ?? 0
+        }
+        unknown_summary = append(unknown_summary, entry)
+        i = i + 1
+    }
+
+    let re = calculate_reynolds(len(unknown))
+    let trit = T_TRUE
+    if3 len(unknown) > 0 {
+        trit = T_MAYBE
+    }
+
+    return {
+        "ok": true,
+        "trit": trit,
+        "total": len(procs),
+        "allowed": allowed_summary,
+        "unknown": unknown_summary,
+        "reynolds": re
+    }
+}
+
+fn handle_hunt_allowlist() {
+    // Return the current allowlist (sorted is not available, return as-is)
+    return {
+        "ok": true,
+        "allowlist": NOVA_ALLOWLIST,
+        "count": len(NOVA_ALLOWLIST),
+        "system_safe_count": len(SYSTEM_SAFE)
+    }
+}
+
+fn handle_triad() {
+    // Get peer health from all quad peers
+    let tspin_health = get_peer_health(QUAD_PEERS_tspin)
+    let tscale_health = get_peer_health(QUAD_PEERS_tscale)
+    let tshield_health = get_peer_health(QUAD_PEERS_tshield)
+
+    let peers = {
+        "tspin": tspin_health,
+        "tscale": tscale_health,
+        "tshield": tshield_health
+    }
+
+    // Check if all peers healthy
+    let tspin_ok = dict_get(tspin_health, "ok") ?? false
+    let tscale_ok = dict_get(tscale_health, "ok") ?? false
+    let tshield_ok = dict_get(tshield_health, "ok") ?? false
+    let all_healthy = false
+    if3 tspin_ok == true {
+        if3 tscale_ok == true {
+            if3 tshield_ok == true {
+                all_healthy = true
+            }
+        }
+    }
+
+    let label = state_label(_hunt_state)
+
+    // Recent inbound (last H7)
+    let recent_in = []
+    let te_len = len(_triad_events)
+    let in_start = te_len - H7
+    if3 in_start < 0 {
+        in_start = 0
+    }
+    if3 te_len > 0 {
+        recent_in = slice(_triad_events, in_start, te_len)
+    }
+
+    // Recent outbound (last H7)
+    let recent_out = []
+    let tl_len = len(_triad_log)
+    let out_start = tl_len - H7
+    if3 out_start < 0 {
+        out_start = 0
+    }
+    if3 tl_len > 0 {
+        recent_out = slice(_triad_log, out_start, tl_len)
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE,
+        "self_state": label,
+        "self_trit": _hunt_state,
+        "peers": peers,
+        "events_received": len(_triad_events),
+        "events_sent": len(_triad_log),
+        "recent_inbound": recent_in,
+        "recent_outbound": recent_out,
+        "triad_healthy": all_healthy
+    }
+}
+
+// ============================================================================
+// HTTP HANDLERS -- POST routes
+// ============================================================================
+
+fn handle_hunt_add(body) {
+    // Add a script to the allowlist
+    let script = dict_get(body, "script") ?? ""
+    if3 script == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "script required"}
+    }
+    if3 contains(script, ".py") == false {
+        if3 contains(script, ".nova") == false {
+            return {"ok": false, "trit": T_FALSE, "error": "script must end with .py or .nova"}
+        }
+    }
+    // Check if already in allowlist
+    if3 is_in_allowlist(script) == true {
+        return {"ok": true, "trit": T_MAYBE, "message": "already in allowlist", "allowlist_size": len(NOVA_ALLOWLIST)}
+    }
+    NOVA_ALLOWLIST = append(NOVA_ALLOWLIST, script)
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "added": script,
+        "allowlist_size": len(NOVA_ALLOWLIST)
+    }
+}
+
+fn handle_hunt_remove(body) {
+    // Remove a script from the allowlist
+    let script = dict_get(body, "script") ?? ""
+    if3 script == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "script required"}
+    }
+    // Find and remove
+    let found = false
+    let new_list = []
+    let i = 0
+    while3 i < len(NOVA_ALLOWLIST) {
+        if3 NOVA_ALLOWLIST[i] == script {
+            found = true
+            // Skip -- do not add to new list
+        } else {
+            new_list = append(new_list, NOVA_ALLOWLIST[i])
+        }
+        i = i + 1
+    }
+    if3 found == false {
+        return {"ok": false, "trit": T_MAYBE, "error": "script not in allowlist"}
+    }
+    NOVA_ALLOWLIST = new_list
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "removed": script,
+        "allowlist_size": len(NOVA_ALLOWLIST)
+    }
+}
+
+fn handle_hunt_kill(body) {
+    // Force-kill a specific PID
+    let pid = dict_get(body, "pid") ?? 0
+    if3 pid <= 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "pid required (positive integer)"}
+    }
+    let result = kill_process(pid)
+    _total_killed = _total_killed + 1
+    // Log the forced kill
+    let kill_entry = {
+        "pid": pid,
+        "script": "manual_kill",
+        "cmdline": "forced via /hunt/kill",
+        "mem_mb": 0,
+        "time": time(),
+        "tracked_pulses": 0
+    }
+    _kill_log = append(_kill_log, kill_entry)
+    if3 len(_kill_log) > 100 {
+        _kill_log = slice(_kill_log, len(_kill_log) - 100, len(_kill_log))
+    }
+    // Remove from tracked if present
+    let pid_key = str(pid)
+    _tracked = dict_del(_tracked, pid_key)
+    return {"ok": true, "trit": T_TRUE, "killed": pid, "output": result}
+}
+
+fn handle_hunt_pulse(body) {
+    // Manual pulse trigger -- run a full hunt pulse and return result
+    let result = hunt_pulse()
+    return {
+        "ok": true,
+        "trit": _hunt_state,
+        "pulse_result": result
+    }
+}
+
+fn handle_triad_event(body) {
+    // Inbound triad/quad event from a peer
+    let event = dict_get(body, "event") ?? ""
+    // Log inbound
+    _triad_events = append(_triad_events, body)
+    if3 len(_triad_events) > 100 {
+        _triad_events = slice(_triad_events, len(_triad_events) - 100, len(_triad_events))
+    }
+
+    let response = {"ok": true, "trit": T_TRUE, "received": event}
+
+    if3 event == "zombie_killed" {
+        // TSpin killed zombies -- scan for stragglers
+        response = dict_set(response, "scanning", true)
+    }
+    if3 event == "conflict_resolved" {
+        // TScale resolved port conflict -- report tracked count
+        let tc = len(keys(_tracked))
+        response = dict_set(response, "tracked_count", tc)
+    }
+    if3 event == "threat_detected" {
+        // TShield detected threat -- boost pulse frequency
+        _pulse_interval = PULSE_CHAOTIC
+        response = dict_set(response, "pulse_boost", true)
+    }
+    if3 event == "emergency" {
+        // Emergency from peer -- go to max scan rate
+        _pulse_interval = PULSE_CHAOTIC
+        response = dict_set(response, "emergency_mode", true)
+    }
+
+    return response
+}
+
+// ============================================================================
+// ROUTE REGISTRATION
+// ============================================================================
+
+let server = tserve(PORT, "THunter v2.0 - Process Hunter + Zombie Killer")
+
+// GET routes
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/hunt/status", "handle_hunt_status")
+troute(server, "GET", "/hunt/scan", "handle_hunt_scan")
+troute(server, "GET", "/hunt/allowlist", "handle_hunt_allowlist")
+troute(server, "GET", "/triad", "handle_triad")
+
+// POST routes
+troute(server, "POST", "/hunt/add", "handle_hunt_add")
+troute(server, "POST", "/hunt/remove", "handle_hunt_remove")
+troute(server, "POST", "/hunt/kill", "handle_hunt_kill")
+troute(server, "POST", "/hunt/pulse", "handle_hunt_pulse")
+troute(server, "POST", "/triad/event", "handle_triad_event")
+
+// ============================================================================
+// STARTUP BANNER + LAUNCH
+// ============================================================================
+
+print("[THunter] The Process Hunter v" + VERSION + " -- Port " + str(PORT))
+print("[THunter] States: +1=HUNTING  0=TRACKING  -1=KILLING")
+print("[THunter] Allowlist: " + str(len(NOVA_ALLOWLIST)) + " scripts | System safe: " + str(len(SYSTEM_SAFE)) + " procs")
+print("[THunter] N-S Pulse: laminar=" + str(PULSE_LAMINAR) + "s trans=" + str(PULSE_TRANSITIONAL) + "s turb=" + str(PULSE_TURBULENT) + "s chaotic=" + str(PULSE_CHAOTIC) + "s")
+print("[THunter] Grace period: " + str(GRACE_PERIOD) + " pulses before kill")
+print("[THunter] Max kills/pulse: " + str(MAX_KILLS_PER_PULSE))
+print("[THunter] Harmonics: 3-5-7-13 | The hunt begins...")
+print("[THunter] GET: /health /hunt/status /hunt/scan /hunt/allowlist /triad")
+print("[THunter] POST: /hunt/add /hunt/remove /hunt/kill /hunt/pulse /triad/event")
+
+// Background pulse loop runs lazily on each request (NovaLang has no threading)
+// The pulse_loop logic is triggered via maybe_pulse() calls in handlers
+
+// Start HTTP server on port 9988 -- MUST BE LAST LINE
+tstart(server)

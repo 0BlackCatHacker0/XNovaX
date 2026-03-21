@@ -1,0 +1,1717 @@
+// NovaX TTerraform Service v1.0 - Ternary Terraform Wrapper (NovaLang)
+// Port 9915: Terraform operations through ternary-native micro-tools
+//
+// 10 ternary-native terraform tools on 3-5-7-13 harmonic constants:
+//   1.  /tterraform/init      -- Initialize terraform working directory
+//   2.  /tterraform/plan      -- Generate execution plan
+//   3.  /tterraform/apply     -- Apply changes (auto-approve option)
+//   4.  /tterraform/destroy   -- Destroy infrastructure (requires confirm)
+//   5.  /tterraform/state     -- State management (list/show/pull/rm)
+//   6.  /tterraform/output    -- Get terraform outputs
+//   7.  /tterraform/workspace -- Workspace management (Tier 3)
+//   8.  /tterraform/validate  -- Validate configuration (Tier 3)
+//   9.  /tterraform/import    -- Import existing resource into state (Tier 5)
+//   10. /tterraform/fmt       -- Format terraform files (Tier 5)
+//
+// N-S Mapping:
+//   infra_stream     = velocity_field (infrastructure changes flowing)
+//   drift_pressure   = turbulent_energy (state drift from desired)
+//   Reynolds(terraform) = infra_ops * H5
+//   RE_LAMINAR=27    = stable infra (few changes)
+//   RE_TRANSITION=125= infra under moderate churn
+//   RE_TURBULENT=343 = infra in heavy drift state
+//
+// Endpoints:
+//   GET  /health                    -- Health check
+//   GET  /tterraform/service-status -- Full service status with stats
+//   POST /tterraform/init           -- Initialize working directory
+//   POST /tterraform/plan           -- Generate execution plan
+//   POST /tterraform/apply          -- Apply changes
+//   POST /tterraform/destroy        -- Destroy infrastructure
+//   POST /tterraform/state          -- State management
+//   POST /tterraform/output         -- Get outputs
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9915
+let server = tserve(PORT, "TTerraform v1.0 - Ternary Terraform Wrapper")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE     = 2187
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+let TOOLS_COUNT    = 10
+let VERSION        = "1.0.0"
+let SERVICE_NAME   = "nova-tterraform"
+let TF_TIMEOUT     = 13
+let TF_PLAN_TIMEOUT = 30
+let TF_APPLY_TIMEOUT = 60
+let TF_DESTROY_TIMEOUT = 60
+
+// -- Global Stats --
+let stat_ops         = 0
+let stat_trit_true   = 0
+let stat_trit_maybe  = 0
+let stat_trit_false  = 0
+let stat_t0          = time()
+
+// by_tool counters (one per tool)
+let by_tool_init     = 0
+let by_tool_plan     = 0
+let by_tool_apply    = 0
+let by_tool_destroy  = 0
+let by_tool_state    = 0
+let by_tool_output    = 0
+let by_tool_workspace = 0
+let by_tool_validate  = 0
+let by_tool_import    = 0
+let by_tool_fmt       = 0
+
+// -- Infra tracking cache (working_dir -> last known info) --
+let _infra_cache = {}
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_stat(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "init" {
+        by_tool_init = by_tool_init + 1
+    }
+    if3 tool_name == "plan" {
+        by_tool_plan = by_tool_plan + 1
+    }
+    if3 tool_name == "apply" {
+        by_tool_apply = by_tool_apply + 1
+    }
+    if3 tool_name == "destroy" {
+        by_tool_destroy = by_tool_destroy + 1
+    }
+    if3 tool_name == "state" {
+        by_tool_state = by_tool_state + 1
+    }
+    if3 tool_name == "output" {
+        by_tool_output = by_tool_output + 1
+    }
+    if3 tool_name == "import" {
+        by_tool_import = by_tool_import + 1
+    }
+    if3 tool_name == "fmt" {
+        by_tool_fmt = by_tool_fmt + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: run a terraform command with specified timeout
+// Returns stripped output string
+// ===========================================================================
+fn run_tf(cmd, timeout_s) {
+    let raw = nova_run(cmd, timeout_s)
+    let output = trim(str(raw))
+    return output
+}
+
+// ===========================================================================
+// HELPER: check if output indicates a terraform error
+// ===========================================================================
+fn is_tf_error(output) {
+    let lc = lower(output)
+    if3 contains(lc, "error:") {
+        return true
+    }
+    if3 contains(lc, "error running") {
+        return true
+    }
+    if3 contains(lc, "failed to") {
+        return true
+    }
+    if3 contains(lc, "could not") {
+        return true
+    }
+    if3 contains(lc, "no such file") {
+        return true
+    }
+    if3 contains(lc, "terraform not found") {
+        return true
+    }
+    if3 contains(lc, "command not found") {
+        return true
+    }
+    if3 contains(lc, "is not recognized") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: count non-empty lines in output
+// ===========================================================================
+fn count_lines(output) {
+    let count = 0
+    if3 len(output) == 0 {
+        return 0
+    }
+    let lines = split(output, "\n")
+    let i = 0
+    while3 i < len(lines) {
+        let line = trim(lines[i])
+        if3 len(line) > 0 {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ===========================================================================
+// HELPER: count lines with a given prefix/substring
+// ===========================================================================
+fn count_lines_with_prefix(output, prefix) {
+    let count = 0
+    if3 len(output) == 0 {
+        return 0
+    }
+    let lines = split(output, "\n")
+    let i = 0
+    while3 i < len(lines) {
+        let line = trim(lines[i])
+        if3 len(line) > 0 {
+            if3 len(prefix) == 0 {
+                count = count + 1
+            }
+            if3 len(prefix) > 0 {
+                if3 contains(line, prefix) {
+                    count = count + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ===========================================================================
+// HELPER: extract a number after a keyword in output
+// Looks for patterns like "X to add" and extracts X
+// Returns 0 if not found
+// ===========================================================================
+fn extract_count_after(output, keyword) {
+    // Search for lines containing the keyword
+    if3 len(output) == 0 {
+        return 0
+    }
+    let lines = split(output, "\n")
+    let i = 0
+    while3 i < len(lines) {
+        let line = trim(lines[i])
+        if3 contains(line, keyword) {
+            // Try to find number before the keyword
+            // Pattern: "Plan: X to add, Y to change, Z to destroy"
+            // Or: "Resources: X added, Y changed, Z destroyed"
+            let parts = split(line, keyword)
+            if3 len(parts) > 0 { before = trim(parts[0])
+                // Get the last token before keyword which should be the number
+                let tokens = split(before, " ")
+                if3 len(tokens) > 0 { last_idx = len(tokens) - 1
+                    let num_str = trim(tokens[last_idx])
+                    // Remove any trailing comma or colon
+                    if3 contains(num_str, ",") { clean_parts = split(num_str, ",")
+                        num_str = clean_parts[0]
+                    }
+                    if3 contains(num_str, ":") { clean_parts = split(num_str, ":")
+                        num_str = clean_parts[0]
+                    }
+                    // Try to convert to int
+                    let val = int(num_str)
+                    return val
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ===========================================================================
+// HELPER: parse resource lines from state list output
+// Returns list of resource strings
+// ===========================================================================
+fn parse_resource_lines(output) {
+    let resources = []
+    if3 len(output) == 0 {
+        return resources
+    }
+    let lines = split(output, "\n")
+    let i = 0
+    while3 i < len(lines) {
+        let line = trim(lines[i])
+        if3 len(line) > 0 {
+            // Skip header lines or empty lines
+            // Resource lines typically look like: aws_instance.example
+            // or module.foo.aws_instance.bar
+            resources = append(resources, line)
+        }
+        i = i + 1
+    }
+    return resources
+}
+
+// ===========================================================================
+// HELPER: compute N-S flow metrics for a terraform operation
+// ===========================================================================
+fn compute_flow_metrics(tool_name, trit, resource_count) {
+    // infra_stream = velocity_field based on resource count
+    let infra_stream = resource_count
+
+    // drift_pressure = turbulent_energy based on trit result
+    let drift_pressure = 0
+    if3 trit == T_MAYBE {
+        drift_pressure = resource_count * H3
+    }
+    if3 trit == T_FALSE {
+        drift_pressure = resource_count * H7
+    }
+
+    // Reynolds number = infra_ops * H5
+    let re = stat_ops * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    let metrics = {}
+    metrics = dict_set(metrics, "infra_stream", infra_stream)
+    metrics = dict_set(metrics, "drift_pressure", drift_pressure)
+    metrics = dict_set(metrics, "reynolds", re)
+    metrics = dict_set(metrics, "regime", regime)
+    metrics = dict_set(metrics, "tool", tool_name)
+    return metrics
+}
+
+// ===========================================================================
+// TOOL 1: POST /tterraform/init
+// Initialize terraform working directory
+// Body: {working_dir: "C:\\path\\to\\tf", backend_config: "", upgrade: false}
+// Trit: +1=initialized, 0=partial init, -1=error
+// ===========================================================================
+fn handle_init(body) {
+    let working_dir = dict_get(body, "working_dir") ?? ""
+
+    // working_dir is REQUIRED
+    if3 len(working_dir) == 0 {
+        record_stat("init", T_FALSE)
+        return {
+            "ok": false,
+            "working_dir": "",
+            "error": "working_dir is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let backend_config = dict_get(body, "backend_config") ?? ""
+    let upgrade = dict_get(body, "upgrade") ?? false
+
+    // Build terraform init command
+    let cmd = "terraform -chdir=\"" + working_dir + "\" init -no-color"
+
+    // Add backend config if provided
+    if3 len(backend_config) > 0 {
+        cmd = cmd + " -backend-config=\"" + backend_config + "\""
+    }
+
+    // Add upgrade flag
+    if3 upgrade == true {
+        cmd = cmd + " -upgrade"
+    }
+
+    cmd = cmd + " 2>&1"
+
+    // Run with standard timeout
+    let output = ""
+    let init_trit = T_FALSE
+
+    try3 {
+        output = run_tf(cmd, TF_TIMEOUT)
+    } success {
+        // Check output for success/partial/error
+        let lc_output = lower(output)
+
+        if3 contains(lc_output, "terraform has been successfully initialized") {
+            init_trit = T_TRUE
+        }
+        if3 init_trit != T_TRUE {
+            if3 contains(lc_output, "initializing") {
+                init_trit = T_MAYBE
+            }
+        }
+        if3 init_trit != T_TRUE {
+            if3 init_trit != T_MAYBE {
+                if3 is_tf_error(output) == true {
+                    init_trit = T_FALSE
+                }
+            }
+        }
+        // If no error keywords but also not success, mark maybe
+        if3 init_trit != T_TRUE {
+            if3 init_trit != T_MAYBE {
+                if3 is_tf_error(output) == false {
+                    init_trit = T_MAYBE
+                }
+            }
+        }
+    } maybe {
+        init_trit = T_MAYBE
+        output = "init command returned uncertain result"
+    } fail {
+        init_trit = T_FALSE
+        output = "init command failed to execute"
+    }
+
+    // Cache working dir info
+    let cache_entry = {}
+    cache_entry = dict_set(cache_entry, "initialized", init_trit == T_TRUE)
+    cache_entry = dict_set(cache_entry, "last_init", time())
+    _infra_cache = dict_set(_infra_cache, working_dir, cache_entry)
+
+    // Compute flow metrics
+    let flow = compute_flow_metrics("init", init_trit, 0)
+
+    record_stat("init", init_trit)
+    return {
+        "ok": init_trit != T_FALSE,
+        "working_dir": working_dir,
+        "initialized": init_trit == T_TRUE,
+        "upgrade": upgrade,
+        "output": output,
+        "trit": init_trit,
+        "char": bt_one(init_trit),
+        "flow": flow,
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 2: POST /tterraform/plan
+// Generate execution plan
+// Body: {working_dir: "...", target: "", var_file: "", vars: {}}
+// Trit: +1=changes detected, 0=no changes (no drift), -1=error
+// ===========================================================================
+fn handle_plan(body) {
+    let working_dir = dict_get(body, "working_dir") ?? ""
+
+    // working_dir is REQUIRED
+    if3 len(working_dir) == 0 {
+        record_stat("plan", T_FALSE)
+        return {
+            "ok": false,
+            "working_dir": "",
+            "error": "working_dir is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let target = dict_get(body, "target") ?? ""
+    let var_file = dict_get(body, "var_file") ?? ""
+    let out_file = dict_get(body, "out") ?? ""
+
+    // Build terraform plan command
+    let cmd = "terraform -chdir=\"" + working_dir + "\" plan -no-color"
+
+    // Add target if provided
+    if3 len(target) > 0 {
+        cmd = cmd + " -target=\"" + target + "\""
+    }
+
+    // Add var file if provided
+    if3 len(var_file) > 0 {
+        cmd = cmd + " -var-file=\"" + var_file + "\""
+    }
+
+    // Add output file if provided
+    if3 len(out_file) > 0 {
+        cmd = cmd + " -out=\"" + out_file + "\""
+    }
+
+    cmd = cmd + " 2>&1"
+
+    // Run with plan timeout (30s)
+    let output = ""
+    let plan_trit = T_FALSE
+    let to_add = 0
+    let to_change = 0
+    let to_destroy = 0
+    let no_changes = false
+
+    try3 {
+        output = run_tf(cmd, TF_PLAN_TIMEOUT)
+    } success {
+        let lc_output = lower(output)
+
+        // Check for "No changes"
+        if3 contains(lc_output, "no changes") {
+            no_changes = true
+            plan_trit = T_MAYBE
+        }
+
+        // Check for plan summary: "Plan: X to add, Y to change, Z to destroy"
+        if3 no_changes == false {
+            if3 contains(output, "to add") {
+                to_add = extract_count_after(output, " to add")
+            }
+            if3 contains(output, "to change") {
+                to_change = extract_count_after(output, " to change")
+            }
+            if3 contains(output, "to destroy") {
+                to_destroy = extract_count_after(output, " to destroy")
+            }
+
+            // If we found plan counts, success
+            let total_changes = to_add + to_change + to_destroy
+            if3 total_changes > 0 {
+                plan_trit = T_TRUE
+            }
+            if3 total_changes == 0 {
+                // No plan line found, check for errors
+                if3 is_tf_error(output) == true {
+                    plan_trit = T_FALSE
+                }
+                if3 is_tf_error(output) == false {
+                    plan_trit = T_MAYBE
+                }
+            }
+        }
+
+        // Final error check
+        if3 is_tf_error(output) == true {
+            if3 plan_trit != T_TRUE {
+                plan_trit = T_FALSE
+            }
+        }
+    } maybe {
+        plan_trit = T_MAYBE
+        output = "plan command returned uncertain result"
+    } fail {
+        plan_trit = T_FALSE
+        output = "plan command failed to execute"
+    }
+
+    // Cache plan info
+    let cache_entry = dict_get(_infra_cache, working_dir) ?? {}
+    cache_entry = dict_set(cache_entry, "last_plan", time())
+    cache_entry = dict_set(cache_entry, "plan_add", to_add)
+    cache_entry = dict_set(cache_entry, "plan_change", to_change)
+    cache_entry = dict_set(cache_entry, "plan_destroy", to_destroy)
+    cache_entry = dict_set(cache_entry, "no_changes", no_changes)
+    _infra_cache = dict_set(_infra_cache, working_dir, cache_entry)
+
+    // Compute flow metrics -- drift_pressure from change counts
+    let resource_count = to_add + to_change + to_destroy
+    let flow = compute_flow_metrics("plan", plan_trit, resource_count)
+
+    record_stat("plan", plan_trit)
+    return {
+        "ok": plan_trit != T_FALSE,
+        "working_dir": working_dir,
+        "no_changes": no_changes,
+        "to_add": to_add,
+        "to_change": to_change,
+        "to_destroy": to_destroy,
+        "total_changes": resource_count,
+        "output": output,
+        "trit": plan_trit,
+        "char": bt_one(plan_trit),
+        "flow": flow,
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 3: POST /tterraform/apply
+// Apply changes (with auto-approve option)
+// Body: {working_dir: "...", auto_approve: false, target: "", var_file: ""}
+// Trit: +1=applied, 0=needs confirmation, -1=error
+// ===========================================================================
+fn handle_apply(body) {
+    let working_dir = dict_get(body, "working_dir") ?? ""
+
+    // working_dir is REQUIRED
+    if3 len(working_dir) == 0 {
+        record_stat("apply", T_FALSE)
+        return {
+            "ok": false,
+            "working_dir": "",
+            "error": "working_dir is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let auto_approve = dict_get(body, "auto_approve") ?? false
+    let target = dict_get(body, "target") ?? ""
+    let var_file = dict_get(body, "var_file") ?? ""
+
+    // If NOT auto_approve, return plan with confirmation needed
+    if3 auto_approve == false {
+        // Run plan first to show what would happen
+        let plan_cmd = "terraform -chdir=\"" + working_dir + "\" plan -no-color"
+        if3 len(target) > 0 {
+            plan_cmd = plan_cmd + " -target=\"" + target + "\""
+        }
+        if3 len(var_file) > 0 {
+            plan_cmd = plan_cmd + " -var-file=\"" + var_file + "\""
+        }
+        plan_cmd = plan_cmd + " 2>&1"
+
+        let plan_output = ""
+        let plan_ok = false
+
+        try3 {
+            plan_output = run_tf(plan_cmd, TF_PLAN_TIMEOUT)
+            plan_ok = true
+        } success {
+            // plan ran
+        } maybe {
+            plan_output = "plan command returned uncertain result"
+        } fail {
+            plan_output = "plan command failed to execute"
+        }
+
+        if3 plan_ok == false {
+            record_stat("apply", T_FALSE)
+            return {
+                "ok": false,
+                "working_dir": working_dir,
+                "auto_approve": false,
+                "error": plan_output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Extract plan counts
+        let to_add = 0
+        let to_change = 0
+        let to_destroy = 0
+        if3 contains(plan_output, "to add") {
+            to_add = extract_count_after(plan_output, " to add")
+        }
+        if3 contains(plan_output, "to change") {
+            to_change = extract_count_after(plan_output, " to change")
+        }
+        if3 contains(plan_output, "to destroy") {
+            to_destroy = extract_count_after(plan_output, " to destroy")
+        }
+
+        let flow = compute_flow_metrics("apply", T_MAYBE, to_add + to_change + to_destroy)
+
+        record_stat("apply", T_MAYBE)
+        return {
+            "ok": true,
+            "working_dir": working_dir,
+            "auto_approve": false,
+            "needs_confirmation": true,
+            "to_add": to_add,
+            "to_change": to_change,
+            "to_destroy": to_destroy,
+            "plan_output": plan_output,
+            "note": "Set auto_approve=true to apply these changes",
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "flow": flow,
+            "runtime": "novalang"
+        }
+    }
+
+    // Auto-approve mode: actually apply
+    let cmd = "terraform -chdir=\"" + working_dir + "\" apply -auto-approve -no-color"
+    if3 len(target) > 0 {
+        cmd = cmd + " -target=\"" + target + "\""
+    }
+    if3 len(var_file) > 0 {
+        cmd = cmd + " -var-file=\"" + var_file + "\""
+    }
+    cmd = cmd + " 2>&1"
+
+    let output = ""
+    let apply_trit = T_FALSE
+    let added = 0
+    let changed = 0
+    let destroyed = 0
+
+    try3 {
+        output = run_tf(cmd, TF_APPLY_TIMEOUT)
+    } success {
+        let lc_output = lower(output)
+
+        // Parse "Apply complete! Resources: X added, Y changed, Z destroyed"
+        if3 contains(lc_output, "apply complete") {
+            apply_trit = T_TRUE
+
+            // Extract resource counts from apply output
+            if3 contains(output, " added") {
+                added = extract_count_after(output, " added")
+            }
+            if3 contains(output, " changed") {
+                changed = extract_count_after(output, " changed")
+            }
+            if3 contains(output, " destroyed") {
+                destroyed = extract_count_after(output, " destroyed")
+            }
+        }
+
+        // Check for errors
+        if3 apply_trit != T_TRUE {
+            if3 is_tf_error(output) == true {
+                apply_trit = T_FALSE
+            }
+            if3 is_tf_error(output) == false {
+                // No explicit success or error
+                apply_trit = T_MAYBE
+            }
+        }
+    } maybe {
+        apply_trit = T_MAYBE
+        output = "apply command returned uncertain result"
+    } fail {
+        apply_trit = T_FALSE
+        output = "apply command failed to execute"
+    }
+
+    // Update cache
+    let cache_entry = dict_get(_infra_cache, working_dir) ?? {}
+    cache_entry = dict_set(cache_entry, "last_apply", time())
+    cache_entry = dict_set(cache_entry, "apply_added", added)
+    cache_entry = dict_set(cache_entry, "apply_changed", changed)
+    cache_entry = dict_set(cache_entry, "apply_destroyed", destroyed)
+    cache_entry = dict_set(cache_entry, "apply_trit", apply_trit)
+    _infra_cache = dict_set(_infra_cache, working_dir, cache_entry)
+
+    // Compute flow metrics
+    let resource_count = added + changed + destroyed
+    let flow = compute_flow_metrics("apply", apply_trit, resource_count)
+
+    record_stat("apply", apply_trit)
+    return {
+        "ok": apply_trit != T_FALSE,
+        "working_dir": working_dir,
+        "auto_approve": true,
+        "applied": apply_trit == T_TRUE,
+        "resources_added": added,
+        "resources_changed": changed,
+        "resources_destroyed": destroyed,
+        "total_resources": resource_count,
+        "output": output,
+        "trit": apply_trit,
+        "char": bt_one(apply_trit),
+        "flow": flow,
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 4: POST /tterraform/destroy
+// Destroy infrastructure (ALWAYS requires confirm: true)
+// Body: {working_dir: "...", confirm: true, target: "", var_file: ""}
+// Trit: +1=destroyed, 0=not confirmed, -1=error
+// ===========================================================================
+fn handle_destroy(body) {
+    let working_dir = dict_get(body, "working_dir") ?? ""
+
+    // working_dir is REQUIRED
+    if3 len(working_dir) == 0 {
+        record_stat("destroy", T_FALSE)
+        return {
+            "ok": false,
+            "working_dir": "",
+            "error": "working_dir is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let confirm = dict_get(body, "confirm") ?? false
+    let target = dict_get(body, "target") ?? ""
+    let var_file = dict_get(body, "var_file") ?? ""
+
+    // ALWAYS require confirm: true for destroy
+    if3 confirm == false {
+        // Show what would be destroyed via plan -destroy
+        let plan_cmd = "terraform -chdir=\"" + working_dir + "\" plan -destroy -no-color"
+        if3 len(target) > 0 {
+            plan_cmd = plan_cmd + " -target=\"" + target + "\""
+        }
+        if3 len(var_file) > 0 {
+            plan_cmd = plan_cmd + " -var-file=\"" + var_file + "\""
+        }
+        plan_cmd = plan_cmd + " 2>&1"
+
+        let plan_output = ""
+        try3 {
+            plan_output = run_tf(plan_cmd, TF_PLAN_TIMEOUT)
+        } success {
+            // plan ran
+        } maybe {
+            plan_output = "destroy plan returned uncertain result"
+        } fail {
+            plan_output = "destroy plan failed to execute"
+        }
+
+        let to_destroy = 0
+        if3 contains(plan_output, "to destroy") {
+            to_destroy = extract_count_after(plan_output, " to destroy")
+        }
+
+        let flow = compute_flow_metrics("destroy", T_MAYBE, to_destroy)
+
+        record_stat("destroy", T_MAYBE)
+        return {
+            "ok": true,
+            "working_dir": working_dir,
+            "confirmed": false,
+            "needs_confirmation": true,
+            "to_destroy": to_destroy,
+            "plan_output": plan_output,
+            "warning": "DANGEROUS: Set confirm=true to destroy infrastructure",
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "flow": flow,
+            "runtime": "novalang"
+        }
+    }
+
+    // Confirmed destroy
+    let cmd = "terraform -chdir=\"" + working_dir + "\" destroy -auto-approve -no-color"
+    if3 len(target) > 0 {
+        cmd = cmd + " -target=\"" + target + "\""
+    }
+    if3 len(var_file) > 0 {
+        cmd = cmd + " -var-file=\"" + var_file + "\""
+    }
+    cmd = cmd + " 2>&1"
+
+    let output = ""
+    let destroy_trit = T_FALSE
+    let destroyed = 0
+
+    try3 {
+        output = run_tf(cmd, TF_DESTROY_TIMEOUT)
+    } success {
+        let lc_output = lower(output)
+
+        // Parse "Destroy complete! Resources: X destroyed"
+        if3 contains(lc_output, "destroy complete") {
+            destroy_trit = T_TRUE
+            if3 contains(output, " destroyed") {
+                destroyed = extract_count_after(output, " destroyed")
+            }
+        }
+
+        // Check for errors
+        if3 destroy_trit != T_TRUE {
+            if3 is_tf_error(output) == true {
+                destroy_trit = T_FALSE
+            }
+            if3 is_tf_error(output) == false {
+                destroy_trit = T_MAYBE
+            }
+        }
+    } maybe {
+        destroy_trit = T_MAYBE
+        output = "destroy command returned uncertain result"
+    } fail {
+        destroy_trit = T_FALSE
+        output = "destroy command failed to execute"
+    }
+
+    // Update cache
+    let cache_entry = dict_get(_infra_cache, working_dir) ?? {}
+    cache_entry = dict_set(cache_entry, "last_destroy", time())
+    cache_entry = dict_set(cache_entry, "destroyed_count", destroyed)
+    cache_entry = dict_set(cache_entry, "destroy_trit", destroy_trit)
+    _infra_cache = dict_set(_infra_cache, working_dir, cache_entry)
+
+    // Compute flow metrics
+    let flow = compute_flow_metrics("destroy", destroy_trit, destroyed)
+
+    record_stat("destroy", destroy_trit)
+    return {
+        "ok": destroy_trit != T_FALSE,
+        "working_dir": working_dir,
+        "confirmed": true,
+        "destroyed": destroy_trit == T_TRUE,
+        "resources_destroyed": destroyed,
+        "output": output,
+        "trit": destroy_trit,
+        "char": bt_one(destroy_trit),
+        "flow": flow,
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 5: POST /tterraform/state
+// State management: list/show/pull/rm
+// Body: {working_dir: "...", action: "list"|"show"|"pull"|"rm",
+//        resource: "", confirm: false}
+// Trit: +1=success, 0=empty/partial, -1=error
+// ===========================================================================
+fn handle_state(body) {
+    let working_dir = dict_get(body, "working_dir") ?? ""
+
+    // working_dir is REQUIRED
+    if3 len(working_dir) == 0 {
+        record_stat("state", T_FALSE)
+        return {
+            "ok": false,
+            "working_dir": "",
+            "error": "working_dir is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let action = dict_get(body, "action") ?? "list"
+    let resource = dict_get(body, "resource") ?? ""
+    let confirm = dict_get(body, "confirm") ?? false
+
+    // -----------------------------------------------------------------------
+    // ACTION: list
+    // -----------------------------------------------------------------------
+    if3 action == "list" { cmd = "terraform -chdir=\"" + working_dir + "\" state list 2>&1"
+
+        let output = ""
+        let list_trit = T_FALSE
+
+        try3 {
+            output = run_tf(cmd, TF_TIMEOUT)
+        } success {
+            // Parse resource list
+            if3 is_tf_error(output) == true {
+                list_trit = T_FALSE
+            }
+            if3 is_tf_error(output) == false {
+                list_trit = T_TRUE
+            }
+        } maybe {
+            list_trit = T_MAYBE
+            output = "state list returned uncertain result"
+        } fail {
+            list_trit = T_FALSE
+            output = "state list failed to execute"
+        }
+
+        let resources = parse_resource_lines(output)
+        let resource_count = len(resources)
+
+        // If no resources, mark as maybe (empty state)
+        if3 list_trit == T_TRUE {
+            if3 resource_count == 0 {
+                list_trit = T_MAYBE
+            }
+        }
+
+        let flow = compute_flow_metrics("state", list_trit, resource_count)
+
+        record_stat("state", list_trit)
+        return {
+            "ok": list_trit != T_FALSE,
+            "working_dir": working_dir,
+            "action": "list",
+            "resources": resources,
+            "resource_count": resource_count,
+            "output": output,
+            "trit": list_trit,
+            "char": bt_one(list_trit),
+            "flow": flow,
+            "runtime": "novalang"
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ACTION: show
+    // -----------------------------------------------------------------------
+    if3 action == "show" {
+        if3 len(resource) == 0 {
+            record_stat("state", T_FALSE)
+            return {
+                "ok": false,
+                "working_dir": working_dir,
+                "action": "show",
+                "error": "resource name is required for state show",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "terraform -chdir=\"" + working_dir + "\" state show " + resource + " 2>&1"
+
+        let output = ""
+        let show_trit = T_FALSE
+
+        try3 {
+            output = run_tf(cmd, TF_TIMEOUT)
+        } success {
+            if3 is_tf_error(output) == true {
+                show_trit = T_FALSE
+            }
+            if3 is_tf_error(output) == false {
+                show_trit = T_TRUE
+            }
+        } maybe {
+            show_trit = T_MAYBE
+            output = "state show returned uncertain result"
+        } fail {
+            show_trit = T_FALSE
+            output = "state show failed to execute"
+        }
+
+        // Parse attribute count from output
+        let attr_count = count_lines(output)
+
+        let flow = compute_flow_metrics("state", show_trit, 1)
+
+        record_stat("state", show_trit)
+        return {
+            "ok": show_trit != T_FALSE,
+            "working_dir": working_dir,
+            "action": "show",
+            "resource": resource,
+            "attributes": attr_count,
+            "details": output,
+            "trit": show_trit,
+            "char": bt_one(show_trit),
+            "flow": flow,
+            "runtime": "novalang"
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ACTION: pull
+    // -----------------------------------------------------------------------
+    if3 action == "pull" { cmd = "terraform -chdir=\"" + working_dir + "\" state pull 2>&1"
+
+        let output = ""
+        let pull_trit = T_FALSE
+
+        try3 {
+            output = run_tf(cmd, TF_TIMEOUT)
+        } success {
+            if3 is_tf_error(output) == true {
+                pull_trit = T_FALSE
+            }
+            if3 is_tf_error(output) == false {
+                pull_trit = T_TRUE
+                // Check if state is empty/minimal
+                if3 len(output) < 10 {
+                    pull_trit = T_MAYBE
+                }
+            }
+        } maybe {
+            pull_trit = T_MAYBE
+            output = "state pull returned uncertain result"
+        } fail {
+            pull_trit = T_FALSE
+            output = "state pull failed to execute"
+        }
+
+        let state_size = len(output)
+        let flow = compute_flow_metrics("state", pull_trit, 0)
+
+        record_stat("state", pull_trit)
+        return {
+            "ok": pull_trit != T_FALSE,
+            "working_dir": working_dir,
+            "action": "pull",
+            "state_size_bytes": state_size,
+            "state": output,
+            "trit": pull_trit,
+            "char": bt_one(pull_trit),
+            "flow": flow,
+            "runtime": "novalang"
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ACTION: rm (DANGEROUS -- requires confirm)
+    // -----------------------------------------------------------------------
+    if3 action == "rm" {
+        if3 len(resource) == 0 {
+            record_stat("state", T_FALSE)
+            return {
+                "ok": false,
+                "working_dir": working_dir,
+                "action": "rm",
+                "error": "resource name is required for state rm",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // DANGEROUS: require confirmation
+        if3 confirm == false { flow = compute_flow_metrics("state", T_MAYBE, 1)
+            record_stat("state", T_MAYBE)
+            return {
+                "ok": true,
+                "working_dir": working_dir,
+                "action": "rm",
+                "resource": resource,
+                "confirmed": false,
+                "needs_confirmation": true,
+                "warning": "DANGEROUS: state rm removes resource from state without destroying it. Set confirm=true to proceed.",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "flow": flow,
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "terraform -chdir=\"" + working_dir + "\" state rm " + resource + " 2>&1"
+
+        let output = ""
+        let rm_trit = T_FALSE
+
+        try3 {
+            output = run_tf(cmd, TF_TIMEOUT)
+        } success {
+            let lc_output = lower(output)
+            if3 is_tf_error(output) == true {
+                rm_trit = T_FALSE
+            }
+            if3 is_tf_error(output) == false {
+                // Success usually says "Removed ..." or "Successfully removed"
+                if3 contains(lc_output, "removed") {
+                    rm_trit = T_TRUE
+                }
+                if3 rm_trit != T_TRUE {
+                    rm_trit = T_MAYBE
+                }
+            }
+        } maybe {
+            rm_trit = T_MAYBE
+            output = "state rm returned uncertain result"
+        } fail {
+            rm_trit = T_FALSE
+            output = "state rm failed to execute"
+        }
+
+        let flow = compute_flow_metrics("state", rm_trit, 1)
+
+        record_stat("state", rm_trit)
+        return {
+            "ok": rm_trit != T_FALSE,
+            "working_dir": working_dir,
+            "action": "rm",
+            "resource": resource,
+            "confirmed": true,
+            "removed": rm_trit == T_TRUE,
+            "output": output,
+            "trit": rm_trit,
+            "char": bt_one(rm_trit),
+            "flow": flow,
+            "runtime": "novalang"
+        }
+    }
+
+    // Unknown action
+    record_stat("state", T_FALSE)
+    return {
+        "ok": false,
+        "working_dir": working_dir,
+        "action": action,
+        "error": "unknown action: " + action + " (use list/show/pull/rm)",
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 6: POST /tterraform/output
+// Get terraform outputs
+// Body: {working_dir: "...", name: ""}
+// Trit: +1=outputs found, 0=no outputs, -1=error
+// ===========================================================================
+fn handle_output(body) {
+    let working_dir = dict_get(body, "working_dir") ?? ""
+
+    // working_dir is REQUIRED
+    if3 len(working_dir) == 0 {
+        record_stat("output", T_FALSE)
+        return {
+            "ok": false,
+            "working_dir": "",
+            "error": "working_dir is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let name = dict_get(body, "name") ?? ""
+
+    // Build terraform output command
+    let cmd = "terraform -chdir=\"" + working_dir + "\" output -json"
+    if3 len(name) > 0 {
+        cmd = "terraform -chdir=\"" + working_dir + "\" output -json " + name
+    }
+    cmd = cmd + " 2>&1"
+
+    let output = ""
+    let output_trit = T_FALSE
+
+    try3 {
+        output = run_tf(cmd, TF_TIMEOUT)
+    } success {
+        if3 is_tf_error(output) == true {
+            output_trit = T_FALSE
+        }
+        if3 is_tf_error(output) == false {
+            // Check if we got meaningful output
+            if3 len(output) > 2 {
+                output_trit = T_TRUE
+            }
+            if3 len(output) <= 2 {
+                // Empty JSON object {} or empty
+                output_trit = T_MAYBE
+            }
+        }
+    } maybe {
+        output_trit = T_MAYBE
+        output = "output command returned uncertain result"
+    } fail {
+        output_trit = T_FALSE
+        output = "output command failed to execute"
+    }
+
+    // Count output keys (rough estimate from lines)
+    let output_count = 0
+    if3 output_trit == T_TRUE {
+        // Count lines that look like output entries
+        // JSON output format has key-value pairs
+        output_count = count_lines_with_prefix(output, "\"value\"")
+        // If that didn't match, try counting top-level keys
+        if3 output_count == 0 {
+            // Rough count: lines with a colon that aren't braces
+            let lines = split(output, "\n")
+            let i = 0
+            while3 i < len(lines) {
+                let line = trim(lines[i])
+                if3 contains(line, ":") {
+                    if3 contains(line, "{") == false {
+                        if3 contains(line, "}") == false {
+                            output_count = output_count + 1
+                        }
+                    }
+                }
+                i = i + 1
+            }
+        }
+    }
+
+    let flow = compute_flow_metrics("output", output_trit, output_count)
+
+    record_stat("output", output_trit)
+    return {
+        "ok": output_trit != T_FALSE,
+        "working_dir": working_dir,
+        "name": name,
+        "outputs_raw": output,
+        "output_count": output_count,
+        "trit": output_trit,
+        "char": bt_one(output_trit),
+        "flow": flow,
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 7: POST /tterraform/workspace
+// Terraform workspace management (list/new/select/delete/show)
+// Body: {working_dir, action: "list|new|select|delete|show", name: ""}
+// Trit: +1=success, 0=partial, -1=error
+// ===========================================================================
+fn handle_workspace(body) {
+    let working_dir = dict_get(body, "working_dir") ?? ""
+    let action = dict_get(body, "action") ?? "list"
+    let name = dict_get(body, "name") ?? ""
+
+    if3 len(working_dir) == 0 {
+        record_stat("workspace", T_FALSE)
+        return {"ok": false, "error": "working_dir is required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+    }
+
+    if3 action == "list" { cmd = "terraform -chdir=\"" + working_dir + "\" workspace list -no-color 2>&1"
+        let output = ""
+        let op_trit = T_FALSE
+        try3 {
+            output = run_tf(cmd, TF_TIMEOUT)
+        } success {
+            op_trit = T_TRUE
+        } maybe {
+            op_trit = T_MAYBE
+            output = "workspace list returned uncertain result"
+        } fail {
+            output = "workspace list failed"
+        }
+        let flow = compute_flow_metrics("workspace", op_trit, len(output))
+        record_stat("workspace", op_trit)
+        return {"ok": op_trit != T_FALSE, "working_dir": working_dir, "action": "list", "output": output, "trit": op_trit, "char": bt_one(op_trit), "flow": flow, "runtime": "novalang"}
+    }
+
+    if3 action == "new" {
+        if3 len(name) == 0 {
+            record_stat("workspace", T_FALSE)
+            return {"ok": false, "error": "name required for new workspace", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "terraform -chdir=\"" + working_dir + "\" workspace new " + name + " -no-color 2>&1"
+        let output = ""
+        let op_trit = T_FALSE
+        try3 {
+            output = run_tf(cmd, TF_TIMEOUT)
+        } success {
+            op_trit = T_TRUE
+        } maybe {
+            op_trit = T_MAYBE
+        } fail {
+            output = "workspace new failed"
+        }
+        record_stat("workspace", op_trit)
+        return {"ok": op_trit != T_FALSE, "working_dir": working_dir, "action": "new", "name": name, "output": output, "trit": op_trit, "char": bt_one(op_trit), "runtime": "novalang"}
+    }
+
+    if3 action == "select" {
+        if3 len(name) == 0 {
+            record_stat("workspace", T_FALSE)
+            return {"ok": false, "error": "name required for select", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "terraform -chdir=\"" + working_dir + "\" workspace select " + name + " -no-color 2>&1"
+        let output = ""
+        let op_trit = T_FALSE
+        try3 {
+            output = run_tf(cmd, TF_TIMEOUT)
+        } success {
+            op_trit = T_TRUE
+        } maybe {
+            op_trit = T_MAYBE
+        } fail {
+            output = "workspace select failed"
+        }
+        record_stat("workspace", op_trit)
+        return {"ok": op_trit != T_FALSE, "working_dir": working_dir, "action": "select", "name": name, "output": output, "trit": op_trit, "char": bt_one(op_trit), "runtime": "novalang"}
+    }
+
+    if3 action == "delete" {
+        if3 len(name) == 0 {
+            record_stat("workspace", T_FALSE)
+            return {"ok": false, "error": "name required for delete", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "terraform -chdir=\"" + working_dir + "\" workspace delete " + name + " -no-color 2>&1"
+        let output = ""
+        let op_trit = T_FALSE
+        try3 {
+            output = run_tf(cmd, TF_TIMEOUT)
+        } success {
+            op_trit = T_TRUE
+        } maybe {
+            op_trit = T_MAYBE
+        } fail {
+            output = "workspace delete failed"
+        }
+        record_stat("workspace", op_trit)
+        return {"ok": op_trit != T_FALSE, "working_dir": working_dir, "action": "delete", "name": name, "output": output, "trit": op_trit, "char": bt_one(op_trit), "runtime": "novalang"}
+    }
+
+    if3 action == "show" { cmd = "terraform -chdir=\"" + working_dir + "\" workspace show -no-color 2>&1"
+        let output = ""
+        let op_trit = T_FALSE
+        try3 {
+            output = run_tf(cmd, TF_TIMEOUT)
+        } success {
+            op_trit = T_TRUE
+        } maybe {
+            op_trit = T_MAYBE
+        } fail {
+            output = "workspace show failed"
+        }
+        record_stat("workspace", op_trit)
+        return {"ok": op_trit != T_FALSE, "working_dir": working_dir, "action": "show", "current": trim(output), "trit": op_trit, "char": bt_one(op_trit), "runtime": "novalang"}
+    }
+
+    record_stat("workspace", T_FALSE)
+    return {"ok": false, "error": "unknown action: " + action + " (use list/new/select/delete/show)", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+}
+
+// ===========================================================================
+// TOOL 8: POST /tterraform/validate
+// Validate terraform configuration files
+// Body: {working_dir}
+// Trit: +1=valid, 0=warnings, -1=errors
+// ===========================================================================
+fn handle_validate(body) {
+    let working_dir = dict_get(body, "working_dir") ?? ""
+
+    if3 len(working_dir) == 0 {
+        record_stat("validate", T_FALSE)
+        return {"ok": false, "error": "working_dir is required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+    }
+
+    let cmd = "terraform -chdir=\"" + working_dir + "\" validate -json -no-color 2>&1"
+    let output = ""
+    let op_trit = T_FALSE
+
+    try3 {
+        output = run_tf(cmd, TF_TIMEOUT)
+    } success {
+        let lc = lower(output)
+        if3 contains(lc, "\"valid\":true") {
+            op_trit = T_TRUE
+        }
+        if3 op_trit != T_TRUE {
+            if3 contains(lc, "warning") {
+                op_trit = T_MAYBE
+            }
+            if3 op_trit != T_MAYBE {
+                op_trit = T_FALSE
+            }
+        }
+    } maybe {
+        op_trit = T_MAYBE
+        output = "validate returned uncertain result"
+    } fail {
+        output = "validate failed to execute"
+    }
+
+    let flow = compute_flow_metrics("validate", op_trit, len(output))
+    record_stat("validate", op_trit)
+    return {
+        "ok": op_trit != T_FALSE,
+        "working_dir": working_dir,
+        "output": output,
+        "valid": op_trit == T_TRUE,
+        "trit": op_trit,
+        "char": bt_one(op_trit),
+        "flow": flow,
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// GET /health -- Standard health endpoint
+// ===========================================================================
+fn health() {
+    let counters = {}
+    counters = dict_set(counters, "strong", stat_trit_true)
+    counters = dict_set(counters, "partial", stat_trit_maybe)
+    counters = dict_set(counters, "failed", stat_trit_false)
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, counters)
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    return resp
+}
+
+// ===========================================================================
+// GET /tterraform/service-status -- Full service status with stats
+// ===========================================================================
+fn tterraform_service_status() {
+    let uptime = time() - stat_t0
+
+    // Service Reynolds from total false ops
+    let re = stat_trit_false * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    // System trit
+    let sys_trit = T_TRUE
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    let by_tool = {}
+    by_tool = dict_set(by_tool, "init", by_tool_init)
+    by_tool = dict_set(by_tool, "plan", by_tool_plan)
+    by_tool = dict_set(by_tool, "apply", by_tool_apply)
+    by_tool = dict_set(by_tool, "destroy", by_tool_destroy)
+    by_tool = dict_set(by_tool, "state", by_tool_state)
+    by_tool = dict_set(by_tool, "output", by_tool_output)
+    by_tool = dict_set(by_tool, "workspace", by_tool_workspace)
+    by_tool = dict_set(by_tool, "validate", by_tool_validate)
+    by_tool = dict_set(by_tool, "import", by_tool_import)
+    by_tool = dict_set(by_tool, "fmt", by_tool_fmt)
+
+    // Cached infra dirs
+    let cached_dirs = keys(_infra_cache)
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "total_ops": stat_ops,
+        "by_tool": by_tool,
+        "trits": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        },
+        "cached_dirs": len(cached_dirs),
+        "ns_mapping": {
+            "infra_stream": "velocity_field",
+            "drift_pressure": "turbulent_energy",
+            "reynolds_formula": "infra_ops * H5"
+        },
+        "reynolds": re,
+        "regime": regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE
+    }
+}
+
+// ===========================================================================
+// TIER 5: /tterraform/import -- Import existing resource into state
+// ===========================================================================
+fn handle_import(body) {
+    let dir = dict_get(body, "dir") ?? "."
+    let address = dict_get(body, "address") ?? ""
+    let id = dict_get(body, "id") ?? ""
+
+    if3 len(address) == 0 {
+        record_stat("import", T_FALSE)
+        return {
+            "ok": false,
+            "action": "import",
+            "error": "resource address required (e.g. aws_instance.web)",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(id) == 0 {
+        record_stat("import", T_FALSE)
+        return {
+            "ok": false,
+            "action": "import",
+            "error": "resource ID required (e.g. i-1234567890abcdef0)",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let cmd = "cd \"" + dir + "\" && terraform import " + address + " " + id + " 2>&1"
+    let import_timeout = H13 * H7
+    let raw = nova_run(cmd, import_timeout)
+    let out = trim(str(raw))
+    let lc_out = lower(out)
+
+    if3 contains(lc_out, "error") {
+        record_stat("import", T_FALSE)
+        return {
+            "ok": false,
+            "action": "import",
+            "address": address,
+            "id": id,
+            "error": out,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let import_ok = false
+    if3 contains(lc_out, "import successful") {
+        import_ok = true
+    }
+    if3 contains(lc_out, "imported") {
+        import_ok = true
+    }
+
+    let import_trit = T_MAYBE
+    if3 import_ok == true {
+        import_trit = T_TRUE
+    }
+
+    record_stat("import", import_trit)
+    return {
+        "ok": true,
+        "action": "import",
+        "address": address,
+        "id": id,
+        "output": out,
+        "trit": import_trit,
+        "char": bt_one(import_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TIER 5: /tterraform/fmt -- Format terraform files
+// ===========================================================================
+fn handle_fmt(body) {
+    let dir = dict_get(body, "dir") ?? "."
+    let check = dict_get(body, "check") ?? false
+    let diff = dict_get(body, "diff") ?? false
+    let recursive = dict_get(body, "recursive") ?? true
+
+    let cmd = "cd \"" + dir + "\" && terraform fmt"
+
+    if3 check == true {
+        cmd = cmd + " -check"
+    }
+    if3 diff == true {
+        cmd = cmd + " -diff"
+    }
+    if3 recursive == true {
+        cmd = cmd + " -recursive"
+    }
+
+    cmd = cmd + " 2>&1"
+    let raw = nova_run(cmd, H13 * H5)
+    let out = trim(str(raw))
+    let lc_out = lower(out)
+
+    if3 contains(lc_out, "error") {
+        record_stat("fmt", T_FALSE)
+        return {
+            "ok": false,
+            "action": "fmt",
+            "dir": dir,
+            "error": out,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // If check mode, non-empty output means files need formatting
+    let fmt_trit = T_TRUE
+    if3 check == true {
+        if3 len(out) > 0 {
+            fmt_trit = T_MAYBE
+        }
+    }
+
+    // List formatted files
+    let formatted = []
+    if3 len(out) > 0 {
+        formatted = split(out, "\n")
+    }
+
+    record_stat("fmt", fmt_trit)
+    return {
+        "ok": true,
+        "action": "fmt",
+        "dir": dir,
+        "check_only": check,
+        "formatted_files": formatted,
+        "count": len(formatted),
+        "trit": fmt_trit,
+        "char": bt_one(fmt_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+troute(server, "GET",  "/health",                      "health")
+troute(server, "GET",  "/tterraform/service-status",   "tterraform_service_status")
+troute(server, "POST", "/tterraform/init",             "handle_init")
+troute(server, "POST", "/tterraform/plan",             "handle_plan")
+troute(server, "POST", "/tterraform/apply",            "handle_apply")
+troute(server, "POST", "/tterraform/destroy",          "handle_destroy")
+troute(server, "POST", "/tterraform/state",            "handle_state")
+troute(server, "POST", "/tterraform/output",           "handle_output")
+troute(server, "POST", "/tterraform/workspace",        "handle_workspace")
+troute(server, "POST", "/tterraform/validate",         "handle_validate")
+troute(server, "POST", "/tterraform/import",           "handle_import")
+troute(server, "POST", "/tterraform/fmt",              "handle_fmt")
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[TTerraform] NovaX Ternary Terraform Wrapper v" + VERSION + " on port " + str(PORT))
+print("[TTerraform] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[TTerraform] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TTerraform] Re boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TTerraform] N-S: infra_stream=velocity_field | drift_pressure=turbulent_energy | Re=infra_ops*H5")
+print("[TTerraform] Timeouts: init=" + str(TF_TIMEOUT) + "s plan=" + str(TF_PLAN_TIMEOUT) + "s apply=" + str(TF_APPLY_TIMEOUT) + "s destroy=" + str(TF_DESTROY_TIMEOUT) + "s")
+print("[TTerraform] Routes: /health, /tterraform/service-status")
+print("[TTerraform]         /tterraform/init, /tterraform/plan, /tterraform/apply")
+print("[TTerraform]         /tterraform/destroy, /tterraform/state, /tterraform/output")
+print("[TTerraform] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

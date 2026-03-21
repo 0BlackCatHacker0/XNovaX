@@ -1,0 +1,756 @@
+"""
+NovaX Universal Debugger (LIUD) — Language-Integrated Universal Debugger
+Port 9886 — Security Layer Service
+
+Step-through debugger across ALL NovaX execution layers:
+  - NovaLang source (line-by-line stepping)
+  - Ternary routing (channel activation per operation)
+  - Modulation (scheme selection, SNR for each channel)
+  - Hivemind (model dispatch tracking)
+
+Integrated with Sentinel for anomaly detection.
+Extends the existing novalang_debugger.py with in-process execution hooks.
+"""
+
+import os
+import sys
+import json
+import time
+import math
+import threading
+import logging
+import urllib.request
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Any, Optional, Dict, List
+from collections import deque
+
+# Add NovaX root to path
+sys.path.insert(0, r"C:\NovaX")
+sys.path.insert(0, r"C:\NovaX\core")
+
+log = logging.getLogger("NovaX.UniversalDebugger")
+
+PORT = 9886
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DEBUG STATE & FRAMES
+# ═══════════════════════════════════════════════════════════════════
+
+class DebugState(Enum):
+    STOPPED = "stopped"
+    RUNNING = "running"
+    PAUSED = "paused"
+    STEPPING = "stepping"
+    STEP_OVER = "step_over"
+    FINISHED = "finished"
+
+
+@dataclass
+class DebugFrame:
+    """Snapshot of execution state at a single point."""
+    line_num: int
+    source_line: str
+    variables: dict
+    ternary_step: dict           # from TernaryCodeLayer trace
+    modulation_info: dict        # scheme, SNR, BER for active channel
+    call_stack: list             # function call chain
+    timestamp: float = 0.0
+
+    def to_dict(self):
+        return {
+            "line": self.line_num,
+            "source": self.source_line,
+            "variables": {k: _safe_repr(v) for k, v in self.variables.items()},
+            "ternary": self.ternary_step,
+            "modulation": self.modulation_info,
+            "call_stack": self.call_stack,
+            "ts": self.timestamp,
+        }
+
+
+def _safe_repr(val, max_len=200):
+    """Safe string representation of a value for debug display."""
+    try:
+        s = repr(val)
+        return s[:max_len] + "..." if len(s) > max_len else s
+    except Exception:
+        return str(type(val).__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# EXECUTION INSPECTOR — hooks into interpreter for step-through
+# ═══════════════════════════════════════════════════════════════════
+
+class ExecutionInspector:
+    """In-process interpreter hook for step-through debugging.
+
+    Monkey-patches the interpreter's _exec_line to pause at breakpoints
+    and step points. Uses threading.Event for pause/resume control.
+    """
+
+    def __init__(self):
+        self.state = DebugState.STOPPED
+        self.breakpoints: Dict[int, Optional[str]] = {}  # line -> condition or None
+        self.watchpoints: Dict[str, Any] = {}             # var_name -> last_value
+        self.frames: List[DebugFrame] = []
+        self.current_frame: Optional[DebugFrame] = None
+        self.anomaly_detector = AnomalyDetector()
+
+        self._step_event = threading.Event()
+        self._stop_requested = False
+        self._current_line = 0
+        self._source_lines: List[str] = []
+        self._interpreter = None
+        self._ternary_layer = None
+        self._exec_thread: Optional[threading.Thread] = None
+        self._fn_depth = 0
+
+    def start_session(self, code: str):
+        """Start a debug session with the given NovaLang code."""
+        self.state = DebugState.PAUSED
+        self.frames.clear()
+        self.current_frame = None
+        self._stop_requested = False
+        self._current_line = 0
+        self._source_lines = code.split('\n')
+        self.anomaly_detector.reset()
+
+        # Create interpreter with ternary code layer
+        try:
+            from novalang import NovaInterpreter
+            self._interpreter = NovaInterpreter()
+
+            # Attach ternary code layer
+            try:
+                from ternary_code_layer import create_layer
+                self._ternary_layer = create_layer()
+                # Don't wrap with ternary layer yet — we wrap with debug hooks instead
+            except ImportError:
+                self._ternary_layer = None
+
+            # Hook into interpreter
+            self._hook_interpreter()
+
+        except ImportError as e:
+            log.error(f"Failed to import NovaLang: {e}")
+            self.state = DebugState.STOPPED
+            return {"ok": False, "error": str(e)}
+
+        # Start execution in background thread (will pause immediately)
+        self._exec_thread = threading.Thread(
+            target=self._run_code, args=(code,), daemon=True
+        )
+        self._exec_thread.start()
+
+        return {"ok": True, "state": self.state.value,
+                "lines": len(self._source_lines)}
+
+    def _hook_interpreter(self):
+        """Monkey-patch interpreter to pause at breakpoints and step points."""
+        interp = self._interpreter
+        original_exec_line = interp._exec_line
+        inspector = self
+
+        def debug_exec_line(line, env=None):
+            if inspector._stop_requested:
+                raise StopIteration("Debug session stopped")
+
+            inspector._current_line += 1
+            line_num = inspector._current_line
+
+            # Build ternary step info
+            ternary_info = {}
+            if inspector._ternary_layer:
+                step = inspector._ternary_layer._classify_and_route(line)
+                inspector._ternary_layer.trace.record(step)
+                ternary_info = step.to_dict()
+
+            # Build modulation info
+            mod_info = {}
+            if inspector._ternary_layer and inspector._ternary_layer.modulation:
+                ch = ternary_info.get("channel", "REASON")
+                mod = inspector._ternary_layer.modulation
+                scheme, cfg = mod.select_scheme(ch)
+                mod_info = {"scheme": scheme, "snr": round(mod.estimate_snr(ch), 3),
+                            "description": cfg.get("description", "")}
+
+            # Capture variables
+            target_env = env if env else interp.globals
+            var_snapshot = dict(target_env.vars)
+
+            # Check watchpoints
+            for var_name, last_val in list(inspector.watchpoints.items()):
+                current = var_snapshot.get(var_name)
+                if current != last_val:
+                    inspector.watchpoints[var_name] = current
+                    # Watchpoint triggered — force pause
+                    inspector.state = DebugState.PAUSED
+
+            # Build frame
+            frame = DebugFrame(
+                line_num=line_num,
+                source_line=line.strip()[:200],
+                variables=var_snapshot,
+                ternary_step=ternary_info,
+                modulation_info=mod_info,
+                call_stack=[],
+                timestamp=time.time(),
+            )
+            inspector.frames.append(frame)
+            inspector.current_frame = frame
+
+            # Anomaly checks
+            inspector.anomaly_detector.check_iteration(line_num)
+            inspector.anomaly_detector.check_variables(var_snapshot)
+            if ternary_info:
+                inspector.anomaly_detector.check_channel_activation(
+                    len(ternary_info.get("activated", [])),
+                    len(ternary_info.get("activated", [])) +
+                    len(ternary_info.get("suppressed", [])) +
+                    len(ternary_info.get("neutral", []))
+                )
+
+            # Check if we should pause
+            should_pause = False
+            if inspector.state == DebugState.STEPPING:
+                should_pause = True
+            elif inspector.state == DebugState.STEP_OVER:
+                if inspector._fn_depth <= 0:
+                    should_pause = True
+            elif inspector.state == DebugState.PAUSED:
+                should_pause = True
+            elif line_num in inspector.breakpoints:
+                cond = inspector.breakpoints[line_num]
+                if cond:
+                    try:
+                        if interp._eval(cond, target_env):
+                            should_pause = True
+                    except Exception:
+                        should_pause = True
+                else:
+                    should_pause = True
+
+            if should_pause:
+                inspector.state = DebugState.PAUSED
+                inspector._step_event.clear()
+                inspector._step_event.wait(timeout=300)  # 5 min max wait
+                if inspector._stop_requested:
+                    raise StopIteration("Debug session stopped")
+
+            # Execute the original statement
+            if env:
+                return original_exec_line(line, env)
+            else:
+                return original_exec_line(line)
+
+        # Patch — handle both signatures (with and without env parameter)
+        import inspect
+        sig = inspect.signature(original_exec_line)
+        if len(sig.parameters) >= 2:
+            interp._exec_line = debug_exec_line
+        else:
+            def debug_wrapper(line):
+                return debug_exec_line(line, interp.globals)
+            interp._exec_line = debug_wrapper
+
+    def _run_code(self, code: str):
+        """Execute code in background thread (called from start_session)."""
+        try:
+            # Wait for first step/continue command
+            self._step_event.clear()
+            self._step_event.wait(timeout=300)
+            if self._stop_requested:
+                return
+
+            self.state = DebugState.RUNNING
+            self._interpreter.run(code, repl_mode=True)
+            self.state = DebugState.FINISHED
+        except StopIteration:
+            self.state = DebugState.STOPPED
+        except Exception as e:
+            log.error(f"Debug execution error: {e}")
+            self.state = DebugState.FINISHED
+
+    def step(self):
+        """Execute one line then pause."""
+        if self.state in (DebugState.STOPPED, DebugState.FINISHED):
+            return {"ok": False, "error": "Not debugging"}
+        self.state = DebugState.STEPPING
+        self._step_event.set()
+        # Wait briefly for the step to complete
+        time.sleep(0.05)
+        return {"ok": True, "state": self.state.value,
+                "frame": self.current_frame.to_dict() if self.current_frame else None}
+
+    def next(self):
+        """Step over (don't enter function calls)."""
+        if self.state in (DebugState.STOPPED, DebugState.FINISHED):
+            return {"ok": False, "error": "Not debugging"}
+        self._fn_depth = 0
+        self.state = DebugState.STEP_OVER
+        self._step_event.set()
+        time.sleep(0.05)
+        return {"ok": True, "state": self.state.value,
+                "frame": self.current_frame.to_dict() if self.current_frame else None}
+
+    def continue_run(self):
+        """Continue until next breakpoint."""
+        if self.state in (DebugState.STOPPED, DebugState.FINISHED):
+            return {"ok": False, "error": "Not debugging"}
+        self.state = DebugState.RUNNING
+        self._step_event.set()
+        time.sleep(0.1)
+        return {"ok": True, "state": self.state.value}
+
+    def stop(self):
+        """Stop the debug session."""
+        self._stop_requested = True
+        self._step_event.set()
+        self.state = DebugState.STOPPED
+        return {"ok": True, "state": "stopped"}
+
+    def set_breakpoint(self, line: int, condition: str = None):
+        """Set a breakpoint at a line number."""
+        self.breakpoints[line] = condition
+        return {"ok": True, "line": line, "condition": condition,
+                "total": len(self.breakpoints)}
+
+    def remove_breakpoint(self, line: int):
+        """Remove a breakpoint."""
+        self.breakpoints.pop(line, None)
+        return {"ok": True, "line": line}
+
+    def add_watchpoint(self, var_name: str):
+        """Watch a variable for changes."""
+        self.watchpoints[var_name] = None
+        return {"ok": True, "var": var_name}
+
+    def get_frame(self) -> Optional[dict]:
+        if self.current_frame:
+            return self.current_frame.to_dict()
+        return None
+
+    def get_frames(self, limit: int = 50) -> list:
+        return [f.to_dict() for f in self.frames[-limit:]]
+
+    def get_vars(self) -> dict:
+        if self.current_frame:
+            return {k: _safe_repr(v) for k, v in self.current_frame.variables.items()}
+        return {}
+
+    def get_ternary_state(self) -> dict:
+        if self.current_frame:
+            return self.current_frame.ternary_step
+        return {}
+
+    def get_callstack(self) -> list:
+        if self.current_frame:
+            return self.current_frame.call_stack
+        return []
+
+    def get_output(self) -> str:
+        if self._interpreter:
+            return '\n'.join(self._interpreter.output)
+        return ""
+
+    def status(self) -> dict:
+        return {
+            "state": self.state.value,
+            "line": self._current_line,
+            "total_frames": len(self.frames),
+            "breakpoints": dict(self.breakpoints),
+            "watchpoints": list(self.watchpoints.keys()),
+            "anomalies": self.anomaly_detector.get_alerts(),
+            "output_lines": len(self._interpreter.output) if self._interpreter else 0,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ANOMALY DETECTOR — Security Integration with Sentinel
+# ═══════════════════════════════════════════════════════════════════
+
+class AnomalyDetector:
+    """Detects anomalous execution patterns for security monitoring.
+
+    Integrated with Sentinel — posts alerts to /sentinel/anomaly.
+    """
+
+    THRESHOLDS = {
+        "loop_iterations_max": 10000,
+        "recursion_depth_max": 100,
+        "channel_activation_anomaly": 0.8,  # >80% channels active = suspicious
+        "execution_lines_max": 50000,
+        "memory_vars_max": 5000,
+        "string_size_max": 1_000_000,  # 1MB string
+    }
+
+    SENTINEL_URL = "http://localhost:9884"
+
+    def __init__(self):
+        self.alerts: List[dict] = []
+        self._iteration_count = 0
+        self._reported_to_sentinel = set()
+
+    def reset(self):
+        self.alerts.clear()
+        self._iteration_count = 0
+        self._reported_to_sentinel.clear()
+
+    def _add_alert(self, category: str, message: str, severity: str = "warning"):
+        alert = {
+            "category": category,
+            "message": message,
+            "severity": severity,
+            "timestamp": time.time(),
+            "iteration": self._iteration_count,
+        }
+        self.alerts.append(alert)
+
+        # Report to Sentinel (fire-and-forget)
+        alert_key = f"{category}:{self._iteration_count}"
+        if alert_key not in self._reported_to_sentinel:
+            self._reported_to_sentinel.add(alert_key)
+            threading.Thread(target=self._report_to_sentinel, args=(alert,), daemon=True).start()
+
+    def _report_to_sentinel(self, alert: dict):
+        """POST alert to Sentinel security service."""
+        try:
+            data = json.dumps(alert).encode()
+            req = urllib.request.Request(
+                f"{self.SENTINEL_URL}/sentinel/anomaly",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass  # Sentinel may not be running
+
+    def check_iteration(self, line_num: int):
+        self._iteration_count += 1
+        if self._iteration_count > self.THRESHOLDS["execution_lines_max"]:
+            self._add_alert("excessive_execution",
+                            f"Execution exceeded {self.THRESHOLDS['execution_lines_max']} lines",
+                            "critical")
+
+    def check_variables(self, vars_dict: dict):
+        if len(vars_dict) > self.THRESHOLDS["memory_vars_max"]:
+            self._add_alert("memory_pressure",
+                            f"Variable count ({len(vars_dict)}) exceeds threshold",
+                            "warning")
+
+        # Check for huge strings
+        for name, val in vars_dict.items():
+            if isinstance(val, str) and len(val) > self.THRESHOLDS["string_size_max"]:
+                self._add_alert("memory_pressure",
+                                f"Variable '{name}' is a {len(val)}-byte string",
+                                "warning")
+
+    def check_channel_activation(self, activated_count: int, total_channels: int):
+        if total_channels > 0:
+            ratio = activated_count / total_channels
+            if ratio > self.THRESHOLDS["channel_activation_anomaly"]:
+                self._add_alert("channel_anomaly",
+                                f"Unusual channel activation: {activated_count}/{total_channels} "
+                                f"({ratio:.0%}) channels active",
+                                "warning")
+
+    def check_loop(self, loop_id: str, iteration: int) -> bool:
+        """Returns True if loop is anomalous."""
+        if iteration > self.THRESHOLDS["loop_iterations_max"]:
+            self._add_alert("infinite_loop",
+                            f"Loop '{loop_id}' exceeded {iteration} iterations",
+                            "critical")
+            return True
+        return False
+
+    def get_alerts(self) -> list:
+        return self.alerts[-50:]  # last 50 alerts
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LIVE MONITOR — Continuous monitoring daemon (not tied to sessions)
+# ═══════════════════════════════════════════════════════════════════
+
+class LiveMonitor:
+    """Continuous live monitoring that feeds anomalies to the Closed Loop Engine."""
+
+    SERVICES = {
+        "hivemind": 9881, "sentinel": 9884, "ternary": 9885,
+        "cli": 9887, "closedloop": 9888, "cloud_router": 9878
+    }
+
+    def __init__(self):
+        self.running = False
+        self._thread = None
+        self._metrics_history = deque(maxlen=300)  # ~25 min at 5s interval
+        self._latency_baseline = {}  # service -> EMA baseline
+        self._failure_counts = {}    # service -> consecutive failures
+        self._lock = threading.Lock()
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self._thread = threading.Thread(target=self._monitor_loop, daemon=True,
+                                        name="live-monitor")
+        self._thread.start()
+        print("[LIUD] LiveMonitor started")
+
+    def stop(self):
+        self.running = False
+        print("[LIUD] LiveMonitor stopped")
+
+    def _monitor_loop(self):
+        while self.running:
+            try:
+                metrics = self._collect_metrics()
+                with self._lock:
+                    self._metrics_history.append(metrics)
+                self._detect_anomalies(metrics)
+            except Exception as e:
+                print(f"[LIUD] LiveMonitor error: {e}")
+            time.sleep(5)
+
+    def _collect_metrics(self) -> dict:
+        """Poll all service health endpoints and measure latency."""
+        metrics = {"timestamp": time.time(), "services": {}}
+        for name, port in self.SERVICES.items():
+            t0 = time.time()
+            try:
+                req = urllib.request.Request(f"http://localhost:{port}/health")
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    latency = (time.time() - t0) * 1000
+                    metrics["services"][name] = {
+                        "status": "up", "latency_ms": round(latency, 1), "port": port
+                    }
+                    # EMA baseline update (alpha=0.3)
+                    old = self._latency_baseline.get(name, latency)
+                    self._latency_baseline[name] = old * 0.7 + latency * 0.3
+                    self._failure_counts[name] = 0
+            except Exception:
+                latency = (time.time() - t0) * 1000
+                metrics["services"][name] = {
+                    "status": "down", "latency_ms": round(latency, 1), "port": port
+                }
+                self._failure_counts[name] = self._failure_counts.get(name, 0) + 1
+        return metrics
+
+    def _detect_anomalies(self, metrics: dict):
+        """Detect anomalies and forward to Closed Loop Engine."""
+        for name, svc in metrics.get("services", {}).items():
+            # Service down: 3 consecutive failures
+            if self._failure_counts.get(name, 0) >= 3:
+                self._send_anomaly({
+                    "type": "service_down",
+                    "service": name,
+                    "port": svc["port"],
+                    "consecutive_failures": self._failure_counts[name],
+                    "timestamp": time.time(),
+                    "source": "live_monitor"
+                })
+                self._failure_counts[name] = 0  # Reset after reporting
+
+            # Latency spike: 3x baseline AND > 500ms
+            if svc["status"] == "up":
+                baseline = self._latency_baseline.get(name, 100)
+                if svc["latency_ms"] > baseline * 3 and svc["latency_ms"] > 500:
+                    self._send_anomaly({
+                        "type": "latency_spike",
+                        "service": name,
+                        "latency_ms": svc["latency_ms"],
+                        "baseline_ms": round(baseline, 1),
+                        "timestamp": time.time(),
+                        "source": "live_monitor"
+                    })
+
+    def _send_anomaly(self, anomaly: dict):
+        """POST anomaly to Closed Loop Engine."""
+        try:
+            data = json.dumps(anomaly).encode()
+            req = urllib.request.Request("http://localhost:9888/loop/anomaly",
+                                        data=data, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass  # Closed Loop might not be running yet
+
+    def get_status(self) -> dict:
+        with self._lock:
+            latest = self._metrics_history[-1] if self._metrics_history else {}
+        return {
+            "running": self.running,
+            "metrics_collected": len(self._metrics_history),
+            "baselines": {k: round(v, 1) for k, v in self._latency_baseline.items()},
+            "latest": latest
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# HTTP SERVER — Universal Debugger Service
+# ═══════════════════════════════════════════════════════════════════
+
+# Global instances
+_inspector = ExecutionInspector()
+_live_monitor = LiveMonitor()
+
+
+class LIUDHandler(BaseHTTPRequestHandler):
+    """HTTP handler for the Universal Debugger service."""
+
+    def log_message(self, format, *args):
+        log.debug(format, *args)
+
+    def _json_response(self, data, status=200):
+        body = json.dumps(data, default=str).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            return json.loads(self.rfile.read(length))
+        return {}
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+
+        if path == "/health":
+            self._json_response({
+                "service": "universal-debugger", "port": PORT,
+                "status": "ok", "state": _inspector.state.value,
+                "uptime": time.time(),
+            })
+
+        elif path == "/liud/status":
+            self._json_response(_inspector.status())
+
+        elif path == "/liud/frame":
+            frame = _inspector.get_frame()
+            self._json_response(frame or {"state": _inspector.state.value})
+
+        elif path == "/liud/frames":
+            self._json_response({"frames": _inspector.get_frames()})
+
+        elif path == "/liud/vars":
+            self._json_response({"variables": _inspector.get_vars()})
+
+        elif path == "/liud/ternary":
+            self._json_response({"ternary": _inspector.get_ternary_state()})
+
+        elif path == "/liud/callstack":
+            self._json_response({"callstack": _inspector.get_callstack()})
+
+        elif path == "/liud/breakpoints":
+            self._json_response({"breakpoints": dict(_inspector.breakpoints)})
+
+        elif path == "/liud/anomalies":
+            self._json_response({
+                "anomalies": _inspector.anomaly_detector.get_alerts()
+            })
+
+        elif path == "/liud/output":
+            self._json_response({"output": _inspector.get_output()})
+
+        elif path == "/liud/live-status":
+            self._json_response(_live_monitor.get_status())
+
+        else:
+            self._json_response({"error": "not found"}, 404)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        body = self._read_body()
+
+        if path == "/liud/start":
+            code = body.get("code", "")
+            file_path = body.get("file")
+            if file_path and os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    code = f.read()
+            if not code:
+                self._json_response({"ok": False, "error": "No code provided"}, 400)
+                return
+            result = _inspector.start_session(code)
+            self._json_response(result)
+
+        elif path == "/liud/step":
+            self._json_response(_inspector.step())
+
+        elif path == "/liud/next":
+            self._json_response(_inspector.next())
+
+        elif path == "/liud/continue":
+            self._json_response(_inspector.continue_run())
+
+        elif path == "/liud/stop":
+            self._json_response(_inspector.stop())
+
+        elif path == "/liud/breakpoint":
+            line = body.get("line", 0)
+            condition = body.get("condition")
+            self._json_response(_inspector.set_breakpoint(int(line), condition))
+
+        elif path == "/liud/watch":
+            var_name = body.get("var", "")
+            self._json_response(_inspector.add_watchpoint(var_name))
+
+        elif path == "/liud/live-monitor/start":
+            _live_monitor.start()
+            self._json_response({"ok": True, "running": True})
+
+        elif path == "/liud/live-monitor/stop":
+            _live_monitor.stop()
+            self._json_response({"ok": True, "running": False})
+
+        else:
+            self._json_response({"error": "not found"}, 404)
+
+    def do_DELETE(self):
+        path = self.path.split("?")[0]
+        body = self._read_body()
+
+        if path == "/liud/breakpoint":
+            line = body.get("line", 0)
+            self._json_response(_inspector.remove_breakpoint(int(line)))
+        else:
+            self._json_response({"error": "not found"}, 404)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN — Start the Universal Debugger server
+# ═══════════════════════════════════════════════════════════════════
+
+def main():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [LIUD] %(message)s")
+    server = HTTPServer(("0.0.0.0", PORT), LIUDHandler)
+    log.info(f"Universal Debugger listening on port {PORT}")
+    print(f"Universal Debugger listening on port {PORT}", flush=True)
+
+    # Auto-start LiveMonitor for continuous debugging
+    _live_monitor.start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        _live_monitor.stop()
+        log.info("Shutting down Universal Debugger")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

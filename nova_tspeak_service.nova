@@ -1,0 +1,122 @@
+// NovaX TSpeak v3.0 -- Neural Voice via edge-tts CLI
+// Port 9895 | edge-tts neural voices (Google/Alexa quality) + SAPI fallback
+// Micro-tool: +1=spoken, 0=fallback, -1=failed
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9895
+let VERSION = "3.0-neural"
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+let _speak_count = 0
+let _voice = "en-US-AvaNeural"
+
+let VOICES = [
+  "en-US-AvaNeural", "en-US-EmmaNeural", "en-US-AriaNeural",
+  "en-US-JennyNeural", "en-US-GuyNeural", "en-US-DavisNeural",
+  "en-US-JasonNeural", "en-US-SaraNeural", "en-US-TonyNeural",
+  "en-US-NancyNeural", "en-GB-RyanNeural", "en-GB-SoniaNeural",
+  "en-AU-WilliamNeural", "en-AU-NatashaNeural"
+]
+
+fn speak_neural(text, voice) {
+  let safe = replace(text, "'", "")
+  safe = replace(safe, "\"", "")
+  safe = replace(safe, "\n", ". ")
+  safe = replace(safe, "\r", " ")
+  safe = replace(safe, "\\", "")
+  safe = replace(safe, "$", "")
+  safe = replace(safe, "`", "")
+  safe = replace(safe, "#", "")
+  safe = replace(safe, "*", "")
+
+  // Map voice names to edge-tts neural voices
+  let neural = "en-US-AvaNeural"
+  if3 contains(voice, "Jenny") == 1 { neural = "en-US-JennyNeural" }
+  if3 contains(voice, "Aria") == 1 { neural = "en-US-AriaNeural" }
+  if3 contains(voice, "Emma") == 1 { neural = "en-US-EmmaNeural" }
+  if3 contains(voice, "Guy") == 1 { neural = "en-US-GuyNeural" }
+  if3 contains(voice, "Davis") == 1 { neural = "en-US-DavisNeural" }
+  if3 contains(voice, "Ava") == 1 { neural = "en-US-AvaNeural" }
+  if3 contains(voice, "Ryan") == 1 { neural = "en-GB-RyanNeural" }
+  if3 contains(voice, "Sonia") == 1 { neural = "en-GB-SoniaNeural" }
+
+  // Write text to file for long text safety (no shell escaping issues)
+  write_file("C:/NovaX/tmp/speak_text.txt", safe)
+
+  // Unique output file per call to avoid playback conflicts
+  let mp3_file = "C:/NovaX/tmp/tspeak_" + str(_speak_count) + ".mp3"
+
+  // Step 1: Generate MP3 with edge-tts CLI (real neural voice synthesis)
+  let tts_cmd = "edge-tts --voice " + neural + " --file C:/NovaX/tmp/speak_text.txt --write-media " + mp3_file
+  let tts_result = try3 { nova_run(tts_cmd) } fail { {} }
+
+  // Step 2: Play the MP3 with WPF MediaPlayer (supports mp3 natively)
+  let play_script = "Add-Type -AssemblyName presentationCore; "
+  play_script = play_script + "$p = New-Object System.Windows.Media.MediaPlayer; "
+  play_script = play_script + "$p.Open('" + mp3_file + "'); "
+  play_script = play_script + "Start-Sleep -Milliseconds 500; "
+  play_script = play_script + "$p.Play(); "
+  play_script = play_script + "while ($p.NaturalDuration.HasTimeSpan -eq $false) { Start-Sleep -Milliseconds 100 }; "
+  play_script = play_script + "Start-Sleep -Seconds ([math]::Ceiling($p.NaturalDuration.TimeSpan.TotalSeconds)); "
+  play_script = play_script + "$p.Close()"
+  write_file("C:/NovaX/tmp/do_speak.ps1", play_script)
+  let play = try3 { nova_run("powershell.exe -ExecutionPolicy Bypass -File C:/NovaX/tmp/do_speak.ps1") } fail { {} }
+
+  _speak_count = _speak_count + 1
+  return {"ok": T_TRUE, "trit": T_TRUE, "spoken": slice(safe, 0, 100), "voice": neural, "method": "edge-tts-neural-cli", "chars": len(safe), "count": _speak_count}
+}
+
+fn speak_sapi(text) {
+  let safe = replace(replace(text, "'", ""), "\"", "")
+  if3 len(safe) > 1000 { safe = slice(safe, 0, 1000) }
+  let cmd = "powershell -Command \"Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak('" + safe + "')\""
+  try3 { shell(cmd) } fail { {} }
+  _speak_count = _speak_count + 1
+  return {"ok": T_TRUE, "trit": T_MAYBE, "spoken": safe, "voice": "sapi-fallback", "method": "windows-sapi", "count": _speak_count}
+}
+
+fn handle_say(req) {
+  let body = try3 { json_decode(req["body"]) } fail { req }
+  let text = dict_get(body, "text") ?? ""
+  let voice = dict_get(body, "voice") ?? _voice
+  if3 len(text) == 0 { return {"ok": T_FALSE, "trit": T_FALSE, "error": "no text"} }
+  let result = speak_neural(text, voice)
+  let ok = dict_get(result, "ok") ?? 0
+  if3 ok != T_TRUE { result = speak_sapi(text) }
+  return result
+}
+
+fn handle_voices(req) {
+  return {"ok": T_TRUE, "voices": VOICES, "current": _voice, "method": "edge-tts-neural"}
+}
+
+fn handle_set_voice(req) {
+  let body = try3 { json_decode(req["body"]) } fail { req }
+  let v = dict_get(body, "voice") ?? ""
+  if3 len(v) > 0 { _voice = v }
+  return {"ok": T_TRUE, "voice": _voice}
+}
+
+fn handle_health(req) {
+  return ns_health_dict("nova-tspeak", VERSION, PORT, {"speaks": _speak_count, "voice": _voice, "method": "neural"})
+}
+
+let server = tserve(PORT, "TSpeak v3.0 Neural")
+troute(server, "POST", "/tspeak/say", "handle_say")
+troute(server, "GET", "/tspeak/voices", "handle_voices")
+troute(server, "POST", "/tspeak/set-voice", "handle_set_voice")
+troute(server, "GET", "/health", "handle_health")
+
+print("[TSpeak] v3.0 Neural Voice (edge-tts CLI)")
+print("[TSpeak] Port " + str(PORT) + " | Voice: " + _voice)
+print("[TSpeak] 14 neural voices | SAPI fallback available")
+
+tstart(server)

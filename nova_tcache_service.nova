@@ -1,0 +1,496 @@
+// nova_tcache_service.nova -- NovaX Distributed Ternary Cache (port 9956)
+// Pure NovaLang | N-S Flow Enhanced
+//
+// LRU cache with TTL expiration and ternary cache coherence:
+//   TRUE  (+1) = cache hit   (fresh)
+//   MAYBE ( 0) = stale-while-revalidate (expired but cached)
+//   FALSE (-1) = cache miss
+//
+// Harmonics:
+//   MAX_ENTRIES = 3^7 = 2187   (H3^H7 block boundary)
+//   Default TTL = 300s          (5 min)
+//   Cleaner sweep = 13s         (H13)
+//   Key hash seal = sha256()    (H13-char prefix)
+
+// -- Shared Libraries --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+// -- Constants (H3/H5/H7/H13 from VM globals, RE_* from ns_core) --
+let PORT = 9956
+let VERSION = "1.1"
+let MAX_ENTRIES = 2187       // 3^7 = H3^H7 harmonic block
+let DEFAULT_TTL = 300        // seconds (5 min)
+let MAX_TTL = 86400          // 24-hour ceiling
+let CLEANER_INTERVAL = 13    // H13 seconds between TTL sweeps
+let MAX_KEY_LEN = 512        // max key length in chars
+let TRUE = 1
+let MAYBE = 0
+let FALSE = -1
+
+// -- N-S Flow Counters --
+let _ns = ns_init_counters()
+
+// -- Cache state (flat dicts -- no OrderedDict in NovaLang) --
+// _cache: key -> entry dict { key, value, ttl, created, accessed, hits, size }
+// _order: list of keys in insertion/access order (back = most-recently-used)
+let _cache = {}
+let _order = []
+
+// -- Global stats counters --
+let _hits = 0
+let _misses = 0
+let _stales = 0
+let _evictions = 0
+let _sets = 0
+let _deletes = 0
+
+// -- Helpers --
+
+fn is_expired(entry) {
+    // ttl <= 0 means no expiration (live forever)
+    let ttl = dict_get(entry, "ttl") ?? 0
+    if3 ttl <= 0 {
+        return FALSE
+    } else ttl > 0 { created = dict_get(entry, "created") ?? 0
+        let now = time()
+        let age = now - created
+        if3 age > ttl {
+            return TRUE
+        } else age <= ttl {
+            return FALSE
+        } else {
+            return FALSE
+    } else {
+        return FALSE
+    }
+}
+}
+
+fn mem_size(value) {
+    // Estimate size of a value by JSON-encoding it
+    let encoded = json_encode(value)
+    return len(encoded)
+}
+
+// -- LRU helpers --
+// Remove a key from _order list (linear scan -- no Set in NovaLang)
+fn order_remove(key) {
+    let new_order = []
+    let i = 0
+    while3 i < len(_order) {
+        let k = _order[i]
+        if3 k == key {
+            // skip -- effectively removes it
+        } else {
+            new_order = append(new_order, k)
+        }
+        i = i + 1
+    }
+    _order = new_order
+}
+
+// Move a key to the back of _order (most-recently-used end)
+fn order_touch(key) {
+    order_remove(key)
+    _order = append(_order, key)
+}
+
+// Evict the least-recently-used entry (front of _order) if cache is full
+fn evict_lru() {
+    if3 len(_order) >= MAX_ENTRIES { oldest = _order[0]
+        _cache = dict_del(_cache, oldest)
+        order_remove(oldest)
+        _evictions = _evictions + 1
+    } else {
+        // no-op: cache has room
+    }
+}
+
+// -- Sweep expired entries (called periodically via /tcache/clean) --
+fn sweep_expired() {
+    let all_keys = keys(_cache)
+    let expired = []
+    let now = time()
+    let i = 0
+    while3 i < len(all_keys) {
+        let k = all_keys[i]
+        let entry = dict_get(_cache, k) ?? {}
+        let ttl = dict_get(entry, "ttl") ?? 0
+        if3 ttl > 0 { created = dict_get(entry, "created") ?? 0
+            let age = now - created
+            if3 age > ttl {
+                expired = append(expired, k)
+            } else {
+                // still fresh
+        } else {
+            // no expiry -- skip
+        }
+        i = i + 1
+    }
+
+    let purged = 0
+    let j = 0
+    while3 j < len(expired) {
+        let ek = expired[j]
+        _cache = dict_del(_cache, ek)
+        order_remove(ek)
+        purged = purged + 1
+        _evictions = _evictions + 1
+        j = j + 1
+    }
+
+    return purged
+}
+
+// -- Route: GET /tcache/health --
+}
+fn tcache_health() {
+    let entry_count = len(_order)
+    let base = ns_health_dict("nova-tcache", VERSION, PORT, _ns)
+    base = dict_set(base, "entries", entry_count)
+    base = dict_set(base, "max_entries", MAX_ENTRIES)
+    return base
+}
+
+// -- Route: GET /tcache/stats --
+fn tcache_stats() {
+    let entry_count = len(_order)
+    let total_ops = _hits + _misses + _stales
+
+    // Compute total size by summing entry size fields
+    let total_size = 0
+    let sk = keys(_cache)
+    let si = 0
+    while3 si < len(sk) {
+        let skey = sk[si]
+        let sentry = dict_get(_cache, skey) ?? {}
+        let sz = dict_get(sentry, "size") ?? 0
+        total_size = total_size + sz
+        si = si + 1
+    }
+
+    // Hit / miss / stale rates
+    let hit_rate = 0
+    let miss_rate = 0
+    let stale_rate = 0
+    if3 total_ops > 0 { hit_rate = round(float(_hits) / float(total_ops) * 100, 2)
+        let miss_rate = round(float(_misses) / float(total_ops) * 100, 2)
+        let stale_rate = round(float(_stales) / float(total_ops) * 100, 2)
+    } else {
+        // keep 0
+    }
+
+    let fill_pct = round(float(entry_count) / float(MAX_ENTRIES) * 100, 2)
+    let mem_kb = round(float(total_size) / 1024, 2)
+
+    return {
+        "ok": true,
+        "trit": TRUE,
+        "entries": entry_count,
+        "max_entries": MAX_ENTRIES,
+        "fill_pct": fill_pct,
+        "memory_bytes": total_size,
+        "memory_kb": mem_kb,
+        "hits": _hits,
+        "misses": _misses,
+        "stales": _stales,
+        "total_ops": total_ops,
+        "hit_rate": hit_rate,
+        "miss_rate": miss_rate,
+        "stale_rate": stale_rate,
+        "evictions": _evictions,
+        "sets": _sets,
+        "deletes": _deletes,
+        "harmonics": {
+            "max_entries": "3^7=2187",
+            "cleaner_interval": "H13=13s",
+            "default_ttl": "300s"
+        },
+        "runtime": "novalang",
+        "ternary": true
+    }
+}
+
+// -- Route: GET /tcache/keys --
+fn tcache_keys() {
+    let keys_info = []
+    let now = time()
+    let ak = keys(_cache)
+    let i = 0
+    while3 i < len(ak) {
+        let k = ak[i]
+        let entry = dict_get(_cache, k) ?? {}
+        let ttl = dict_get(entry, "ttl") ?? 0
+        let created = dict_get(entry, "created") ?? 0
+        let age = round(now - created, 2)
+        let entry_hits = dict_get(entry, "hits") ?? 0
+        let entry_size = dict_get(entry, "size") ?? 0
+
+        // Determine state
+        let expired = is_expired(entry)
+        let state = "fresh"
+        let trit_val = TRUE
+        if3 expired == TRUE { state = "stale"
+            let trit_val = MAYBE
+        } else {
+            // fresh
+        }
+
+        append(keys_info, {
+            "key": k,
+            "ttl": ttl,
+            "age": age,
+            "hits": entry_hits,
+            "size_bytes": entry_size,
+            "state": state,
+            "trit": trit_val
+        })
+        i = i + 1
+    }
+
+    return {
+        "ok": true,
+        "trit": TRUE,
+        "count": len(keys_info),
+        "keys": keys_info,
+        "runtime": "novalang"
+    }
+}
+
+// -- Route: POST /tcache/get --
+fn tcache_get(body) {
+    let key = dict_get(body, "key") ?? ""
+    if3 len(key) == 0 {
+        return {"ok": false, "trit": FALSE, "error": "key required"}
+    } else { entry = dict_get(_cache, key) ?? {}
+        if3 len(keys(entry)) == 0 {
+            // miss -- key not in cache
+            _misses = _misses + 1
+            return {
+                "ok": true,
+                "trit": FALSE,
+                "state": "miss",
+                "key": key,
+                "value": ""
+        } else {
+            // key exists -- check expiry
+            let expired = is_expired(entry)
+            let now = time()
+            let created = dict_get(entry, "created") ?? 0
+            let age = round(now - created, 2)
+            let ttl = dict_get(entry, "ttl") ?? 0
+            let entry_hits = dict_get(entry, "hits") ?? 0
+            let value = dict_get(entry, "value") ?? ""
+
+            if3 expired == TRUE {
+                // stale-while-revalidate: return MAYBE with value
+                _stales = _stales + 1
+                return {
+                    "ok": true,
+                    "trit": MAYBE,
+                    "state": "stale",
+                    "key": key,
+                    "value": value,
+                    "age": age,
+                    "ttl": ttl,
+                    "hits": entry_hits
+            } else {
+                // fresh hit -- touch LRU order
+                order_touch(key)
+                let new_hits = entry_hits + 1
+                entry = dict_set(entry, "hits", new_hits)
+                entry = dict_set(entry, "accessed", now)
+                _cache = dict_set(_cache, key, entry)
+                _hits = _hits + 1
+                return {
+                    "ok": true,
+                    "trit": TRUE,
+                    "state": "hit",
+                    "key": key,
+                    "value": value,
+                    "age": age,
+                    "ttl": ttl,
+                    "hits": new_hits
+                }
+            }
+        }
+    }
+}
+
+// -- Route: POST /tcache/set --
+}
+}
+fn tcache_set(body) {
+    let key = dict_get(body, "key") ?? ""
+    if3 len(key) == 0 {
+        return {"ok": false, "trit": FALSE, "error": "key required"}
+    } else {
+        // Key length check
+        if3 len(key) > MAX_KEY_LEN {
+            return {"ok": false, "trit": FALSE, "error": "key too long (max 512 chars)"}
+        } else { value = dict_get(body, "value") ?? ""
+            let ttl = dict_get(body, "ttl") ?? DEFAULT_TTL
+
+            // Clamp TTL: 0 = forever, max = 24h
+            if3 ttl < 0 { ttl = 0
+            } else {
+                // keep
+            }
+            if3 ttl > MAX_TTL { ttl = MAX_TTL
+            } else {
+                // keep
+            }
+
+            // Estimate size
+            let size = mem_size(value)
+
+            let now = time()
+            let entry = {
+                "key": key,
+                "value": value,
+                "ttl": ttl,
+                "created": now,
+                "accessed": now,
+                "hits": 0,
+                "size": size
+            }
+
+            // Check if key already existed
+            let existing = dict_get(_cache, key) ?? {}
+            let existed = len(keys(existing)) > 0
+
+            // If not already present, maybe evict LRU
+            if3 existed == FALSE {
+                evict_lru()
+            } else {
+                // overwrite: remove from order first, re-add below
+                order_remove(key)
+            }
+
+            _cache = dict_set(_cache, key, entry)
+            _order = append(_order, key)
+            _sets = _sets + 1
+
+            return {
+                "ok": true,
+                "trit": TRUE,
+                "key": key,
+                "ttl": ttl,
+                "size_bytes": size,
+                "replaced": existed
+            }
+        }
+    }
+}
+
+// -- Route: POST /tcache/delete --
+fn tcache_delete(body) {
+    let key = dict_get(body, "key") ?? ""
+    if3 len(key) == 0 {
+        return {"ok": false, "trit": FALSE, "error": "key required"}
+    } else { entry = dict_get(_cache, key) ?? {}
+        if3 len(keys(entry)) > 0 {
+            _cache = dict_del(_cache, key)
+            order_remove(key)
+            _deletes = _deletes + 1
+            return {"ok": true, "trit": TRUE, "key": key, "deleted": true}
+        } else {
+            return {"ok": true, "trit": MAYBE, "key": key, "deleted": false, "msg": "key not found"}
+        }
+    }
+}
+
+// -- Route: POST /tcache/flush -- clear all or prefix-matched keys --
+fn tcache_flush(body) {
+    let prefix = dict_get(body, "prefix") ?? ""
+
+    if3 len(prefix) == 0 {
+        // Flush everything
+        let count = len(_order)
+        let flushed_keys = keys(_cache)
+        let fi = 0
+        while3 fi < len(flushed_keys) {
+            let fk = flushed_keys[fi]
+            _cache = dict_del(_cache, fk)
+            fi = fi + 1
+        }
+        _order = []
+        return {"ok": true, "trit": TRUE, "flushed": count, "pattern": "*"}
+    } else {
+        // Flush keys starting with prefix
+        let to_flush = []
+        let ak = keys(_cache)
+        let pi = 0
+        while3 pi < len(ak) {
+            let pk = ak[pi]
+            // Manual startswith: compare slice of key to prefix
+            let pk_len = len(pk)
+            let pfx_len = len(prefix)
+            if3 pk_len >= pfx_len { pk_slice = slice(pk, 0, pfx_len)
+                if3 pk_slice == prefix {
+                    to_flush = append(to_flush, pk)
+                } else {
+                    // no match
+            } else {
+                // key shorter than prefix -- no match
+            }
+            pi = pi + 1
+        }
+
+        let fi2 = 0
+        while3 fi2 < len(to_flush) {
+            let fk2 = to_flush[fi2]
+            _cache = dict_del(_cache, fk2)
+            order_remove(fk2)
+            fi2 = fi2 + 1
+        }
+
+        return {
+            "ok": true,
+            "trit": TRUE,
+            "flushed": len(to_flush),
+            "pattern": prefix + "*"
+        }
+    }
+}
+
+// -- Route: POST /tcache/clean -- manual TTL sweep (H13 trigger) --
+}
+fn tcache_clean(body) {
+    let purged = sweep_expired()
+    return {
+        "ok": true,
+        "trit": TRUE,
+        "purged": purged,
+        "remaining": len(_order),
+        "runtime": "novalang"
+    }
+}
+
+// -- Setup server --
+let server = tserve(PORT, "TCache v1.0 - NovaX Distributed Ternary Cache")
+
+// GET routes
+troute(server, "GET", "/tcache/health", "tcache_health")
+troute(server, "GET", "/tcache/stats",  "tcache_stats")
+troute(server, "GET", "/tcache/keys",   "tcache_keys")
+
+// POST routes
+troute(server, "POST", "/tcache/get",    "tcache_get")
+troute(server, "POST", "/tcache/set",    "tcache_set")
+troute(server, "POST", "/tcache/delete", "tcache_delete")
+troute(server, "POST", "/tcache/flush",  "tcache_flush")
+troute(server, "POST", "/tcache/clean",  "tcache_clean")
+
+// Startup banner
+print("[TCache] NovaX Distributed Ternary Cache starting in NovaLang...")
+print("[TCache] Port: " + str(PORT) + " | Version: " + VERSION + " | Runtime: NovaLang")
+print("[TCache] MAX_ENTRIES=3^7=" + str(MAX_ENTRIES) + " | DEFAULT_TTL=" + str(DEFAULT_TTL) + "s | CLEANER=H13=" + str(H13) + "s")
+print("[TCache] Ternary: TRUE=hit, MAYBE=stale(SWR), FALSE=miss")
+print("[TCache] GET  /tcache/health | /tcache/stats | /tcache/keys")
+print("[TCache] POST /tcache/get | /tcache/set | /tcache/delete | /tcache/flush | /tcache/clean")
+
+troute(server, "GET", "/health", fn(req) { return json_decode(http_get("http://127.0.0.1:9956/tcache/health")) })
+
+tstart(server)

@@ -1,0 +1,220 @@
+// Nova THealth v1.0 - Ternary Health Aggregator (N-S Flow Model)
+// Port 9940: Aggregates health status across all NovaX services
+// Uses Navier-Stokes Reynolds classification for system-wide health
+//
+// N-S Mapping:
+//   service_health = velocity_field (flow of health signals)
+//   alive_services = laminar_particles (healthy flow)
+//   dead_services = turbulent_particles (flow disruption)
+//   degraded = transitional (partial flow)
+//   Reynolds = dead_count * check_frequency
+//   Re < 27 (H3^3) = laminar (system healthy)
+//   27 < Re < 343 (H7^3) = transitional (degraded)
+//   Re > 343 = turbulent (critical - multiple services down)
+
+let PORT = 9940
+let server = tserve(PORT, "THealth v1.0 - Ternary Health Aggregator")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let RE_LAMINAR = 27     // H3^3 - safe boundary
+let RE_TURBULENT = 343  // H7^3 - critical boundary
+let BLOCK_SIZE = 2187   // H3^7 - ternary block
+
+// -- Service Registry (port -> name) --
+let service_ports = [9999, 9878, 9881, 9890, 9905, 9906, 9907, 9908, 9909, 9910, 9911, 9926, 9941, 9942, 9943, 9944]
+let service_names = ["orchestrator", "cloud-router", "hivemind", "novaxcore", "tvault", "tcache", "tqueue", "tpulse", "twatch", "tschema", "tdispatch", "tsniffer", "tconfig", "tlog", "tmetrics", "tnotify"]
+
+// -- Stats --
+let total_checks = 0
+let services_up = 0
+let services_down = 0
+let services_degraded = 0
+let last_reynolds = 0
+let last_regime = "unknown"
+
+// -- Check a single service health --
+fn check_one(port) {
+    let url = "http://127.0.0.1:" + str(port) + "/health"
+    let cmd = "curl -s -m 3 " + url + " 2>nul"
+    let raw = nova_run(cmd, 5)
+    let result = str(raw)
+    if3 len(result) < 3 {
+        return FALSE   // -1: dead
+    }
+    if3 contains(result, "\"ok\"") {
+        if3 contains(result, "true") {
+            return TRUE    // +1: alive
+        }
+    }
+    if3 contains(result, "\"ok\": true") {
+        return TRUE
+    }
+    if3 contains(result, "error") {
+        return FALSE
+    }
+    return MAYBE   // 0: degraded / unknown response
+}
+
+// -- N-S Reynolds Calculation --
+fn calc_reynolds(down_count, degraded_count) {
+    // Re = (down * H7) + (degraded * H3) -- weighted disruption
+    let re = (down_count * H7) + (degraded_count * H3)
+    let regime = "laminar"
+    if3 re > RE_TURBULENT {
+        regime = "turbulent"
+    }
+    if3 re > RE_LAMINAR {
+        if3 re <= RE_TURBULENT {
+            regime = "transitional"
+        }
+    }
+    last_reynolds = re
+    last_regime = regime
+    return {"reynolds": re, "regime": regime}
+}
+
+// -- Health endpoint (own health) --
+fn health() {
+    let trit = TRUE
+    if3 last_reynolds > RE_TURBULENT {
+        trit = FALSE
+    }
+    if3 last_reynolds > RE_LAMINAR {
+        if3 last_reynolds <= RE_TURBULENT {
+            trit = MAYBE
+        }
+    }
+    return {
+        "ok": true,
+        "service": "thealth",
+        "port": PORT,
+        "version": "1.0",
+        "ternary": true,
+        "trit": trit,
+        "char": trit_char(trit),
+        "reynolds": last_reynolds,
+        "flow_regime": last_regime,
+        "runtime": "novalang",
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// -- Status: check all services --
+fn thealth_status(body) {
+    let results = []
+    let up = 0
+    let down = 0
+    let degraded = 0
+
+    let i = 0
+    for3 port in service_ports {
+        let trit = check_one(port)
+        let name = service_names[i]
+        let status = "unknown"
+        if3 trit == TRUE { status = "alive"
+            up = up + 1
+        } else trit == MAYBE { status = "degraded"
+            degraded = degraded + 1
+        } else { status = "dead"
+            down = down + 1
+        }
+        results = append(results, {
+            "name": name,
+            "port": port,
+            "trit": trit,
+            "char": trit_char(trit),
+            "status": status
+        })
+        i = i + 1
+    }
+
+    // Update global stats
+    total_checks = total_checks + 1
+    services_up = up
+    services_down = down
+    services_degraded = degraded
+
+    // N-S classification
+    let ns = calc_reynolds(down, degraded)
+
+    return {
+        "ok": true,
+        "ternary": true,
+        "runtime": "novalang",
+        "check_number": total_checks,
+        "total_services": len(service_ports),
+        "up": up,
+        "down": down,
+        "degraded": degraded,
+        "reynolds": dict_get(ns, "reynolds") ?? 0,
+        "regime": dict_get(ns, "regime") ?? "unknown",
+        "services": results
+    }
+}
+
+// -- Summary: compact stats --
+fn thealth_summary(body) {
+    // Quick re-check
+    let up = 0
+    let down = 0
+    let degraded = 0
+
+    for3 port in service_ports {
+        let trit = check_one(port)
+        if3 trit == TRUE { up = up + 1
+        } else trit == MAYBE { degraded = degraded + 1
+        } else { down = down + 1
+        }
+    }
+
+    total_checks = total_checks + 1
+    services_up = up
+    services_down = down
+    services_degraded = degraded
+
+    let ns = calc_reynolds(down, degraded)
+    let total = len(service_ports)
+
+    // Overall system trit
+    let sys_trit = TRUE
+    if3 down > 0 {
+        sys_trit = MAYBE
+    }
+    if3 down > H5 {
+        sys_trit = FALSE
+    }
+
+    return {
+        "ok": true,
+        "ternary": true,
+        "runtime": "novalang",
+        "system_trit": sys_trit,
+        "system_char": trit_char(sys_trit),
+        "total": total,
+        "alive": up,
+        "dead": down,
+        "degraded": degraded,
+        "health_pct": (up * 100) / total,
+        "reynolds": dict_get(ns, "reynolds") ?? 0,
+        "regime": dict_get(ns, "regime") ?? "unknown",
+        "total_checks": total_checks,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// -- Register routes --
+troute(server, "GET", "/health", "health")
+troute(server, "GET", "/thealth/status", "thealth_status")
+troute(server, "GET", "/thealth/summary", "thealth_summary")
+
+print("[THealth] NovaLang THealth v1.0 - Ternary Health Aggregator")
+print("[THealth] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[THealth] N-S Boundaries: Re<" + str(RE_LAMINAR) + "=laminar, Re>" + str(RE_TURBULENT) + "=turbulent")
+print("[THealth] Monitoring " + str(len(service_ports)) + " services")
+print("[THealth] Routes: /health, /thealth/status, /thealth/summary")
+
+tstart(server)

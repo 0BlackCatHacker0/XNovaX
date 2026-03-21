@@ -1,0 +1,121 @@
+## backup_scheduler.nova - Create backups of specified directories
+## Usage: nova backup_scheduler.nova <source_dir> [backup_dir]
+##        nova backup_scheduler.nova C:/NovaX/scripts C:/NovaX/backups
+##        nova backup_scheduler.nova list
+##        nova backup_scheduler.nova restore <backup_file> <dest_dir>
+
+let args = argv()
+let argc = len(args)
+
+let default_backup_dir = "C:/NovaX/backups"
+
+if3 argc < 2
+  print("Usage: backup_scheduler.nova <source_dir> [backup_dir]")
+  print("       backup_scheduler.nova list")
+  print("       backup_scheduler.nova restore <backup_file> <dest>")
+  exit(-1)
+
+let action = args[1]
+
+if3 action == "list"
+  ## List existing backups
+  print("=== Backup Archive ===")
+  let result = shell("ls -lhtr " + default_backup_dir + "/*.tar.gz 2>/dev/null || ls -lhtr " + default_backup_dir + "/*.zip 2>/dev/null || echo 'NO_BACKUPS'")
+  let output = trim(result["stdout"])
+  if3 output == "NO_BACKUPS" || output == ""
+    print("  No backups found in " + default_backup_dir)
+    print("[TRIT: 0] No backups")
+  else3
+    print(output)
+    print("")
+    ## Count backups
+    let count_result = shell("ls " + default_backup_dir + "/*.tar.gz 2>/dev/null | wc -l")
+    let count = trim(count_result["stdout"])
+    print("Total backups: " + count)
+    print("[TRIT: +1] Backup list retrieved")
+  exit(0)
+
+if3 action == "restore"
+  if3 argc < 4
+    print("[-1] Usage: backup_scheduler.nova restore <backup_file> <dest>")
+    exit(-1)
+  let backup_file = args[2]
+  let dest_dir = args[3]
+  print("=== Restoring Backup ===")
+  print("From: " + backup_file)
+  print("To:   " + dest_dir)
+  shell("mkdir -p '" + dest_dir + "'")
+  let result = shell("tar -xzf '" + backup_file + "' -C '" + dest_dir + "' 2>&1")
+  if3 result["ok"] == 1
+    print("Restore complete.")
+    print("[TRIT: +1] Backup restored")
+  else3
+    let err = dict_get(result, "stderr") ?? "Unknown error"
+    print("[-1] Restore failed: " + err)
+    exit(-1)
+  exit(0)
+
+## Main backup flow
+let source_dir = args[1]
+let backup_dir = default_backup_dir
+if3 argc >= 3
+  let backup_dir = args[2]
+
+## Ensure backup dir exists
+shell("mkdir -p '" + backup_dir + "'")
+
+## Generate timestamp for backup name
+let ts_result = shell("date '+%Y%m%d_%H%M%S'")
+let timestamp = trim(ts_result["stdout"])
+
+## Get basename of source for naming
+let basename_result = shell("basename '" + source_dir + "'")
+let basename = trim(basename_result["stdout"])
+
+let backup_name = basename + "_backup_" + timestamp + ".tar.gz"
+let backup_path = backup_dir + "/" + backup_name
+
+print("=== Creating Backup ===")
+print("Source:  " + source_dir)
+print("Dest:    " + backup_path)
+print("")
+
+## Check source exists
+let check = shell("test -d '" + source_dir + "' && echo 'EXISTS' || echo 'MISSING'")
+if3 trim(check["stdout"]) == "MISSING"
+  print("[-1] Source directory does not exist: " + source_dir)
+  exit(-1)
+
+## Get source size
+let size_result = shell("du -sh '" + source_dir + "' 2>/dev/null | cut -f1")
+let source_size = trim(size_result["stdout"])
+print("Source size: " + source_size)
+
+## Create tar.gz backup
+print("Compressing...")
+let tar_cmd = "tar -czf '" + backup_path + "' -C '" + source_dir + "/..' '" + basename + "' 2>&1"
+let result = shell(tar_cmd)
+
+if3 result["ok"] == 1
+  ## Get backup file size
+  let bsize_result = shell("ls -lh '" + backup_path + "' | awk '{print $5}'")
+  let backup_size = trim(bsize_result["stdout"])
+  print("Backup size: " + backup_size)
+  print("")
+  print("Backup created: " + backup_path)
+
+  ## Save backup log
+  let log_file = backup_dir + "/backup_log.txt"
+  let log_line = timestamp + " | " + source_dir + " -> " + backup_name + " (" + backup_size + ")\n"
+  let existing_log = ""
+  try3
+    let existing_log = read_file(log_file)
+  fail3 e
+    let existing_log = ""
+  write_file(log_file, existing_log + log_line)
+
+  print("[TRIT: +1] Backup complete")
+else3
+  let err = dict_get(result, "stderr") ?? result["stdout"]
+  print("[-1] Backup failed: " + err)
+  exit(-1)

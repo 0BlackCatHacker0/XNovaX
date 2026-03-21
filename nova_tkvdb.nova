@@ -1,0 +1,1357 @@
+// ============================================================
+// NOVA TKVDB — Ternary Key-Value Database Engine
+// ============================================================
+// Version: 1.0.0-ternary
+// Harmonic Constants: 3-5-7-13
+// Page Size: 3^7 = 2187 bytes (trit frame)
+// Tree Fan-out: 3 (ternary B-tree)
+// Hash Base: balanced ternary
+// Replication: 3-way with ternary consensus
+// WAL: ternary write-ahead log
+// ============================================================
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+let PAGE_SIZE = 2187          // 3^7 bytes — the trit frame
+let MAX_KEYS_PER_NODE = 2     // ternary B-tree: 2 keys, 3 children
+let MAX_CHILDREN = 3          // natural 3-way branching
+let TZIP_TRITS_PER_BYTE = 5   // TZip packing density
+let BLOCK_SIZE = 2187         // 3^7 aligned
+let WAL_SEGMENT_SIZE = 6561   // 3^8 = 3 pages per WAL segment
+let HASH_TRIT_WIDTH = 39      // 3^39 ~ 4.05e18, enough for 64-bit key space
+let LOAD_FACTOR_MAX = 0.729   // 3^(-0.3) ~ optimal for base-3 open addressing
+let REPLICATION_FACTOR = 3    // natural ternary replication
+let TOMBSTONE_TTL = 2187      // seconds before tombstone purge
+
+// Ternary state constants
+let TRIT_NEG = -1
+let TRIT_ZERO = 0
+let TRIT_POS = 1
+
+# ============================================================
+# 1. TERNARY B-TREE
+# ============================================================
+// Each node: 2 keys, 3 children
+// Height: log3(n) — 37% shorter than binary B-trees
+// Comparison: natural {-1, 0, +1} at every branch point
+// Node layout in page:
+//   [header:13][key0:TZip][val0:TZip][key1:TZip][val1:TZip][child0:13][child1:13][child2:13]
+//   Total fits within 2187-byte page
+
+class3 TBTreeNode {
+    fn __init__() {
+        let keys = []          // up to 2 keys (balanced ternary encoded)
+        let values = []        // up to 2 values (TZip compressed)
+        let children = []      // up to 3 child page_ids
+        let page_id = -1       // location on disk
+        let is_leaf = 1        // +1 = leaf, -1 = internal, 0 = tombstoned
+        let key_count = 0
+    }
+
+    fn compare_keys(a, b) {
+        // Balanced ternary comparison — returns {-1, 0, +1} naturally
+        let a_trits = to_balanced_ternary(a)
+        let b_trits = to_balanced_ternary(b)
+        let max_len = max(len(a_trits), len(b_trits))
+
+        // Pad shorter to max_len with zeros (MSB first)
+        while3 len(a_trits) < max_len { a_trits = [0] + a_trits }
+        while3 len(b_trits) < max_len { b_trits = [0] + b_trits }
+
+        for3 i in range(max_len) {
+            if3 a_trits[i] > b_trits[i] { return 1 }
+            if3 a_trits[i] < b_trits[i] { return -1 }
+        }
+        return 0
+    }
+
+    fn find_branch(key) {
+        // 3-way branching: returns child index {0, 1, 2}
+        if3 key_count == 0 { return 0 }
+        let cmp0 = compare_keys(key, keys[0])
+        if3 cmp0 == -1 { return 0 }     // go left
+        if3 cmp0 == 0 { return -1 }      // exact match on key0 (signal: -1 = found)
+        if3 key_count == 1 { return 1 }   // only 1 key, go middle/right
+        let cmp1 = compare_keys(key, keys[1])
+        if3 cmp1 == -1 { return 1 }     // go middle
+        if3 cmp1 == 0 { return -2 }      // exact match on key1 (signal: -2 = found)
+        return 2                          // go right
+    }
+
+    fn insert_key_value(key, value) {
+        // Insert into non-full leaf. Returns position inserted.
+        if3 key_count == 0 {
+            keys = [key]
+            values = [value]
+            key_count = 1
+            return 0
+        }
+        let cmp = compare_keys(key, keys[0])
+        if3 cmp == -1 {
+            keys = [key] + keys
+            values = [value] + values
+            key_count = key_count + 1
+            return 0
+        }
+        if3 cmp == 0 {
+            values[0] = value    // update existing
+            return 0
+        }
+        // key > keys[0], insert at position 1
+        if3 key_count == 1 {
+            keys = keys + [key]
+            values = values + [value]
+            key_count = 2
+            return 1
+        }
+        let cmp1 = compare_keys(key, keys[1])
+        if3 cmp1 == 0 {
+            values[1] = value    // update existing
+            return 1
+        }
+        if3 cmp1 == -1 {
+            keys = [keys[0], key, keys[1]]
+            values = [values[0], value, values[1]]
+            key_count = 3        // overflow — caller must split
+            return 1
+        }
+        keys = keys + [key]
+        values = values + [value]
+        key_count = 3            // overflow — caller must split
+        return 2
+    }
+
+    fn serialize() {
+        // Serialize node to 2187-byte page
+        let buf = dict_new()
+        buf = dict_set(buf, "keys", keys)
+        buf = dict_set(buf, "values", values)
+        buf = dict_set(buf, "children", children)
+        buf = dict_set(buf, "is_leaf", is_leaf)
+        buf = dict_set(buf, "key_count", key_count)
+        buf = dict_set(buf, "page_id", page_id)
+        let raw = json_encode(buf)
+        let compressed = tzip_compress(raw)
+        // Pad or truncate to PAGE_SIZE
+        return pad_to_page(compressed)
+    }
+
+    fn deserialize(page_data) {
+        let raw = tzip_decompress(page_data)
+        let buf = json_decode(raw)
+        keys = dict_get(buf, "keys")
+        values = dict_get(buf, "values")
+        children = dict_get(buf, "children")
+        is_leaf = dict_get(buf, "is_leaf")
+        key_count = dict_get(buf, "key_count")
+        page_id = dict_get(buf, "page_id")
+    }
+}
+
+class3 TBTree {
+    fn __init__(storage) {
+        let root_page = 0
+        let store = storage       // TernaryStorage instance
+        let height = 0
+        let total_keys = 0
+    }
+
+    fn search(key) {
+        // Returns {value, trit_status}
+        // trit_status: -1=not_found, 0=found_stale, +1=found_fresh
+        let node = store.read_page(root_page)
+        while3 1 {
+            let branch = node.find_branch(key)
+            if3 branch == -1 {
+                // Found at key0
+                let freshness = check_freshness(node.values[0])
+                return dict_from("value", node.values[0], "status", freshness)
+            }
+            if3 branch == -2 {
+                // Found at key1
+                let freshness = check_freshness(node.values[1])
+                return dict_from("value", node.values[1], "status", freshness)
+            }
+            if3 node.is_leaf == 1 {
+                return dict_from("value", null, "status", -1)  // not found
+            }
+            node = store.read_page(node.children[branch])
+        }
+    }
+
+    fn insert(key, value) {
+        // Returns: -1=error, 0=exists_updated, +1=created
+        let wal_entry = wal_write("INSERT", key, value)
+
+        try3 {
+            let result = insert_recursive(root_page, key, value)
+            if3 result.split_needed {
+                // Root split: create new root with 3 children
+                let new_root = TBTreeNode()
+                new_root.keys = [result.median_key]
+                new_root.values = [result.median_value]
+                new_root.children = [result.left_page, result.right_page]
+                new_root.is_leaf = -1
+                new_root.key_count = 1
+                new_root.page_id = store.alloc_page()
+                store.write_page(new_root)
+                root_page = new_root.page_id
+                height = height + 1
+            }
+            wal_commit(wal_entry)
+            return result.created    // +1=created, 0=updated
+        } fail {
+            wal_rollback(wal_entry)
+            return -1                // error
+        }
+    }
+
+    fn insert_recursive(page_id, key, value) {
+        let node = store.read_page(page_id)
+        let result = dict_new()
+
+        if3 node.is_leaf == 1 {
+            let old_count = node.key_count
+            node.insert_key_value(key, value)
+            if3 node.key_count <= MAX_KEYS_PER_NODE {
+                store.write_page(node)
+                result = dict_set(result, "split_needed", 0)
+                result = dict_set(result, "created", if3 node.key_count > old_count { 1 } else { 0 })
+                return result
+            }
+            // Node overflow: split into 3 parts
+            return split_node(node)
+        }
+
+        // Internal node: recurse into correct child
+        let branch = node.find_branch(key)
+        if3 branch == -1 {
+            // Key exists at position 0, update
+            node.values[0] = value
+            store.write_page(node)
+            result = dict_set(result, "split_needed", 0)
+            result = dict_set(result, "created", 0)
+            return result
+        }
+        if3 branch == -2 {
+            // Key exists at position 1, update
+            node.values[1] = value
+            store.write_page(node)
+            result = dict_set(result, "split_needed", 0)
+            result = dict_set(result, "created", 0)
+            return result
+        }
+
+        let child_result = insert_recursive(node.children[branch], key, value)
+        if3 child_result.split_needed == 0 { return child_result }
+
+        // Promote median from child split
+        node.insert_key_value(child_result.median_key, child_result.median_value)
+        // Replace old child with two new children
+        let new_children = []
+        for3 i in range(len(node.children)) {
+            if3 i == branch {
+                new_children = new_children + [child_result.left_page, child_result.right_page]
+            } else {
+                new_children = new_children + [node.children[i]]
+            }
+        }
+        node.children = new_children
+
+        if3 node.key_count <= MAX_KEYS_PER_NODE {
+            store.write_page(node)
+            result = dict_set(result, "split_needed", 0)
+            result = dict_set(result, "created", child_result.created)
+            return result
+        }
+
+        return split_node(node)
+    }
+
+    fn split_node(node) {
+        // 3-way split: left gets key0, right gets key2, median promotes key1
+        let result = dict_new()
+        let left = TBTreeNode()
+        let right = TBTreeNode()
+
+        left.keys = [node.keys[0]]
+        left.values = [node.values[0]]
+        left.key_count = 1
+        left.is_leaf = node.is_leaf
+        left.page_id = node.page_id    // reuse old page
+
+        right.keys = [node.keys[2]]
+        right.values = [node.values[2]]
+        right.key_count = 1
+        right.is_leaf = node.is_leaf
+        right.page_id = store.alloc_page()
+
+        if3 node.is_leaf == -1 {
+            // Distribute 4 children: 2 to left, 2 to right
+            left.children = [node.children[0], node.children[1]]
+            right.children = [node.children[2], node.children[3]]
+        }
+
+        store.write_page(left)
+        store.write_page(right)
+
+        result = dict_set(result, "split_needed", 1)
+        result = dict_set(result, "median_key", node.keys[1])
+        result = dict_set(result, "median_value", node.values[1])
+        result = dict_set(result, "left_page", left.page_id)
+        result = dict_set(result, "right_page", right.page_id)
+        result = dict_set(result, "created", 1)
+        return result
+    }
+
+    fn delete(key) {
+        // Returns: -1=not_found, 0=tombstoned, +1=deleted
+        let wal_entry = wal_write("DELETE", key, null)
+        let result = delete_recursive(root_page, key)
+        if3 result == -1 {
+            wal_rollback(wal_entry)
+            return -1
+        }
+        wal_commit(wal_entry)
+        total_keys = total_keys - 1
+        return result
+    }
+
+    fn delete_recursive(page_id, key) {
+        let node = store.read_page(page_id)
+        let branch = node.find_branch(key)
+
+        if3 branch == -1 {
+            // Found at key0
+            if3 node.is_leaf == 1 {
+                // Leaf: remove directly
+                node.keys = node.keys[1:]
+                node.values = node.values[1:]
+                node.key_count = node.key_count - 1
+                store.write_page(node)
+                return 1    // +1 = deleted
+            }
+            // Internal: tombstone (lazy delete)
+            node.values[0] = "__TOMBSTONE__"
+            store.write_page(node)
+            return 0        // 0 = tombstoned
+        }
+        if3 branch == -2 {
+            if3 node.is_leaf == 1 {
+                node.keys = node.keys[:1]
+                node.values = node.values[:1]
+                node.key_count = node.key_count - 1
+                store.write_page(node)
+                return 1
+            }
+            node.values[1] = "__TOMBSTONE__"
+            store.write_page(node)
+            return 0
+        }
+        if3 node.is_leaf == 1 { return -1 }  // not found
+        return delete_recursive(node.children[branch], key)
+    }
+
+    fn range_query(low, high) {
+        // Range query with ternary bounds
+        // Returns list of {key, value} pairs where low <= key <= high
+        let results = []
+        range_collect(root_page, low, high, results)
+        return results
+    }
+
+    fn range_collect(page_id, low, high, results) {
+        let node = store.read_page(page_id)
+        for3 i in range(node.key_count) {
+            let cmp_low = node.compare_keys(node.keys[i], low)
+            let cmp_high = node.compare_keys(node.keys[i], high)
+            // Include if cmp_low >= 0 AND cmp_high <= 0
+            if3 node.is_leaf == -1 {
+                if3 cmp_low >= 0 {
+                    range_collect(node.children[i], low, high, results)
+                }
+            }
+            if3 cmp_low >= 0 {
+                if3 cmp_high <= 0 {
+                    if3 node.values[i] != "__TOMBSTONE__" {
+                        results = results + [dict_from("key", node.keys[i], "value", node.values[i])]
+                    }
+                }
+            }
+        }
+        // Rightmost child
+        if3 node.is_leaf == -1 {
+            if3 node.key_count > 0 {
+                let last_cmp = node.compare_keys(node.keys[node.key_count - 1], high)
+                if3 last_cmp <= 0 {
+                    range_collect(node.children[node.key_count], low, high, results)
+                }
+            }
+        }
+    }
+}
+
+
+# ============================================================
+# 2. TERNARY INDEXING — Balanced Ternary Key Encoding
+# ============================================================
+
+fn to_balanced_ternary(n) {
+    // Convert integer to balanced ternary representation
+    // Returns list of trits (MSB first): each trit in {-1, 0, +1}
+    if3 n == 0 { return [0] }
+    let trits = []
+    let val = abs(n)
+    let sign = if3 n > 0 { 1 } else { -1 }
+    while3 val > 0 {
+        let r = val % 3
+        if3 r == 2 {
+            trits = [-1] + trits
+            val = (val + 1) / 3
+        } else {
+            trits = [r] + trits
+            val = val / 3
+        }
+    }
+    // Apply sign
+    if3 sign == -1 {
+        let neg_trits = []
+        let ni = 0
+        while3 ni < len(trits) {
+            neg_trits = append(neg_trits, trits[ni] * -1)
+            ni = ni + 1
+        }
+        trits = neg_trits
+    }
+    return trits
+}
+
+fn from_balanced_ternary(trits) {
+    // Convert balanced ternary list back to integer
+    let result = 0
+    let power = 1
+    for3 i in range(len(trits) - 1, -1, -1) {
+        result = result + trits[i] * power
+        power = power * 3
+    }
+    return result
+}
+
+fn ternary_key_encode(key_str) {
+    // Encode a string key as balanced ternary
+    // Each character -> 7 trits (3^7 = 2187 > 128 ASCII)
+    let trits = []
+    for3 ch in key_str {
+        let char_trits = to_balanced_ternary(ord(ch))
+        while3 len(char_trits) < 7 { char_trits = [0] + char_trits }
+        trits = trits + char_trits
+    }
+    return trits
+}
+
+fn ternary_compare(a_trits, b_trits) {
+    // 3-way comparison: returns {-1, 0, +1} naturally
+    let max_len = max(len(a_trits), len(b_trits))
+    for3 i in range(max_len) {
+        let a_val = if3 i < len(a_trits) { a_trits[i] } else { 0 }
+        let b_val = if3 i < len(b_trits) { b_trits[i] } else { 0 }
+        if3 a_val > b_val { return 1 }
+        if3 a_val < b_val { return -1 }
+    }
+    return 0
+}
+
+
+# ============================================================
+# 3. TERNARY HASH TABLE
+# ============================================================
+// Hash function outputs ternary digits
+// 3-way collision resolution via open addressing with 3 probe sequences
+// Load factor optimized for base-3
+
+class3 TernaryHashTable {
+    fn __init__(capacity) {
+        // Capacity should be a power of 3 (3^n)
+        let cap = next_power_of_3(capacity)
+        let table = list_new(cap, null)     // array of entries
+        let states = list_new(cap, 0)       // 0=empty, +1=occupied, -1=deleted
+        let count = 0
+        let max_load = int(cap * LOAD_FACTOR_MAX)
+    }
+
+    fn ternary_hash(key) {
+        // Hash function producing HASH_TRIT_WIDTH ternary digits
+        // Uses FNV-like algorithm in base 3
+        let hash_val = 2187        // 3^7 initial offset
+        let prime = 59049          // 3^10 FNV prime equivalent
+        for3 ch in str(key) {
+            hash_val = hash_val * prime
+            hash_val = ternary_xor(hash_val, ord(ch))
+            hash_val = hash_val % (3 ** HASH_TRIT_WIDTH)
+        }
+        return hash_val % cap
+    }
+
+    fn ternary_xor(a, b) {
+        // Ternary XOR: trit-wise (a + b) mod 3, balanced
+        let a_trits = to_balanced_ternary(a)
+        let b_trits = to_balanced_ternary(b)
+        let max_len = max(len(a_trits), len(b_trits))
+        let result = []
+        for3 i in range(max_len) {
+            let av = if3 i < len(a_trits) { a_trits[i] } else { 0 }
+            let bv = if3 i < len(b_trits) { b_trits[i] } else { 0 }
+            let s = av + bv
+            if3 s > 1 { s = s - 3 }
+            if3 s < -1 { s = s + 3 }
+            result = result + [s]
+        }
+        return from_balanced_ternary(result)
+    }
+
+    fn probe_sequence(hash_idx, attempt) {
+        // 3-way probe: cycles through 3 different probe strategies
+        let strategy = attempt % 3
+        match3 strategy {
+            0 { return (hash_idx + attempt) % cap }                              // linear
+            1 { return (hash_idx + attempt * attempt) % cap }                    // quadratic
+            2 { return (hash_idx + attempt * 2187 + attempt * attempt) % cap }   // double-hash
+        }
+    }
+
+    fn put(key, value) {
+        // Returns: -1=error (table full), 0=exists_updated, +1=created
+        if3 count >= max_load {
+            let resize_result = resize()
+            if3 resize_result == -1 { return -1 }
+        }
+
+        let h = ternary_hash(key)
+        for3 attempt in range(cap) {
+            let idx = probe_sequence(h, attempt)
+            if3 states[idx] == 0 {
+                // Empty slot: insert
+                table[idx] = dict_from("key", key, "value", value, "ts", time_now())
+                states[idx] = 1
+                count = count + 1
+                return 1    // created
+            }
+            if3 states[idx] == 1 {
+                if3 table[idx].key == key {
+                    // Existing key: update
+                    table[idx].value = value
+                    table[idx].ts = time_now()
+                    return 0    // updated
+                }
+            }
+            if3 states[idx] == -1 {
+                // Deleted slot: can reuse
+                table[idx] = dict_from("key", key, "value", value, "ts", time_now())
+                states[idx] = 1
+                count = count + 1
+                return 1    // created
+            }
+        }
+        return -1   // should not reach if load factor is correct
+    }
+
+    fn get(key) {
+        // Returns: {value, status} where status: -1=not_found, 0=stale, +1=fresh
+        let h = ternary_hash(key)
+        for3 attempt in range(cap) {
+            let idx = probe_sequence(h, attempt)
+            if3 states[idx] == 0 { return dict_from("value", null, "status", -1) }
+            if3 states[idx] == 1 {
+                if3 table[idx].key == key {
+                    let freshness = check_freshness(table[idx])
+                    return dict_from("value", table[idx].value, "status", freshness)
+                }
+            }
+            // states[idx] == -1: deleted, keep probing
+        }
+        return dict_from("value", null, "status", -1)
+    }
+
+    fn remove(key) {
+        // Returns: -1=not_found, 0=tombstoned, +1=deleted
+        let h = ternary_hash(key)
+        for3 attempt in range(cap) {
+            let idx = probe_sequence(h, attempt)
+            if3 states[idx] == 0 { return -1 }
+            if3 states[idx] == 1 {
+                if3 table[idx].key == key {
+                    states[idx] = -1    // mark deleted (tombstone)
+                    count = count - 1
+                    return 1
+                }
+            }
+        }
+        return -1
+    }
+
+    fn resize() {
+        // Grow to next power of 3
+        let old_table = table
+        let old_states = states
+        let old_cap = cap
+        cap = cap * 3
+        table = list_new(cap, null)
+        states = list_new(cap, 0)
+        count = 0
+        max_load = int(cap * LOAD_FACTOR_MAX)
+        for3 i in range(old_cap) {
+            if3 old_states[i] == 1 {
+                put(old_table[i].key, old_table[i].value)
+            }
+        }
+        return 1
+    }
+}
+
+fn next_power_of_3(n) {
+    let p = 1
+    while3 p < n { p = p * 3 }
+    return p
+}
+
+
+# ============================================================
+# 4. STORAGE FORMAT — TZip + Ternary Pages + WAL
+# ============================================================
+
+class3 TernaryStorage {
+    fn __init__(db_path) {
+        let path = db_path
+        let page_file = db_path + ".tpages"    // main data pages
+        let wal_file = db_path + ".twal"        // write-ahead log
+        let meta_file = db_path + ".tmeta"      // metadata
+        let next_page_id = 0
+        let page_cache = dict_new()             // in-memory page cache
+        let cache_limit = 243                    // 3^5 pages cached
+    }
+
+    fn init_db() {
+        // Create or open the database files
+        if3 file_exists(page_file) == 0 {
+            file_create(page_file)
+            file_create(wal_file)
+            // Write metadata header
+            let meta = dict_new()
+            meta = dict_set(meta, "version", "1.0.0-ternary")
+            meta = dict_set(meta, "page_size", PAGE_SIZE)
+            meta = dict_set(meta, "created", time_now())
+            meta = dict_set(meta, "harmonic", "3-5-7-13")
+            file_write(meta_file, json_encode(meta))
+
+            // Allocate root page (page 0)
+            let root = TBTreeNode()
+            root.page_id = 0
+            root.is_leaf = 1
+            next_page_id = 1
+            write_page(root)
+        } else {
+            let meta = json_decode(read_file(meta_file))
+            next_page_id = dict_get(meta, "next_page_id")
+        }
+    }
+
+    fn alloc_page() {
+        let pid = next_page_id
+        next_page_id = next_page_id + 1
+        update_meta()
+        return pid
+    }
+
+    fn write_page(node) {
+        // Serialize node -> TZip compressed -> write at page offset
+        let raw = node.serialize()
+        let offset = node.page_id * PAGE_SIZE
+        file_write_at(page_file, offset, raw)
+        // Update cache
+        page_cache = dict_set(page_cache, str(node.page_id), node)
+        evict_cache()
+    }
+
+    fn read_page(page_id) {
+        // Check cache first
+        let cached = dict_get(page_cache, str(page_id))
+        if3 cached != null { return cached }
+        // Read from disk
+        let offset = page_id * PAGE_SIZE
+        let raw = file_read_at(page_file, offset, PAGE_SIZE)
+        let node = TBTreeNode()
+        node.deserialize(raw)
+        page_cache = dict_set(page_cache, str(page_id), node)
+        evict_cache()
+        return node
+    }
+
+    fn evict_cache() {
+        // LRU eviction when cache exceeds 3^5 = 243 entries
+        if3 len(keys(page_cache)) > cache_limit {
+            // Remove oldest entry (simplified: remove first key)
+            let first_key = keys(page_cache)[0]
+            page_cache = dict_del(page_cache, first_key)
+        }
+    }
+
+    fn update_meta() {
+        let meta = json_decode(read_file(meta_file))
+        meta = dict_set(meta, "next_page_id", next_page_id)
+        meta = dict_set(meta, "updated", time_now())
+        file_write(meta_file, json_encode(meta))
+    }
+}
+
+fn pad_to_page(data) {
+    // Pad data to exactly PAGE_SIZE bytes with zero-trits
+    let padded = data
+    while3 len(padded) < PAGE_SIZE {
+        padded = padded + "\x00"
+    }
+    return padded[:PAGE_SIZE]
+}
+
+fn tzip_compress(data) {
+    // TZip: pack 5 trits per byte (3^5 = 243 states per byte)
+    let trits = string_to_trits(data)
+    let packed = []
+    let i = 0
+    while3 i < len(trits) {
+        let chunk = trits[i:i+5]
+        while3 len(chunk) < 5 { chunk = chunk + [0] }
+        let byte_val = 0
+        for3 j in range(5) {
+            byte_val = byte_val + (chunk[j] + 1) * (3 ** j)
+        }
+        packed = packed + [byte_val]
+        i = i + 5
+    }
+    return bytes(packed)
+}
+
+fn tzip_decompress(packed_data) {
+    // Reverse TZip: unpack bytes to trits, then to string
+    let trits = []
+    for3 b in packed_data {
+        let val = int(b)
+        for3 _ in range(5) {
+            let trit = (val % 3) - 1
+            trits = trits + [trit]
+            val = val / 3
+        }
+    }
+    return trits_to_string(trits)
+}
+
+
+# ============================================================
+# 5. TERNARY WAL (Write-Ahead Log)
+# ============================================================
+
+class3 TernaryWAL {
+    fn __init__(wal_path) {
+        let path = wal_path
+        let sequence = 0
+        let pending = []      // uncommitted entries
+    }
+
+    fn write_entry(op, key, value) {
+        // WAL entry format: [seq:13][op:1][key_len:7][key][value_len:7][value][checksum:13]
+        let entry = dict_new()
+        entry = dict_set(entry, "seq", sequence)
+        entry = dict_set(entry, "op", op)          // "INSERT", "DELETE", "UPDATE"
+        entry = dict_set(entry, "key", key)
+        entry = dict_set(entry, "value", value)
+        entry = dict_set(entry, "ts", time_now())
+        entry = dict_set(entry, "state", 0)        // 0=pending, +1=committed, -1=rolled_back
+
+        let serialized = json_encode(entry)
+        let checksum = ternary_checksum(serialized)
+        entry = dict_set(entry, "checksum", checksum)
+
+        // Write to WAL file (append)
+        file_append(path, json_encode(entry) + "\n")
+        pending = pending + [entry]
+        sequence = sequence + 1
+        return entry
+    }
+
+    fn commit(entry) {
+        entry = dict_set(entry, "state", 1)    // +1 = committed
+        // Rewrite entry in WAL with committed state
+        update_wal_entry(entry)
+        // filter stub replaced with for3 loop
+        let new_pending = []
+        let fi = 0
+        while3 fi < len(pending) {
+            if3 pending[fi].seq != entry.seq { new_pending = append(new_pending, pending[fi]) }
+            fi = fi + 1
+        }
+        pending = new_pending
+    }
+
+    fn rollback(entry) {
+        entry = dict_set(entry, "state", -1)   // -1 = rolled back
+        update_wal_entry(entry)
+        // filter stub replaced with for3 loop
+        let new_pending = []
+        let fi = 0
+        while3 fi < len(pending) {
+            if3 pending[fi].seq != entry.seq { new_pending = append(new_pending, pending[fi]) }
+            fi = fi + 1
+        }
+        pending = new_pending
+    }
+
+    fn recover() {
+        // On startup: replay committed entries, discard rolled back
+        let lines = file_read_lines(path)
+        let replay = []
+        for3 line in lines {
+            let entry = json_decode(line)
+            let check = ternary_checksum(json_encode(dict_without(entry, "checksum")))
+            if3 check != entry.checksum {
+                // Corrupted entry — skip
+                continue3
+            }
+            if3 entry.state == 1 {
+                replay = replay + [entry]
+            }
+            // state == 0 (pending) at crash = rollback
+            // state == -1 (rolled back) = skip
+        }
+        return replay
+    }
+
+    fn checkpoint() {
+        // Flush WAL: all committed entries have been applied to pages
+        // Truncate WAL file
+        file_write(path, "")
+        sequence = 0
+        pending = []
+    }
+
+    fn update_wal_entry(entry) {
+        // In production: seek and overwrite state byte
+        // Simplified: rewrite entire WAL (for prototype)
+        let lines = file_read_lines(path)
+        let new_lines = []
+        for3 line in lines {
+            let e = json_decode(line)
+            if3 e.seq == entry.seq {
+                new_lines = new_lines + [json_encode(entry)]
+            } else {
+                new_lines = new_lines + [line]
+            }
+        }
+        file_write(path, join(new_lines, "\n") + "\n")
+    }
+}
+
+fn ternary_checksum(data) {
+    // 13-trit checksum (3^13 = 1594323 distinct values)
+    let sum = 0
+    let str_data = str(data)
+    let i = 0
+    while3 i < len(str_data) {
+        let ch = slice(str_data, i, i + 1)
+        sum = sum + ord(ch) * (3 ** (i % 13))
+        sum = sum % (3 ** 13)
+        i = i + 1
+    }
+    return sum
+}
+
+
+# ============================================================
+# 6. REPLICATION — 3-Way Ternary Consensus
+# ============================================================
+// Ternary replica states: {-1=stale, 0=syncing, +1=current}
+// Consensus: majority of 3 replicas (2 out of 3 must agree)
+
+class3 TernaryReplicaSet {
+    fn __init__(nodes) {
+        // nodes = list of 3 replica endpoints
+        let replicas = nodes[:3]    // exactly 3 replicas
+        let states = [0, 0, 0]     // all start as syncing
+        let primary = 0            // index of primary replica
+    }
+
+    fn write(key, value) {
+        // Write to primary, replicate to secondaries
+        // Returns: -1=failed, 0=partial, +1=full_consensus
+        let results = []
+        for3 i in range(3) {
+            try3 {
+                let r = replicas[i].put(key, value)
+                results = results + [r]
+                states[i] = 1     // +1 = current
+            } fail {
+                results = results + [-1]
+                states[i] = -1    // -1 = stale
+            }
+        }
+        return consensus(results)
+    }
+
+    fn read(key) {
+        // Read from majority (quorum read)
+        // Returns value agreed upon by >= 2 replicas
+        let responses = []
+        for3 i in range(3) {
+            if3 states[i] != -1 {
+                try3 {
+                    let r = replicas[i].get(key)
+                    responses = responses + [dict_from("idx", i, "result", r)]
+                } fail {
+                    states[i] = -1
+                }
+            }
+        }
+
+        if3 len(responses) < 2 {
+            return dict_from("value", null, "status", -1)  // no quorum
+        }
+
+        // Find majority value
+        let best = responses[0].result
+        let agreement = 1
+        for3 j in range(1, len(responses)) {
+            if3 responses[j].result.value == best.value {
+                agreement = agreement + 1
+            }
+        }
+        if3 agreement >= 2 {
+            return best    // quorum achieved
+        }
+        // Conflict: return newest by timestamp
+        return responses[0].result
+    }
+
+    fn consensus(results) {
+        // Ternary consensus: count +1 votes
+        let pos = 0
+        let neg = 0
+        for3 r in results {
+            if3 r >= 0 { pos = pos + 1 }
+            if3 r == -1 { neg = neg + 1 }
+        }
+        if3 pos >= 2 { return 1 }     // majority success
+        if3 neg >= 2 { return -1 }    // majority failure
+        return 0                       // split — needs resolution
+    }
+
+    fn sync_replica(idx) {
+        // Bring stale replica back to current
+        states[idx] = 0    // syncing
+        let primary_data = replicas[primary].dump_all()
+        try3 {
+            replicas[idx].restore(primary_data)
+            states[idx] = 1    // current
+            return 1
+        } fail {
+            states[idx] = -1   // still stale
+            return -1
+        }
+    }
+
+    fn elect_primary() {
+        // Elect new primary: prefer replica with state=+1
+        for3 i in range(3) {
+            if3 states[i] == 1 {
+                primary = i
+                return i
+            }
+        }
+        // All degraded: pick first syncing
+        for3 i in range(3) {
+            if3 states[i] == 0 {
+                primary = i
+                return i
+            }
+        }
+        return -1    // all stale — critical failure
+    }
+}
+
+
+# ============================================================
+# 7. QUERY ENGINE — Range, Pattern, Aggregate
+# ============================================================
+
+class3 TernaryQueryEngine {
+    fn __init__(btree) {
+        let tree = btree
+    }
+
+    fn range(low, high) {
+        // Range query with ternary bounds
+        // Leverages B-tree's ordered structure
+        return tree.range_query(low, high)
+    }
+
+    fn pattern_match(pattern) {
+        // Ternary pattern matching on keys
+        // Pattern trits: +1=must_match, 0=wildcard, -1=must_not_match
+        let results = []
+        scan_pattern(tree.root_page, pattern, results)
+        return results
+    }
+
+    fn scan_pattern(page_id, pattern, results) {
+        let node = tree.store.read_page(page_id)
+        for3 i in range(node.key_count) {
+            if3 ternary_pattern_test(node.keys[i], pattern) == 1 {
+                if3 node.values[i] != "__TOMBSTONE__" {
+                    results = results + [dict_from("key", node.keys[i], "value", node.values[i])]
+                }
+            }
+            if3 node.is_leaf == -1 {
+                scan_pattern(node.children[i], pattern, results)
+            }
+        }
+        if3 node.is_leaf == -1 {
+            if3 node.key_count > 0 {
+                scan_pattern(node.children[node.key_count], pattern, results)
+            }
+        }
+    }
+
+    fn ternary_pattern_test(key, pattern) {
+        // Test if key matches ternary pattern
+        // Pattern format: string where each char is '+' (must match), '.' (any), '-' (must differ)
+        let key_str = str(key)
+        if3 len(key_str) < len(pattern) { return -1 }
+        for3 i in range(len(pattern)) {
+            match3 pattern[i] {
+                "+" {
+                    // Must have a non-zero trit at this position
+                    if3 key_str[i] == "0" { return -1 }
+                }
+                "-" {
+                    // Must have zero/negative trit
+                    if3 key_str[i] != "0" { return -1 }
+                }
+                "." {
+                    // Wildcard: accept anything
+                }
+            }
+        }
+        return 1
+    }
+
+    fn aggregate(op, keys_list) {
+        // Ternary reduction over values
+        // op: "sum3" | "min3" | "max3" | "count3" | "consensus3"
+        let values = []
+        for3 key in keys_list {
+            let result = tree.search(key)
+            if3 result.status >= 0 {
+                values = values + [result.value]
+            }
+        }
+
+        match3 op {
+            "sum3" {
+                let total = 0
+                for3 v in values { total = total + int(v) }
+                return total
+            }
+            "min3" {
+                let m = values[0]
+                for3 v in values { if3 int(v) < int(m) { m = v } }
+                return m
+            }
+            "max3" {
+                let m = values[0]
+                for3 v in values { if3 int(v) > int(m) { m = v } }
+                return m
+            }
+            "count3" {
+                return len(values)
+            }
+            "consensus3" {
+                // Ternary consensus: return the value held by majority
+                let freq = dict_new()
+                for3 v in values {
+                    let k = str(v)
+                    let c = dict_get(freq, k)
+                    if3 c == null { c = 0 }
+                    freq = dict_set(freq, k, c + 1)
+                }
+                let best_val = null
+                let best_count = 0
+                for3 k in keys(freq) {
+                    if3 dict_get(freq, k) > best_count {
+                        best_count = dict_get(freq, k)
+                        best_val = k
+                    }
+                }
+                return best_val
+            }
+        }
+    }
+}
+
+
+# ============================================================
+# 8. PUBLIC API — The TKVDB Interface
+# ============================================================
+
+class3 TKVDB {
+    fn __init__(db_path) {
+        let storage = TernaryStorage(db_path)
+        let wal = TernaryWAL(db_path + ".twal")
+        let btree = TBTree(storage)
+        let hash_index = TernaryHashTable(2187)    // 3^7 initial capacity
+        let query = TernaryQueryEngine(btree)
+        let replicas = null    // optional replication
+    }
+
+    fn open() {
+        storage.init_db()
+        // Replay WAL if crash recovery needed
+        let replay = wal.recover()
+        for3 entry in replay {
+            match3 entry.op {
+                "INSERT" { btree.insert(entry.key, entry.value) }
+                "DELETE" { btree.delete(entry.key) }
+            }
+        }
+        wal.checkpoint()
+        return 1
+    }
+
+    fn close() {
+        wal.checkpoint()
+        storage.update_meta()
+        return 1
+    }
+
+    // ---- Core API: PUT / GET / DELETE ----
+    // All return ternary states {-1, 0, +1}
+
+    fn PUT(key, value) {
+        // Returns: -1=error, 0=exists_updated, +1=created
+        let result = btree.insert(key, value)
+        if3 result >= 0 {
+            hash_index.put(key, value)    // update hash index
+        }
+        if3 replicas != null {
+            replicas.write(key, value)
+        }
+        return result
+    }
+
+    fn GET(key) {
+        // Returns: {value, status} where status: -1=not_found, 0=found_stale, +1=found_fresh
+        // Try hash index first (O(1)), fall back to B-tree (O(log3 n))
+        let hash_result = hash_index.get(key)
+        if3 hash_result.status >= 0 { return hash_result }
+        // Hash miss: search B-tree
+        let tree_result = btree.search(key)
+        if3 tree_result.status >= 0 {
+            // Populate hash index for next time
+            hash_index.put(key, tree_result.value)
+        }
+        return tree_result
+    }
+
+    fn DELETE(key) {
+        // Returns: -1=not_found, 0=tombstoned, +1=deleted
+        let result = btree.delete(key)
+        if3 result >= 0 {
+            hash_index.remove(key)
+        }
+        if3 replicas != null {
+            replicas.write(key, "__TOMBSTONE__")
+        }
+        return result
+    }
+
+    // ---- Extended API ----
+
+    fn RANGE(low, high) {
+        return query.range(low, high)
+    }
+
+    fn PATTERN(pattern) {
+        return query.pattern_match(pattern)
+    }
+
+    fn AGGREGATE(op, keys) {
+        return query.aggregate(op, keys)
+    }
+
+    fn REPLICATE(nodes) {
+        replicas = TernaryReplicaSet(nodes)
+        return 1
+    }
+
+    fn STATS() {
+        return dict_from(
+            "total_keys", btree.total_keys,
+            "tree_height", btree.height,
+            "hash_load", hash_index.count / hash_index.cap,
+            "page_count", storage.next_page_id,
+            "wal_pending", len(wal.pending),
+            "replica_states", if3 replicas != null { replicas.states } else { [0,0,0] }
+        )
+    }
+}
+
+
+# ============================================================
+# 9. FRESHNESS CHECK
+# ============================================================
+
+fn check_freshness(entry) {
+    // Determine if a value is fresh (+1) or stale (0)
+    // Based on timestamp age relative to TOMBSTONE_TTL
+    if3 type_of(entry) == "dict" {
+        let ts = dict_get(entry, "ts")
+        if3 ts != null {
+            let age = time_now() - ts
+            if3 age > TOMBSTONE_TTL { return 0 }   // stale
+            return 1                                 // fresh
+        }
+    }
+    if3 entry == "__TOMBSTONE__" { return -1 }
+    return 1    // no timestamp = assume fresh
+}
+
+
+# ============================================================
+# 10. HTTP SERVICE WRAPPER (for NovaX orchestrator)
+# ============================================================
+
+fn serve_tkvdb(port) {
+    let db = TKVDB("C:/NovaX/data/tkvdb")
+    db.open()
+
+    http_serve(port, fn(req) {
+        let method = req.method
+        let path = req.path
+
+        if3 path == "/health" {
+            return http_response(200, dict_from("status", "ok", "engine", "TKVDB", "version", "1.0.0-ternary"))
+        }
+
+        if3 path == "/api/put" {
+            let key = req.body.key
+            let value = req.body.value
+            let result = db.PUT(key, value)
+            return http_response(200, dict_from("result", result, "meaning",
+                match3 result { -1 { "error" } 0 { "exists_updated" } 1 { "created" } }
+            ))
+        }
+
+        if3 path == "/api/get" {
+            let key = req.params.key
+            let result = db.GET(key)
+            return http_response(200, dict_from(
+                "value", result.value,
+                "status", result.status,
+                "meaning", match3 result.status { -1 { "not_found" } 0 { "found_stale" } 1 { "found_fresh" } }
+            ))
+        }
+
+        if3 path == "/api/delete" {
+            let key = req.body.key
+            let result = db.DELETE(key)
+            return http_response(200, dict_from("result", result, "meaning",
+                match3 result { -1 { "not_found" } 0 { "tombstoned" } 1 { "deleted" } }
+            ))
+        }
+
+        if3 path == "/api/range" {
+            let low = req.params.low
+            let high = req.params.high
+            return http_response(200, dict_from("results", db.RANGE(low, high)))
+        }
+
+        if3 path == "/api/pattern" {
+            let pat = req.params.pattern
+            return http_response(200, dict_from("results", db.PATTERN(pat)))
+        }
+
+        if3 path == "/api/aggregate" {
+            let op = req.body.op
+            let keys = req.body.keys
+            return http_response(200, dict_from("result", db.AGGREGATE(op, keys)))
+        }
+
+        if3 path == "/api/stats" {
+            return http_response(200, db.STATS())
+        }
+
+        return http_response(404, dict_from("error", "unknown endpoint"))
+    })
+}
+
+// Boot point
+// serve_tkvdb(9912)
+
+
+# ============================================================
+# SCHEMA SUMMARY
+# ============================================================
+//
+// DISK LAYOUT:
+//   .tpages — B-tree pages, each 2187 bytes, TZip compressed
+//   .twal   — Write-ahead log, JSON lines with 13-trit checksums
+//   .tmeta  — Metadata (version, page count, timestamps)
+//
+// PAGE FORMAT (2187 bytes):
+//   [header: 13 bytes]
+//     magic: "TKV" (3 bytes)
+//     version: 1 byte
+//     page_id: 4 bytes (balanced ternary encoded)
+//     key_count: 1 byte
+//     is_leaf: 1 byte (-1/0/+1)
+//     reserved: 3 bytes
+//   [key0: variable, TZip packed]
+//   [val0: variable, TZip packed]
+//   [key1: variable, TZip packed]  (if key_count == 2)
+//   [val1: variable, TZip packed]  (if key_count == 2)
+//   [child0: 13 bytes]  (if internal)
+//   [child1: 13 bytes]  (if internal)
+//   [child2: 13 bytes]  (if internal)
+//   [padding: zero-trits to 2187]
+//
+// WAL ENTRY FORMAT:
+//   {"seq": N, "op": "INSERT"|"DELETE", "key": K, "value": V,
+//    "ts": T, "state": -1|0|+1, "checksum": C}
+//   state: -1=rolled_back, 0=pending, +1=committed
+//   checksum: 13-trit ternary checksum (3^13 space)
+//
+// INDEX STRUCTURES:
+//   Primary: Ternary B-tree (2 keys, 3 children per node)
+//     Height: ceil(log3(n)) — 37% shorter than binary
+//     Fan-out: 3 (natural ternary branching)
+//     Comparison: balanced ternary {-1, 0, +1}
+//   Secondary: Ternary hash table
+//     Hash: FNV-variant producing 39-trit digests
+//     Probing: 3-way (linear, quadratic, double-hash)
+//     Load factor: 0.729 (optimized for base-3)
+//     Capacity: always a power of 3
+//
+// REPLICATION:
+//   3 replicas (natural ternary)
+//   States: {-1=stale, 0=syncing, +1=current}
+//   Consensus: majority of 3 (quorum = 2)
+//   Primary election: prefer state=+1, fallback state=0
+//
+// API RETURNS (all ternary):
+//   PUT:    -1=error,      0=exists_updated,  +1=created
+//   GET:    -1=not_found,  0=found_stale,     +1=found_fresh
+//   DELETE: -1=not_found,  0=tombstoned,      +1=deleted
+//
+// HARMONIC ALIGNMENT:
+//   3  — ternary base, tree fan-out, replica count
+//   5  — TZip packing (5 trits/byte, 3^5=243)
+//   7  — page size (3^7=2187), key encoding (7 trits/char)
+//   13 — checksum width (3^13), header size, child pointers
+//

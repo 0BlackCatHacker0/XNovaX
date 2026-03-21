@@ -1,0 +1,1249 @@
+// nova_treplay_service.nova -- NovaX TReplay v1.0 - Request Recording and Replay Micro-Tool
+// Port 9970: Time-travel debugging for NovaX.
+//
+// Records API request/response sequences, replays them against live services,
+// and compares results for regression detection.
+//
+// Workflow:
+//   1. Start a recording session  (POST /treplay/start)
+//   2. Record requests as they happen (POST /treplay/record)
+//   3. Stop recording (POST /treplay/stop)
+//   4. Replay the session against live services (POST /treplay/replay)
+//   5. Compare original vs replay to find regressions (POST /treplay/compare)
+//
+// Endpoints:
+//   GET  /health              -- standard NovaX health check
+//   GET  /treplay/health      -- same as /health
+//   GET  /treplay/stats       -- service statistics
+//   GET  /treplay/sessions    -- list all sessions
+//   GET  /treplay/session/:id -- detail for one session
+//   POST /treplay/start       -- begin recording session
+//   POST /treplay/stop        -- stop recording session
+//   POST /treplay/record      -- record one request/response pair
+//   POST /treplay/replay      -- replay all requests in a session
+//   POST /treplay/compare     -- compare original vs replay session
+//
+// 3-5-7-13 Harmonic Design:
+//   MAX_SESSIONS = H13 * H3 = 39  (bounded session pool)
+//   MAX_REQUESTS_PER_SESSION = 1000
+//   REPLAY_TIMEOUT = H7 = 7 seconds
+//   BLOCK = 3^7 = 2187
+//   MAX_BODY = BLOCK * H5 = 10935 bytes
+//
+// Replay trit result:
+//   TRUE  (+1) = all requests match status + trit
+//   MAYBE  (0) = partial match (some differ)
+//   FALSE (-1) = major divergence (most fail)
+//
+// Persistence: C:\NovaX\data\replays\ (one JSON file per session)
+//
+// N-S Reynolds boundaries:
+//   Re < 27  = laminar (quiet)
+//   Re < 125 = transitional
+//   Re < 343 = turbulent
+//   Re >= 343 = chaotic
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT   = 9937
+let server = tserve(PORT, "TReplay v1.0 - Request Recording and Replay Micro-Tool")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3    = 3
+let H5    = 5
+let H7    = 7
+let H13   = 13
+let BLOCK = 2187
+
+// -- Ternary Values --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds Boundaries --
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+// -- Service Identity --
+let VERSION      = "1.0"
+let SERVICE_NAME = "nova-treplay"
+
+// -- Operational Constants --
+let MAX_SESSIONS             = 39     // H13 * H3 = 39
+let MAX_REQUESTS_PER_SESSION = 1000
+let REPLAY_TIMEOUT           = 7      // H7 seconds per request during replay
+let LATENCY_TOLERANCE        = 2      // replay latency must be within 2x original
+let MAX_BODY                 = 10935  // BLOCK * H5 bytes
+let PERSIST_DIR              = "C:\\NovaX\\data\\replays"
+
+// -- Session State (in-memory) --
+// sessions_list: list of session dicts
+// Each session dict keys:
+//   session_id, name, start_ts, end_ts, active (0/1),
+//   request_count, requests (list of request dicts)
+let sessions_list    = []
+let active_session   = ""   // session_id of currently recording session ("" = none)
+let replay_counter   = 0
+
+// -- Service Stats --
+let stat_t0        = time()
+let stat_ops       = 0
+let stat_ok        = 0
+let stat_fail      = 0
+let stat_op_times  = []
+
+// ============================================================================
+// HELPER: tchar -- trit to display character
+// ============================================================================
+
+fn tchar(t) {
+    if3 t > 0 {
+        return "+"
+    }
+    if3 t < 0 {
+        return "T"
+    }
+    return "0"
+}
+
+
+// ============================================================================
+// HELPER: calc_reynolds -- ops in last 60 seconds
+// ============================================================================
+
+fn calc_reynolds() {
+    let now    = time()
+    let cutoff = now - 60
+    let count  = 0
+    let total  = len(stat_op_times)
+    let i      = 0
+    while3 i < total {
+        let ts = stat_op_times[i]
+        if3 ts > cutoff {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+
+// ============================================================================
+// HELPER: flow_regime -- Reynolds number to regime string
+// ============================================================================
+
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+
+// ============================================================================
+// HELPER: trim_op_times -- keep last 3600 entries
+// ============================================================================
+
+fn trim_op_times() {
+    let sz = len(stat_op_times)
+    if3 sz > 3600 {
+        stat_op_times = slice(stat_op_times, sz - 3600, sz)
+    }
+}
+
+
+// ============================================================================
+// HELPER: record_op -- log one operation
+// ============================================================================
+
+fn record_op(t) {
+    stat_ops = stat_ops + 1
+    if3 t > 0 {
+        stat_ok = stat_ok + 1
+    }
+    if3 t < 0 {
+        stat_fail = stat_fail + 1
+    }
+    stat_op_times = append(stat_op_times, time())
+    trim_op_times()
+}
+
+
+// ============================================================================
+// HELPER: new_session_id -- generate 13-char hex ID
+// ============================================================================
+
+fn new_session_id() {
+    let u = uuid_hex()
+    return slice(u, 0, H13)
+}
+
+
+// ============================================================================
+// HELPER: find_session_index -- return index of session by id, or -1
+// ============================================================================
+
+fn find_session_index(sid) {
+    let total = len(sessions_list)
+    let i     = 0
+    while3 i < total {
+        let s  = sessions_list[i]
+        let id = dict_get(s, "session_id") ?? ""
+        if3 id == sid {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+
+// ============================================================================
+// HELPER: get_session -- return session dict by id, or {} if missing
+// ============================================================================
+
+fn get_session(sid) {
+    let idx = find_session_index(sid)
+    if3 idx < 0 {
+        return {}
+    }
+    return sessions_list[idx]
+}
+
+
+// ============================================================================
+// HELPER: evict_oldest -- remove oldest inactive session when at capacity
+// ============================================================================
+
+fn evict_oldest() {
+    let total = len(sessions_list)
+    if3 total < MAX_SESSIONS {
+        return T_MAYBE
+    }
+    // Find oldest inactive by start_ts string comparison (ISO strings sort correctly)
+    let oldest_idx  = -1
+    let oldest_ts   = ""
+    let i           = 0
+    while3 i < total {
+        let s      = sessions_list[i]
+        let active = dict_get(s, "active") ?? 0
+        let ts     = dict_get(s, "start_ts") ?? ""
+        if3 active == 0 {
+            if3 oldest_idx < 0 {
+                let oldest_idx = i
+                let oldest_ts  = ts
+            }
+            if3 ts < oldest_ts {
+                let oldest_idx = i
+                let oldest_ts  = ts
+            }
+        }
+        i = i + 1
+    }
+    if3 oldest_idx >= 0 {
+        // Remove from list by rebuilding without that index
+        let new_list = []
+        let j        = 0
+        while3 j < total {
+            if3 j != oldest_idx {
+                let entry = sessions_list[j]
+                new_list = append(new_list, entry)
+            }
+            j = j + 1
+        }
+        let sessions_list = new_list
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+
+// ============================================================================
+// HELPER: session_persist_path -- file path for a session JSON
+// ============================================================================
+
+fn session_persist_path(sid) {
+    return PERSIST_DIR + "\\" + sid + ".json"
+}
+
+
+// ============================================================================
+// HELPER: persist_session -- write session to disk via nova_write
+// ============================================================================
+
+fn persist_session(sid) {
+    let idx = find_session_index(sid)
+    if3 idx < 0 {
+        return T_FALSE
+    }
+    let s         = sessions_list[idx]
+    let path      = session_persist_path(sid)
+    let data_str  = json_encode(s)
+    try3 {
+        nova_write(path, data_str)
+    } fail {
+        // Disk errors must not crash the service
+    }
+    return T_TRUE
+}
+
+
+// ============================================================================
+// HELPER: load_persisted_sessions -- restore sessions from disk at startup
+// ============================================================================
+
+fn load_persisted_sessions() {
+    // We attempt to load up to MAX_SESSIONS files from PERSIST_DIR.
+    // Session IDs are 13 hex chars. We probe known IDs via an index file.
+    // Primary index file: PERSIST_DIR\__index.json
+    let index_path = PERSIST_DIR + "\\__index.json"
+    try3 {
+        let raw  = nova_read(index_path)
+        let idx  = json_decode(raw)
+        let ids  = dict_get(idx, "ids") ?? []
+        let n    = len(ids)
+        let i    = 0
+        let loaded = 0
+        while3 i < n {
+            let sid  = ids[i]
+            let path = session_persist_path(sid)
+            try3 {
+                let sraw = nova_read(path)
+                let s    = json_decode(sraw)
+                // Mark as inactive on restore -- never resume recording
+                let _r1  = dict_set(s, "active", 0)
+                let cur  = len(sessions_list)
+                if3 cur < MAX_SESSIONS {
+                    sessions_list = append(sessions_list, s)
+                    loaded = loaded + 1
+                }
+            } fail {
+                // Skip unreadable session files
+            }
+            i = i + 1
+        }
+        print("[TReplay] Restored " + str(loaded) + " sessions from disk")
+    } fail {
+        // No index file -- fresh start
+        print("[TReplay] No persisted sessions found -- fresh start")
+    }
+}
+
+
+// ============================================================================
+// HELPER: update_persist_index -- rewrite __index.json with all known IDs
+// ============================================================================
+
+fn update_persist_index() {
+    let ids   = []
+    let total = len(sessions_list)
+    let i     = 0
+    while3 i < total {
+        let s   = sessions_list[i]
+        let sid = dict_get(s, "session_id") ?? ""
+        if3 len(sid) > 0 {
+            ids = append(ids, sid)
+        }
+        i = i + 1
+    }
+    let index_path = PERSIST_DIR + "\\__index.json"
+    let data_str   = json_encode({"ids": ids})
+    try3 {
+        nova_write(index_path, data_str)
+    } fail {
+        // Index write failure is non-fatal
+    }
+}
+
+
+// ============================================================================
+// HELPER: tmerge_list -- consensus trit from a list of trits
+// MAYBE if list empty; TRUE if all positive; FALSE if any negative and not
+// majority positive; MAYBE otherwise.
+// ============================================================================
+
+fn tmerge_list(trit_list) {
+    let n = len(trit_list)
+    if3 n == 0 {
+        return T_MAYBE
+    }
+    let pos = 0
+    let neg = 0
+    let i   = 0
+    while3 i < n {
+        let t = dict_get(trit_list, i) ?? 0
+        if3 t > 0 {
+            pos = pos + 1
+        }
+        if3 t < 0 {
+            neg = neg + 1
+        }
+        i = i + 1
+    }
+    if3 neg == 0 {
+        return T_TRUE
+    }
+    if3 pos > neg {
+        return T_MAYBE
+    }
+    return T_FALSE
+}
+
+
+// ============================================================================
+// HELPER: replay_single_request -- replay one recorded request via orchestrator
+// Returns a result dict with comparison trits.
+// ============================================================================
+
+fn replay_single_request(req) {
+    let service          = dict_get(req, "service") ?? ""
+    let method           = upper(dict_get(req, "method") ?? "GET")
+    let path             = dict_get(req, "path") ?? "/health"
+    let body_data        = dict_get(req, "body") ?? {}
+    let original_status  = dict_get(req, "status") ?? 0
+    let original_latency = dict_get(req, "latency_ms") ?? 0
+
+    // Route through orchestrator at :9999
+    let url = "http://127.0.0.1:9999" + str(path)
+
+    let t0     = time()
+    let status = 0
+    let resp   = {}
+
+    try3 {
+        if3 method == "POST" {
+            let r    = http_post(url, body_data)
+            let t1   = time()
+            let status = dict_get(r, "status") ?? 0
+            let resp   = dict_get(r, "body") ?? {}
+            let latency_ms = round((t1 - t0) * 1000, 2)
+        }
+        if3 method == "GET" {
+            let r    = http_get(url)
+            let t1   = time()
+            let status = dict_get(r, "status") ?? 0
+            let resp   = dict_get(r, "body") ?? {}
+            let latency_ms = round((t1 - t0) * 1000, 2)
+        }
+    } fail {
+        let t1         = time()
+        let latency_ms = round((t1 - t0) * 1000, 2)
+        let resp       = {"error": "request failed"}
+    }
+
+    let t1         = time()
+    let latency_ms = round((t1 - t0) * 1000, 2)
+
+    // Per-request comparison
+    let status_match = 0
+    if3 status == original_status {
+        let status_match = 1
+    }
+
+    let latency_ok = 1
+    if3 original_latency > 0 {
+        let threshold = original_latency * LATENCY_TOLERANCE
+        if3 latency_ms > threshold {
+            let latency_ok = 0
+        }
+    }
+
+    // Trit comparison
+    let orig_resp_dict = dict_get(req, "response") ?? {}
+    let orig_trit      = dict_get(orig_resp_dict, "trit") ?? T_MAYBE
+    let replay_trit    = dict_get(resp, "trit") ?? T_MAYBE
+    let trit_match     = 0
+    if3 orig_trit == replay_trit {
+        let trit_match = 1
+    }
+
+    let match_trit = T_FALSE
+    if3 status_match == 1 {
+        if3 trit_match == 1 {
+            let match_trit = T_TRUE
+        }
+        if3 trit_match == 0 {
+            let match_trit = T_MAYBE
+        }
+    }
+    if3 status_match == 0 {
+        if3 trit_match == 1 {
+            let match_trit = T_MAYBE
+        }
+    }
+
+    return {
+        "service":             str(service),
+        "method":              str(method),
+        "path":                str(path),
+        "original_status":     original_status,
+        "replay_status":       status,
+        "status_match":        status_match,
+        "original_latency_ms": original_latency,
+        "replay_latency_ms":   latency_ms,
+        "latency_ok":          latency_ok,
+        "original_trit":       orig_trit,
+        "replay_trit":         replay_trit,
+        "trit_match":          trit_match,
+        "match_trit":          match_trit,
+        "match_char":          tchar(match_trit),
+        "replay_response":     resp
+    }
+}
+
+
+// ============================================================================
+// ROUTE: health -- GET /health, GET /treplay/health
+// ============================================================================
+
+fn route_health(body) {
+    let now    = time()
+    let uptime = int(now - stat_t0)
+    let nsess  = len(sessions_list)
+
+    record_op(T_TRUE)
+
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "self_trit", dict_get(resp, "trit") ?? 0)
+    resp = dict_set(resp, "char", tchar(dict_get(resp, "trit") ?? 0))
+    resp = dict_set(resp, "uptime", uptime)
+    resp = dict_set(resp, "flow_regime", dict_get(resp, "regime") ?? "laminar")
+    resp = dict_set(resp, "sessions", nsess)
+    resp = dict_set(resp, "max_sessions", MAX_SESSIONS)
+    resp = dict_set(resp, "replays_done", replay_counter)
+    resp = dict_set(resp, "active_session", active_session)
+    resp = dict_set(resp, "persist_dir", PERSIST_DIR)
+    resp = dict_set(resp, "quality", {
+        "strong":  stat_ok,
+        "partial": 0,
+        "failed":  stat_fail
+    })
+    return resp
+}
+
+
+// ============================================================================
+// ROUTE: stats -- GET /treplay/stats
+// ============================================================================
+
+fn route_stats(body) {
+    let now         = time()
+    let uptime      = now - stat_t0
+    let re_num      = calc_reynolds()
+    let regime      = flow_regime(re_num)
+    let nsess       = len(sessions_list)
+    let active_cnt  = 0
+    let total_reqs  = 0
+    let i           = 0
+    while3 i < nsess {
+        let s      = sessions_list[i]
+        let act    = dict_get(s, "active") ?? 0
+        let rcount = dict_get(s, "request_count") ?? 0
+        if3 act == 1 {
+            active_cnt = active_cnt + 1
+        }
+        total_reqs = total_reqs + rcount
+        i = i + 1
+    }
+
+    record_op(T_TRUE)
+    return {
+        "ok":                    true,
+        "trit":                  T_TRUE,
+        "char":                  "+",
+        "service":               SERVICE_NAME,
+        "version":               VERSION,
+        "uptime":                int(uptime),
+        "total_sessions":        nsess,
+        "max_sessions":          MAX_SESSIONS,
+        "active_sessions":       active_cnt,
+        "active_session_id":     active_session,
+        "total_requests_recorded": total_reqs,
+        "replays_done":          replay_counter,
+        "persist_dir":           PERSIST_DIR,
+        "reynolds":              re_num,
+        "flow_regime":           regime,
+        "ops":                   stat_ops,
+        "ops_ok":                stat_ok,
+        "ops_fail":              stat_fail,
+        "harmonics": {
+            "H3":    H3,
+            "H5":    H5,
+            "H7":    H7,
+            "H13":   H13,
+            "BLOCK": BLOCK
+        }
+    }
+}
+
+
+// ============================================================================
+// ROUTE: sessions -- GET /treplay/sessions
+// ============================================================================
+
+fn route_sessions(body) {
+    let result = []
+    let total  = len(sessions_list)
+    let i      = 0
+    while3 i < total {
+        let s    = sessions_list[i]
+        let summ = {
+            "session_id":    dict_get(s, "session_id") ?? "",
+            "name":          dict_get(s, "name") ?? "",
+            "start_ts":      dict_get(s, "start_ts") ?? "",
+            "end_ts":        dict_get(s, "end_ts") ?? "",
+            "active":        dict_get(s, "active") ?? 0,
+            "request_count": dict_get(s, "request_count") ?? 0
+        }
+        result = append(result, summ)
+        i = i + 1
+    }
+
+    record_op(T_TRUE)
+    return {
+        "ok":      true,
+        "trit":    T_TRUE,
+        "char":    "+",
+        "sessions": result,
+        "count":   len(result)
+    }
+}
+
+
+// ============================================================================
+// ROUTE: session_detail -- GET /treplay/session/:id
+// Body: {"session_id": "..."}  (extracted from path by troute or passed in body)
+// ============================================================================
+
+fn route_session_detail(body) {
+    let sid = dict_get(body, "session_id") ?? ""
+    if3 len(str(sid)) == 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "session_id required"
+        }
+    }
+
+    let s = get_session(str(sid))
+    if3 len(keys(s)) == 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "session not found: " + str(sid)
+        }
+    }
+
+    record_op(T_TRUE)
+    return {
+        "ok":           true,
+        "trit":         T_TRUE,
+        "char":         "+",
+        "session_id":   dict_get(s, "session_id") ?? "",
+        "name":         dict_get(s, "name") ?? "",
+        "start_ts":     dict_get(s, "start_ts") ?? "",
+        "end_ts":       dict_get(s, "end_ts") ?? "",
+        "active":       dict_get(s, "active") ?? 0,
+        "request_count": dict_get(s, "request_count") ?? 0,
+        "requests":     dict_get(s, "requests") ?? []
+    }
+}
+
+
+// ============================================================================
+// ROUTE: start -- POST /treplay/start
+// Body: {"session_name": "my-recording"}
+// ============================================================================
+
+fn route_start(body) {
+    let name_raw = dict_get(body, "session_name") ?? "unnamed"
+    let name     = str(name_raw)
+
+    if3 len(active_session) > 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":             false,
+            "trit":           T_FALSE,
+            "char":           "T",
+            "error":          "session already active: " + active_session,
+            "active_session": active_session
+        }
+    }
+
+    // Evict oldest inactive session if at capacity
+    evict_oldest()
+
+    let sid    = new_session_id()
+    let now_ts = str(time())
+
+    let new_sess = {
+        "session_id":    sid,
+        "name":          name,
+        "start_ts":      now_ts,
+        "end_ts":        "",
+        "active":        1,
+        "request_count": 0,
+        "requests":      []
+    }
+
+    sessions_list = append(sessions_list, new_sess)
+    let active_session = sid
+
+    record_op(T_TRUE)
+    return {
+        "ok":        true,
+        "trit":      T_TRUE,
+        "char":      "+",
+        "session_id": sid,
+        "name":      name,
+        "message":   "recording started"
+    }
+}
+
+
+// ============================================================================
+// ROUTE: stop -- POST /treplay/stop
+// Body: {} (stops the currently active session)
+// ============================================================================
+
+fn route_stop(body) {
+    if3 len(active_session) == 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "no active recording session"
+        }
+    }
+
+    let sid = active_session
+    let idx = find_session_index(sid)
+
+    let req_count = 0
+    if3 idx >= 0 {
+        let s         = sessions_list[idx]
+        let req_count = dict_get(s, "request_count") ?? 0
+        let now_ts    = str(time())
+        s = dict_set(s, "active",  0)
+        s = dict_set(s, "end_ts",  now_ts)
+        // Update entry in sessions_list
+        sessions_list = dict_set(sessions_list, idx, s)
+        // Persist to disk
+        persist_session(sid)
+        update_persist_index()
+    }
+
+    let active_session = ""
+
+    record_op(T_TRUE)
+    return {
+        "ok":           true,
+        "trit":         T_TRUE,
+        "char":         "+",
+        "session_id":   sid,
+        "request_count": req_count,
+        "message":      "recording stopped and persisted"
+    }
+}
+
+
+// ============================================================================
+// ROUTE: record -- POST /treplay/record
+// Body: {session_id?, service, method, path, body, response, status, latency_ms}
+// ============================================================================
+
+fn route_record(body) {
+    let target_sid = dict_get(body, "session_id") ?? active_session
+    let sid_str    = str(target_sid)
+
+    if3 len(sid_str) == 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "no active session and no session_id provided"
+        }
+    }
+
+    let idx = find_session_index(sid_str)
+    if3 idx < 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "session not found: " + sid_str
+        }
+    }
+
+    let s = sessions_list[idx]
+
+    let entry = {
+        "timestamp":  str(time()),
+        "service":    str(dict_get(body, "service") ?? "unknown"),
+        "method":     upper(str(dict_get(body, "method") ?? "GET")),
+        "path":       str(dict_get(body, "path") ?? "/"),
+        "body":       dict_get(body, "body") ?? {},
+        "response":   dict_get(body, "response") ?? {},
+        "status":     int(dict_get(body, "status") ?? 0),
+        "latency_ms": float(dict_get(body, "latency_ms") ?? 0)
+    }
+
+    let existing_reqs = dict_get(s, "requests") ?? []
+    let old_count     = dict_get(s, "request_count") ?? 0
+
+    // Enforce MAX_REQUESTS_PER_SESSION cap via slice
+    existing_reqs = append(existing_reqs, entry)
+    let new_count = old_count + 1
+    if3 new_count > MAX_REQUESTS_PER_SESSION {
+        let existing_reqs = slice(existing_reqs, 1, len(existing_reqs))
+        let new_count = MAX_REQUESTS_PER_SESSION
+    }
+
+    s = dict_set(s, "requests",      existing_reqs)
+    s = dict_set(s, "request_count", new_count)
+    sessions_list = dict_set(sessions_list, idx, s)
+
+    record_op(T_TRUE)
+    return {
+        "ok":         true,
+        "trit":       T_TRUE,
+        "char":       "+",
+        "session_id": sid_str,
+        "recorded":   new_count
+    }
+}
+
+
+// ============================================================================
+// ROUTE: replay -- POST /treplay/replay
+// Body: {"session_id": "..."}
+// ============================================================================
+
+fn route_replay(body) {
+    let sid = str(dict_get(body, "session_id") ?? "")
+
+    if3 len(sid) == 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "session_id required"
+        }
+    }
+
+    let s = get_session(sid)
+    if3 len(keys(s)) == 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "session not found: " + sid
+        }
+    }
+
+    let orig_name = dict_get(s, "name") ?? "unknown"
+    let reqs      = dict_get(s, "requests") ?? []
+    let req_total = len(reqs)
+
+    if3 req_total == 0 {
+        record_op(T_MAYBE)
+        return {
+            "ok":    false,
+            "trit":  T_MAYBE,
+            "char":  "0",
+            "error": "session has no recorded requests"
+        }
+    }
+
+    // Replay each request sequentially
+    let results      = []
+    let match_trits  = []
+    let status_hits  = 0
+    let trit_hits    = 0
+    let i            = 0
+
+    while3 i < req_total {
+        let req    = dict_get(reqs, i) ?? {}
+        let result = replay_single_request(req)
+        results = append(results, result)
+        let mt = dict_get(result, "match_trit") ?? T_FALSE
+        let sm = dict_get(result, "status_match") ?? 0
+        let tm = dict_get(result, "trit_match") ?? 0
+        match_trits = append(match_trits, mt)
+        if3 sm == 1 {
+            status_hits = status_hits + 1
+        }
+        if3 tm == 1 {
+            trit_hits = trit_hits + 1
+        }
+        i = i + 1
+    }
+
+    let overall_trit = tmerge_list(match_trits)
+
+    // Build match_bt string (+/0/T per request)
+    let bt_parts = []
+    let j        = 0
+    while3 j < len(match_trits) {
+        let mt = match_trits[j]
+        bt_parts = append(bt_parts, tchar(mt))
+        j = j + 1
+    }
+    let bt_string = join(bt_parts, "")
+
+    let match_pct = 0
+    if3 req_total > 0 {
+        let match_pct = round((status_hits / req_total) * 100, 1)
+    }
+
+    // Create replay session to store results
+    let replay_id = new_session_id()
+    let now_ts    = str(time())
+
+    // Build compact replay request list from results
+    let replay_reqs = []
+    let k           = 0
+    while3 k < len(results) {
+        let r  = results[k]
+        let rq = {
+            "timestamp":  now_ts,
+            "service":    dict_get(r, "service") ?? "",
+            "method":     dict_get(r, "method") ?? "GET",
+            "path":       dict_get(r, "path") ?? "/",
+            "body":       {},
+            "response":   dict_get(r, "replay_response") ?? {},
+            "status":     dict_get(r, "replay_status") ?? 0,
+            "latency_ms": dict_get(r, "replay_latency_ms") ?? 0
+        }
+        replay_reqs = append(replay_reqs, rq)
+        k = k + 1
+    }
+
+    let replay_sess = {
+        "session_id":    replay_id,
+        "name":          "replay-of-" + str(orig_name),
+        "start_ts":      now_ts,
+        "end_ts":        now_ts,
+        "active":        0,
+        "request_count": len(replay_reqs),
+        "requests":      replay_reqs,
+        "replay_of":     sid,
+        "replay_results": results
+    }
+
+    evict_oldest()
+    sessions_list = append(sessions_list, replay_sess)
+    persist_session(replay_id)
+    update_persist_index()
+    replay_counter = replay_counter + 1
+
+    record_op(overall_trit)
+    return {
+        "ok":              true,
+        "trit":            overall_trit,
+        "char":            tchar(overall_trit),
+        "replay_id":       replay_id,
+        "original_session": sid,
+        "total_requests":  req_total,
+        "status_matches":  status_hits,
+        "trit_matches":    trit_hits,
+        "match_bt":        bt_string,
+        "match_pct":       match_pct,
+        "results":         results
+    }
+}
+
+
+// ============================================================================
+// ROUTE: compare -- POST /treplay/compare
+// Body: {"session_id": "...", "replay_id": "..."}
+// ============================================================================
+
+fn route_compare(body) {
+    let sid = str(dict_get(body, "session_id") ?? "")
+    let rid = str(dict_get(body, "replay_id") ?? "")
+
+    if3 len(sid) == 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "session_id required"
+        }
+    }
+    if3 len(rid) == 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "replay_id required"
+        }
+    }
+
+    let original_s = get_session(sid)
+    if3 len(keys(original_s)) == 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "original session not found: " + sid
+        }
+    }
+
+    let replay_s = get_session(rid)
+    if3 len(keys(replay_s)) == 0 {
+        record_op(T_FALSE)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "T",
+            "error": "replay session not found: " + rid
+        }
+    }
+
+    let orig_reqs   = dict_get(original_s, "requests") ?? []
+    let replay_reqs = dict_get(replay_s,   "requests") ?? []
+    let orig_len    = len(orig_reqs)
+    let rep_len     = len(replay_reqs)
+
+    let max_len = orig_len
+    if3 rep_len > max_len {
+        let max_len = rep_len
+    }
+
+    let comparisons  = []
+    let match_trits  = []
+    let exact_hits   = 0
+    let partial_hits = 0
+    let mismatch_cnt = 0
+    let i            = 0
+
+    while3 i < max_len {
+        let has_orig = 0
+        if3 i < orig_len {
+            let has_orig = 1
+        }
+        let has_rep = 0
+        if3 i < rep_len {
+            let has_rep = 1
+        }
+
+        if3 has_orig == 1 {
+            if3 has_rep == 1 {
+                // Both present -- detailed comparison
+                let orig = dict_get(orig_reqs, i) ?? {}
+                let rep  = replay_reqs[i]
+
+                let o_status = dict_get(orig, "status") ?? 0
+                let r_status = dict_get(rep,  "status") ?? 0
+                let o_path   = dict_get(orig, "path") ?? ""
+                let r_path   = dict_get(rep,  "path") ?? ""
+                let o_lat    = float(dict_get(orig, "latency_ms") ?? 0)
+                let r_lat    = float(dict_get(rep,  "latency_ms") ?? 0)
+
+                let status_match = 0
+                if3 o_status == r_status {
+                    let status_match = 1
+                }
+                let path_match = 0
+                if3 o_path == r_path {
+                    let path_match = 1
+                }
+
+                let latency_ok = 1
+                if3 o_lat > 0 {
+                    let threshold = o_lat * LATENCY_TOLERANCE
+                    if3 r_lat > threshold {
+                        let latency_ok = 0
+                    }
+                }
+
+                let lat_ratio = 0
+                if3 o_lat > 0 {
+                    let lat_ratio = round(r_lat / o_lat, 2)
+                }
+
+                let o_resp = dict_get(orig, "response") ?? {}
+                let r_resp = dict_get(rep,  "response") ?? {}
+                let o_trit = dict_get(o_resp, "trit") ?? T_MAYBE
+                let r_trit = dict_get(r_resp, "trit") ?? T_MAYBE
+                let trit_match = 0
+                if3 o_trit == r_trit {
+                    let trit_match = 1
+                }
+
+                let cmp_trit = T_FALSE
+                if3 status_match == 1 {
+                    if3 trit_match == 1 {
+                        if3 latency_ok == 1 {
+                            let cmp_trit = T_TRUE
+                        }
+                        if3 latency_ok == 0 {
+                            let cmp_trit = T_MAYBE
+                        }
+                    }
+                    if3 trit_match == 0 {
+                        let cmp_trit = T_MAYBE
+                    }
+                }
+
+                if3 cmp_trit == T_TRUE {
+                    exact_hits = exact_hits + 1
+                }
+                if3 cmp_trit == T_MAYBE {
+                    partial_hits = partial_hits + 1
+                }
+                if3 cmp_trit == T_FALSE {
+                    mismatch_cnt = mismatch_cnt + 1
+                }
+
+                match_trits = append(match_trits, cmp_trit)
+                append(comparisons, {
+                    "index":               i,
+                    "path":                str(o_path),
+                    "method":              str(dict_get(orig, "method") ?? ""),
+                    "original_status":     o_status,
+                    "replay_status":       r_status,
+                    "status_match":        status_match,
+                    "path_match":          path_match,
+                    "original_latency_ms": o_lat,
+                    "replay_latency_ms":   r_lat,
+                    "latency_ratio":       lat_ratio,
+                    "latency_ok":          latency_ok,
+                    "original_trit":       o_trit,
+                    "replay_trit":         r_trit,
+                    "trit_match":          trit_match,
+                    "comparison_trit":     cmp_trit,
+                    "comparison_char":     tchar(cmp_trit)
+                })
+            }
+        }
+
+        // One side missing -- definite mismatch
+        if3 has_orig == 0 {
+            match_trits = append(match_trits, T_FALSE)
+            append(comparisons, {
+                "index":            i,
+                "path":             "?",
+                "original_present": 0,
+                "replay_present":   has_rep,
+                "comparison_trit":  T_FALSE,
+                "comparison_char":  "T"
+            })
+            mismatch_cnt = mismatch_cnt + 1
+        }
+        if3 has_rep == 0 {
+            if3 has_orig == 1 {
+                // only missing on replay side
+                let orig  = dict_get(orig_reqs, i) ?? {}
+                let opath = dict_get(orig, "path") ?? "?"
+                match_trits = append(match_trits, T_FALSE)
+                append(comparisons, {
+                    "index":            i,
+                    "path":             str(opath),
+                    "original_present": 1,
+                    "replay_present":   0,
+                    "comparison_trit":  T_FALSE,
+                    "comparison_char":  "T"
+                })
+                mismatch_cnt = mismatch_cnt + 1
+            }
+        }
+
+        i = i + 1
+    }
+
+    let overall_trit = tmerge_list(match_trits)
+
+    let bt_parts = []
+    let j        = 0
+    while3 j < len(match_trits) {
+        let mt = match_trits[j]
+        bt_parts = append(bt_parts, tchar(mt))
+        j = j + 1
+    }
+    let bt_string = join(bt_parts, "")
+
+    let total     = len(comparisons)
+    let match_pct = 0
+    if3 total > 0 {
+        let match_pct = round((exact_hits / total) * 100, 1)
+    }
+
+    record_op(overall_trit)
+    return {
+        "ok":            true,
+        "trit":          overall_trit,
+        "char":          tchar(overall_trit),
+        "session_id":    sid,
+        "replay_id":     rid,
+        "original_name": str(dict_get(original_s, "name") ?? ""),
+        "replay_name":   str(dict_get(replay_s,   "name") ?? ""),
+        "original_count": orig_len,
+        "replay_count":  rep_len,
+        "total_compared": total,
+        "exact_matches": exact_hits,
+        "partial_matches": partial_hits,
+        "mismatches":    mismatch_cnt,
+        "match_bt":      bt_string,
+        "match_pct":     match_pct,
+        "comparisons":   comparisons
+    }
+}
+
+
+// ============================================================================
+// Route registrations
+// ============================================================================
+
+troute(server, "GET",  "/health",              "route_health")
+troute(server, "GET",  "/treplay/health",      "route_health")
+troute(server, "GET",  "/treplay/stats",       "route_stats")
+troute(server, "GET",  "/treplay/sessions",    "route_sessions")
+troute(server, "GET",  "/treplay/session",     "route_session_detail")
+troute(server, "POST", "/treplay/start",       "route_start")
+troute(server, "POST", "/treplay/stop",        "route_stop")
+troute(server, "POST", "/treplay/record",      "route_record")
+troute(server, "POST", "/treplay/replay",      "route_replay")
+troute(server, "POST", "/treplay/compare",     "route_compare")
+
+
+// ============================================================================
+// Startup: load persisted sessions then print banner
+// ============================================================================
+
+load_persisted_sessions()
+
+print("[TReplay] NovaX Request Replay v" + VERSION + " -- Port " + str(PORT))
+print("[TReplay] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TReplay] Reynolds boundaries: " + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT))
+print("[TReplay] Max sessions: " + str(MAX_SESSIONS) + " (H13*H3=39) | Max requests/session: " + str(MAX_REQUESTS_PER_SESSION))
+print("[TReplay] Persist dir: " + PERSIST_DIR)
+print("[TReplay] Replay timeout: " + str(REPLAY_TIMEOUT) + "s | Latency tolerance: " + str(LATENCY_TOLERANCE) + "x")
+print("[TReplay] Trits: T_TRUE=+1 T_MAYBE=0 T_FALSE=-1")
+print("[TReplay] Routes GET:  /health /treplay/health /treplay/stats /treplay/sessions /treplay/session")
+print("[TReplay] Routes POST: /treplay/start /treplay/stop /treplay/record /treplay/replay /treplay/compare")
+print("[TReplay] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

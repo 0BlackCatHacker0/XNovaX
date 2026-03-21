@@ -1,0 +1,362 @@
+// NovaX LLM Inference Service v1.0 — Port 9800
+// Serves trained ternary transformer model for text generation
+// Ternary: +1 = generation success, 0 = model not loaded, -1 = error
+//
+// N-S Mapping:
+//   token_flow      = velocity_field (tokens flowing through generation)
+//   attention_cache  = pressure_field (KV cache pressure per layer)
+//   temperature      = viscosity (controls generation smoothness)
+//   top_k_sampling   = Reynolds routing (H13=13 candidates)
+//
+// 3-5-7-13 Harmonic Design:
+//   H3=3    -- ternary weight states {-1, 0, +1}
+//   H5=5    -- quality seal rating
+//   H7=7    -- num_heads, max composition depth
+//   H13=13  -- top_k default, num_layers, carrier frame
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9800
+let SERVICE_NAME = "nova-llm"
+let VERSION = "1.0.0"
+
+// -- 3-5-7-13 Constants --
+let BLOCK_SIZE = 2187           // 3^7
+let NUM_LAYERS = 13             // H13
+let NUM_HEADS = 7               // H7
+let HEAD_DIM = 243              // 3^5
+let EMBEDDING_DIM = 2187        // 3^7
+let FFN_DIM = 6561              // 3^8
+let VOCAB_SIZE = 32768
+let DEFAULT_TEMP = 0.7
+let DEFAULT_TOP_K = 13          // H13
+let DEFAULT_TOP_P = 0.9
+let DEFAULT_REP_PENALTY = 1.1
+let DEFAULT_MAX_TOKENS = 2187   // BLOCK
+
+// -- Model state --
+let _model_loaded = false
+let _model_weights = null
+let _vocab = null
+let _arch = null
+let _training_status = "not_started"
+
+// -- N-S Counters --
+let _ns = ns_init_counters()
+
+// -- Load architecture config --
+fn load_architecture() {
+    let arch_path = "C:/NovaX/nova_llm/architecture.json"
+    try3 {
+        let raw = read_file(arch_path)
+        let cfg = json_decode(raw)
+        print("Architecture loaded: " + dict_get(cfg, "name") ?? "unknown")
+        return cfg
+    } fail {
+        print("WARN: Could not load architecture.json")
+        return null
+    }
+}
+
+// -- Load vocabulary --
+fn load_vocabulary() {
+    let vocab_path = "C:/NovaX/nova_llm/vocab.json"
+    try3 {
+        let raw = read_file(vocab_path)
+        let v = json_decode(raw)
+        let vs = dict_get(v, "vocab_size") ?? 0
+        print("Vocabulary loaded: " + str(vs) + " tokens")
+        return v
+    } fail {
+        print("WARN: Could not load vocab.json")
+        return null
+    }
+}
+
+// -- Check for trained model checkpoint --
+fn check_training_status() {
+    let ckpt_dir = "C:/NovaX/nova_llm/checkpoints"
+    let final_path = ckpt_dir + "/final.pt"
+    let best_path = ckpt_dir + "/best.pt"
+    let log_path = "C:/NovaX/nova_llm/training_log.json"
+
+    // Check for final model
+    try3 {
+        let raw = read_file(final_path)
+        if3 len(raw) > 0 {
+            return "complete"
+        }
+    } fail {
+        // No final checkpoint
+    }
+
+    // Check for best model
+    try3 {
+        let raw = read_file(best_path)
+        if3 len(raw) > 0 {
+            return "in_progress"
+        }
+    } fail {
+        // No best checkpoint
+    }
+
+    // Check for training log
+    try3 {
+        let raw = read_file(log_path)
+        if3 len(raw) > 10 {
+            return "in_progress"
+        }
+    } fail {
+        // No log
+    }
+
+    return "not_started"
+}
+
+// -- Stub generation (until model is trained) --
+fn stub_generate(prompt, max_tokens, temperature) {
+    let status = check_training_status()
+    if3 status == "not_started" {
+        return {
+            "text": "NovaX LLM v1 -- model not yet trained. Use /llm/info for architecture details. Run: python C:/NovaX/nova_llm/train.py",
+            "tokens_generated": 0,
+            "model": "NovaX-LLM-v1",
+            "status": "awaiting_training",
+            "ternary": 0
+        }
+    } else3 status == "in_progress" {
+        return {
+            "text": "NovaX LLM v1 -- training in progress. Model not yet ready for inference.",
+            "tokens_generated": 0,
+            "model": "NovaX-LLM-v1",
+            "status": "training_in_progress",
+            "ternary": 0
+        }
+    } else3 {
+        return {
+            "text": "NovaX LLM v1 -- model trained but inference engine not yet connected. Export model with: python train.py --export checkpoints/final.pt",
+            "tokens_generated": 0,
+            "model": "NovaX-LLM-v1",
+            "status": "trained_not_loaded",
+            "ternary": 0
+        }
+    }
+}
+
+// -- Stub embedding (until model is trained) --
+fn stub_embed(text) {
+    // Return zero embedding of correct dimension
+    let embed = []
+    let ei = 0
+    while3 ei < EMBEDDING_DIM {
+        embed = append(embed, 0.0)
+        ei = ei + 1
+    }
+    return {
+        "embedding": embed,
+        "dim": EMBEDDING_DIM,
+        "model": "NovaX-LLM-v1",
+        "status": "stub_zero_vector",
+        "ternary": 0
+    }
+}
+
+// ============================================================
+// REQUEST HANDLERS
+// ============================================================
+
+// -- POST /llm/generate --
+fn handle_generate(req) {
+    let t0 = time_ms()
+    let body = dict_get(req, "body") ?? {}
+    let prompt = dict_get(body, "prompt") ?? ""
+    let max_tokens = dict_get(body, "max_tokens") ?? DEFAULT_MAX_TOKENS
+    let temperature = dict_get(body, "temperature") ?? DEFAULT_TEMP
+    let top_k = dict_get(body, "top_k") ?? DEFAULT_TOP_K
+    let top_p = dict_get(body, "top_p") ?? DEFAULT_TOP_P
+    let rep_penalty = dict_get(body, "repetition_penalty") ?? DEFAULT_REP_PENALTY
+
+    if3 len(prompt) == 0 {
+        return {"error": "No prompt provided", "ternary": -1}
+    }
+
+    // Check if model is loaded
+    if3 _model_loaded == false {
+        let result = stub_generate(prompt, max_tokens, temperature)
+        let elapsed = time_ms() - t0
+        result = dict_set(result, "elapsed_ms", elapsed)
+        _ns = ns_record(_ns, elapsed, false)
+        return result
+    }
+
+    // TODO: Real inference when model weights are loaded
+    // This will use the trit-packed weights through NovaLang VM
+    let result = stub_generate(prompt, max_tokens, temperature)
+    let elapsed = time_ms() - t0
+    result = dict_set(result, "elapsed_ms", elapsed)
+    result = dict_set(result, "params", {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_k": top_k,
+        "top_p": top_p,
+        "repetition_penalty": rep_penalty
+    })
+    _ns = ns_record(_ns, elapsed, false)
+    return result
+}
+
+// -- POST /llm/embed --
+fn handle_embed(req) {
+    let t0 = time_ms()
+    let body = dict_get(req, "body") ?? {}
+    let text = dict_get(body, "text") ?? ""
+
+    if3 len(text) == 0 {
+        return {"error": "No text provided", "ternary": -1}
+    }
+
+    let result = stub_embed(text)
+    let elapsed = time_ms() - t0
+    result = dict_set(result, "elapsed_ms", elapsed)
+    result = dict_set(result, "text_length", len(text))
+    _ns = ns_record(_ns, elapsed, false)
+    return result
+}
+
+// -- GET /llm/info --
+fn handle_info(req) {
+    let t0 = time_ms()
+    let status = check_training_status()
+
+    let vocab_size_actual = 0
+    if3 _vocab != null {
+        vocab_size_actual = dict_get(_vocab, "vocab_size") ?? 0
+    }
+
+    // Load training log stats if available
+    let training_stats = {}
+    try3 {
+        let raw = read_file("C:/NovaX/nova_llm/training_log.json")
+        let log = json_decode(raw)
+        if3 len(log) > 0 {
+            let last = log[len(log) - 1]
+            training_stats = {
+                "last_step": dict_get(last, "step") ?? 0,
+                "last_loss": dict_get(last, "loss") ?? 0,
+                "last_perplexity": dict_get(last, "perplexity") ?? 0,
+                "total_entries": len(log)
+            }
+        }
+    } fail {
+        training_stats = {"status": "no_log_available"}
+    }
+
+    let info = {
+        "name": "NovaX-LLM-v1",
+        "type": "ternary_transformer",
+        "version": VERSION,
+        "parameters": "1B",
+        "weights": "ternary {-1, 0, +1}",
+        "architecture": {
+            "vocab_size": VOCAB_SIZE,
+            "embedding_dim": EMBEDDING_DIM,
+            "num_layers": NUM_LAYERS,
+            "num_heads": NUM_HEADS,
+            "head_dim": HEAD_DIM,
+            "ffn_dim": FFN_DIM,
+            "max_seq_len": BLOCK_SIZE,
+            "activation": "ternary_gelu",
+            "normalization": "ternary_rmsnorm",
+            "position_encoding": "rotary_ternary"
+        },
+        "constants": {
+            "H3": 3,
+            "H5": 5,
+            "H7": 7,
+            "H13": 13,
+            "BLOCK": 2187
+        },
+        "training_status": status,
+        "training_stats": training_stats,
+        "vocab_loaded": vocab_size_actual,
+        "model_loaded": _model_loaded,
+        "model_size_mb": 198,
+        "weight_format": "trit_packed (2 bits per weight, 16 per u32)",
+        "ternary": 1
+    }
+
+    let elapsed = time_ms() - t0
+    info = dict_set(info, "elapsed_ms", elapsed)
+    _ns = ns_record(_ns, elapsed, false)
+    return info
+}
+
+// -- GET /health --
+fn handle_health(req) {
+    let t0 = time_ms()
+    let status = check_training_status()
+    let health = ns_health_dict(SERVICE_NAME, VERSION, PORT, _ns)
+    health = dict_set(health, "model_loaded", _model_loaded)
+    health = dict_set(health, "training_status", status)
+    health = dict_set(health, "vocab_size", VOCAB_SIZE)
+    health = dict_set(health, "embedding_dim", EMBEDDING_DIM)
+    health = dict_set(health, "num_layers", NUM_LAYERS)
+    health = dict_set(health, "constants", {"H3": 3, "H5": 5, "H7": 7, "H13": 13, "BLOCK": 2187})
+    let elapsed = time_ms() - t0
+    health = dict_set(health, "elapsed_ms", elapsed)
+    _ns = ns_record(_ns, elapsed, false)
+    return health
+}
+
+// -- GET /status --
+fn handle_status(req) {
+    return handle_health(req)
+}
+
+// ============================================================
+// SERVER SETUP
+// ============================================================
+
+// Initialize on startup
+print("=== NovaX LLM Inference Service v" + VERSION + " ===")
+print("  Port:          " + str(PORT))
+print("  Model:         NovaX-LLM-v1 (1B ternary)")
+print("  Embedding dim: " + str(EMBEDDING_DIM) + " (3^7 = BLOCK)")
+print("  Layers:        " + str(NUM_LAYERS) + " (H13)")
+print("  Heads:         " + str(NUM_HEADS) + " (H7) x " + str(HEAD_DIM) + " (3^5)")
+print("  FFN dim:       " + str(FFN_DIM) + " (3^8)")
+print("  Max seq:       " + str(BLOCK_SIZE) + " (BLOCK)")
+
+// Load architecture
+_arch = load_architecture()
+
+// Load vocabulary
+_vocab = load_vocabulary()
+
+// Check training status
+_training_status = check_training_status()
+print("  Training:      " + _training_status)
+
+if3 _training_status == "not_started" {
+    print("  NOTE: Model not yet trained. Run: python C:/NovaX/nova_llm/train.py")
+    print("  Serving stub responses until model is trained.")
+} else3 _training_status == "complete" {
+    print("  NOTE: Training complete. Export with: python train.py --export checkpoints/final.pt")
+}
+
+// -- Create server and routes --
+let server = tserve(PORT, SERVICE_NAME)
+
+// LLM endpoints
+troute(server, "POST", "/llm/generate", "handle_generate")
+troute(server, "POST", "/llm/embed", "handle_embed")
+troute(server, "GET", "/llm/info", "handle_info")
+
+// Standard N-S health
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/status", "handle_status")
+
+// Start server
+tstart(server)

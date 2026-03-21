@@ -1,0 +1,515 @@
+// ═══════════════════════════════════════════════════════════════════
+// nova_pure_tools.nova — Pure NovaLang replacements for Python bridges
+// ═══════════════════════════════════════════════════════════════════
+// Every function here replaces a legacy shell() call.
+// NO PYTHON. NO py_call. Pure NovaLang only.
+// Uses only NovaLang builtins + shell() for system commands (curl, powershell).
+// ═══════════════════════════════════════════════════════════════════
+
+// ── 1. classify_prompt — replaces tools/classify_prompt.py ────────
+// Classifies a prompt into a Go territory for optimal model routing.
+
+let CODE_SIGNALS = [
+    "write code", "function", "implement", "debug", "fix bug", "refactor",
+    "class ", "def ", "import ", "const ", "var ", "let ", "async ", "await ",
+    "python", "javascript", "typescript", "rust", "golang", "java", "c++",
+    "sql", "query", "database", "api", "endpoint", "regex", "algorithm",
+    "syntax", "compile", "build", "deploy", "docker", "git", "commit",
+    "test", "unit test", "```", "code review"
+]
+
+let REASONING_SIGNALS = [
+    "explain why", "reason", "analyze", "think step by step", "logic",
+    "proof", "theorem", "math", "calculate", "solve", "equation",
+    "compare and contrast", "evaluate", "assess", "deduce", "infer",
+    "chain of thought", "step by step", "reasoning"
+]
+
+let IMAGE_SIGNALS = [
+    "image", "picture", "photo", "describe what you see", "screenshot",
+    "visual", "look at", "diagram", "chart", "graph", "draw"
+]
+
+let AUDIO_SIGNALS = [
+    "audio", "sound", "music", "voice", "speak", "listen", "transcript",
+    "speech", "tts", "text to speech", "whisper"
+]
+
+let EMBEDDING_SIGNALS = [
+    "embed", "embedding", "vector", "similarity", "semantic search",
+    "rag", "retrieval", "cosine"
+]
+
+fn classify_prompt(prompt) {
+    let pl = lower(prompt)
+    let code_score = 0
+    let reasoning_score = 0
+    let image_score = 0
+    let audio_score = 0
+    let embedding_score = 0
+
+    for3 sig in CODE_SIGNALS {
+        if3 contains(pl, sig) { code_score = code_score + 1 }
+    }
+    for3 sig in REASONING_SIGNALS {
+        if3 contains(pl, sig) { reasoning_score = reasoning_score + 1 }
+    }
+    for3 sig in IMAGE_SIGNALS {
+        if3 contains(pl, sig) { image_score = image_score + 1 }
+    }
+    for3 sig in AUDIO_SIGNALS {
+        if3 contains(pl, sig) { audio_score = audio_score + 1 }
+    }
+    for3 sig in EMBEDDING_SIGNALS {
+        if3 contains(pl, sig) { embedding_score = embedding_score + 1 }
+    }
+
+    // Short prompts → fast territory
+    let max_score = max(code_score, max(reasoning_score, max(image_score, max(audio_score, embedding_score))))
+    if3 len(prompt) < 50 {
+        if3 max_score == 0 { return "fast" }
+    }
+
+    if3 max_score == 0 { return "chat" }
+
+    // Find highest
+    if3 code_score >= reasoning_score {
+        if3 code_score >= image_score {
+            if3 code_score >= audio_score {
+                if3 code_score >= embedding_score { return "code" }
+                return "embedding"
+            }
+            return "audio"
+        }
+        if3 image_score >= audio_score {
+            if3 image_score >= embedding_score { return "image" }
+            return "embedding"
+        }
+        return "audio"
+    }
+    if3 reasoning_score >= image_score {
+        if3 reasoning_score >= audio_score {
+            if3 reasoning_score >= embedding_score { return "reasoning" }
+            return "embedding"
+        }
+        return "audio"
+    }
+    if3 image_score >= audio_score {
+        if3 image_score >= embedding_score { return "image" }
+        return "embedding"
+    }
+    if3 audio_score >= embedding_score { return "audio" }
+    return "embedding"
+}
+
+fn classify_prompt_with_model(prompt) {
+    let territory = classify_prompt(prompt)
+
+    // Load best model for territory from go_pieces.json
+    let raw = try3 { read_file("C:/NovaX/data/go_pieces.json") } { "" }
+    if3 len(raw) == 0 { return {"territory": territory} }
+
+    let data = try3 { json_decode(raw) } { {} }
+    let pieces = dict_get(data, "pieces") ?? {}
+    let best_model = ""
+    let best_provider = ""
+    let best_score = -999999
+    let best_max_tokens = 8192
+
+    for3 key in dict_keys(pieces) {
+        let piece = dict_get(pieces, key) ?? {}
+        let terr = dict_get(piece, "territory") ?? ""
+        if3 terr == territory {
+            let active = dict_get(piece, "active") ?? 1
+            if3 active == 1 {
+                let wins = dict_get(piece, "wins") ?? 0
+                let losses = dict_get(piece, "losses") ?? 0
+                let score = wins - losses
+                if3 score > best_score {
+                    best_score = score
+                    best_model = dict_get(piece, "model") ?? ""
+                    best_provider = dict_get(piece, "provider") ?? ""
+                    best_max_tokens = dict_get(piece, "max_tokens") ?? 8192
+                }
+            }
+        }
+    }
+
+    let result = {"territory": territory}
+    if3 len(best_model) > 0 {
+        result = dict_set(result, "provider", best_provider)
+        result = dict_set(result, "model", best_model)
+        result = dict_set(result, "max_tokens", best_max_tokens)
+    }
+    return result
+}
+
+
+// ── 2. discover_all_models — replaces tools/discover_all_models.py ──
+// Discovers ALL models from providers and builds complete registry.
+
+let TERRITORY_PATTERNS = {
+    "code": ["code", "coder", "starcoder", "codellama", "sqlcoder", "codegen", "codegeex",
+             "granite-code", "wizardcoder", "deepseek-coder", "qwen2.5-coder", "codestral",
+             "stable-code", "magicoder"],
+    "reasoning": ["o1-", "o3-", "o4-", "deepseek-r1", "reasoning", "think", "reflection",
+                   "qwq", "orca", "reasoner"],
+    "image": ["vision", "llava", "bakllava", "dall", "image", "moondream",
+              "cogvlm", "internvl", "flux", "vl"],
+    "audio": ["whisper", "audio", "tts", "speech", "voice", "bark", "coqui"],
+    "embedding": ["embed", "nomic", "bge", "e5-", "minilm", "mxbai", "jina-embed",
+                   "text-embedding", "gte-"],
+    "fast": ["tiny", "mini", ":1b", "-1b", ":3b", "-3b",
+             "flash", "haiku", "instant", "lite", "nano", "small", "turbo"]
+}
+
+let TERRITORY_MAX_TOKENS = {
+    "chat": 8192, "code": 16384, "reasoning": 32768, "image": 4096,
+    "audio": 4096, "embedding": 512, "fast": 2048
+}
+
+fn _classify_model_territory(name) {
+    let nl = lower(name)
+    let territories = []
+    for3 terr in dict_keys(TERRITORY_PATTERNS) {
+        let patterns = dict_get(TERRITORY_PATTERNS, terr) ?? []
+        for3 pattern in patterns {
+            if3 contains(nl, pattern) {
+                territories = append(territories, terr)
+                break3
+            }
+        }
+    }
+    if3 len(territories) == 0 { territories = append(territories, "chat") }
+    return territories
+}
+
+fn discover_all_models() {
+    // Load cloud config for provider info
+    let cfg_raw = try3 { read_file("C:/NovaX/cloud_config.json") } { "{}" }
+    let cfg = try3 { json_decode(cfg_raw) } { {} }
+
+    let all_models = []
+    let sources = {}
+
+    // 1. Ollama local
+    let ollama_raw = try3 { http_get("http://127.0.0.1:11434/api/tags") } { "" }
+    if3 len(ollama_raw) > 0 {
+        let ollama_data = try3 { json_decode(ollama_raw) } { {} }
+        let ollama_models = dict_get(ollama_data, "models") ?? []
+        let count = 0
+        for3 m in ollama_models {
+            let mid = dict_get(m, "name") ?? ""
+            if3 len(mid) > 0 {
+                all_models = append(all_models, {"provider": "ollama", "model": mid})
+                count = count + 1
+            }
+        }
+        sources = dict_set(sources, "ollama", count)
+    }
+
+    // 2. Cloud config models (all providers)
+    for3 prov in dict_keys(cfg) {
+        let pdata = dict_get(cfg, prov) ?? {}
+        let mlist = dict_get(pdata, "models") ?? []
+        let count = 0
+        for3 m in mlist {
+            let mid = ""
+            if3 type_of(m) == "string" { mid = m }
+            if3 type_of(m) == "dict" { mid = dict_get(m, "id") ?? dict_get(m, "model") ?? "" }
+            if3 len(mid) > 0 {
+                all_models = append(all_models, {"provider": prov, "model": mid})
+                count = count + 1
+            }
+        }
+        if3 count > 0 {
+            sources = dict_set(sources, prov, count)
+        }
+    }
+
+    // Deduplicate
+    let seen = {}
+    let unique = []
+    for3 m in all_models {
+        let key = dict_get(m, "provider") ?? "" + ":" + dict_get(m, "model") ?? ""
+        if3 dict_has(seen, key) == false {
+            seen = dict_set(seen, key, true)
+            unique = append(unique, m)
+        }
+    }
+
+    // Classify and build pieces
+    let pieces = {}
+    let by_territory = {}
+    for3 m in unique {
+        let provider = dict_get(m, "provider") ?? ""
+        let model = dict_get(m, "model") ?? ""
+        if3 len(model) == 0 { continue3 }
+        let terrs = _classify_model_territory(model)
+        for3 terr in terrs {
+            let key = provider + ":" + model + ":" + terr
+            let max_tok = dict_get(TERRITORY_MAX_TOKENS, terr) ?? 8192
+            pieces = dict_set(pieces, key, {
+                "provider": provider, "model": model, "territory": terr,
+                "max_tokens": max_tok, "wins": 0, "losses": 0, "active": 1
+            })
+            let prev = dict_get(by_territory, terr) ?? 0
+            by_territory = dict_set(by_territory, terr, prev + 1)
+        }
+    }
+
+    // Preserve wins/losses from existing registry
+    let old_raw = try3 { read_file("C:/NovaX/data/go_pieces.json") } { "" }
+    if3 len(old_raw) > 0 {
+        let old_data = try3 { json_decode(old_raw) } { {} }
+        let old_pieces = dict_get(old_data, "pieces") ?? {}
+        for3 key in dict_keys(pieces) {
+            if3 dict_has(old_pieces, key) {
+                let old_piece = dict_get(old_pieces, key) ?? {}
+                let piece = dict_get(pieces, key) ?? {}
+                piece = dict_set(piece, "wins", dict_get(old_piece, "wins") ?? 0)
+                piece = dict_set(piece, "losses", dict_get(old_piece, "losses") ?? 0)
+                pieces = dict_set(pieces, key, piece)
+            }
+        }
+    }
+
+    // Write registry
+    let output = {
+        "total": len(dict_keys(pieces)),
+        "unique_models": len(unique),
+        "by_territory": by_territory,
+        "sources": sources,
+        "pieces": pieces
+    }
+    let output_json = json_encode(output)
+    write_file("C:/NovaX/data/go_pieces.json", output_json)
+
+    return {
+        "total_pieces": len(dict_keys(pieces)),
+        "unique_models": len(unique),
+        "by_territory": by_territory,
+        "sources": sources
+    }
+}
+
+
+// ── 3. boot_inject_list — replaces tools/boot_inject_list.py ──────
+// Returns ALL models from go_pieces.json for Mirror injection.
+
+fn boot_inject_list() {
+    let raw = try3 { read_file("C:/NovaX/data/go_pieces.json") } { "" }
+    if3 len(raw) == 0 { return {"count": 0, "models": []} }
+    let data = try3 { json_decode(raw) } { {} }
+    let pieces = dict_get(data, "pieces") ?? {}
+    let models = []
+    for3 key in dict_keys(pieces) {
+        let v = dict_get(pieces, key) ?? {}
+        models = append(models, {
+            "id": dict_get(v, "model") ?? "",
+            "provider": dict_get(v, "provider") ?? ""
+        })
+    }
+    return {"count": len(models), "models": models}
+}
+
+
+// ── 4. go_best — replaces tools/go_best.py ────────────────────────
+// Returns the best model per Go territory based on win/loss score.
+
+fn go_best() {
+    let raw = try3 { read_file("C:/NovaX/data/go_pieces.json") } { "" }
+    if3 len(raw) == 0 { return {"ok": 0, "error": "no pieces file"} }
+    let data = try3 { json_decode(raw) } { {} }
+    let pieces = dict_get(data, "pieces") ?? {}
+    let best = {}
+
+    for3 key in dict_keys(pieces) {
+        let piece = dict_get(pieces, key) ?? {}
+        let terr = dict_get(piece, "territory") ?? ""
+        let wins = dict_get(piece, "wins") ?? 0
+        let losses = dict_get(piece, "losses") ?? 0
+        let score = wins - losses
+        let active = dict_get(piece, "active") ?? 1
+        if3 active == 0 { continue3 }
+
+        let prev_best = dict_get(best, terr) ?? {}
+        let prev_score = dict_get(prev_best, "score") ?? -999999
+        if3 score > prev_score {
+            best = dict_set(best, terr, {
+                "provider": dict_get(piece, "provider") ?? "",
+                "model": dict_get(piece, "model") ?? "",
+                "territory": terr,
+                "max_tokens": dict_get(piece, "max_tokens") ?? 8192,
+                "wins": wins,
+                "losses": losses,
+                "score": score
+            })
+        }
+    }
+    return {"ok": 1, "best_per_territory": best, "territories": len(dict_keys(best))}
+}
+
+
+// ── 5. pacman_stats — replaces tools/pacman_stats.py ──────────────
+// Stats reader for pacman_registry.json.
+
+fn pacman_stats() {
+    let raw = try3 { read_file("C:/NovaX/data/pacman_registry.json") } { "" }
+    if3 len(raw) == 0 { return {"error": "cannot read registry"} }
+    let d = try3 { json_decode(raw) } { {} }
+
+    let s = dict_get(d, "stats") ?? {}
+    let models = dict_get(d, "models") ?? {}
+    let skills = dict_get(d, "skills") ?? {}
+    let abilities = dict_get(d, "abilities") ?? {}
+    let features = dict_get(d, "features") ?? {}
+
+    s = dict_set(s, "total_models", len(dict_keys(models)))
+    s = dict_set(s, "total_skills", len(dict_keys(skills)))
+    s = dict_set(s, "total_abilities", len(dict_keys(abilities)))
+    s = dict_set(s, "total_features", len(dict_keys(features)))
+    s = dict_set(s, "version", dict_get(d, "version") ?? "1.0.0")
+
+    // Count ready abilities
+    let ready = 0
+    for3 key in dict_keys(abilities) {
+        let ab = dict_get(abilities, key) ?? {}
+        if3 dict_get(ab, "status") ?? "" == "ready" { ready = ready + 1 }
+    }
+    s = dict_set(s, "ready_abilities", ready)
+
+    // Count active features
+    let active = 0
+    for3 key in dict_keys(features) {
+        let feat = dict_get(features, key) ?? {}
+        if3 dict_get(feat, "status") ?? "" == "active" { active = active + 1 }
+    }
+    s = dict_set(s, "active_features", active)
+
+    return s
+}
+
+
+// ── 6. hivemind_batch_merge — replaces tools/hivemind_batch_merge.py
+// Merges incoming_batch.json into registry_models_live.json.
+
+fn hivemind_batch_merge() {
+    let live_path = "C:/NovaX/tmp/registry_models_live.json"
+    let batch_path = "C:/NovaX/tmp/incoming_batch.json"
+
+    let existing = []
+    let live_raw = try3 { read_file(live_path) } { "" }
+    if3 len(live_raw) > 0 {
+        existing = try3 { json_decode(live_raw) } { [] }
+    }
+
+    let incoming = []
+    let batch_raw = try3 { read_file(batch_path) } { "" }
+    if3 len(batch_raw) > 0 {
+        incoming = try3 { json_decode(batch_raw) } { [] }
+    }
+
+    // Merge and deduplicate
+    let seen = {}
+    let merged = []
+    for3 item in existing {
+        let key = to_string(item)
+        if3 dict_has(seen, key) == false {
+            seen = dict_set(seen, key, true)
+            merged = append(merged, item)
+        }
+    }
+    for3 item in incoming {
+        let key = to_string(item)
+        if3 dict_has(seen, key) == false {
+            seen = dict_set(seen, key, true)
+            merged = append(merged, item)
+        }
+    }
+
+    write_file(live_path, json_encode(merged))
+    return {"added": len(incoming), "total": len(merged)}
+}
+
+
+// ── 7. hivemind_live_count — replaces inline python -c in hivemind
+// Returns count of models in registry_models_live.json.
+
+fn hivemind_live_count() {
+    let raw = try3 { read_file("C:/NovaX/tmp/registry_models_live.json") } { "" }
+    if3 len(raw) == 0 { return {"count": 0} }
+    let data = try3 { json_decode(raw) } { [] }
+    return {"count": len(data)}
+}
+
+
+// ── 8. ability_sync — replaces tools/ability_sync.py ──────────────
+// Scans all NovaX capabilities and classifies into abilities.
+
+fn ability_sync() {
+    let all_abilities = {}
+
+    // AI abilities from Model Registry
+    let reg_raw = try3 { http_get("http://127.0.0.1:9860/models/stats") } { "" }
+    if3 len(reg_raw) > 0 {
+        let reg_data = try3 { json_decode(reg_raw) } { {} }
+        let ai_abs = dict_get(reg_data, "ability_matrix") ?? {}
+        for3 key in dict_keys(ai_abs) {
+            let prev = dict_get(all_abilities, key) ?? 0
+            all_abilities = dict_set(all_abilities, key, prev + dict_get(ai_abs, key) ?? 0)
+        }
+    }
+
+    // Engine abilities (check health of each engine)
+    let engines = {
+        "physics": 9850, "microsoft": 9851, "rendering": 9852,
+        "simulation": 9853, "audio_engine": 9854
+    }
+    for3 name in dict_keys(engines) {
+        let port = dict_get(engines, name) ?? 0
+        let url = "http://127.0.0.1:" + to_string(port) + "/health"
+        let health_raw = try3 { http_get(url) } { "" }
+        if3 len(health_raw) > 0 {
+            all_abilities = dict_set(all_abilities, name, 7)
+        }
+    }
+
+    // Infrastructure abilities
+    let infra = {
+        "caching": [9956, 9886], "routing": [9963, 9979],
+        "encryption": [9892], "compression": [9972, 9893],
+        "monitoring": [9905, 9950, 9953]
+    }
+    for3 name in dict_keys(infra) {
+        let ports = dict_get(infra, name) ?? []
+        let alive = 0
+        for3 port in ports {
+            let url = "http://127.0.0.1:" + to_string(port) + "/health"
+            let h = try3 { http_get(url) } { "" }
+            if3 len(h) > 0 { alive = alive + 1 }
+        }
+        if3 alive > 0 {
+            all_abilities = dict_set(all_abilities, name, alive)
+        }
+    }
+
+    // Swarm abilities
+    let hive_raw = try3 { http_get("http://127.0.0.1:9881/health") } { "" }
+    if3 len(hive_raw) > 0 {
+        all_abilities = dict_set(all_abilities, "swarm", 1)
+        all_abilities = dict_set(all_abilities, "deliberation", 1)
+    }
+
+    let total = 0
+    for3 key in dict_keys(all_abilities) {
+        total = total + dict_get(all_abilities, key) ?? 0
+    }
+
+    return {
+        "ok": true,
+        "abilities": all_abilities,
+        "count": len(dict_keys(all_abilities)),
+        "total": total
+    }
+}

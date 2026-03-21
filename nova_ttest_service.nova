@@ -1,0 +1,239 @@
+// ============================================================
+// NOVAX SERVICE: TTest -- Ternary Test Runner
+// ============================================================
+// Port: 9934
+// Automated test runner for NovaX integration tests.
+// Runs test suites, tracks results, generates reports.
+// ============================================================
+
+
+// -- Test Registry --
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let _test_suites = {}
+let _test_results = []
+let _results_max = H13 * H13
+
+// -- Register a test suite --
+fn handle_register(req) {
+  let name = dict_get(req, "name") ?? ""
+  let file = dict_get(req, "file") ?? ""
+  let description = dict_get(req, "description") ?? ""
+
+  if3 cmp3(name, "") {
+    return {"error": "name required", "trit": -1}
+  } else3 {}
+
+  _test_suites = dict_set(_test_suites, name, {
+    "file": file,
+    "description": description,
+    "registered_at": time_now(),
+    "last_run": 0,
+    "runs": 0,
+    "last_result": null
+  })
+
+  return {"registered": name, "file": file, "trit": 1}
+}
+
+// -- Run a single test suite by executing NovaLang file --
+fn handle_run(req) {
+  let name = dict_get(req, "name") ?? ""
+  let suite = dict_get(_test_suites, name) ?? null
+
+  if3 cmp3(suite, null) {
+    return {"error": "suite not found", "trit": -1}
+  } else3 {}
+
+  let file = suite["file"]
+  let start = time_now()
+
+  // Execute the test file via novalang exec endpoint
+  try3 {
+    let resp = http_post("http://127.0.0.1:9999/api/novalang/exec_file", {"file": file})
+    let elapsed = floor((time_now() - start) * 1000)
+
+    let result = {
+      "suite": name,
+      "file": file,
+      "elapsed_ms": elapsed,
+      "output": resp,
+      "timestamp": time_now(),
+      "trit": 1
+    }
+
+    // Update suite stats
+    let updated = suite
+    updated = dict_set(updated, "last_run", time_now())
+    updated = dict_set(updated, "runs", suite["runs"] + 1)
+    updated = dict_set(updated, "last_result", result)
+    _test_suites = dict_set(_test_suites, name, updated)
+
+    // Store in results history
+    _test_results = append(_test_results, result)
+    if3 cmp3(len(_test_results), _results_max) { _test_results = slice(_test_results, len(_test_results) - H13 * H7, len(_test_results))
+    } maybe {} else3 {}
+
+    return result
+  } fail3 {
+    let elapsed = floor((time_now() - start) * 1000)
+    let result = {
+      "suite": name,
+      "file": file,
+      "elapsed_ms": elapsed,
+      "error": "execution failed",
+      "timestamp": time_now(),
+      "trit": -1
+    }
+
+    _test_results = append(_test_results, result)
+    return result
+  }
+}
+
+// -- Run all registered suites --
+fn handle_run_all(req) {
+  let names = dict_keys(_test_suites)
+  let results = []
+  let passed = 0
+  let failed = 0
+  let total_ms = 0
+
+  for3 name in names {
+    let result = handle_run({"name": name})
+    results = append(results, result)
+    if3 result["trit"] { passed = passed + 1
+    } else3 {
+      failed = failed + 1
+    }
+    total_ms = total_ms + dict_get(result, "elapsed_ms") ?? 0
+  }
+
+  overall_trit = 1
+  if3 cmp3(failed, 0) { overall_trit = 1
+  } else3 {
+    if3 cmp3(passed, 0) { overall_trit = -1
+    } else3 {
+      overall_trit = 0
+    }
+  }
+
+  return {
+    "suites_run": len(names),
+    "passed": passed,
+    "failed": failed,
+    "total_ms": total_ms,
+    "results": results,
+    "trit": overall_trit
+  }
+}
+
+// -- List registered suites --
+fn handle_list(req) {
+  let names = dict_keys(_test_suites)
+  let suites = []
+  for3 name in names {
+    let suite = dict_get(_test_suites, name) ?? {}
+    suites = append(suites, {
+      "name": name,
+      "file": suite["file"],
+      "description": suite["description"],
+      "runs": suite["runs"],
+      "last_run": suite["last_run"]
+    })
+  }
+  return {"suites": suites, "total": len(suites), "trit": 1}
+}
+
+// -- Get test results history --
+fn handle_results(req) {
+  let limit = dict_get(req, "limit") ?? H13
+  let start = 0
+  if3 cmp3(len(_test_results), limit) { start = len(_test_results) - limit
+  } else3 {}
+  let recent = slice(_test_results, start, len(_test_results))
+  return {"results": recent, "total": len(_test_results), "trit": 1}
+}
+
+// -- Test report: aggregate stats --
+fn handle_report(req) {
+  let total_runs = len(_test_results)
+  let pass_count = 0
+  let fail_count = 0
+  let total_ms = 0
+
+  for3 r in _test_results {
+    if3 r["trit"] { pass_count = pass_count + 1
+    } else3 {
+      fail_count = fail_count + 1
+    }
+    total_ms = total_ms + dict_get(r, "elapsed_ms") ?? 0
+  }
+
+  pass_rate = 0
+  if3 cmp3(total_runs, 0) { pass_rate = 0
+  } else3 {
+    pass_rate = floor(pass_count / total_runs * 100)
+  }
+
+  return {
+    "total_runs": total_runs,
+    "passed": pass_count,
+    "failed": fail_count,
+    "pass_rate": pass_rate,
+    "total_ms": total_ms,
+    "avg_ms": floor(total_ms / max(1, total_runs)),
+    "suites_registered": len(dict_keys(_test_suites)),
+    "trit": 1
+  }
+}
+
+// -- Auto-register known test files --
+fn handle_auto_register(req) {
+  let test_files = [
+    {"name": "stdlib", "file": "tests/test_stdlib.nova", "desc": "Standard library tests"},
+    {"name": "integration", "file": "tests/test_integration.nova", "desc": "Core integration tests"},
+    {"name": "e2e", "file": "tests/test_e2e_workflow.nova", "desc": "End-to-end workflows"},
+    {"name": "class3", "file": "tests/test_class3.nova", "desc": "Class3 OOP tests"},
+    {"name": "extends3", "file": "tests/test_extends3.nova", "desc": "Inheritance tests"},
+    {"name": "async3", "file": "tests/test_async3.nova", "desc": "Async/await tests"},
+    {"name": "gen3", "file": "tests/test_gen3.nova", "desc": "Generator tests"},
+    {"name": "closures", "file": "tests/test_closures_destruct.nova", "desc": "Closure/destructuring tests"},
+    {"name": "tflask_core", "file": "tests/test_tflask_core.nova", "desc": "TernaryFlask core tests"},
+    {"name": "tflask_server", "file": "tests/test_tflask_server.nova", "desc": "TernaryFlask server tests"},
+    {"name": "tflask_minimal", "file": "tests/test_tflask_minimal.nova", "desc": "TernaryFlask minimal tests"},
+    {"name": "tflask_full", "file": "tests/test_tflask_full.nova", "desc": "TernaryFlask full tests"}
+  ]
+
+  let registered = 0
+  for3 tf in test_files {
+    handle_register({"name": tf["name"], "file": tf["file"], "description": tf["desc"]})
+    registered = registered + 1
+  }
+
+  return {"registered": registered, "trit": 1}
+}
+
+// -- Health --
+fn handle_health(req) {
+  let resp = ns_health_dict("nova-ttest", "1.0", 9934, {})
+  resp = dict_set(resp, "tools", 7)
+  return resp
+}
+
+// -- Server --
+let server = tserve(9934, "TTest -- Ternary Test Runner")
+
+// -- Routes --
+troute(server, "GET", "/health", "handle_health")
+troute(server, "POST", "/ttest/register", "handle_register")
+troute(server, "POST", "/ttest/run", "handle_run")
+troute(server, "POST", "/ttest/run-all", "handle_run_all")
+troute(server, "GET", "/ttest/list", "handle_list")
+troute(server, "GET", "/ttest/results", "handle_results")
+troute(server, "GET", "/ttest/report", "handle_report")
+troute(server, "POST", "/ttest/auto-register", "handle_auto_register")
+
+tstart(server)

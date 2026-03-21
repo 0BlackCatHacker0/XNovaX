@@ -1,0 +1,873 @@
+// Nova Rendering Engine v1.0 - Ternary Rendering Micro-Tools (NovaLang)
+// Port 9852: 7 rendering tools on 3-5-7-13 harmonic constants
+//
+// Tools:
+//   1. POST /render/ascii    -- ASCII art (box, table, banner, border)
+//   2. POST /render/chart    -- Charts (bar, histogram, sparkline, heatmap, progress)
+//   3. POST /render/svg      -- SVG generation (circle, rect, line, path, text, group)
+//   4. POST /render/canvas   -- HTML5 Canvas JS code generation (draw, animate)
+//   5. POST /render/color    -- Color operations (hex_to_rgb, rgb_to_hex, complement, blend, etc.)
+//   6. POST /render/layout   -- Layout computation (grid, flex, stack)
+//   7. POST /render/scene    -- 3D projection (project, wireframe)
+//
+// N-S Mapping:
+//   pixel_stream        = velocity_field (visual elements flowing through renderer)
+//   render_complexity    = turbulent_energy (number of shapes/chars)
+//   Reynolds(render)     = element_count * H5
+//   RE_LAMINAR=27        = simple render (few elements)
+//   RE_TRANSITION=125    = medium render (moderate complexity)
+//   RE_TURBULENT=343     = heavy render (many elements, 3D projection)
+//
+// Endpoints:
+//   GET  /health                  -- Health check
+//   GET  /render/service-status   -- Full service status with stats
+//   POST /render/ascii            -- ASCII art rendering
+//   POST /render/chart            -- Chart rendering
+//   POST /render/svg              -- SVG generation
+//   POST /render/canvas           -- Canvas JS code generation
+//   POST /render/color            -- Color operations
+//   POST /render/layout           -- Layout computation
+//   POST /render/scene            -- 3D projection
+
+let PORT = 9852
+let server = tserve(PORT, "Rendering Engine v1.0 - Ternary Rendering Micro-Tools")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds Boundaries (N-S) --
+let BLOCK_SIZE    = 2187
+let RE_LAMINAR    = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT  = 343
+
+// -- Service Constants --
+let TOOLS_COUNT  = 7
+let VERSION      = "1.0.0"
+let SERVICE_NAME = "rendering-engine"
+
+// -- Global Stats --
+let _stats = {"total": 0, "t0": 0}
+let _stats = dict_set(_stats, "t0", time())
+let stat_ascii  = 0
+let stat_chart  = 0
+let stat_svg    = 0
+let stat_canvas = 0
+let stat_color  = 0
+let stat_layout = 0
+let stat_scene  = 0
+
+// ===========================================================================
+// PSEUDO-RANDOM (LCG)
+// ===========================================================================
+fn pseudo_random(seed) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483647
+    let next = (a * seed + c) % m
+    if3 next < 0 { next = 0 - next }
+    return next
+}
+
+fn rand_float(seed, lo, hi) {
+    let r = pseudo_random(seed)
+    let range = hi - lo
+    let frac = (r % 10000) / 10000
+    return lo + frac * range
+}
+
+// ===========================================================================
+// HELPER: increment stats
+// ===========================================================================
+fn bump_stats() {
+    _stats = dict_set(_stats, "total", (dict_get(_stats, "total") ?? 0) + 1)
+    return T_TRUE
+}
+
+// ===========================================================================
+// HELPER: repeat a string N times
+// ===========================================================================
+fn repeat_str(s, n) {
+    let result = ""
+    let i = 0
+    while3 i < n {
+        let result = result + s
+        i = i + 1
+    }
+    return result
+}
+
+// ===========================================================================
+// HELPER: pad string to width
+// ===========================================================================
+fn pad_right(s, w) {
+    let slen = len(s)
+    if3 slen >= w { return s }
+    let diff = w - slen
+    return s + repeat_str(" ", diff)
+}
+
+fn pad_left(s, w) {
+    let slen = len(s)
+    if3 slen >= w { return s }
+    let diff = w - slen
+    return repeat_str(" ", diff) + s
+}
+
+// ===========================================================================
+// HELPER: abs value
+// ===========================================================================
+fn abs_val(x) {
+    if3 x < 0 { return 0 - x }
+    return x
+}
+
+// ===========================================================================
+// HELPER: max of two
+// ===========================================================================
+fn max2(a, b) {
+    if3 a >= b { return a }
+    return b
+}
+
+fn min2(a, b) {
+    if3 a <= b { return a }
+    return b
+}
+
+// ===========================================================================
+// HELPER: int to string
+// ===========================================================================
+fn int_to_str(n) {
+    let v = str(n)
+    return v
+}
+
+// ===========================================================================
+// TOOL 1: ASCII - POST /render/ascii
+// ===========================================================================
+fn render_ascii_box(content, width) {
+    let w = width - 2
+    if3 w < 1 { w = 38 }
+    let top = "+" + repeat_str("-", w) + "+"
+    let padded = pad_right(content, w)
+    // truncate if too long
+    let clen = len(padded)
+    if3 clen > w { padded = pad_right(content, w)
+    }
+    let mid = "|" + padded + "|"
+    let bot = "+" + repeat_str("-", w) + "+"
+    return top + "\n" + mid + "\n" + bot
+}
+
+fn render_ascii_table(headers, rows) {
+    let ncols = len(headers)
+    if3 ncols == 0 { return "(empty table)" }
+    // compute column widths
+    let widths = []
+    let ci = 0
+    while3 ci < ncols {
+        let h = dict_get(headers, ci)
+        widths = append(widths, len(str(h)))
+        ci = ci + 1
+    }
+    // scan rows for max widths
+    let ri = 0
+    while3 ri < len(rows) {
+        let row = dict_get(rows, ri)
+        let ci = 0
+        while3 ci < ncols {
+            let cell = str(dict_get(row, ci) ?? "")
+            let cw = dict_get(widths, ci)
+            let nw = max2(cw, len(cell))
+            let widths = list_set(widths, ci, nw)
+            ci = ci + 1
+        }
+        ri = ri + 1
+    }
+    // build separator
+    let sep = "+"
+    let ci = 0
+    while3 ci < ncols {
+        let cw = dict_get(widths, ci)
+        let sep = sep + repeat_str("-", cw + 2) + "+"
+        ci = ci + 1
+    }
+    // build header row
+    let hdr_line = "|"
+    let ci = 0
+    while3 ci < ncols {
+        let cw = dict_get(widths, ci)
+        let h = pad_right(str(dict_get(headers, ci)), cw)
+        let hdr_line = hdr_line + " " + h + " |"
+        ci = ci + 1
+    }
+    let output = sep + "\n" + hdr_line + "\n" + sep
+    // build data rows
+    let ri = 0
+    while3 ri < len(rows) {
+        let row = dict_get(rows, ri)
+        let line = "|"
+        let ci = 0
+        while3 ci < ncols {
+            let cw = dict_get(widths, ci)
+            let cell = pad_right(str(dict_get(row, ci) ?? ""), cw)
+            let line = line + " " + cell + " |"
+            ci = ci + 1
+        }
+        let output = output + "\n" + line
+        ri = ri + 1
+    }
+    let output = output + "\n" + sep
+    return output
+}
+
+fn render_ascii_banner(content) {
+    let bar = repeat_str("=", len(content) + 4)
+    return bar + "\n| " + content + " |\n" + bar
+}
+
+fn render_ascii_border(content, width) {
+    let w = width - 4
+    if3 w < 1 { w = 36 }
+    let top = ".-" + repeat_str("-", w) + "-."
+    let padded = pad_right(content, w)
+    let mid = "| " + padded + " |"
+    let bot = "'-" + repeat_str("-", w) + "-'"
+    return top + "\n" + mid + "\n" + bot
+}
+
+fn handle_ascii(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_ascii = stat_ascii + 1
+    let rtype = dict_get(body, "type") ?? "box"
+    let content = dict_get(body, "content") ?? "NovaX"
+    let width = dict_get(body, "width") ?? 40
+    if3 rtype == "box" { rendered = render_ascii_box(content, width)
+        return {"trit": T_TRUE, "type": "box", "render": rendered}
+    }
+    if3 rtype == "table" { headers = dict_get(body, "headers", ["A", "B", "C"])
+        let rows = dict_get(body, "rows") ?? []
+        let rendered = render_ascii_table(headers, rows)
+        return {"trit": T_TRUE, "type": "table", "render": rendered}
+    }
+    if3 rtype == "banner" { rendered = render_ascii_banner(content)
+        return {"trit": T_TRUE, "type": "banner", "render": rendered}
+    }
+    if3 rtype == "border" { rendered = render_ascii_border(content, width)
+        return {"trit": T_TRUE, "type": "border", "render": rendered}
+    }
+    return {"trit": T_FALSE, "error": "unknown ascii type", "valid": ["box", "table", "banner", "border"]}
+}
+
+// ===========================================================================
+// TOOL 2: CHART - POST /render/chart
+// ===========================================================================
+fn render_bar_chart(data, labels, width) {
+    let n = len(data)
+    if3 n == 0 { return "(no data)" }
+    // find max value
+    let mx = 0
+    let i = 0
+    while3 i < n {
+        let v = dict_get(data, i)
+        let mx = max2(mx, v)
+        i = i + 1
+    }
+    if3 mx == 0 { mx = 1 }
+    let output = ""
+    let i = 0
+    while3 i < n {
+        let v = dict_get(data, i)
+        let bar_len = (v * width) / mx
+        let bar = repeat_str("#", bar_len)
+        let lbl = ""
+        if3 len(labels) > i { lbl = str(dict_get(labels, i))
+        }
+        let lbl = pad_right(lbl, 8)
+        let vstr = int_to_str(v)
+        let line = lbl + " |" + bar + " " + vstr
+        if3 i > 0 { output = output + "\n" }
+        let output = output + line
+        i = i + 1
+    }
+    return output
+}
+
+fn render_sparkline(data) {
+    let chars = ["_", ".", "-", "~", ":", "+", "*", "#"]
+    let n = len(data)
+    if3 n == 0 { return "" }
+    let mx = 0
+    let mn = 999999
+    let i = 0
+    while3 i < n {
+        let v = dict_get(data, i)
+        let mx = max2(mx, v)
+        let mn = min2(mn, v)
+        i = i + 1
+    }
+    let range = mx - mn
+    if3 range == 0 { range = 1 }
+    let output = ""
+    let i = 0
+    while3 i < n {
+        let v = dict_get(data, i)
+        let idx = ((v - mn) * 7) / range
+        if3 idx > 7 { idx = 7 }
+        if3 idx < 0 { idx = 0 }
+        let ch = dict_get(chars, idx)
+        let output = output + ch
+        i = i + 1
+    }
+    return output
+}
+
+fn render_progress(data, width) {
+    let pct = dict_get(data, 0) ?? 50
+    if3 pct > 100 { pct = 100 }
+    if3 pct < 0   { pct = 0 }
+    let filled = (pct * width) / 100
+    let empty = width - filled
+    let bar = "[" + repeat_str("#", filled) + repeat_str(".", empty) + "]"
+    let pstr = int_to_str(pct)
+    return bar + " " + pstr + "%"
+}
+
+fn render_heatmap(data, width) {
+    let chars = [" ", ".", ":", "+", "*", "#", "@"]
+    let n = len(data)
+    if3 n == 0 { return "(no data)" }
+    let mx = 0
+    let i = 0
+    while3 i < n {
+        let v = dict_get(data, i)
+        let mx = max2(mx, abs_val(v))
+        i = i + 1
+    }
+    if3 mx == 0 { mx = 1 }
+    let output = ""
+    let i = 0
+    while3 i < n {
+        let v = dict_get(data, i)
+        let idx = (abs_val(v) * 6) / mx
+        if3 idx > 6 { idx = 6 }
+        let ch = dict_get(chars, idx)
+        let output = output + ch
+        if3 ((i + 1) % width) == 0 { output = output + "\n"
+        }
+        i = i + 1
+    }
+    return output
+}
+
+fn handle_chart(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_chart = stat_chart + 1
+    let ctype = dict_get(body, "type") ?? "bar"
+    let data = dict_get(body, "data", [1, 2, 3, 4, 5])
+    let labels = dict_get(body, "labels") ?? []
+    let width = dict_get(body, "width") ?? 40
+    if3 ctype == "bar" { rendered = render_bar_chart(data, labels, width)
+        return {"trit": T_TRUE, "type": "bar", "render": rendered}
+    }
+    if3 ctype == "sparkline" { rendered = render_sparkline(data)
+        return {"trit": T_TRUE, "type": "sparkline", "render": rendered}
+    }
+    if3 ctype == "progress" { rendered = render_progress(data, width)
+        return {"trit": T_TRUE, "type": "progress", "render": rendered}
+    }
+    if3 ctype == "heatmap" { rendered = render_heatmap(data, width)
+        return {"trit": T_TRUE, "type": "heatmap", "render": rendered}
+    }
+    if3 ctype == "histogram" {
+        // vertical histogram via rotated bar chart
+        let rendered = render_bar_chart(data, labels, width)
+        return {"trit": T_TRUE, "type": "histogram", "render": rendered}
+    }
+    return {"trit": T_FALSE, "error": "unknown chart type", "valid": ["bar", "histogram", "sparkline", "heatmap", "progress"]}
+}
+
+// ===========================================================================
+// TOOL 3: SVG - POST /render/svg
+// ===========================================================================
+fn svg_shape(s) {
+    let stype = dict_get(s, "type") ?? "rect"
+    if3 stype == "circle" { cx = dict_get(s, "cx") ?? 50
+        let cy = dict_get(s, "cy") ?? 50
+        let r = dict_get(s, "r") ?? 25
+        let fill = dict_get(s, "fill") ?? "#00ffcc"
+        let stroke = dict_get(s, "stroke") ?? "none"
+        let cxs = int_to_str(cx)
+        let cys = int_to_str(cy)
+        let rs = int_to_str(r)
+        return "<circle cx=\"" + cxs + "\" cy=\"" + cys + "\" r=\"" + rs + "\" fill=\"" + fill + "\" stroke=\"" + stroke + "\" />"
+    }
+    if3 stype == "rect" { x = dict_get(s, "x") ?? 10
+        let y = dict_get(s, "y") ?? 10
+        let w = dict_get(s, "w") ?? 50
+        let h = dict_get(s, "h") ?? 50
+        let fill = dict_get(s, "fill") ?? "#ff00aa"
+        let rx = dict_get(s, "rx") ?? 0
+        let xs = int_to_str(x)
+        let ys = int_to_str(y)
+        let ws = int_to_str(w)
+        let hs = int_to_str(h)
+        let rxs = int_to_str(rx)
+        return "<rect x=\"" + xs + "\" y=\"" + ys + "\" width=\"" + ws + "\" height=\"" + hs + "\" rx=\"" + rxs + "\" fill=\"" + fill + "\" />"
+    }
+    if3 stype == "line" { x1 = int_to_str(dict_get(s, "x1") ?? 0)
+        let y1 = int_to_str(dict_get(s, "y1") ?? 0)
+        let x2 = int_to_str(dict_get(s, "x2") ?? 100)
+        let y2 = int_to_str(dict_get(s, "y2") ?? 100)
+        let stroke = dict_get(s, "stroke") ?? "#00ffcc"
+        return "<line x1=\"" + x1 + "\" y1=\"" + y1 + "\" x2=\"" + x2 + "\" y2=\"" + y2 + "\" stroke=\"" + stroke + "\" stroke-width=\"2\" />"
+    }
+    if3 stype == "path" { d = dict_get(s, "d") ?? "M 10 10 L 50 50"
+        let stroke = dict_get(s, "stroke") ?? "#00ffcc"
+        let fill = dict_get(s, "fill") ?? "none"
+        return "<path d=\"" + d + "\" fill=\"" + fill + "\" stroke=\"" + stroke + "\" stroke-width=\"2\" />"
+    }
+    if3 stype == "text" { x = int_to_str(dict_get(s, "x") ?? 10)
+        let y = int_to_str(dict_get(s, "y") ?? 30)
+        let content = dict_get(s, "content") ?? "NovaX"
+        let fs = int_to_str(dict_get(s, "font-size") ?? 14)
+        return "<text x=\"" + x + "\" y=\"" + y + "\" font-size=\"" + fs + "\" fill=\"#00ffcc\">" + content + "</text>"
+    }
+    return "<!-- unknown shape: " + stype + " -->"
+}
+
+fn handle_svg(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_svg = stat_svg + 1
+    let stype = dict_get(body, "type") ?? "rect"
+    let shapes = dict_get(body, "shapes") ?? []
+    let w = int_to_str(dict_get(body, "width") ?? 200)
+    let h = int_to_str(dict_get(body, "height") ?? 200)
+    let svg_open = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + w + "\" height=\"" + h + "\" viewBox=\"0 0 " + w + " " + h + "\">"
+    let svg_close = "</svg>"
+    let inner = ""
+    // if shapes provided, render them
+    if3 len(shapes) > 0 { i = 0
+        while3 i < len(shapes) {
+            let s = dict_get(shapes, i)
+            let rendered = svg_shape(s)
+            let inner = inner + "\n  " + rendered
+            i = i + 1
+        }
+    }
+    // if single shape from type
+    if3 len(shapes) == 0 { single = dict_set(body, "type", stype)
+        let inner = "\n  " + svg_shape(single)
+    }
+    // group wrapper?
+    if3 stype == "group" { inner = "\n  <g>" + inner + "\n  </g>"
+    }
+    let svg_out = svg_open + inner + "\n" + svg_close
+    return {"trit": T_TRUE, "type": stype, "svg": svg_out, "shape_count": len(shapes)}
+}
+
+// ===========================================================================
+// TOOL 4: CANVAS - POST /render/canvas
+// ===========================================================================
+fn handle_canvas(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_canvas = stat_canvas + 1
+    let ctype = dict_get(body, "type") ?? "draw"
+    let shapes = dict_get(body, "shapes") ?? []
+    let w = int_to_str(dict_get(body, "width") ?? 400)
+    let h = int_to_str(dict_get(body, "height") ?? 300)
+    let code = "const canvas = document.getElementById('novaCanvas');\n"
+    let code = code + "canvas.width = " + w + "; canvas.height = " + h + ";\n"
+    let code = code + "const ctx = canvas.getContext('2d');\n"
+    let i = 0
+    while3 i < len(shapes) {
+        let s = dict_get(shapes, i)
+        let st = dict_get(s, "type") ?? "rect"
+        if3 st == "rect" { sx = int_to_str(dict_get(s, "x") ?? 10)
+            let sy = int_to_str(dict_get(s, "y") ?? 10)
+            let sw = int_to_str(dict_get(s, "w") ?? 50)
+            let sh = int_to_str(dict_get(s, "h") ?? 50)
+            let fill = dict_get(s, "fill") ?? "#00ffcc"
+            let code = code + "ctx.fillStyle = '" + fill + "';\n"
+            let code = code + "ctx.fillRect(" + sx + ", " + sy + ", " + sw + ", " + sh + ");\n"
+        }
+        if3 st == "circle" { cx = int_to_str(dict_get(s, "cx") ?? 50)
+            let cy = int_to_str(dict_get(s, "cy") ?? 50)
+            let r = int_to_str(dict_get(s, "r") ?? 25)
+            let fill = dict_get(s, "fill") ?? "#ff00aa"
+            let code = code + "ctx.beginPath();\n"
+            let code = code + "ctx.arc(" + cx + ", " + cy + ", " + r + ", 0, Math.PI * 2);\n"
+            let code = code + "ctx.fillStyle = '" + fill + "';\n"
+            let code = code + "ctx.fill();\n"
+        }
+        if3 st == "line" { x1 = int_to_str(dict_get(s, "x1") ?? 0)
+            let y1 = int_to_str(dict_get(s, "y1") ?? 0)
+            let x2 = int_to_str(dict_get(s, "x2") ?? 100)
+            let y2 = int_to_str(dict_get(s, "y2") ?? 100)
+            let stroke = dict_get(s, "stroke") ?? "#00ffcc"
+            let code = code + "ctx.beginPath();\n"
+            let code = code + "ctx.moveTo(" + x1 + ", " + y1 + ");\n"
+            let code = code + "ctx.lineTo(" + x2 + ", " + y2 + ");\n"
+            let code = code + "ctx.strokeStyle = '" + stroke + "';\n"
+            let code = code + "ctx.stroke();\n"
+        }
+        i = i + 1
+    }
+    if3 ctype == "animate" { code = code + "let frame = 0;\n"
+        let code = code + "function animate() {\n"
+        let code = code + "  ctx.clearRect(0, 0, " + w + ", " + h + ");\n"
+        let code = code + "  frame++;\n"
+        let code = code + "  // re-draw shapes with frame offset\n"
+        let code = code + "  ctx.fillStyle = '#00ffcc';\n"
+        let code = code + "  ctx.fillRect(frame % " + w + ", 50, 40, 40);\n"
+        let code = code + "  requestAnimationFrame(animate);\n"
+        let code = code + "}\nanimate();\n"
+    }
+    return {"trit": T_TRUE, "type": ctype, "canvas_js": code, "shape_count": len(shapes)}
+}
+
+// ===========================================================================
+// TOOL 5: COLOR - POST /render/color
+// ===========================================================================
+fn hex_char_val(c) {
+    if3 c == "0" { return 0 }
+    if3 c == "1" { return 1 }
+    if3 c == "2" { return 2 }
+    if3 c == "3" { return 3 }
+    if3 c == "4" { return 4 }
+    if3 c == "5" { return 5 }
+    if3 c == "6" { return 6 }
+    if3 c == "7" { return 7 }
+    if3 c == "8" { return 8 }
+    if3 c == "9" { return 9 }
+    if3 c == "a" { return 10 }
+    if3 c == "b" { return 11 }
+    if3 c == "c" { return 12 }
+    if3 c == "d" { return 13 }
+    if3 c == "e" { return 14 }
+    if3 c == "f" { return 15 }
+    if3 c == "A" { return 10 }
+    if3 c == "B" { return 11 }
+    if3 c == "C" { return 12 }
+    if3 c == "D" { return 13 }
+    if3 c == "E" { return 14 }
+    if3 c == "F" { return 15 }
+    return 0
+}
+
+fn hex_pair_to_int(h1, h2) {
+    return hex_char_val(h1) * 16 + hex_char_val(h2)
+}
+
+fn int_to_hex_char(n) {
+    let chars = ["0","1","2","3","4","5","6","7","8","9","a","b","c","d","e","f"]
+    if3 n < 0  { n = 0 }
+    if3 n > 15 { n = 15 }
+    return dict_get(chars, n)
+}
+
+fn int_to_hex_pair(v) {
+    if3 v < 0   { v = 0 }
+    if3 v > 255 { v = 255 }
+    let hi = v / 16
+    let lo = v % 16
+    return int_to_hex_char(hi) + int_to_hex_char(lo)
+}
+
+fn parse_hex_color(hex) {
+    // expects "#rrggbb" format
+    let r = hex_pair_to_int(substr(hex, 1, 1), substr(hex, 2, 1))
+    let g = hex_pair_to_int(substr(hex, 3, 1), substr(hex, 4, 1))
+    let b = hex_pair_to_int(substr(hex, 5, 1), substr(hex, 6, 1))
+    return {"r": r, "g": g, "b": b}
+}
+
+fn rgb_to_hex_str(r, g, b) {
+    return "#" + int_to_hex_pair(r) + int_to_hex_pair(g) + int_to_hex_pair(b)
+}
+
+fn handle_color(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_color = stat_color + 1
+    let op = dict_get(body, "op") ?? "hex_to_rgb"
+    if3 op == "hex_to_rgb" { hex = dict_get(body, "color") ?? "#ff0000"
+        let rgb = parse_hex_color(hex)
+        return {"trit": T_TRUE, "op": "hex_to_rgb", "hex": hex, "r": dict_get(rgb, "r"), "g": dict_get(rgb, "g"), "b": dict_get(rgb, "b")}
+    }
+    if3 op == "rgb_to_hex" { r = dict_get(body, "r") ?? 255
+        let g = dict_get(body, "g") ?? 0
+        let b = dict_get(body, "b") ?? 0
+        let hex = rgb_to_hex_str(r, g, b)
+        return {"trit": T_TRUE, "op": "rgb_to_hex", "hex": hex, "r": r, "g": g, "b": b}
+    }
+    if3 op == "complement" { hex = dict_get(body, "color") ?? "#ff0000"
+        let rgb = parse_hex_color(hex)
+        let cr = 255 - dict_get(rgb, "r")
+        let cg = 255 - dict_get(rgb, "g")
+        let cb = 255 - dict_get(rgb, "b")
+        let comp_hex = rgb_to_hex_str(cr, cg, cb)
+        return {"trit": T_TRUE, "op": "complement", "original": hex, "complement": comp_hex, "r": cr, "g": cg, "b": cb}
+    }
+    if3 op == "ternary_palette" {
+        // trit -1 = cool (blue), 0 = neutral (gray), +1 = warm (orange)
+        let neg1 = "#0066ff"
+        let zero  = "#888888"
+        let pos1  = "#ff6600"
+        return {"trit": T_TRUE, "op": "ternary_palette", "neg1": neg1, "zero": zero, "pos1": pos1, "mapping": "trit(-1)=cool_blue, trit(0)=neutral_gray, trit(+1)=warm_orange"}
+    }
+    if3 op == "blend" { c1 = dict_get(body, "color1") ?? "#ff0000"
+        let c2 = dict_get(body, "color2") ?? "#0000ff"
+        let ratio = dict_get(body, "ratio") ?? 0.5
+        let rgb1 = parse_hex_color(c1)
+        let rgb2 = parse_hex_color(c2)
+        let br = dict_get(rgb1, "r") * (1 - ratio) + dict_get(rgb2, "r") * ratio
+        let bg = dict_get(rgb1, "g") * (1 - ratio) + dict_get(rgb2, "g") * ratio
+        let bb = dict_get(rgb1, "b") * (1 - ratio) + dict_get(rgb2, "b") * ratio
+        let blended = rgb_to_hex_str(br, bg, bb)
+        return {"trit": T_TRUE, "op": "blend", "color1": c1, "color2": c2, "ratio": ratio, "blended": blended}
+    }
+    if3 op == "hsl_to_rgb" {
+        // simplified HSL to RGB: h [0-360], s [0-100], l [0-100]
+        let h = dict_get(body, "h") ?? 0
+        let s = (dict_get(body, "s") ?? 100) / 100
+        let l = (dict_get(body, "l") ?? 50) / 100
+        let c = (1 - abs_val(2 * l - 1)) * s
+        let hh = h / 60
+        let x = c * (1 - abs_val(hh % 2 - 1))
+        let r = 0
+        let g = 0
+        let b = 0
+        if3 hh < 1 { r = c  let g = x  let b = 0 }
+        if3 hh >= 1 { if3 hh < 2 { r = x  let g = c  let b = 0 } }
+        if3 hh >= 2 { if3 hh < 3 { r = 0  let g = c  let b = x } }
+        if3 hh >= 3 { if3 hh < 4 { r = 0  let g = x  let b = c } }
+        if3 hh >= 4 { if3 hh < 5 { r = x  let g = 0  let b = c } }
+        if3 hh >= 5 { r = c  let g = 0  let b = x }
+        let m = l - c / 2
+        let ro = (r + m) * 255
+        let go = (g + m) * 255
+        let bo = (b + m) * 255
+        let hex = rgb_to_hex_str(ro, go, bo)
+        return {"trit": T_TRUE, "op": "hsl_to_rgb", "hex": hex, "r": ro, "g": go, "b": bo}
+    }
+    return {"trit": T_FALSE, "error": "unknown color op", "valid": ["hex_to_rgb", "rgb_to_hex", "hsl_to_rgb", "complement", "ternary_palette", "blend"]}
+}
+
+// ===========================================================================
+// TOOL 6: LAYOUT - POST /render/layout
+// ===========================================================================
+fn handle_layout(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_layout = stat_layout + 1
+    let ltype = dict_get(body, "type") ?? "grid"
+    let items = dict_get(body, "items", [1, 2, 3, 4, 5, 6])
+    let columns = dict_get(body, "columns") ?? 3
+    let gap = dict_get(body, "gap") ?? 10
+    let cw = dict_get(body, "container_width") ?? 800
+    let n = len(items)
+    if3 ltype == "grid" { col_width = (cw - (columns - 1) * gap) / columns
+        let positions = []
+        let i = 0
+        while3 i < n {
+            let col = i % columns
+            let row = i / columns
+            let x = col * (col_width + gap)
+            let y = row * (col_width + gap)
+            let pos = {"index": i, "x": x, "y": y, "w": col_width, "h": col_width, "col": col, "row": row}
+            positions = append(positions, pos)
+            i = i + 1
+        }
+        return {"trit": T_TRUE, "type": "grid", "positions": positions, "columns": columns, "col_width": col_width, "count": n}
+    }
+    if3 ltype == "flex" { item_width = (cw - (n - 1) * gap) / n
+        let positions = []
+        let i = 0
+        while3 i < n {
+            let x = i * (item_width + gap)
+            let pos = {"index": i, "x": x, "y": 0, "w": item_width}
+            positions = append(positions, pos)
+            i = i + 1
+        }
+        return {"trit": T_TRUE, "type": "flex", "positions": positions, "item_width": item_width, "count": n}
+    }
+    if3 ltype == "stack" { direction = dict_get(body, "direction") ?? "vertical"
+        let item_size = dict_get(body, "item_size") ?? 50
+        let positions = []
+        let i = 0
+        while3 i < n {
+            let x = 0
+            let y = 0
+            if3 direction == "vertical" { y = i * (item_size + gap)
+            }
+            if3 direction == "horizontal" { x = i * (item_size + gap)
+            }
+            let pos = {"index": i, "x": x, "y": y}
+            positions = append(positions, pos)
+            i = i + 1
+        }
+        return {"trit": T_TRUE, "type": "stack", "direction": direction, "positions": positions, "count": n}
+    }
+    return {"trit": T_FALSE, "error": "unknown layout type", "valid": ["grid", "flex", "stack"]}
+}
+
+// ===========================================================================
+// TOOL 7: SCENE - POST /render/scene
+// ===========================================================================
+fn project_point(vx, vy, vz, cam_x, cam_y, cam_z, fov, cx, cy) {
+    // simple perspective: translate to camera, then project
+    let dx = vx - cam_x
+    let dy = vy - cam_y
+    let dz = vz - cam_z
+    // distance from camera
+    let dist = abs_val(dz)
+    if3 dist < 1 { dist = 1 }
+    let scale = fov / dist
+    let px = cx + dx * scale
+    let py = cy - dy * scale
+    return {"x": px, "y": py, "depth": dist}
+}
+
+fn handle_scene(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_scene = stat_scene + 1
+    let stype = dict_get(body, "type") ?? "project"
+    let vertices = dict_get(body, "vertices") ?? []
+    let edges = dict_get(body, "edges") ?? []
+    let camera = dict_get(body, "camera", {"x": 5, "y": 5, "z": 5})
+    let fov = dict_get(body, "fov") ?? 60
+    let cam_x = dict_get(camera, "x") ?? 5
+    let cam_y = dict_get(camera, "y") ?? 5
+    let cam_z = dict_get(camera, "z") ?? 5
+    // default viewport center
+    let cx = 200
+    let cy = 150
+    // project all vertices to 2D
+    let projected = []
+    let i = 0
+    while3 i < len(vertices) {
+        let v = dict_get(vertices, i)
+        let vx = dict_get(v, "x") ?? 0
+        let vy = dict_get(v, "y") ?? 0
+        let vz = dict_get(v, "z") ?? 0
+        let p = project_point(vx, vy, vz, cam_x, cam_y, cam_z, fov, cx, cy)
+        projected = append(projected, p)
+        i = i + 1
+    }
+    if3 stype == "project" {
+        return {"trit": T_TRUE, "type": "project", "projected": projected, "vertex_count": len(vertices)}
+    }
+    if3 stype == "wireframe" {
+        // generate SVG wireframe from projected points + edges
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"400\" height=\"300\" style=\"background:#111\">"
+        // draw edges as lines
+        let ei = 0
+        while3 ei < len(edges) {
+            let edge = dict_get(edges, ei)
+            let idx_a = dict_get(edge, 0) ?? 0
+            let idx_b = dict_get(edge, 1) ?? 1
+            if3 idx_a < len(projected) {
+                if3 idx_b < len(projected) { pa = dict_get(projected, idx_a)
+                    let pb = dict_get(projected, idx_b)
+                    let x1s = int_to_str(dict_get(pa, "x") ?? 0)
+                    let y1s = int_to_str(dict_get(pa, "y") ?? 0)
+                    let x2s = int_to_str(dict_get(pb, "x") ?? 0)
+                    let y2s = int_to_str(dict_get(pb, "y") ?? 0)
+                    let svg = svg + "\n  <line x1=\"" + x1s + "\" y1=\"" + y1s + "\" x2=\"" + x2s + "\" y2=\"" + y2s + "\" stroke=\"#00ffcc\" stroke-width=\"1\" />"
+                }
+            }
+            let ei = ei + 1
+        }
+        // draw vertices as dots
+        let vi = 0
+        while3 vi < len(projected) {
+            let p = dict_get(projected, vi)
+            let pxs = int_to_str(dict_get(p, "x") ?? 0)
+            let pys = int_to_str(dict_get(p, "y") ?? 0)
+            let svg = svg + "\n  <circle cx=\"" + pxs + "\" cy=\"" + pys + "\" r=\"3\" fill=\"#ff00aa\" />"
+            vi = vi + 1
+        }
+        let svg = svg + "\n</svg>"
+        return {"trit": T_TRUE, "type": "wireframe", "svg": svg, "projected": projected, "vertex_count": len(vertices), "edge_count": len(edges)}
+    }
+    return {"trit": T_FALSE, "error": "unknown scene type", "valid": ["project", "wireframe"]}
+}
+
+// ===========================================================================
+// HEALTH + STATUS
+// ===========================================================================
+fn handle_health(req) {
+    return {"status": "ok", "service": SERVICE_NAME, "version": VERSION, "port": PORT, "trit": T_TRUE}
+}
+
+fn handle_status(req) {
+    let uptime = time() - dict_get(_stats, "t0") ?? 0
+    return {
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "trit": T_TRUE,
+        "tools": TOOLS_COUNT,
+        "uptime_s": uptime,
+        "total_requests": dict_get(_stats, "total") ?? 0,
+        "by_tool": {
+            "ascii": stat_ascii,
+            "chart": stat_chart,
+            "svg": stat_svg,
+            "canvas": stat_canvas,
+            "color": stat_color,
+            "layout": stat_layout,
+            "scene": stat_scene
+        },
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13, "BLOCK_SIZE": BLOCK_SIZE},
+        "reynolds": {"laminar": RE_LAMINAR, "transition": RE_TRANSITION, "turbulent": RE_TURBULENT}
+    }
+}
+
+// ===========================================================================
+// ROUTES
+// ===========================================================================
+troute(server, "GET",  "/health",               "handle_health")
+troute(server, "GET",  "/render/service-status", "handle_status")
+troute(server, "POST", "/render/ascii",          "handle_ascii")
+troute(server, "POST", "/render/chart",          "handle_chart")
+troute(server, "POST", "/render/svg",            "handle_svg")
+troute(server, "POST", "/render/canvas",         "handle_canvas")
+troute(server, "POST", "/render/color",          "handle_color")
+troute(server, "POST", "/render/layout",         "handle_layout")
+troute(server, "POST", "/render/scene",          "handle_scene")
+
+print("=== Nova Rendering Engine v1.0 ===")
+print("  Port:    9852")
+print("  Service: " + SERVICE_NAME)
+print("  Tools:   7 rendering micro-tools")
+print("  Routes:")
+print("    GET  /health")
+print("    GET  /render/service-status")
+print("    POST /render/ascii    (box, table, banner, border)")
+print("    POST /render/chart    (bar, histogram, sparkline, heatmap, progress)")
+print("    POST /render/svg      (circle, rect, line, path, text, group)")
+print("    POST /render/canvas   (draw, animate)")
+print("    POST /render/color    (hex_to_rgb, rgb_to_hex, hsl_to_rgb, complement, ternary_palette, blend)")
+print("    POST /render/layout   (grid, flex, stack)")
+print("    POST /render/scene    (project, wireframe)")
+print("  Harmonics: H3=3 H5=5 H7=7 H13=13 BLOCK=2187")
+print("  Reynolds:  laminar=27 transition=125 turbulent=343")
+print("=================================")
+
+tstart(server)

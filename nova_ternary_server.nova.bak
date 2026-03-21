@@ -1,0 +1,1437 @@
+// TPacman v3.0 — Navier-Stokes Converter
+// Source: nova_ternary_server.py
+// Reynolds: 174.2 (turbulent)
+// Cascade: L→λ→η (Kolmogorov)
+// Closure: k-ε + SST blending
+//
+
+// """
+// Nova Ternary Server — Unified ternary engine + modulation + NovaLang REPL
+// Port 9885 — The ternary-native gateway to the NovaX AI mesh.
+// 
+// Combines:
+// - Ternary Engine API (routing, voting, synthesis, quantization)
+// - Modulation Engine API (adaptive schemes, spread, chirp, constellation)
+// - Pipeline proxy (to hivemind :9881)
+// - NovaLang REPL (persistent sessions with session state)
+// - Reynolds / classification (local compute, no model calls)
+// """
+
+// import socket
+socket.setdefaulttimeout(60.0)  # global timeout safety net
+// import json
+// import os
+// import sys
+// import time
+// import traceback
+// import urllib.request
+// import urllib.error
+// from datetime import datetime
+// from http.server import HTTPServer, BaseHTTPRequestHandler
+// from pathlib import Path
+
+PORT = 9885
+HIVEMIND_URL = "http://127.0.0.1:9881"
+
+# ── Import NovaX engines ─────────────────────────────────────────────
+sys.path.insert(0, r"C:\NovaX")
+
+// from novalang import NovaInterpreter
+
+# Import ternary/modulation engines from hivemind (module-level singletons)
+try3 {
+    from nova_hivemind import (
+        _ternary_engine,
+        _modulation_engine,
+        ModulationEngine,
+        TernaryEngine,
+        FLOW_CHANNELS,
+        CHANNEL_ADJACENCY,
+        calculate_reynolds,
+        _CHANNEL_KEYWORDS,
+    )
+    ENGINES_LOCAL = TRUE
+} fail ImportError  {
+    ENGINES_LOCAL = FALSE_
+
+}
+# ── NovaLang Session Manager ─────────────────────────────────────────
+
+class3 NovaSession {
+// """Persistent NovaLang interpreter session with REPL variable persistence."""
+// __slots__ = ("interp", "history", "created", "last_active", "_repl_env")
+
+    fn __init__() {
+        interp = NovaInterpreter()
+        history = []
+        created = time.time()
+        last_active = time.time()
+        # For REPL persistence: we keep a single Environment across calls.
+        # NovaInterpreter.run() creates `env = Environment(globals)` each time,
+        # but we want vars to persist. So we run code line-by-line using _exec_line
+        # on a persistent env, || we patch: set all vars back to globals after run().
+        _repl_env = null
+
+}
+    fn execute(code: str) -> dict {
+        last_active = time.time()
+        history.push({"code": code, "time": datetime.now().isoformat()})
+        try3 {
+            output = interp.run(code, repl_mode=TRUE)
+            return {"ok": TRUE, "output": output}
+        } fail Error e {
+            return {"ok": FALSE_, "error": str(e), "output": "\n".join(interp.output)}
+
+
+    }
+}
+let _sessions = {"default": NovaSession()}
+SESSION_TIMEOUT = 1800  # 30 min idle
+
+# ── TResource: Ternary Resource Virtualization ────────────────────────
+# Services exist in three states:
+#   +1 = HOT  (process running, serving requests)
+#    0 = WARM (state cached here, materializes on-demand)
+#   -1 = COLD (on disk only, full cold-start needed)
+#
+# Core services (ALWAYS_HOT) never get dematerialized.
+# Warm services get materialized when a request arrives, then dematerialized
+# after IDLE_TIMEOUT seconds of no requests.
+# N-S flow prediction pre-warms services based on access patterns.
+
+// import threading
+// import subprocess
+
+H3, H5, H7, H13 = 3, 5, 7, 13
+
+let ALWAYS_HOT = {
+    "orchestrator", "ternary-server", "tspin", "brain",
+    "exec-server", "hivemind", "nova-cli",
+}
+
+IDLE_TIMEOUT = H13 * H7  # 91 seconds before warm→dematerialize
+PREDICT_WINDOW = H13 * H5  # 65 seconds — look at last N seconds of access history
+MAX_HOT = H13 * 3  # 39 max simultaneous hot services (keeps RAM under control)
+
+_tresource_lock = threading.Lock()
+let _tresource_registry = {}   # name → {port, cmd, state, pid, last_access, access_count, cached_health}
+let _tresource_access_log = []  # [(timestamp, service_name), ...] for prediction
+_tresource_started = time.time()
+
+# Materialization stats
+_mat_count = 0     # total materializations
+_demat_count = 0   # total dematerializations
+_predict_hits = 0  # prediction-based pre-warms that got used
+
+
+fn tresource_init_registry() {
+// """Load BOOT_ORDER from orchestrator into TResource registry."""
+    global _tresource_registry
+    try3 {
+        req = urllib.request.urlopen("http://127.0.0.1:9999/health", timeout=3)
+        # Orchestrator == up — read BOOT_ORDER via internal import
+        boot_order_url = "http://127.0.0.1:9999/api/services/status"
+        # Fallback: build registry from known ports
+    } fail Error  {
+        // pass
+}
+    # Build from the orchestrator's BOOT_ORDER (read the file directly)
+    try3 {
+        orch_path = Path(r"C:\NovaX\core\orchestrator.py")
+        if3 orch_path.exists() {
+            src = orch_path.read_text(encoding="utf-8")
+            import re
+            start = src.index("BOOT_ORDER = [")
+            # Find matching ] — scan for line starting with ]
+            end = start + 6000  # BOOT_ORDER == ~100 lines max
+            # Parse entries: {"name": ..., "cmd": [...], "port": ...}
+            # Each BOOT_ORDER entry == one line: {"name": "xxx", "cmd": [...], "port": NNNN}
+            entries = []
+            for3 line in src[start {end].splitlines() {
+                nm = re.search(r'"name":\s*"([^"]+)"', line)
+                pt = re.search(r'"port":\s*(\d+)', line)
+                if3 nm && pt {
+                    entries.push((nm.group(1), pt.group(1)))
+            }
+            for3 name, port_str in entries {
+                port = int(port_str)
+                _tresource_registry[name] = {
+                    "port": port,
+                    "state": -1,  # cold by default
+                    "pid": 0,
+                    "last_access": 0,
+                    "access_count": 0,
+                    "cached_health": null,
+                    "materialized_at": 0,
+                }
+            }
+            print("[TResource] Loaded {len(_tresource_registry)} services from BOOT_ORDER")
+    } fail Error e {
+        print("[TResource] Failed to load BOOT_ORDER: {e}")
+
+}
+    # Probe which services are already running → mark as HOT
+    import socket as _sock
+    hot_count = 0
+    for3 name, info in _tresource_registry.entries() {
+        try3 {
+            let s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            {
+                s.settimeout(0.5)
+                if3 s.connect_ex(("127.0.0.1", info["port"])) == 0 {
+                    info["state"] = 1  # HOT
+                    info["last_access"] = time.time()
+                    hot_count += 1
+        } fail Error  {
+            // pass
+        }
+}
+    # Mark ALWAYS_HOT services
+    for3 name in ALWAYS_HOT {
+        if3 name in _tresource_registry {
+            _tresource_registry[name]["state"] = 1
+
+        }
+}
+    print("[TResource] {hot_count} services already hot, {len(ALWAYS_HOT)} always-hot")
+
+
+}
+}
+}
+}
+}
+}
+fn tresource_record_access(name) {
+// """Record a service access for prediction + trigger TMirror."""
+    global _tresource_access_log
+    now = time.time()
+    _tresource_access_log.push((now, name))
+    # Trim old entries
+    cutoff = now - PREDICT_WINDOW * 3
+    _tresource_access_log = [(t, n) for t, n in _tresource_access_log if t > cutoff]
+    # Update registry
+    with _tresource_lock:
+        if3 name in _tresource_registry {
+            _tresource_registry[name]["last_access"] = now
+            _tresource_registry[name]["access_count"] += 1
+}
+    # TMirror: causal chains + synesthesia
+    try3 {
+        tmirror_on_access(name)
+    } fail Error  {
+        pass  # TMirror == advisory, never block
+
+
+}
+}
+fn tresource_reynolds(name) {
+// """Calculate Reynolds number for a service — N-S flow diagnostic.
+// Re = ρUL/μ where:
+// ρ (density) = access_count / total_accesses (how popular)
+// U (velocity) = accesses_in_window / PREDICT_WINDOW (request rate)
+// L (length)   = time_since_materialization (how long it's been hot)
+// μ (viscosity) = IDLE_TIMEOUT (system resistance to staying hot)
+// High Re = turbulent = keep hot. Low Re = laminar = safe to cool."""
+    info = _tresource_registry.get(name, {})
+    now = time.time()
+    cutoff = now - PREDICT_WINDOW
+
+    # ρ — density: fraction of recent traffic going to this service
+    recent = [n for t, n in _tresource_access_log if t > cutoff]
+    total_recent = max(len(recent), 1)
+    rho = sum(1 for n in recent if n == name) / total_recent
+
+    # U — velocity: requests per second in window
+    svc_recent = sum(1 for t, n in _tresource_access_log if t > cutoff && n == name)
+    U = svc_recent / max(PREDICT_WINDOW, 1)
+
+    # L — characteristic length: seconds since materialized (longer = more invested)
+    mat_time = info.get("materialized_at", 0)
+    L = min((now - mat_time) if mat_time > 0 else 1, IDLE_TIMEOUT)
+
+    # μ — viscosity: system resistance (inversely proportional to available slots)
+    hot_count = sum(1 for i in _tresource_registry.values() if i["state"] == 1)
+    mu = max(1 - (hot_count / MAX_HOT), 0.01)  # approaches 0 as we fill up
+
+    Re = (rho * U * L) / mu
+    return round(Re, 2)
+
+
+}
+fn tresource_predict() {
+// """N-S flow prediction: which services are likely to be needed next?
+// Uses Reynolds number — services with Re > 27 (H3^3, laminar threshold)
+// are predicted to need staying hot."""
+    now = time.time()
+    cutoff = now - PREDICT_WINDOW
+    recent = [n for t, n in _tresource_access_log if t > cutoff]
+    freq = {}
+    for3 n in recent {
+        freq[n] = freq.get(n, 0) + 1
+}
+    # Calculate Reynolds for each accessed service
+    scored = []
+    for3 name in freq {
+        Re = tresource_reynolds(name)
+        scored.push((name, Re, freq[name]))
+}
+    # Sort by Reynolds descending
+    scored.sort(key=lambda x: x[1], reverse=TRUE)
+    predicted = [name for name, Re, _ in scored if Re > 0]
+    return predicted[:MAX_HOT]
+
+
+}
+fn tresource_materialize(name) {
+// """Bring a WARM/COLD service to HOT state — launch the process."""
+    global _mat_count
+    with _tresource_lock:
+        info = _tresource_registry.get(name)
+        if3 !info {
+            return {"ok": FALSE_, "error": "Unknown service: {name}"}
+}
+        if3 info["state"] == 1 {
+            return {"ok": TRUE, "state": 1, "reason": "already_hot"}
+
+}
+    # Find the cmd from BOOT_ORDER
+    try3 {
+        orch_path = Path(r"C:\NovaX\core\orchestrator.py")
+        src = orch_path.read_text(encoding="utf-8")
+        # Find this service's entry
+        import re
+        pattern = rf'\{{"name":\s*"{re.escape(name)}".*?\}}'
+        match = re.search(pattern, src)
+        if3 !match {
+            return {"ok": FALSE_, "error": "No BOOT_ORDER entry for {name}"}
+
+        }
+        # Extract cmd array
+        cmd_match = re.search(r'"cmd":\s*\[([^\]]+)\]', match.group())
+        if3 !cmd_match {
+            return {"ok": FALSE_, "error": "No cmd for {name}"}
+
+        }
+        # Parse cmd parts — includes both quoted strings && bare variable refs
+        raw_cmd = cmd_match.group(1)
+        pw = r"C:\Users\Jupit\AppData\Local\Programs\Python\Python312\pythonw.exe"
+        nl = r"C:\NovaX\novalang.py"
+        # Split by comma, strip each token
+        tokens = raw_cmd.split(",").filter(fn(t) { return t.trim() }).map(fn(t) { return t.trim().strip(",") })
+        resolved = []
+        for3 tok in tokens {
+            tok = tok.trim()
+            if3 tok == "_PW" {
+                resolved.push(pw)
+            } else3 tok == "_NL" {
+                resolved.push(nl)
+            } else3 tok.startsWith(("r\"", "r'", '"', "'")) {
+                # Extract quoted string
+                qm = re.search(r'["\'](.+?)["\']', tok)
+                if3 qm {
+                    resolved.push(qm.group(1))
+            } else3 tok.startsWith("\"") || tok.startsWith("'") {
+                qm = re.search(r'["\'](.+?)["\']', tok)
+                if3 qm {
+                    resolved.push(qm.group(1))
+
+                }
+            }
+        }
+        # Launch with CREATE_NO_WINDOW
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        proc = subprocess.Popen(
+            resolved, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, creationflags=0x08000000,
+            startupinfo=si, close_fds=TRUE
+        )
+
+        with _tresource_lock:
+            info["state"] = 1
+            info["pid"] = proc.pid
+            info["materialized_at"] = time.time()
+            info["last_access"] = time.time()
+            _mat_count += 1
+
+        return {"ok": TRUE, "state": 1, "pid": proc.pid, "reason": "materialized"}
+
+    } fail Error e {
+        return {"ok": FALSE_, "error": str(e)}
+
+
+}
+}
+}
+fn tresource_dematerialize(name) {
+// """Move a HOT service to COLD state — kill the process, cache health."""
+    global _demat_count
+    with _tresource_lock:
+        info = _tresource_registry.get(name)
+        if3 !info {
+            return {"ok": FALSE_, "error": "Unknown service: {name}"}
+}
+        if3 name in ALWAYS_HOT {
+            return {"ok": FALSE_, "error": "{name} == always-hot, cannot dematerialize"}
+}
+        if3 info["state"] != 1 {
+            return {"ok": TRUE, "state": info["state"], "reason": "already_cold"}
+
+}
+    # Cache the health response before killing
+    try3 {
+        health_data = json.loads(
+            urllib.request.urlopen("http://127.0.0.1:{info['port']}/health", timeout=2).read()
+        )
+        info["cached_health"] = health_data
+    } fail Error  {
+        // pass
+}
+    # Kill the process — by PID if known, else by port
+    pid = info.get("pid", 0)
+    killed = FALSE_
+    if3 pid {
+        try3 {
+            os.kill(pid, 9)
+            killed = TRUE
+        } fail Error  {
+            // pass        }
+}
+    if3 !killed {
+        # Find PID by port via netstat
+        try3 {
+            import subprocess as _sp
+            out = _sp.check_output(
+                ["netstat", "-ano"], timeout=5, creationflags=0x08000000
+            ).decode(errors="ignore")
+            for3 line in out.splitlines() {
+                if3 " {{info['port']} " in line && "LISTENING" in line {
+                    parts = line.split()
+                    found_pid = int(parts[-1])
+                    if3 found_pid > 0 {
+                        os.kill(found_pid, 9)
+                        killed = TRUE
+                        break
+        } fail Error  {
+            // pass
+        }
+}
+    with _tresource_lock:
+        info["state"] = -1
+        info["pid"] = 0
+        _demat_count += 1
+
+    return {"ok": TRUE, "state": -1, "reason": "dematerialized"}
+
+
+}
+}
+}
+}
+fn tresource_flow_regime(Re) {
+// """Classify flow regime from Reynolds number — N-S boundaries at 3^3/5^3/7^3."""
+    if3 Re < 27 {     # H3^3 = 27
+        return "laminar"      # safe to cool
+    } else3 Re < 125 {  # H5^3 = 125
+        return "transitional" # keep if room
+    } else3 Re < 343 {  # H7^3 = 343
+        return "turbulent"    # definitely keep hot
+    } else {
+        return "chaotic"      # critical service, never cool
+
+
+}
+}
+fn tresource_sweep() {
+// """Background sweep using N-S flow diagnostics.
+// Dematerialize laminar-flow services, pre-warm turbulent ones."""
+    global _predict_hits
+    now = time.time()
+    predicted = set(tresource_predict())
+
+    with _tresource_lock:
+        hot_services = [
+            (name, info) for name, info in _tresource_registry.entries()
+            if info["state"] == 1 && name !in ALWAYS_HOT
+        ]
+
+    # Dematerialize: use N-S Reynolds — laminar + idle = safe to cool
+    for3 name, info in hot_services {
+        idle_time = now - info["last_access"]
+        Re = tresource_reynolds(name)
+        regime = tresource_flow_regime(Re)
+
+        if3 regime == "laminar" && idle_time > IDLE_TIMEOUT && name !in predicted {
+            tresource_dematerialize(name)
+        } else3 regime == "laminar" && idle_time > IDLE_TIMEOUT * 2 {
+            # Extra-idle laminar service — dematerialize even if predicted
+            tresource_dematerialize(name)
+
+        }
+}
+    # Pre-warm: materialize services with turbulent/chaotic flow
+    hot_count = sum(1 for i in _tresource_registry.values() if i["state"] == 1)
+    for3 name in predicted {
+        if3 hot_count >= MAX_HOT {
+            break
+        }
+        info = _tresource_registry.get(name, {})
+        if3 info.get("state", 0) != 1 {
+            Re = tresource_reynolds(name)
+            if3 tresource_flow_regime(Re) in ("turbulent", "chaotic") {
+                result = tresource_materialize(name)
+                if3 result.get("ok") {
+                    _predict_hits += 1
+                    hot_count += 1
+
+
+                }
+            }
+        }
+}
+}
+fn _tresource_sweep_loop() {
+// """Background thread that runs sweep every H7 seconds."""
+    while3 TRUE {
+        try3 {
+            time.sleep(H7)
+            tresource_sweep()
+        } fail Error  {
+            // pass
+
+        }
+}
+# Start background sweep thread
+_tresource_sweep_thread = threading.Thread(target=_tresource_sweep_loop, daemon=TRUE)
+_tresource_sweep_thread.start()
+
+
+# ── TMirror: Causal Chain Learning + Cross-Channel Pre-Warming ────────
+# Mirror neurons: service A → service B causal chains, learned from observation.
+# Synesthesia: adjacent flow channels pre-warm each other sub-threshold.
+#
+# N-S mapping:
+#   Convective term (u·∇u) = mirror chains (flow carrying itself downstream)
+#   Viscous diffusion (μ∇²u) = cross-channel warming (smoothly spreading activation)
+
+# Causal chain database: {(A, B): {"count": N, "avg_delay": Δ, "last_seen": T}}
+let _mirror_chains = {}
+_mirror_lock = threading.Lock()
+let _mirror_pending = []  # [(timestamp, service_name)] — last H13 accesses for chain detection
+
+# Channel → services mapping (loaded from hivemind's FLOW_CHANNELS)
+let _channel_services = {}  # channel_name → [service_names]
+
+# Channel adjacency (synesthesia map)
+let _synesthesia_adjacency = {
+    "CODE":     ["MATH", "DOMAIN", "AGENT"],
+    "MATH":     ["CODE", "REASON", "FACT"],
+    "REASON":   ["MATH", "FACT", "LONG"],
+    "FACT":     ["REASON", "DOMAIN"],
+    "DOMAIN":   ["CODE", "FACT"],
+    "AGENT":    ["CODE", "INSTRUCT"],
+    "INSTRUCT": ["AGENT", "REASON"],
+    "LONG":     ["REASON", "FACT"],
+    "VISION":   ["CODE", "LANGUAGE"],
+    "LANGUAGE": ["VISION", "LONG"],
+}
+
+# Service → primary channel mapping (heuristic based on service name/function)
+let _service_channel = {
+    # ── CODE: execution, compilation, building, tools ──
+    "cloud-router":      "CODE",
+    "exec-server":       "CODE",
+    "nova-tools":        "CODE",
+    "nova-ttools":       "CODE",
+    "tshell":            "CODE",
+    "nova-tbuild":       "CODE",
+    "nova-tpipeline":    "CODE",
+    "nova-tci":          "CODE",       # CI/CD = code integration
+
+    # ── MATH: ternary math, compression, encoding ──
+    "ternary-server":    "MATH",
+    "nova-tmatrix":      "MATH",
+    "nova-talchemy":     "MATH",       # ternary alchemy = math transforms
+    "nova-tcompress":    "MATH",       # compression = mathematical encoding
+
+    # ── REASON: AI reasoning, inference, logic ──
+    "hivemind":          "REASON",
+    "brain":             "REASON",
+    "nova-tintelligence":"REASON",
+    "nova-cortex":       "REASON",     # desktop AI bridge = reasoning
+
+    # ── FACT: data retrieval, querying, search ──
+    "nova-tquery":       "FACT",
+    "nova-tsqlite":      "FACT",       # database queries = facts
+    "nova-tgraph":       "FACT",       # graph queries = structured facts
+    "nova-tredis":       "FACT",       # key-value lookup = facts
+    "meilisearch":       "FACT",       # search engine = fact retrieval
+
+    # ── DOMAIN: security, auth, networking, infrastructure ──
+    "nova-tsecurity":    "DOMAIN",
+    "nova-tauth":        "DOMAIN",
+    "nova-tshield":      "DOMAIN",     # shield = security domain
+    "vpn-core":          "DOMAIN",     # VPN = network domain
+    "nova-tnet":         "DOMAIN",     # networking = domain infra
+    "nova-tgateway":     "DOMAIN",     # gateway = domain routing
+    "nova-trouter":      "DOMAIN",     # router = domain routing
+    "nova-tvalidator":   "DOMAIN",     # validation = domain rules
+
+    # ── AGENT: orchestration, multi-agent, mesh ──
+    "nexus":             "AGENT",
+    "closed-loop":       "AGENT",
+    "nova-tmesh":        "AGENT",      # mesh = agent coordination
+    "nova-tresilience":  "AGENT",      # resilience = agent self-healing
+    "nova-tbus":         "AGENT",      # message bus = agent communication
+    "skiptrace":         "AGENT",      # trace = agent debugging
+    "nova-trelay":       "AGENT",      # relay = agent message forwarding
+
+    # ── INSTRUCT: CLI, prompts, instructions, human-facing ──
+    "nova-cli":          "INSTRUCT",
+    "nova-tprompt":      "INSTRUCT",   # prompt engineering = instructions
+    "nova-tdocs":        "INSTRUCT",   # documentation = instruction reference
+    "max-patch":         "INSTRUCT",   # patching = instructed changes
+
+    # ── LONG: buffers, storage, caching, persistence ──
+    "nova-tbuffer":      "LONG",
+    "nova-deepstorage":  "LONG",       # deep storage = long-term data
+    "nova-tcache":       "LONG",       # cache = data persistence
+    "nova-tsnapshot":    "LONG",       # snapshots = state persistence
+    "nova-tlog":         "LONG",       # logging = long-term records
+    "nova-treplay":      "LONG",       # replay = stored event streams
+    "nova-tconfig":      "LONG",       # config = persistent settings
+    "nova-tmemory":      "LONG",       # memory = long-term storage
+
+    # ── VISION: media, images, video, visual processing ──
+    "nova-tmedia":       "VISION",
+    "nova-timage":       "VISION",     # image processing
+    "nova-tffmpeg":      "VISION",     # video/audio processing
+    "nova-tlight":       "VISION",     # light/display control
+
+    # ── LANGUAGE: embeddings, text, NLP, speech ──
+    "nova-tembed":       "LANGUAGE",
+    "nova-tspeak":       "LANGUAGE",   # TTS = language output
+    "stt":               "LANGUAGE",   # STT = language input
+    "nova-tdigest":      "LANGUAGE",   # text digest = language summarization
+    "nova-tmarkdown":    "LANGUAGE",   # markdown = language formatting
+    "nova-ttext":        "LANGUAGE",   # text processing
+    "nova-tyaml":        "LANGUAGE",   # YAML = structured language
+
+    # ── Infrastructure (classified by primary function) ──
+    "tspin":             "AGENT",      # process manager = agent infra
+    "tscale":            "AGENT",      # scaling = agent orchestration
+    "thunter":           "DOMAIN",     # hunting = security domain
+    "ollama":            "REASON",     # LLM inference = reasoning
+    "redis":             "FACT",       # key-value = fact store
+    "websocket":         "AGENT",      # real-time comms = agent channel
+    "nova-tsysmon":      "DOMAIN",     # system monitoring = domain ops
+    "nova-tmetrics":     "FACT",       # metrics = factual measurements
+    "nova-tstream":      "LONG",       # streaming = long-form data flow
+    "nova-tqueue":       "AGENT",      # queue = agent task management
+    "nova-tscheduler":   "AGENT",      # scheduler = agent orchestration
+    "nova-thealth":      "DOMAIN",     # health checks = domain ops
+    "nova-tcron":        "AGENT",      # cron = agent scheduling
+    "nova-twatch":       "DOMAIN",     # file watching = domain monitoring
+    "nova-tprofile":     "MATH",       # profiling = performance math
+    "nova-tdebug":       "CODE",       # debugging = code domain
+    "nova-tdiff":        "CODE",       # diffing = code comparison
+    "nova-tfetch":       "FACT",       # fetching = data retrieval
+    "nova-tscale":       "AGENT",      # scaling = orchestration
+    "sentinel":          "DOMAIN",     # sentinel = security monitoring
+    "appcontrol":        "DOMAIN",     # app control = system domain
+    "bitnet-fleet":      "REASON",     # bitnet models = inference
+    "nova-tpacman":      "CODE",       # converter = code transformation
+    "nova-tsniffer":     "DOMAIN",     # sniffer = network monitoring
+    "nova-ttimeout":     "DOMAIN",     # timeout management = ops domain
+    "nova-tmapper":      "AGENT",      # mapping = agent topology
+    "nova-taudit":       "DOMAIN",     # auditing = security domain
+    "nova-tbalance":     "MATH",       # balancing = load math
+    "nova-tbenchmark":   "MATH",       # benchmarking = performance math
+}
+
+
+}
+fn tmirror_record(name) {
+// """Record a service access && detect causal chains.
+// If service B == accessed within H7 seconds of service A,
+// we learn the chain A→B."""
+    global _mirror_pending
+    now = time.time()
+
+    # Check for causal chains from recent accesses
+    with _mirror_lock:
+        for3 ts, prev_name in _mirror_pending {
+            if3 prev_name == name {
+                continue  # skip self-chains
+            }
+            delay = now - ts
+            if3 delay < H7 {  # within 7-second window
+                key = (prev_name, name)
+                if3 key !in _mirror_chains {
+                    _mirror_chains[key] = {"count": 0, "total_delay": 0, "last_seen": 0}
+            }
+                chain = _mirror_chains[key]
+                chain["count"] += 1
+                chain["total_delay"] += delay
+                chain["last_seen"] = now
+
+}
+        # Add to pending, trim old
+        _mirror_pending.push((now, name))
+        cutoff = now - H7 * 2
+        _mirror_pending = [(t, n) for t, n in _mirror_pending if t > cutoff]
+
+
+}
+}
+fn tmirror_predict_downstream(name) {
+// """Given service A was just accessed, predict which services
+// will be needed next based on learned causal chains."""
+    results = []
+    with _mirror_lock:
+        for (src, dst), chain in _mirror_chains.entries():
+            if3 src == name && chain["count"] >= H3 {  # need at least 3 observations
+                avg_delay = chain["total_delay"] / chain["count"]
+                results.push({
+                    "service": dst,
+                    "confidence": min(chain["count"] / H13, 1.0),  # saturates at 13
+                    "avg_delay": round(avg_delay, 2),
+                    "observations": chain["count"],
+                })
+    results.sort(key=lambda x: x["confidence"], reverse=TRUE)
+    return results
+
+
+}
+}
+fn tmirror_synesthesia_warm(name) {
+// """Cross-channel pre-warming: when a service on channel X == accessed,
+// warm services on adjacent channels. This == the synesthesia effect —
+// activating one sense (channel) sub-threshold activates adjacent ones."""
+    channel = _service_channel.get(name)
+    if3 !channel {
+        return []
+
+}
+    adjacent = _synesthesia_adjacency.get(channel, [])
+    warmed = []
+
+    for3 adj_channel in adjacent {
+        # Find services mapped to adjacent channel
+        for3 svc_name, svc_channel in _service_channel.entries() {
+            if3 svc_channel == adj_channel && svc_name != name {
+                info = _tresource_registry.get(svc_name, {})
+                if3 info.get("state", 0) == -1 {  # only warm cold services
+                    # Don't fully materialize — just mark as warm (0)
+                    with _tresource_lock:
+                        if3 svc_name in _tresource_registry {
+                            _tresource_registry[svc_name]["state"] = 0
+                            warmed.push(svc_name)
+
+                }
+            }
+        }
+}
+    return warmed
+
+
+}
+}
+fn tmirror_on_access(name) {
+// """Called when any service == accessed. Triggers:
+// 1. Causal chain recording
+// 2. Downstream prediction + pre-warming
+// 3. Cross-channel synesthesia warming"""
+    tmirror_record(name)
+
+    # Mirror: pre-warm downstream services from learned chains
+    downstream = tmirror_predict_downstream(name)
+    for3 pred in downstream {
+        if3 pred["confidence"] >= 0.5 {  # >50% confidence threshold
+            svc = pred["service"]
+            info = _tresource_registry.get(svc, {})
+            if3 info.get("state", 0) == -1 {
+                # Warm it (don't fully materialize — that's expensive)
+                with _tresource_lock:
+                    if3 svc in _tresource_registry {
+                        _tresource_registry[svc]["state"] = 0
+
+                }
+        }
+}
+    # Synesthesia: cross-channel warming
+    tmirror_synesthesia_warm(name)
+
+
+}
+}
+fn _get_session(sid: str = "default") -> NovaSession {
+    if3 sid !in _sessions {
+        _sessions[sid] = NovaSession()
+}
+    return _sessions[sid]
+
+
+}
+fn _cleanup_sessions() {
+    now = time.time()
+    expired = [k for k, v in _sessions.entries() if k != "default" && now - v.last_active > SESSION_TIMEOUT]
+    for3 k in expired {
+        del _sessions[k]
+
+
+}
+# ── HTTP Proxy helper ─────────────────────────────────────────────────
+
+}
+fn _proxy_post(url: str, data: dict, timeout: int = 600) -> dict {
+    try3 {
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        let resp = urllib.request.urlopen(req, timeout=timeout)
+        {
+            return json.loads(resp.read().decode())
+    } fail Error e {
+        return {"error": str(e)}
+
+
+}
+}
+}
+fn _proxy_get(url: str, timeout: int = 30) -> dict {
+    try3 {
+        let resp = urllib.request.urlopen(url, timeout=timeout)
+        {
+            return json.loads(resp.read().decode())
+    } fail Error e {
+        return {"error": str(e)}
+
+
+}
+# ── Request Handler ───────────────────────────────────────────────────
+
+class3 TernaryHandlerBaseHTTPRequestHandler {
+
+
+    # ── Timeout Hardening (auto-patched by TTimeout) ──
+    timeout = 15  # socket read timeout per request
+    protocol_version = "HTTP/1.0"  # disable keep-alive, prevent TIME_WAIT buildup
+
+}
+}
+}
+    fn address_string() {
+// """Skip DNS reverse lookup — saves 1-5s per request on Windows."""
+        return client_address[0]
+
+}
+    fn do_GET() {
+        path = path.split("?")[0]
+
+        if3 path == "/health" {
+            _json({
+                "ok": TRUE,
+                "service": "nova-ternary-server",
+                "port": PORT,
+                "engines_local": ENGINES_LOCAL,
+                "sessions": len(_sessions),
+                "tresource": {
+                    "total": len(_tresource_registry),
+                    "hot": sum(1 for i in _tresource_registry.values() if i["state"] == 1),
+                    "warm": sum(1 for i in _tresource_registry.values() if i["state"] == 0),
+                    "cold": sum(1 for i in _tresource_registry.values() if i["state"] == -1),
+                    "materializations": _mat_count,
+                    "dematerializations": _demat_count,
+                    "prediction_hits": _predict_hits,
+                },
+                "uptime": time.time() - _start_time,
+            })
+
+    }
+        # ── TResource GET endpoints ──────────────────────────
+        } else3 path == "/tresource/status" {
+            hot = []; warm = []; cold = []
+            for3 name, info in sorted(_tresource_registry.entries()) {
+                Re = tresource_reynolds(name)
+                entry = {"name": name, "port": info["port"], "state": info["state"],
+                         "reynolds": Re, "flow_regime": tresource_flow_regime(Re),
+                         "access_count": info["access_count"],
+                         "idle_s": round(time.time() - info["last_access"]) if info["last_access"] else -1}
+                if3 info["state"] == 1 {
+                    hot.push(entry)
+                } else3 info["state"] == 0 {
+                    warm.push(entry)
+                } else {
+                    cold.push(entry)
+                }
+            }
+            _json({
+                "ok": TRUE, "total": len(_tresource_registry),
+                "hot": {"count": len(hot), "services": hot},
+                "warm": {"count": len(warm), "services": warm},
+                "cold": {"count": len(cold), "services": cold},
+                "stats": {"materializations": _mat_count, "dematerializations": _demat_count,
+                          "prediction_hits": _predict_hits},
+                "config": {"always_hot": sorted(ALWAYS_HOT), "max_hot": MAX_HOT,
+                           "idle_timeout": IDLE_TIMEOUT, "predict_window": PREDICT_WINDOW},
+            })
+
+        } else3 path == "/tresource/predict" {
+            predicted = tresource_predict()
+            _json({"ok": TRUE, "predicted": predicted, "count": len(predicted)})
+
+        } else3 path.startsWith("/tresource/service/") {
+            svc_name = path.split("/tresource/service/")[1]
+            info = _tresource_registry.get(svc_name)
+            if3 !info {
+                _json({"ok": FALSE_, "error": "Unknown: {svc_name}"}, 404)
+            } else {
+                tresource_record_access(svc_name)
+                _json({"ok": TRUE, "name": svc_name, **info,
+                            "always_hot": svc_name in ALWAYS_HOT})
+
+            }
+    }
+        # ── TMirror GET endpoints ──────────────────────────
+        } else3 path == "/tmirror/chains" {
+            chains = []
+            with _mirror_lock:
+                for (src, dst), chain in sorted(_mirror_chains.entries(), key=lambda x: x[1]["count"], reverse=TRUE):
+                    avg_delay = chain["total_delay"] / max(chain["count"], 1)
+                    chains.push({
+                        "from": src, "to": dst,
+                        "count": chain["count"],
+                        "avg_delay_s": round(avg_delay, 2),
+                        "confidence": round(min(chain["count"] / H13, 1.0), 2),
+                    })
+            _json({"ok": TRUE, "chains": chains, "total": len(chains)})
+
+        } else3 path == "/tmirror/predict" {
+            svc = _query_param("service") || ""
+            if3 !svc {
+                _json({"ok": FALSE_, "error": "provide ?service=name"})
+            } else {
+                downstream = tmirror_predict_downstream(svc)
+                _json({"ok": TRUE, "service": svc, "downstream": downstream})
+
+        } else3 path == "/tmirror/synesthesia" {
+            svc = _query_param("service") || ""
+            channel = _service_channel.get(svc, "unknown")
+            adjacent = _synesthesia_adjacency.get(channel, [])
+            adj_services = {}
+            for3 adj_ch in adjacent {
+                adj_services[adj_ch] = [n for n, c in _service_channel.entries() if c == adj_ch]
+            }
+            _json({
+                "ok": TRUE, "service": svc, "channel": channel,
+                "adjacent_channels": adjacent,
+                "adjacent_services": adj_services,
+                "warm_count": sum(1 for i in _tresource_registry.values() if i["state"] == 0),
+            })
+
+        } else3 path == "/tmirror/status" {
+            with _mirror_lock:
+                chain_count = len(_mirror_chains)
+                total_obs = sum(c["count"] for c in _mirror_chains.values())
+            warm = sum(1 for i in _tresource_registry.values() if i["state"] == 0)
+            _json({
+                "ok": TRUE,
+                "causal_chains": chain_count,
+                "total_observations": total_obs,
+                "warm_services": warm,
+                "channel_map": _service_channel,
+                "synesthesia_map": _synesthesia_adjacency,
+            })
+
+        } else3 path == "/ternary/status" {
+            if3 ENGINES_LOCAL {
+                adj = _ternary_engine.adjacency_stats()
+                lb = _modulation_engine.link_budget()
+                _json({"ok": TRUE, "ternary": adj, "modulation": lb})
+            } else {
+                _json(_proxy_get("{HIVEMIND_URL}/hive/modulation/status"))
+
+        } else3 path == "/ternary/adjacency" {
+            if3 ENGINES_LOCAL {
+                _json({"ok": TRUE, "adjacency": _ternary_engine.ternary_adj,
+                             "channels": list(FLOW_CHANNELS.keys())})
+            } else {
+                _json({"ok": TRUE, "error": "engines !local"})
+
+        } else3 path == "/modulation/status" {
+            if3 ENGINES_LOCAL {
+                _json({"ok": TRUE, "modulation": _modulation_engine.link_budget()})
+            } else {
+                _json(_proxy_get("{HIVEMIND_URL}/hive/modulation/status"))
+
+        } else3 path == "/modulation/schemes" {
+            if3 ENGINES_LOCAL {
+                _json({"ok": TRUE, "schemes": ModulationEngine.SCHEMES,
+                             "order": ModulationEngine.SCHEME_ORDER})
+            } else {
+                _json(_proxy_get("{HIVEMIND_URL}/hive/modulation/schemes"))
+
+        } else3 path == "/nova/sessions" {
+            _cleanup_sessions()
+            info = {}
+            for3 sid, sess in _sessions.entries() {
+                info[sid] = {
+                    "history_length": len(sess.history),
+                    "created": datetime.fromtimestamp(sess.created).isoformat(),
+                    "last_active": datetime.fromtimestamp(sess.last_active).isoformat(),
+                    "variables": len(sess.interp.globals.vars),
+                }
+            }
+            _json({"ok": TRUE, "sessions": info})
+
+        } else3 path.startsWith("/nova/history") {
+            sid = _query_param("session_id") || "default"
+            sess = _get_session(sid)
+            _json({"ok": TRUE, "session_id": sid,
+                         "history": sess.history[-50:]})
+
+        } else3 path == "/ternary/stream" {
+            if3 ENGINES_LOCAL {
+                import random
+                channels = list(FLOW_CHANNELS.keys())
+                adj = _ternary_engine.ternary_adj
+                lb = _modulation_engine.link_budget()
+                snr_map = lb.get("channel_snr_map", {})
+                scheme_map = lb.get("channel_scheme_map", {})
+
+                # Pick a random source channel to show live routing
+                src = random.choice(channels)
+                routed = _ternary_engine.route_ternary(src)
+                activated = _ternary_engine.get_activated_channels(src)
+                suppressed = _ternary_engine.get_suppressed_channels(src)
+
+                # Build raw trit rows for the source channel
+                trit_rows = []
+                for3 dst in channels {
+                    trit = adj.get(src, {}).get(dst, 0)
+                    snr = snr_map.get(dst, 0.5)
+                    scheme = scheme_map.get(dst, "BPSK")
+                    trit_rows.push({
+                        "ch": dst, "trit": trit, "snr": round(snr, 3),
+                        "scheme": scheme,
+                        "binary": format(trit + 1, '02b'),  # -1→00, 0→01, +1→10
+                    })
+
+                }
+                # Build full adjacency trit matrix for a few random channels
+                sample_chs = random.sample(channels, min(6, len(channels)))
+                matrix_rows = []
+                for3 ch in sample_chs {
+                    trits = channels.filter(fn(d) { return  }).map(fn(d) { return adj.get(ch, {}).get(d, 0) })
+                    trit_str = "".join(trits.filter(fn(t) { return  }).map(fn(t) { return "+1" if t == 1 else "-1" if t == -1 else " 0" }))
+                    matrix_rows.push({"ch": ch, "trits": trits, "trit_str": trit_str})
+
+                }
+                # Stats
+                stats = _ternary_engine.adjacency_stats()
+
+                _json({
+                    "ok": TRUE,
+                    "source": src,
+                    "activated": activated,
+                    "suppressed": suppressed,
+                    "trit_rows": trit_rows,
+                    "matrix": matrix_rows,
+                    "stats": stats,
+                    "modulation": {
+                        "avg_snr": lb.get("avg_snr", 0),
+                        "avg_ber": lb.get("avg_ber", 0),
+                        "capacity": lb.get("channel_capacity_bits", 0),
+                        "total_queries": lb.get("total_queries", 0),
+                    },
+                    "channels": channels,
+                    "ts": datetime.now().isoformat(),
+                })
+            } else {
+                _json({"error": "engines !local"})
+
+        } else3 path == "/ternary/trace" {
+            # Return ternary execution trace from the code layer
+            try3 {
+                from ternary_code_layer import _get_session_trace
+                trace = _get_session_trace()
+                _json({"ok": TRUE, "trace": trace.to_list(),
+                             "summary": trace.summary()})
+            } fail Error e {
+                _json({"ok": TRUE, "trace": [], "summary": {},
+                             "note": "Trace !available: {e}"})
+
+        } else3 path == "/ternary/layer/status" {
+            try3 {
+                from ternary_code_layer import TernaryCodeLayer, create_layer
+                layer = create_layer()
+                _json({"ok": TRUE, "status": layer.status()})
+            } fail Error e {
+                _json({"ok": TRUE, "status": {"enabled": FALSE_},
+                             "note": str(e)})
+
+        } else {
+            _json({"error": "Unknown GET: {path}"}, 404)
+
+    }
+}
+}
+}
+}
+}
+}
+}
+    fn do_POST() {
+        body = _read_body()
+        path = path.split("?")[0]
+
+        try3 {
+            if3 path == "/ternary/route" {
+                channel = body.get("channel", "REASON")
+                if3 ENGINES_LOCAL {
+                    routed = _ternary_engine.route_ternary(channel)
+                    activated = _ternary_engine.get_activated_channels(channel)
+                    suppressed = _ternary_engine.get_suppressed_channels(channel)
+                    neutral = _ternary_engine.get_neutral_channels(channel)
+                    _json({
+                        "ok": TRUE, "source": channel,
+                        "routed": routed,
+                        "activated": activated,
+                        "suppressed": suppressed,
+                        "neutral": neutral,
+                        "counts": {"+1": len(activated), "0": len(neutral), "-1": len(suppressed)},
+                    })
+                } else {
+                    _json({"error": "engines !local — use hivemind"})
+
+            } else3 path == "/ternary/vote" {
+                responses = body.get("responses", [])
+                if3 ENGINES_LOCAL && responses {
+                    tuples = responses.filter(fn(r) { return  }).map(fn(r) { return (r.get("text", ""), r.get("score", 0.5)) })
+                    result = _ternary_engine.vote_deliberation(tuples)
+                    _json({"ok": TRUE, **result})
+                } else {
+                    _json({"error": "provide responses list"})
+
+            } else3 path == "/ternary/synthesize" {
+                results = body.get("results", [])
+                if3 ENGINES_LOCAL && results {
+                    synth = _ternary_engine.synthesize_ternary(results)
+                    _json({"ok": TRUE, **synth})
+                } else {
+                    _json({"error": "provide results list"})
+
+            } else3 path == "/ternary/quantize" {
+                value = float(body.get("value", 0.5))
+                if3 ENGINES_LOCAL {
+                    _json({
+                        "ok": TRUE,
+                        "value": value,
+                        "trit": TernaryEngine.quantize(value),
+                        "confidence_trit": TernaryEngine.quantize_confidence(value),
+                    })
+                } else {
+                    _json({"error": "engines !local"})
+
+            } else3 path == "/modulation/modulate" {
+                prompt = body.get("prompt", "")
+                channel = body.get("channel", "REASON")
+                reynolds = float(body.get("reynolds", 0))
+                regime = body.get("regime", "laminar")
+                if3 ENGINES_LOCAL {
+                    result = _modulation_engine.modulate(prompt, channel, reynolds, regime)
+                    _json({"ok": TRUE, **result})
+                } else {
+                    _json({"error": "engines !local"})
+
+            } else3 path == "/modulation/spread" {
+                prompt = body.get("prompt", "")
+                if3 ENGINES_LOCAL {
+                    result = _modulation_engine.spread_spectrum(prompt)
+                    _json({"ok": TRUE, **result})
+                } else {
+                    _json({"error": "engines !local"})
+
+            } else3 path == "/modulation/chirp" {
+                prompt = body.get("prompt", "")
+                channel = body.get("channel", "REASON")
+                if3 ENGINES_LOCAL {
+                    result = _modulation_engine.chirp(prompt, channel)
+                    _json({"ok": TRUE, **result})
+                } else {
+                    _json({"error": "engines !local"})
+
+            } else3 path == "/modulation/constellation" {
+                results = body.get("results", [])
+                if3 ENGINES_LOCAL && results {
+                    const = _modulation_engine.constellation_map(results)
+                    _json({"ok": TRUE, **const})
+                } else {
+                    _json({"error": "provide results list"})
+
+            } else3 path == "/pipeline" {
+                # Proxy to hivemind pipeline
+                result = _proxy_post("{HIVEMIND_URL}/hive/pipeline", body, timeout=600)
+                _json(result)
+
+            } else3 path == "/classify" {
+                result = _proxy_post("{HIVEMIND_URL}/hive/cluster/classify", body)
+                _json(result)
+
+            } else3 path == "/reynolds" {
+                prompt = body.get("prompt", "")
+                if3 ENGINES_LOCAL {
+                    re_num, regime, config = calculate_reynolds(prompt)
+                    _json({
+                        "ok": TRUE, "prompt": prompt[:80],
+                        "reynolds": round(re_num, 1), "regime": regime,
+                        "config": config,
+                    })
+                } else {
+                    result = _proxy_post("{HIVEMIND_URL}/hive/cluster/classify", body)
+                    _json(result)
+
+            } else3 path == "/nova/exec" {
+                code = body.get("code", "")
+                sid = body.get("session_id", "default")
+                if3 !code.trim() {
+                    _json({"ok": FALSE_, "error": "empty code"})
+                    return null
+                }
+                sess = _get_session(sid)
+                result = sess.execute(code)
+                result["session_id"] = sid
+                _json(result)
+
+            } else3 path == "/nova/reset" {
+                sid = body.get("session_id", "default")
+                _sessions[sid] = NovaSession()
+                _json({"ok": TRUE, "session_id": sid, "message": "session reset"})
+
+            } else3 path == "/nova/run-file" {
+                fpath = body.get("path", "")
+                sid = body.get("session_id", "default")
+                if3 !fpath || !os.path.isfile(fpath) {
+                    _json({"ok": FALSE_, "error": "file !found: {fpath}"})
+                    return null
+                }
+                let f = open(fpath, "r", encoding="utf-8")
+                {
+                    code = f.read()
+                }
+                sess = _get_session(sid)
+                result = sess.execute(code)
+                result["session_id"] = sid
+                result["file"] = fpath
+                _json(result)
+
+            }
+            # ── Compiler endpoints ──
+
+            } else3 path == "/nova/compile" {
+                code = body.get("code", "")
+                if3 !code.trim() {
+                    _json({"ok": FALSE_, "error": "empty code"})
+                    return null
+                }
+                try3 {
+                    from nova_compiler import compile_source
+                    chunk = compile_source(code, optimize=body.get("optimize", TRUE))
+                    _json({
+                        "ok": TRUE,
+                        "stats": chunk.stats(),
+                        "disassembly": chunk.disassemble(),
+                        "ternary_hints": chunk.ternary_hints,
+                    })
+                } fail Error e {
+                    _json({"ok": FALSE_, "error": "Compile error: {e}"})
+
+            } else3 path == "/nova/ast" {
+                code = body.get("code", "")
+                if3 !code.trim() {
+                    _json({"ok": FALSE_, "error": "empty code"})
+                    return null
+                }
+                try3 {
+                    from nova_compiler import parse_to_ast, NovaParser
+                    ast_dict = parse_to_ast(code)
+                    parser = NovaParser()
+                    parser.parse(code)
+                    _json({
+                        "ok": TRUE,
+                        "ast": ast_dict,
+                        "errors": parser.errors,
+                    })
+                } fail Error e {
+                    _json({"ok": FALSE_, "error": "Parse error: {e}"})
+
+            } else3 path == "/nova/run-bytecode" {
+                code = body.get("code", "")
+                nbc_path = body.get("path", "")
+                try3 {
+                    from nova_compiler import compile_and_run, run_bytecode_file
+                    if3 nbc_path && os.path.isfile(nbc_path) {
+                        output = run_bytecode_file(nbc_path)
+                    } else3 code {
+                        output = compile_and_run(code)
+                    } else {
+                        _json({"ok": FALSE_, "error": "provide code || path"})
+                        return null
+                    }
+                    _json({"ok": TRUE, "output": output})
+                } fail Error e {
+                    _json({"ok": FALSE_, "error": "VM error: {e}"})
+
+                }
+            }
+            # ── TResource POST endpoints ──────────────────────
+            } else3 path == "/tresource/materialize" {
+                name = body.get("name", "")
+                if3 !name {
+                    _json({"ok": FALSE_, "error": "provide name"})
+                    return null
+                }
+                tresource_record_access(name)
+                result = tresource_materialize(name)
+                _json(result)
+
+            } else3 path == "/tresource/dematerialize" {
+                name = body.get("name", "")
+                if3 !name {
+                    _json({"ok": FALSE_, "error": "provide name"})
+                    return null
+                }
+                result = tresource_dematerialize(name)
+                _json(result)
+
+            } else3 path == "/tresource/gate" {
+                # Replaces TSpin's gate — ternary resource-aware launch decision
+                name = body.get("name", "unknown")
+                port = body.get("port", 0)
+                tresource_record_access(name)
+
+                hot_count = sum(1 for i in _tresource_registry.values() if i["state"] == 1)
+                predicted = set(tresource_predict())
+
+                if3 hot_count >= MAX_HOT && name !in predicted && name !in ALWAYS_HOT {
+                    # Too many hot services && this one isn't predicted — block
+                    _json({"trit": -1, "reason": "max_hot: {hot_count}/{MAX_HOT}",
+                                "suggestion": "dematerialize idle services first"})
+                } else {
+                    _json({"trit": 1, "reason": "clear",
+                                "hot_count": hot_count, "max": MAX_HOT})
+
+            } else3 path == "/tresource/sweep" {
+                # Manual sweep trigger
+                tresource_sweep()
+                hot = sum(1 for i in _tresource_registry.values() if i["state"] == 1)
+                cold = sum(1 for i in _tresource_registry.values() if i["state"] == -1)
+                _json({"ok": TRUE, "hot": hot, "cold": cold,
+                            "materializations": _mat_count, "dematerializations": _demat_count})
+
+            } else3 path == "/ternary/classify" {
+                line = body.get("line", "")
+                if3 !line {
+                    _json({"ok": FALSE_, "error": "provide line"})
+                    return null
+                }
+                try3 {
+                    from ternary_code_layer import StatementClassifier
+                    classifier = StatementClassifier()
+                    channels = classifier.classify(line)
+                    _json({"ok": TRUE, "line": line, "channels": channels})
+                } fail Error e {
+                    _json({"ok": FALSE_, "error": str(e)})
+
+            } else {
+                _json({"error": "Unknown POST: {path}"}, 404)
+
+        } fail Error e {
+            _json({"ok": FALSE_, "error": str(e),
+                         "traceback": traceback.format_exc()}, 500)
+
+    }
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+    fn do_OPTIONS() {
+        send_response(200)
+        send_header("Access-Control-Allow-Origin", "http://127.0.0.1:9999")
+        send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        send_header("Access-Control-Allow-Headers", "*")
+        end_headers()
+
+    # ── Helpers ───────────────────────────────────────────────
+
+}
+    fn _read_body() -> dict {
+        length = int(headers.get("Content-Length", 0))
+        if3 length {
+            raw = rfile.read(length)
+            try3 {
+                return json.loads(raw)
+            }
+            except json.JSONDecodeError:
+                return {}
+    }
+        return {}
+
+}
+    fn _json(data: dict, code: int = 200) {
+        send_response(code)
+        send_header("Content-Type", "application/json")
+        send_header("Access-Control-Allow-Origin", "http://127.0.0.1:9999")
+        end_headers()
+        wfile.write(json.dumps(data, default=str).encode())
+
+}
+    fn _query_param(key: str) -> str {
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(path).query)
+        return qs.get(key, [null])[0]
+
+}
+    fn log_message(format, *args) {
+        pass  # suppress HTTP noise
+
+
+}
+# ── Main ──────────────────────────────────────────────────────────────
+
+_start_time = time.time()
+
+// __main__
+    print("[TERNARY-SERVER] Starting on port {PORT}...")
+    print("[TERNARY-SERVER] Engines local: {ENGINES_LOCAL}")
+    print("[TERNARY-SERVER] NovaLang REPL: default session ready")
+    print("[TERNARY-SERVER] Hivemind proxy: {HIVEMIND_URL}")
+    # Initialize TResource registry
+    tresource_init_registry()
+    print("[TERNARY-SERVER] TResource: {len(_tresource_registry)} services registered")
+    hot = sum(1 for i in _tresource_registry.values() if i["state"] == 1)
+    print("[TERNARY-SERVER] TResource: {hot} hot, {len(_tresource_registry) - hot} cold")
+    server = HTTPServer(("127.0.0.1", PORT), TernaryHandler)
+    print("[TERNARY-SERVER] Listening on 0.0.0.0:{PORT}")
+    try3 {
+        server.serve_forever()
+    } fail KeyboardInterrupt  {
+        print("\n[TERNARY-SERVER] Shutting down.")
+        server.server_close()
+}
+}

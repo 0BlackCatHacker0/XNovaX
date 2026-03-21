@@ -1,0 +1,508 @@
+// audio_api_call.nova - NovaX Audio Engine (pure NovaLang)
+// Replaces audio_api_call.py — called by nova_audio_engine.nova via shell()
+// Tools: wave, freq, synth, envelope, filter, rhythm, encode
+
+fn3 handle_wave(p) {
+    let wtype = dict_get(p, "type") ?? "sine"
+    let freq = dict_get(p, "freq") ?? 440
+    let dur = dict_get(p, "duration") ?? 1.0
+    let sr = dict_get(p, "sample_rate") ?? 8000
+    let amp = dict_get(p, "amplitude") ?? 0.8
+    let n = int(sr * dur)
+    let samples = []
+    let random_state = 42
+    let pi2 = 6.283185307
+
+    let cap = n
+    if3 cap > 8000 { cap = 8000 }
+
+    let i = 0
+    while3 i < cap {
+        let t = i / sr
+        let s = 0.0
+
+        if3 wtype == "sine" {
+            s = amp * sin(pi2 * freq * t)
+        } else3 {
+            if3 wtype == "square" {
+                let sv = sin(pi2 * freq * t)
+                if3 sv >= 0 { s = amp } else3 { s = 0.0 - amp }
+            } else3 {
+                if3 wtype == "saw" {
+                    s = amp * (2.0 * (t * freq % 1.0) - 1.0)
+                } else3 {
+                    if3 wtype == "triangle" {
+                        s = amp * (4.0 * abs(t * freq % 1.0 - 0.5) - 1.0)
+                    } else3 {
+                        if3 wtype == "noise" {
+                            random_state = (random_state * 1103515245 + 12345) % 2147483647
+                            s = amp * (random_state / 2147483647.0 * 2.0 - 1.0)
+                        } else3 {
+                            s = 0.0
+                        }
+                    }
+                }
+            }
+        }
+
+        let rounded = round(s, 4)
+        samples = append(samples, rounded)
+        i = i + 1
+    }
+
+    let out_samples = slice(samples, 0, 200)
+    let result = {}
+    result = dict_set(result, "ok", true)
+    result = dict_set(result, "type", wtype)
+    result = dict_set(result, "freq", freq)
+    result = dict_set(result, "samples", out_samples)
+    result = dict_set(result, "total_samples", len(samples))
+    result = dict_set(result, "sample_rate", sr)
+    result = dict_set(result, "duration", dur)
+    return3 result
+}
+
+fn3 handle_freq(p) {
+    let samples = dict_get(p, "samples") ?? []
+    let sr = dict_get(p, "sample_rate") ?? 8000
+    let n = len(samples)
+    if3 n == 0 {
+        return3 {"ok": false, "error": "no_samples"}
+    }
+
+    let max_bins = n / 2
+    if3 max_bins > 100 { max_bins = 100 }
+
+    let pi2 = 6.283185307
+    let spectrum = []
+
+    let k = 0
+    while3 k < max_bins {
+        let real_sum = 0.0
+        let imag_sum = 0.0
+        let i = 0
+        while3 i < n {
+            let angle = pi2 * k * i / n
+            let sv = samples[i]
+            real_sum = real_sum + sv * cos(angle)
+            imag_sum = imag_sum + sv * sin(angle)
+            i = i + 1
+        }
+        let mag = sqrt(real_sum * real_sum + imag_sum * imag_sum) / n
+        let freq_val = k * sr / n
+        let entry = {}
+        entry = dict_set(entry, "freq", round(freq_val, 2))
+        entry = dict_set(entry, "magnitude", round(mag, 4))
+        spectrum = append(spectrum, entry)
+        k = k + 1
+    }
+
+    let result = {}
+    result = dict_set(result, "ok", true)
+    result = dict_set(result, "spectrum", spectrum)
+    result = dict_set(result, "bins", len(spectrum))
+    result = dict_set(result, "sample_rate", sr)
+    return3 result
+}
+
+fn3 handle_synth(p) {
+    let harmonics = dict_get(p, "harmonics") ?? []
+    let dur = dict_get(p, "duration") ?? 1.0
+    let sr = dict_get(p, "sample_rate") ?? 8000
+    let n = int(sr * dur)
+    let cap = n
+    if3 cap > 8000 { cap = 8000 }
+    let pi2 = 6.283185307
+
+    // Initialize samples array
+    let samples = []
+    let idx = 0
+    while3 idx < cap {
+        samples = append(samples, 0.0)
+        idx = idx + 1
+    }
+
+    // Add harmonics
+    let hi = 0
+    while3 hi < len(harmonics) {
+        let h = harmonics[hi]
+        let hfreq = dict_get(h, "freq") ?? 440
+        let hamp = dict_get(h, "amp") ?? 1.0
+        let i = 0
+        while3 i < cap {
+            let t = i / sr
+            let old_val = samples[i]
+            samples[i] = old_val + hamp * sin(pi2 * hfreq * t)
+            i = i + 1
+        }
+        hi = hi + 1
+    }
+
+    // Normalize
+    let peak = 0.0
+    let i = 0
+    while3 i < len(samples) {
+        let a = abs(samples[i])
+        if3 a > peak { peak = a }
+        i = i + 1
+    }
+    if3 peak <= 0 { peak = 1.0 }
+
+    let norm = []
+    i = 0
+    while3 i < len(samples) {
+        norm = append(norm, round(samples[i] / peak, 4))
+        i = i + 1
+    }
+
+    let result = {}
+    result = dict_set(result, "ok", true)
+    result = dict_set(result, "samples", slice(norm, 0, 200))
+    result = dict_set(result, "total_samples", len(norm))
+    result = dict_set(result, "harmonics_count", len(harmonics))
+    result = dict_set(result, "sample_rate", sr)
+    return3 result
+}
+
+fn3 handle_envelope(p) {
+    let a = dict_get(p, "attack") ?? 0.1
+    let d = dict_get(p, "decay") ?? 0.1
+    let sus = dict_get(p, "sustain") ?? 0.7
+    let r = dict_get(p, "release") ?? 0.2
+    let dur = dict_get(p, "duration") ?? 1.0
+    let sr = dict_get(p, "sample_rate") ?? 8000
+    let n = int(sr * dur)
+    let env = []
+    let cap = n
+    if3 cap > 8000 { cap = 8000 }
+
+    let i = 0
+    while3 i < cap {
+        let t = i / sr
+        let val = 0.0
+
+        if3 t < a {
+            if3 a > 0 { val = t / a } else3 { val = 1.0 }
+        } else3 {
+            if3 t < a + d {
+                if3 d > 0 { val = 1.0 - (1.0 - sus) * ((t - a) / d) } else3 { val = sus }
+            } else3 {
+                if3 t < dur - r {
+                    val = sus
+                } else3 {
+                    if3 r > 0 { val = sus * (1.0 - (t - (dur - r)) / r) } else3 { val = 0.0 }
+                }
+            }
+        }
+
+        if3 val < 0 { val = 0.0 }
+        if3 val > 1 { val = 1.0 }
+        env = append(env, round(val, 4))
+        i = i + 1
+    }
+
+    let adsr = {}
+    adsr = dict_set(adsr, "attack", a)
+    adsr = dict_set(adsr, "decay", d)
+    adsr = dict_set(adsr, "sustain", sus)
+    adsr = dict_set(adsr, "release", r)
+
+    let result = {}
+    result = dict_set(result, "ok", true)
+    result = dict_set(result, "envelope", slice(env, 0, 200))
+    result = dict_set(result, "total_samples", len(env))
+    result = dict_set(result, "adsr", adsr)
+    return3 result
+}
+
+fn3 handle_filter(p) {
+    let ftype = dict_get(p, "type") ?? "lowpass"
+    let samples = dict_get(p, "samples") ?? []
+    let cutoff = dict_get(p, "cutoff") ?? 1000
+    let sr = dict_get(p, "sample_rate") ?? 8000
+    let bw = dict_get(p, "bandwidth") ?? 200
+
+    if3 len(samples) == 0 {
+        return3 {"ok": false, "error": "no_samples"}
+    }
+
+    let window = 1
+    if3 cutoff > 0 {
+        window = int(sr / (2 * cutoff))
+        if3 window < 1 { window = 1 }
+    }
+
+    let filtered = []
+    let i = 0
+    while3 i < len(samples) {
+        let val = samples[i]
+
+        if3 ftype == "lowpass" {
+            let start = i - window
+            if3 start < 0 { start = 0 }
+            let sum_val = 0.0
+            let cnt = 0
+            let j = start
+            while3 j <= i {
+                sum_val = sum_val + samples[j]
+                cnt = cnt + 1
+                j = j + 1
+            }
+            val = sum_val / cnt
+        } else3 {
+            if3 ftype == "highpass" {
+                let start = i - window
+                if3 start < 0 { start = 0 }
+                let sum_val = 0.0
+                let cnt = 0
+                let j = start
+                while3 j <= i {
+                    sum_val = sum_val + samples[j]
+                    cnt = cnt + 1
+                    j = j + 1
+                }
+                let avg = sum_val / cnt
+                val = samples[i] - avg
+            } else3 {
+                if3 ftype == "bandpass" {
+                    let low_w = int(sr / (2 * (cutoff + bw / 2)))
+                    if3 low_w < 1 { low_w = 1 }
+                    let high_cutoff = cutoff - bw / 2
+                    if3 high_cutoff < 1 { high_cutoff = 1 }
+                    let high_w = int(sr / (2 * high_cutoff))
+                    if3 high_w < 1 { high_w = 1 }
+
+                    let start_l = i - low_w
+                    if3 start_l < 0 { start_l = 0 }
+                    let sum_l = 0.0
+                    let cnt_l = 0
+                    let j = start_l
+                    while3 j <= i {
+                        sum_l = sum_l + samples[j]
+                        cnt_l = cnt_l + 1
+                        j = j + 1
+                    }
+                    let low_val = sum_l / cnt_l
+
+                    let start_h = i - high_w
+                    if3 start_h < 0 { start_h = 0 }
+                    let sum_h = 0.0
+                    let cnt_h = 0
+                    j = start_h
+                    while3 j <= i {
+                        sum_h = sum_h + samples[j]
+                        cnt_h = cnt_h + 1
+                        j = j + 1
+                    }
+                    let high_val = sum_h / cnt_h
+
+                    val = low_val - high_val + samples[i] * 0.5
+                }
+            }
+        }
+
+        filtered = append(filtered, round(val, 4))
+        i = i + 1
+    }
+
+    let result = {}
+    result = dict_set(result, "ok", true)
+    result = dict_set(result, "type", ftype)
+    result = dict_set(result, "samples", slice(filtered, 0, 200))
+    result = dict_set(result, "total_samples", len(filtered))
+    result = dict_set(result, "cutoff", cutoff)
+    return3 result
+}
+
+fn3 handle_rhythm(p) {
+    let pattern = dict_get(p, "pattern") ?? "x.x.x.x."
+    let bpm = dict_get(p, "bpm") ?? 120
+    let subdivisions = dict_get(p, "subdivisions") ?? 8
+    let time_sig = dict_get(p, "time_sig") ?? [4, 4]
+
+    let beat_dur = 60.0 / bpm
+    let sub_dur = beat_dur / (subdivisions / time_sig[1])
+
+    let beats = []
+    let chars = split(pattern, "")
+    let i = 0
+    while3 i < len(chars) {
+        let ch = chars[i]
+        let t = i * sub_dur
+        let trit = -1
+        let hit = true
+
+        if3 ch == "x" { trit = 1 }
+        else3 {
+            if3 ch == "X" { trit = 1 }
+            else3 {
+                if3 ch == "o" { trit = 0 }
+                else3 {
+                    if3 ch == "O" { trit = 0 }
+                    else3 { trit = -1; hit = false }
+                }
+            }
+        }
+
+        let beat = {}
+        beat = dict_set(beat, "index", i)
+        beat = dict_set(beat, "time", round(t, 4))
+        beat = dict_set(beat, "hit", hit)
+        beat = dict_set(beat, "trit", trit)
+        beat = dict_set(beat, "char", ch)
+        beats = append(beats, beat)
+        i = i + 1
+    }
+
+    let result = {}
+    result = dict_set(result, "ok", true)
+    result = dict_set(result, "pattern", pattern)
+    result = dict_set(result, "beats", beats)
+    result = dict_set(result, "bpm", bpm)
+    result = dict_set(result, "time_sig", time_sig)
+    result = dict_set(result, "total_duration", round(len(chars) * sub_dur, 4))
+    return3 result
+}
+
+fn3 handle_encode(p) {
+    let op = dict_get(p, "op") ?? "to_trit"
+    let samples = dict_get(p, "samples") ?? []
+    let depth = dict_get(p, "depth") ?? 3
+
+    if3 op == "to_trit" {
+        let max_val = pow(3, depth)
+        let trits = []
+        let cap = len(samples)
+        if3 cap > 500 { cap = 500 }
+        let i = 0
+        while3 i < cap {
+            let q = round(samples[i] * (max_val - 1))
+            if3 q < (0 - max_val + 1) { q = 0 - max_val + 1 }
+            if3 q > max_val - 1 { q = max_val - 1 }
+            trits = append(trits, int(q))
+            i = i + 1
+        }
+        let result = {}
+        result = dict_set(result, "ok", true)
+        result = dict_set(result, "op", "to_trit")
+        result = dict_set(result, "trits", slice(trits, 0, 200))
+        result = dict_set(result, "total", len(trits))
+        result = dict_set(result, "depth", depth)
+        result = dict_set(result, "range", [0 - max_val + 1, max_val - 1])
+        return3 result
+    }
+
+    if3 op == "from_trit" {
+        let trits = dict_get(p, "trits") ?? samples
+        let max_val = pow(3, depth)
+        let decoded = []
+        let cap = len(trits)
+        if3 cap > 500 { cap = 500 }
+        let i = 0
+        while3 i < cap {
+            let val = 0.0
+            if3 max_val > 1 { val = round(trits[i] / (max_val - 1), 4) }
+            decoded = append(decoded, val)
+            i = i + 1
+        }
+        let result = {}
+        result = dict_set(result, "ok", true)
+        result = dict_set(result, "op", "from_trit")
+        result = dict_set(result, "samples", slice(decoded, 0, 200))
+        result = dict_set(result, "total", len(decoded))
+        return3 result
+    }
+
+    if3 op == "stats" {
+        if3 len(samples) == 0 {
+            return3 {"ok": true, "stats": {"count": 0}}
+        }
+        let peak = 0.0
+        let rms_sum = 0.0
+        let pos = 0
+        let neg = 0
+        let zero = 0
+        let i = 0
+        while3 i < len(samples) {
+            let s = samples[i]
+            let a = abs(s)
+            if3 a > peak { peak = a }
+            rms_sum = rms_sum + s * s
+            if3 s > 0 { pos = pos + 1 }
+            else3 {
+                if3 s < 0 { neg = neg + 1 }
+                else3 { zero = zero + 1 }
+            }
+            i = i + 1
+        }
+        let rms = sqrt(rms_sum / len(samples))
+
+        let trit_balance = {}
+        trit_balance = dict_set(trit_balance, "plus", pos)
+        trit_balance = dict_set(trit_balance, "zero", zero)
+        trit_balance = dict_set(trit_balance, "minus", neg)
+
+        let stats = {}
+        stats = dict_set(stats, "count", len(samples))
+        stats = dict_set(stats, "peak", round(peak, 4))
+        stats = dict_set(stats, "rms", round(rms, 4))
+        stats = dict_set(stats, "positive", pos)
+        stats = dict_set(stats, "negative", neg)
+        stats = dict_set(stats, "zero", zero)
+        stats = dict_set(stats, "trit_balance", trit_balance)
+
+        return3 {"ok": true, "stats": stats}
+    }
+
+    return3 {"ok": false, "error": "unknown_op"}
+}
+
+// Main entry point
+fn3 main() {
+    let args = sys_args()
+    let payload = {}
+
+    if3 contains(str(args), "--file") {
+        // Find --file arg and read from file
+        let i = 0
+        while3 i < len(args) {
+            if3 args[i] == "--file" {
+                let fpath = args[i + 1]
+                let content = read_file(fpath)
+                payload = parse_json(content)
+            }
+            i = i + 1
+        }
+    } else3 {
+        // Read from stdin
+        let input = read_stdin()
+        payload = parse_json(input)
+    }
+
+    let tool = dict_get(payload, "tool") ?? ""
+    let result = {"ok": false, "error": "unknown_tool"}
+
+    if3 tool == "wave" { result = handle_wave(payload) }
+    else3 {
+        if3 tool == "freq" { result = handle_freq(payload) }
+        else3 {
+            if3 tool == "synth" { result = handle_synth(payload) }
+            else3 {
+                if3 tool == "envelope" { result = handle_envelope(payload) }
+                else3 {
+                    if3 tool == "filter" { result = handle_filter(payload) }
+                    else3 {
+                        if3 tool == "rhythm" { result = handle_rhythm(payload) }
+                        else3 {
+                            if3 tool == "encode" { result = handle_encode(payload) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    print(to_json(result))
+}
+
+main()

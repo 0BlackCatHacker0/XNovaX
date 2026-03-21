@@ -1,0 +1,3729 @@
+// nova_talchemy_service.nova -- NovaX TAlchemy v1.0
+// Ternary Data Transformation Engine -- Port 9928
+//
+// The "data plumber" of NovaX. Transforms data between formats, reshapes
+// structures, filters arrays, merges datasets, and aggregates values.
+// Every transformation is ternary-encoded: +1 success, 0 partial, -1 failure.
+//
+// Supported formats: JSON, CSV, YAML (simplified), XML (simplified),
+//                    ternary trit encoding, plain text.
+//
+// 3-5-7-13 Harmonics:
+//   3  = ternary transform states (+1 clean, 0 partial, -1 corrupt)
+//   5  = max nesting depth for flatten/unflatten
+//   7  = max merge sources in one call
+//   13 = JSONPath cache size, hash seal length
+//
+// N-S Reynolds routing:
+//   Re < 27  = laminar     (small payload, simple transform)
+//   Re < 125 = transitional (medium payload)
+//   Re < 343 = turbulent   (large payload)
+//   Re >= 343 = chaotic    (very large or complex transform)
+//
+// Endpoints:
+//   GET  /talchemy/health     -- Health check
+//   GET  /talchemy/stats      -- Transformation statistics
+//   POST /talchemy/transform  -- Convert between formats
+//   POST /talchemy/reshape    -- Reshape JSON using JSONPath-like templates
+//   POST /talchemy/filter     -- Filter array of objects by conditions
+//   POST /talchemy/merge      -- Merge datasets by key
+//   POST /talchemy/aggregate  -- Group-by and aggregate operations
+//   POST /talchemy/ternary    -- Classify every field to trit representation
+//   POST /talchemy/consensus  -- Weighted multi-source consensus with confidence
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9928
+let server = tserve(PORT, "TAlchemy v1.0 - Ternary Data Transformation Engine")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Service identity --
+let VERSION      = "1.0"
+let SERVICE_NAME = "nova-talchemy"
+
+// -- Reynolds boundaries (N-S flow regime thresholds) --
+let RE_LAMINAR     = 27    // H3^3
+let RE_TRANS       = 125   // H5^3
+let RE_TURBULENT   = 343   // H7^3
+
+// -- Operational limits (3-5-7-13 harmonic sizing) --
+let MAX_NEST  = 5          // H5: max nesting depth for flatten/unflatten
+let MAX_MERGE = 7          // H7: max merge sources in one call
+let MAX_ARRAY = 10000      // max array elements to process
+// MAX_BODY: 3^7 * H5 = 2187 * 5 = 10935 bytes
+let MAX_BODY  = 10935
+
+// -- Valid format names (used in validation) --
+let FMT_JSON    = "json"
+let FMT_CSV     = "csv"
+let FMT_YAML    = "yaml"
+let FMT_XML     = "xml"
+let FMT_TERNARY = "ternary"
+let FMT_PLAIN   = "plain"
+
+// -- Cumulative transformation statistics --
+// No threading in NovaLang -- all state is single-flow
+let _start_time          = time()
+let _stat_transforms     = 0
+let _stat_reshapes        = 0
+let _stat_filters         = 0
+let _stat_merges          = 0
+let _stat_aggregations    = 0
+let _stat_ternary_convs   = 0
+let _stat_validations     = 0
+let _stat_diffs           = 0
+// Per-format usage counters (one var per format)
+let _fmt_json_count    = 0
+let _fmt_csv_count     = 0
+let _fmt_yaml_count    = 0
+let _fmt_xml_count     = 0
+let _fmt_ternary_count = 0
+let _fmt_plain_count   = 0
+
+// ============================================================
+// Helper: N-S Reynolds number for a transform payload
+// Re = (payload_size * format_complexity) / H13
+// Complexity: json=1, plain=1, csv=2, ternary=2, yaml=3, xml=3
+// ============================================================
+fn payload_reynolds(data_size, fmt) {
+    let complexity = 1
+    if3 fmt == FMT_CSV { complexity = 2
+    } else fmt == FMT_TERNARY { complexity = 2
+    } else fmt == FMT_YAML { complexity = 3
+    } else fmt == FMT_XML { complexity = 3
+    } else {
+        // json or plain: complexity stays 1
+    }
+    let re = (data_size * complexity) / H13
+    return re
+}
+
+// ============================================================
+// Helper: N-S flow regime label from Reynolds number
+// ============================================================
+fn reynolds_regime(re) {
+    if3 re < RE_LAMINAR {
+        return "laminar"
+    } else re < RE_TRANS {
+        return "transitional"
+    } else re < RE_TURBULENT {
+        return "turbulent"
+    } else {
+        return "chaotic"
+    }
+}
+
+// ============================================================
+// Helper: validate that a format string is supported
+// Returns T_TRUE if valid, T_FALSE if not
+// ============================================================
+fn fmt_valid(fmt) {
+    if3 fmt == FMT_JSON {
+        return T_TRUE
+    } else fmt == FMT_CSV {
+        return T_TRUE
+    } else fmt == FMT_YAML {
+        return T_TRUE
+    } else fmt == FMT_XML {
+        return T_TRUE
+    } else fmt == FMT_TERNARY {
+        return T_TRUE
+    } else fmt == FMT_PLAIN {
+        return T_TRUE
+    } else {
+        return T_FALSE
+    }
+}
+
+// ============================================================
+// Helper: increment per-format usage counter
+// ============================================================
+fn record_fmt(fmt) {
+    if3 fmt == FMT_JSON {
+        _fmt_json_count = _fmt_json_count + 1
+    } else fmt == FMT_CSV {
+        _fmt_csv_count = _fmt_csv_count + 1
+    } else fmt == FMT_YAML {
+        _fmt_yaml_count = _fmt_yaml_count + 1
+    } else fmt == FMT_XML {
+        _fmt_xml_count = _fmt_xml_count + 1
+    } else fmt == FMT_TERNARY {
+        _fmt_ternary_count = _fmt_ternary_count + 1
+    } else {
+        _fmt_plain_count = _fmt_plain_count + 1
+    }
+}
+
+// ============================================================
+// Helper: classify ternary trit from a scalar value
+// truthy -> T_TRUE, null/empty/zero -> T_MAYBE, false/-1 -> T_FALSE
+// This mirrors nova_tlight.trit() logic.
+// ============================================================
+fn scalar_trit(val) {
+    if3 val == null {
+        return T_MAYBE
+    } else val == "" {
+        return T_MAYBE
+    } else val == 0 {
+        return T_MAYBE
+    } else val == false {
+        return T_FALSE
+    } else val == T_FALSE {
+        return T_FALSE
+    } else {
+        return T_TRUE
+    }
+}
+
+// ============================================================
+// FORMAT CONVERSION HELPERS -- Pure NovaLang
+// All transforms implemented inline using json_encode/json_decode,
+// dict_get, keys, split, string ops. No Python, no nova_run.
+// ============================================================
+
+// -- Helper: flatten a nested dict to dot-notation --
+// {"user": {"name": "Alice"}} -> {"user.name": "Alice"}
+fn _flatten_recurse(obj, prefix, depth, max_depth, result) {
+    if3 depth >= max_depth {
+        result = dict_set(result, prefix, obj)
+        return result
+    } else { }
+    if3 type(obj) == "dict" {
+        let obj_keys = keys(obj)
+        for3 k in obj_keys {
+            let v = dict_get(obj, k) ?? null
+            let new_prefix = k
+            if3 prefix != "" { new_prefix = prefix + "." + k
+            } else { }
+            result = _flatten_recurse(v, new_prefix, depth + 1, max_depth, result)
+        }
+        return result
+    } else {
+        result = dict_set(result, prefix, obj)
+        return result
+    }
+}
+
+fn do_flatten(data_json_str) {
+    try3 {
+        let data = json_decode(data_json_str)
+        let flat = _flatten_recurse(data, "", 0, MAX_NEST, {})
+        return {"ok": true, "data": flat}
+    } fail {
+        return {"ok": false, "error": "flatten failed: " + "unknown error"}
+    }
+}
+
+// -- Unflatten dot-notation keys to nested dict --
+fn do_unflatten(data_json_str) {
+    try3 {
+        let data = json_decode(data_json_str)
+        let result = {}
+        let all_keys = keys(data)
+        for3 flat_key in all_keys {
+            let val = dict_get(data, flat_key) ?? null
+            let parts = split(flat_key, ".")
+            let current = result
+            let pi = 0
+            while3 pi < len(parts) - 1 {
+                let part = parts[pi]
+                let existing = dict_get(current, part) ?? null
+                if3 existing == null {
+                    current = dict_set(current, part, {})
+                    // Re-read to descend
+                } else { }
+                pi = pi + 1
+            }
+            // For simple single-level unflattening, set directly on result
+            // Multi-level: build nested path
+            if3 len(parts) == 1 {
+                result = dict_set(result, parts[0], val)
+            } else len(parts) == 2 {
+                let sub = dict_get(result, parts[0]) ?? {}
+                sub = dict_set(sub, parts[1], val)
+                result = dict_set(result, parts[0], sub)
+            } else len(parts) == 3 {
+                let sub = dict_get(result, parts[0]) ?? {}
+                let sub2 = dict_get(sub, parts[1]) ?? {}
+                sub2 = dict_set(sub2, parts[2], val)
+                sub = dict_set(sub, parts[1], sub2)
+                result = dict_set(result, parts[0], sub)
+            } else len(parts) == 4 {
+                let sub = dict_get(result, parts[0]) ?? {}
+                let sub2 = dict_get(sub, parts[1]) ?? {}
+                let sub3 = dict_get(sub2, parts[2]) ?? {}
+                sub3 = dict_set(sub3, parts[3], val)
+                sub2 = dict_set(sub2, parts[2], sub3)
+                sub = dict_set(sub, parts[1], sub2)
+                result = dict_set(result, parts[0], sub)
+            } else len(parts) == 5 {
+                let sub = dict_get(result, parts[0]) ?? {}
+                let sub2 = dict_get(sub, parts[1]) ?? {}
+                let sub3 = dict_get(sub2, parts[2]) ?? {}
+                let sub4 = dict_get(sub3, parts[3]) ?? {}
+                sub4 = dict_set(sub4, parts[4], val)
+                sub3 = dict_set(sub3, parts[3], sub4)
+                sub2 = dict_set(sub2, parts[2], sub3)
+                sub = dict_set(sub, parts[1], sub2)
+                result = dict_set(result, parts[0], sub)
+            } else {
+                // Beyond MAX_NEST depth, store as dotted key
+                result = dict_set(result, flat_key, val)
+            }
+        }
+        return {"ok": true, "data": result}
+    } fail {
+        return {"ok": false, "error": "unflatten failed: " + "unknown error"}
+    }
+}
+
+// -- JSON list/dict -> CSV string --
+fn do_json_to_csv(data_json_str) {
+    try3 {
+        let data = json_decode(data_json_str)
+        if3 type(data) != "list" {
+            return {"ok": false, "error": "json_to_csv requires a list of objects"}
+        } else { }
+        if3 len(data) == 0 {
+            return {"ok": true, "data": ""}
+        } else { }
+        // Collect all column names from all rows
+        let cols = []
+        let col_set = {}
+        let ri = 0
+        while3 ri < len(data) {
+            let row = dict_get(data, ri) ?? {}
+            let rkeys = keys(row)
+            for3 rk in rkeys {
+                let already = dict_get(col_set, rk) ?? null
+                if3 already == null {
+                    cols = append(cols, rk)
+                    col_set = dict_set(col_set, rk, true)
+                } else { }
+            }
+            ri = ri + 1
+        }
+        // Build header line
+        let header = join(cols, ",")
+        let lines = [header]
+        // Build data lines
+        let di = 0
+        while3 di < len(data) {
+            let row = dict_get(data, di) ?? {}
+            let vals = []
+            for3 col in cols {
+                let v = dict_get(row, col) ?? ""
+                let vs = str(v)
+                // Quote if contains comma or newline
+                if3 contains(vs, ",") {
+                    vs = "\"" + vs + "\""
+                } else contains(vs, "\n") {
+                    vs = "\"" + vs + "\""
+                } else { }
+                vals = append(vals, vs)
+            }
+            lines = append(lines, join(vals, ","))
+            di = di + 1
+        }
+        return {"ok": true, "data": join(lines, "\n")}
+    } fail {
+        return {"ok": false, "error": "json_to_csv failed: " + "unknown error"}
+    }
+}
+
+// -- CSV string -> JSON list of dicts --
+fn do_csv_to_json(csv_str) {
+    try3 {
+        let lines = split(csv_str, "\n")
+        if3 len(lines) < 1 {
+            return {"ok": true, "data": []}
+        } else { }
+        let headers = split(lines[0], ",")
+        // Trim whitespace from headers
+        let hi = 0
+        while3 hi < len(headers) {
+            headers[hi] = trim(headers[hi])
+            hi = hi + 1
+        }
+        let result = []
+        let li = 1
+        while3 li < len(lines) {
+            let line = trim(lines[li])
+            if3 len(line) == 0 {
+                li = li + 1
+            } else {
+                let vals = split(line, ",")
+                let row = {}
+                let vi = 0
+                while3 vi < len(headers) {
+                    let val = ""
+                    if3 vi < len(vals) { val = trim(vals[vi])
+                    } else { }
+                    // Remove surrounding quotes
+                    if3 len(val) >= 2 {
+                        if3 starts_with(val, "\"") {
+                            if3 ends_with(val, "\"") {
+                                val = slice(val, 1, len(val) - 1)
+                            } else { }
+                        } else { }
+                    } else { }
+                    row = dict_set(row, headers[vi], val)
+                    vi = vi + 1
+                }
+                result = append(result, row)
+                li = li + 1
+            }
+        }
+        return {"ok": true, "data": result}
+    } fail {
+        return {"ok": false, "error": "csv_to_json failed: " + "unknown error"}
+    }
+}
+
+// -- JSON -> simplified YAML string --
+fn _yaml_value(v) {
+    if3 v == null { return "null"
+    } else v == true { return "true"
+    } else v == false { return "false"
+    } else type(v) == "str" { return v
+    } else { return str(v)
+    }
+}
+
+fn _yaml_dict(obj, indent) {
+    let result = ""
+    let obj_keys = keys(obj)
+    for3 k in obj_keys {
+        let v = dict_get(obj, k) ?? null
+        let pad = ""
+        let pi = 0
+        while3 pi < indent { pad = pad + "  "
+            pi = pi + 1
+        }
+        if3 type(v) == "dict" {
+            result = result + pad + str(k) + ":\n"
+            result = result + _yaml_dict(v, indent + 1)
+        } else type(v) == "list" {
+            result = result + pad + str(k) + ":\n"
+            let li = 0
+            while3 li < len(v) {
+                let item = dict_get(v, li) ?? null
+                if3 type(item) == "dict" {
+                    result = result + pad + "  - \n"
+                    result = result + _yaml_dict(item, indent + 2)
+                } else {
+                    result = result + pad + "  - " + _yaml_value(item) + "\n"
+                }
+                li = li + 1
+            }
+        } else {
+            result = result + pad + str(k) + ": " + _yaml_value(v) + "\n"
+        }
+    }
+    return result
+}
+
+fn do_json_to_yaml(data_json_str) {
+    try3 {
+        let data = json_decode(data_json_str)
+        if3 type(data) == "dict" {
+            let yaml_str = _yaml_dict(data, 0)
+            return {"ok": true, "data": yaml_str}
+        } else type(data) == "list" {
+            let yaml_str = ""
+            let li = 0
+            while3 li < len(data) {
+                let item = dict_get(data, li) ?? null
+                if3 type(item) == "dict" {
+                    yaml_str = yaml_str + "- \n"
+                    yaml_str = yaml_str + _yaml_dict(item, 1)
+                } else {
+                    yaml_str = yaml_str + "- " + _yaml_value(item) + "\n"
+                }
+                li = li + 1
+            }
+            return {"ok": true, "data": yaml_str}
+        } else {
+            return {"ok": true, "data": _yaml_value(data)}
+        }
+    } fail {
+        return {"ok": false, "error": "json_to_yaml failed: " + "unknown error"}
+    }
+}
+
+// -- Simplified YAML string -> JSON --
+fn do_yaml_to_json(yaml_str) {
+    try3 {
+        let result = {}
+        let lines = split(yaml_str, "\n")
+        for3 line in lines {
+            let trimmed = trim(line)
+            if3 len(trimmed) == 0 {
+                // skip blank
+            } else starts_with(trimmed, "#") {
+                // skip comment
+            } else contains(trimmed, ": ") {
+                let parts = split(trimmed, ": ")
+                let k = trim(parts[0])
+                // Remove leading "- " from list items
+                if3 starts_with(k, "- ") {
+                    k = trim(slice(k, 2, len(k)))
+                } else { }
+                let v = ""
+                if3 len(parts) > 1 { v = trim(parts[1])
+                } else { }
+                // Type coercion
+                if3 v == "true" { result = dict_set(result, k, true)
+                } else v == "false" { result = dict_set(result, k, false)
+                } else v == "null" { result = dict_set(result, k, null)
+                } else {
+                    // Try numeric
+                    let is_num = true
+                    try3 {
+                        let num = float(v)
+                        result = dict_set(result, k, num)
+                    } fail {
+                        result = dict_set(result, k, v)
+                    }
+                }
+            } else {
+                // Skip complex YAML structures (nested blocks handled at top level only)
+            }
+        }
+        return {"ok": true, "data": result}
+    } fail {
+        return {"ok": false, "error": "yaml_to_json failed: " + "unknown error"}
+    }
+}
+
+// -- JSON -> simplified XML string --
+fn _xml_escape(s) {
+    let result = replace(str(s), "&", "&amp;")
+    result = replace(result, "<", "&lt;")
+    result = replace(result, ">", "&gt;")
+    result = replace(result, "\"", "&quot;")
+    return result
+}
+
+fn _xml_node(tag, val, indent) {
+    let pad = ""
+    let pi = 0
+    while3 pi < indent { pad = pad + "  "
+        pi = pi + 1
+    }
+    if3 val == null {
+        return pad + "<" + tag + " />\n"
+    } else type(val) == "dict" {
+        let result = pad + "<" + tag + ">\n"
+        let val_keys = keys(val)
+        for3 k in val_keys {
+            let v = dict_get(val, k) ?? null
+            result = result + _xml_node(k, v, indent + 1)
+        }
+        result = result + pad + "</" + tag + ">\n"
+        return result
+    } else type(val) == "list" {
+        let result = ""
+        let li = 0
+        while3 li < len(val) {
+            let item = dict_get(val, li) ?? null
+            result = result + _xml_node(tag, item, indent)
+            li = li + 1
+        }
+        return result
+    } else {
+        return pad + "<" + tag + ">" + _xml_escape(val) + "</" + tag + ">\n"
+    }
+}
+
+fn do_json_to_xml(data_json_str) {
+    try3 {
+        let data = json_decode(data_json_str)
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        if3 type(data) == "dict" {
+            xml = xml + _xml_node("root", data, 0)
+        } else type(data) == "list" {
+            xml = xml + "<root>\n"
+            let li = 0
+            while3 li < len(data) {
+                let item = dict_get(data, li) ?? null
+                xml = xml + _xml_node("item", item, 1)
+                li = li + 1
+            }
+            xml = xml + "</root>\n"
+        } else {
+            xml = xml + "<root>" + _xml_escape(data) + "</root>\n"
+        }
+        return {"ok": true, "data": xml}
+    } fail {
+        return {"ok": false, "error": "json_to_xml failed: " + "unknown error"}
+    }
+}
+
+// -- Simplified XML string -> JSON --
+// Handles simple <tag>value</tag> patterns, no attributes
+fn do_xml_to_json(xml_str) {
+    try3 {
+        let result = {}
+        let lines = split(xml_str, "\n")
+        for3 line in lines {
+            let trimmed = trim(line)
+            if3 len(trimmed) == 0 {
+                // skip blank
+            } else starts_with(trimmed, "<?") {
+                // skip XML declaration
+            } else starts_with(trimmed, "<root>") {
+                // skip root open
+            } else starts_with(trimmed, "</root>") {
+                // skip root close
+            } else starts_with(trimmed, "<") {
+                // Try to extract <tag>value</tag>
+                let gt_pos = index_of(trimmed, ">")
+                if3 gt_pos > 0 {
+                    let tag = slice(trimmed, 1, gt_pos)
+                    // Skip self-closing and close tags
+                    if3 starts_with(tag, "/") {
+                        // close tag, skip
+                    } else ends_with(tag, "/") {
+                        // self-closing, null value
+                        let clean_tag = trim(slice(tag, 0, len(tag) - 1))
+                        result = dict_set(result, clean_tag, null)
+                    } else {
+                        let close_tag = "</" + tag + ">"
+                        let close_pos = index_of(trimmed, close_tag)
+                        if3 close_pos > 0 {
+                            let value = slice(trimmed, gt_pos + 1, close_pos)
+                            // Unescape basic XML entities
+                            value = replace(value, "&amp;", "&")
+                            value = replace(value, "&lt;", "<")
+                            value = replace(value, "&gt;", ">")
+                            value = replace(value, "&quot;", "\"")
+                            result = dict_set(result, tag, value)
+                        } else { }
+                    }
+                } else { }
+            } else { }
+        }
+        return {"ok": true, "data": result}
+    } fail {
+        return {"ok": false, "error": "xml_to_json failed: " + "unknown error"}
+    }
+}
+
+// -- JSON -> plain text key: value --
+fn do_json_to_plain(data_json_str) {
+    try3 {
+        let data = json_decode(data_json_str)
+        if3 type(data) == "dict" {
+            let result = ""
+            let all_keys = keys(data)
+            for3 k in all_keys {
+                let v = dict_get(data, k) ?? ""
+                result = result + str(k) + ": " + str(v) + "\n"
+            }
+            return {"ok": true, "data": result}
+        } else type(data) == "list" {
+            let result = ""
+            let li = 0
+            while3 li < len(data) {
+                let item = dict_get(data, li) ?? ""
+                if3 type(item) == "dict" {
+                    let item_keys = keys(item)
+                    for3 ik in item_keys {
+                        let iv = dict_get(item, ik) ?? ""
+                        result = result + str(ik) + ": " + str(iv) + "\n"
+                    }
+                    result = result + "---\n"
+                } else {
+                    result = result + str(item) + "\n"
+                }
+                li = li + 1
+            }
+            return {"ok": true, "data": result}
+        } else {
+            return {"ok": true, "data": str(data)}
+        }
+    } fail {
+        return {"ok": false, "error": "json_to_plain failed: " + "unknown error"}
+    }
+}
+
+// -- Plain text -> JSON dict --
+fn do_plain_to_json(plain_str) {
+    try3 {
+        let result = {}
+        let lines = split(plain_str, "\n")
+        for3 line in lines {
+            let trimmed = trim(line)
+            if3 len(trimmed) == 0 {
+                // skip blank
+            } else trimmed == "---" {
+                // skip separator
+            } else contains(trimmed, ": ") {
+                let colon_pos = index_of(trimmed, ": ")
+                let k = slice(trimmed, 0, colon_pos)
+                let v = trim(slice(trimmed, colon_pos + 2, len(trimmed)))
+                // Type coercion
+                if3 v == "true" { result = dict_set(result, k, true)
+                } else v == "false" { result = dict_set(result, k, false)
+                } else v == "null" { result = dict_set(result, k, null)
+                } else {
+                    try3 {
+                        let num = float(v)
+                        result = dict_set(result, k, num)
+                    } fail {
+                        result = dict_set(result, k, v)
+                    }
+                }
+            } else { }
+        }
+        return {"ok": true, "data": result}
+    } fail {
+        return {"ok": false, "error": "plain_to_json failed: " + "unknown error"}
+    }
+}
+
+// -- Data -> ternary trit representation --
+// Classifies every field: truthy=+1, None/empty=0, falsy=-1
+fn do_to_ternary(data_json_str) {
+    try3 {
+        let data = json_decode(data_json_str)
+        let result = {}
+        let count_pos = 0
+        let count_zero = 0
+        let count_neg = 0
+        if3 type(data) == "dict" {
+            let all_keys = keys(data)
+            for3 k in all_keys {
+                let v = dict_get(data, k) ?? null
+                let t = scalar_trit(v)
+                result = dict_set(result, k, t)
+                if3 t == T_TRUE { count_pos = count_pos + 1
+                } else t == T_MAYBE { count_zero = count_zero + 1
+                } else { count_neg = count_neg + 1
+                }
+            }
+        } else type(data) == "list" {
+            let result_list = []
+            let li = 0
+            while3 li < len(data) {
+                let v = dict_get(data, li) ?? null
+                if3 type(v) == "dict" {
+                    let row_result = {}
+                    let vkeys = keys(v)
+                    for3 vk in vkeys {
+                        let vv = dict_get(v, vk) ?? null
+                        let t = scalar_trit(vv)
+                        row_result = dict_set(row_result, vk, t)
+                        if3 t == T_TRUE { count_pos = count_pos + 1
+                        } else t == T_MAYBE { count_zero = count_zero + 1
+                        } else { count_neg = count_neg + 1
+                        }
+                    }
+                    result_list = append(result_list, row_result)
+                } else {
+                    let t = scalar_trit(v)
+                    result_list = append(result_list, t)
+                    if3 t == T_TRUE { count_pos = count_pos + 1
+                    } else t == T_MAYBE { count_zero = count_zero + 1
+                    } else { count_neg = count_neg + 1
+                    }
+                }
+                li = li + 1
+            }
+            return {"ok": true, "data": result_list, "count_pos": count_pos, "count_zero": count_zero, "count_neg": count_neg}
+        } else {
+            let t = scalar_trit(data)
+            if3 t == T_TRUE { count_pos = 1
+            } else t == T_MAYBE { count_zero = 1
+            } else { count_neg = 1
+            }
+            return {"ok": true, "data": t, "count_pos": count_pos, "count_zero": count_zero, "count_neg": count_neg}
+        }
+        return {"ok": true, "data": result, "count_pos": count_pos, "count_zero": count_zero, "count_neg": count_neg}
+    } fail {
+        return {"ok": false, "error": "to_ternary failed: " + "unknown error"}
+    }
+}
+
+// -- Ternary representation -> plain values --
+fn do_from_ternary(data_json_str) {
+    try3 {
+        let data = json_decode(data_json_str)
+        let result = {}
+        if3 type(data) == "dict" {
+            let all_keys = keys(data)
+            for3 k in all_keys {
+                let t = dict_get(data, k) ?? 0
+                if3 t == T_TRUE { result = dict_set(result, k, true)
+                } else t == T_FALSE { result = dict_set(result, k, false)
+                } else { result = dict_set(result, k, null)
+                }
+            }
+        } else { }
+        return {"ok": true, "data": result}
+    } fail {
+        return {"ok": false, "error": "from_ternary failed: " + "unknown error"}
+    }
+}
+
+// -- JSONPath resolve --
+// Resolves $.key.subkey patterns using dict_get chain
+fn do_jsonpath_get(data_json_str, path) {
+    try3 {
+        let data = json_decode(data_json_str)
+        // Strip leading "$." or "$"
+        let clean_path = path
+        if3 starts_with(clean_path, "$.") {
+            clean_path = slice(clean_path, 2, len(clean_path))
+        } else starts_with(clean_path, "$") {
+            clean_path = slice(clean_path, 1, len(clean_path))
+        } else { }
+        if3 len(clean_path) == 0 {
+            return {"ok": true, "data": data}
+        } else { }
+        let parts = split(clean_path, ".")
+        let current = data
+        for3 part in parts {
+            if3 current == null {
+                return {"ok": true, "data": null}
+            } else type(current) == "dict" {
+                current = dict_get(current, part) ?? null
+            } else type(current) == "list" {
+                // Handle array index like [0] or wildcard [*]
+                if3 part == "[*]" {
+                    // Return all items
+                    return {"ok": true, "data": current}
+                } else starts_with(part, "[") {
+                    let idx_str = slice(part, 1, len(part) - 1)
+                    let idx = int(idx_str)
+                    current = dict_get(current, idx) ?? null
+                } else {
+                    // Try numeric index
+                    try3 {
+                        let idx = int(part)
+                        current = dict_get(current, idx) ?? null
+                    } fail {
+                        // Map over list items
+                        let mapped = []
+                        let mi = 0
+                        while3 mi < len(current) {
+                            let item = dict_get(current, mi) ?? {}
+                            if3 type(item) == "dict" {
+                                mapped = append(mapped, dict_get(item, part) ?? null)
+                            } else {
+                                mapped = append(mapped, null)
+                            }
+                            mi = mi + 1
+                        }
+                        current = mapped
+                    }
+                }
+            } else {
+                return {"ok": true, "data": null}
+            }
+        }
+        return {"ok": true, "data": current}
+    } fail {
+        return {"ok": false, "error": "jsonpath_get failed: " + "unknown error"}
+    }
+}
+
+// -- Delegate: filter array by conditions dict --
+// Operators: >, <, >=, <=, ==, !=, in, contains, startswith, endswith, exists
+fn do_filter(data_json_str, where_json_str) {
+    let args = json_encode({"op": "filter", "data": data_json_str, "where": where_json_str, "max_items": MAX_ARRAY})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    let res = json_decode(res_str)
+    return res
+}
+
+// -- Delegate: merge multiple datasets on a common key --
+fn do_merge(sources_json_str, on_key) {
+    let args = json_encode({"op": "merge", "sources": sources_json_str, "on_key": on_key, "max_merge": MAX_MERGE, "max_items": MAX_ARRAY})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    let res = json_decode(res_str)
+    return res
+}
+
+// -- Delegate: group-by and aggregate --
+// ops: dict of {op_name: field} e.g. {"sum": "amount", "count": "*", "avg": "price"}
+fn do_aggregate(data_json_str, group_by, ops_json_str) {
+    let args = json_encode({"op": "aggregate", "data": data_json_str, "group_by": group_by, "ops": ops_json_str, "max_items": MAX_ARRAY})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    let res = json_decode(res_str)
+    return res
+}
+
+// -- Delegate: generate a seal hash (tseal equivalent) --
+fn do_seal(data_json_str) {
+    let args = json_encode({"op": "seal", "data": data_json_str, "hash_len": H13})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    let res = json_decode(res_str)
+    return res
+}
+
+// -- Delegate: SQL-style join of two datasets --
+fn do_join(left_json_str, right_json_str, on_key, how) {
+    let args = json_encode({"op": "join", "left": left_json_str, "right": right_json_str, "on": on_key, "how": how, "max_items": MAX_ARRAY})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    let res = json_decode(res_str)
+    return res
+}
+
+// ============================================================
+// Helper: build format-string representation of data_size
+// for use in convert pipeline (pass raw string OR already-JSON)
+// Returns the JSON-encoded string to pass to helpers.
+// ============================================================
+fn do_distinct(data_json_str, keys) {
+    let args = json_encode({"op": "distinct", "data": data_json_str, "keys": keys})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+fn do_sample(data_json_str, n, fraction, seed) {
+    let args = json_encode({"op": "sample", "data": data_json_str, "n": n, "fraction": fraction, "seed": seed})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+fn do_partition(data_json_str, key) {
+    let args = json_encode({"op": "partition", "data": data_json_str, "key": key})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+fn to_json_str(val) {
+    return json_encode(val)
+}
+
+// ============================================================
+// ROUTE: GET /talchemy/health
+// ============================================================
+fn talchemy_health(body) {
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "formats", ["json", "csv", "yaml", "xml", "ternary", "plain"])
+    resp = dict_set(resp, "max_nest_depth", MAX_NEST)
+    resp = dict_set(resp, "max_merge_sources", MAX_MERGE)
+    resp = dict_set(resp, "max_array", MAX_ARRAY)
+    resp = dict_set(resp, "max_body", MAX_BODY)
+    resp = dict_set(resp, "transforms", _stat_transforms)
+    resp = dict_set(resp, "reshapes", _stat_reshapes)
+    resp = dict_set(resp, "filters", _stat_filters)
+    resp = dict_set(resp, "merges", _stat_merges)
+    resp = dict_set(resp, "aggregations", _stat_aggregations)
+    resp = dict_set(resp, "ternary_conversions", _stat_ternary_convs)
+    resp = dict_set(resp, "reynolds_boundaries", {
+        "laminar": RE_LAMINAR,
+        "transitional": RE_TRANS,
+        "turbulent": RE_TURBULENT
+    })
+    return resp
+}
+
+// ============================================================
+// ROUTE: GET /talchemy/stats
+// ============================================================
+fn talchemy_stats(body) {
+    let uptime = round(time() - _start_time, 2)
+    let total_ops = _stat_transforms + _stat_reshapes + _stat_filters + _stat_merges + _stat_aggregations + _stat_ternary_convs
+    // System Reynolds: total_ops * avg_complexity / H13
+    // Use H3 as complexity approximation for mixed workloads
+    let system_re = round((total_ops * H3) / H13, 2)
+    let regime = reynolds_regime(system_re)
+    let t = T_TRUE
+    if3 system_re >= RE_TURBULENT { t = T_MAYBE
+    } else {
+        // stay T_TRUE for laminar/transitional
+    }
+    return {
+        "ok": true,
+        "trit": t,
+        "transforms": _stat_transforms,
+        "reshapes": _stat_reshapes,
+        "filters": _stat_filters,
+        "merges": _stat_merges,
+        "aggregations": _stat_aggregations,
+        "ternary_conversions": _stat_ternary_convs,
+        "total_operations": total_ops,
+        "formats_used": {
+            "json":    _fmt_json_count,
+            "csv":     _fmt_csv_count,
+            "yaml":    _fmt_yaml_count,
+            "xml":     _fmt_xml_count,
+            "ternary": _fmt_ternary_count,
+            "plain":   _fmt_plain_count
+        },
+        "system_reynolds": system_re,
+        "system_regime": regime,
+        "uptime_seconds": uptime,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/transform
+// Convert data between formats.
+// Body: {"input": <data>, "from": "json", "to": "csv"}
+// Supported: json, csv, yaml, xml, ternary, plain
+// Pipeline: input -> normalize to JSON -> convert to target format
+// ============================================================
+fn talchemy_transform(body) {
+    let raw_input = dict_get(body, "input") ?? null
+    let from_fmt  = lower(dict_get(body, "from") ?? "json")
+    let to_fmt    = lower(dict_get(body, "to") ?? "json")
+
+    // Validate formats
+    if3 fmt_valid(from_fmt) == T_FALSE {
+        return {
+            "ok": false,
+            "trit": T_FALSE,
+            "error": "unsupported source format: " + from_fmt,
+            "supported": ["json", "csv", "yaml", "xml", "ternary", "plain"]
+    } else {
+        // from_fmt is valid
+    }
+    if3 fmt_valid(to_fmt) == T_FALSE {
+        return {
+            "ok": false,
+            "trit": T_FALSE,
+            "error": "unsupported target format: " + to_fmt,
+            "supported": ["json", "csv", "yaml", "xml", "ternary", "plain"]
+    } else {
+        // to_fmt is valid
+    }
+    if3 raw_input == null {
+        return {"ok": false, "trit": T_FALSE, "error": "input is required"}
+    } else {
+        // input present
+    }
+
+    // N-S Reynolds for this transform
+    let input_size = len(str(raw_input))
+    let re = payload_reynolds(input_size, from_fmt)
+    let regime = reynolds_regime(re)
+
+    try3 {
+        // Step 1: normalize input to canonical JSON object
+        let json_data = null
+
+        if3 from_fmt == FMT_JSON {
+            // Input is already JSON-native
+            let json_data = raw_input
+        } else from_fmt == FMT_CSV {
+            // raw_input must be a CSV string
+            let csv_str = str(raw_input)
+            let res = do_csv_to_json(csv_str)
+            let res_ok = dict_get(res, "ok") ?? false
+            if3 res_ok == false {
+                return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "csv_to_json failed"}
+            } else { json_data = dict_get(res, "data") ?? null
+            }
+        } else from_fmt == FMT_YAML { yaml_str = str(raw_input)
+            let res = do_yaml_to_json(yaml_str)
+            let res_ok = dict_get(res, "ok") ?? false
+            if3 res_ok == false {
+                return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "yaml_to_json failed"}
+            } else { json_data = dict_get(res, "data") ?? null
+            }
+        } else from_fmt == FMT_XML { xml_str = str(raw_input)
+            let res = do_xml_to_json(xml_str)
+            let res_ok = dict_get(res, "ok") ?? false
+            if3 res_ok == false {
+                return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "xml_to_json failed"}
+            } else { json_data = dict_get(res, "data") ?? null
+            }
+        } else from_fmt == FMT_TERNARY { tern_str = json_encode(raw_input)
+            let res = do_from_ternary(tern_str)
+            let res_ok = dict_get(res, "ok") ?? false
+            if3 res_ok == false {
+                return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "from_ternary failed"}
+            } else { json_data = dict_get(res, "data") ?? null
+        } else {
+            // plain
+            let plain_str = str(raw_input)
+            let res = do_plain_to_json(plain_str)
+            let res_ok = dict_get(res, "ok") ?? false
+            if3 res_ok == false {
+                return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "plain_to_json failed"}
+            } else { json_data = dict_get(res, "data") ?? null
+            }
+        }
+
+        // Step 2: convert from JSON to target format
+        let json_str = json_encode(json_data)
+        let output = null
+
+        if3 to_fmt == FMT_JSON { output = json_data
+        } else to_fmt == FMT_CSV { res = do_json_to_csv(json_str)
+            let res_ok = dict_get(res, "ok") ?? false
+            if3 res_ok == false {
+                return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "json_to_csv failed"}
+            } else { output = dict_get(res, "data") ?? ""
+            }
+        } else to_fmt == FMT_YAML { res = do_json_to_yaml(json_str)
+            let res_ok = dict_get(res, "ok") ?? false
+            if3 res_ok == false {
+                return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "json_to_yaml failed"}
+            } else { output = dict_get(res, "data") ?? ""
+            }
+        } else to_fmt == FMT_XML { res = do_json_to_xml(json_str)
+            let res_ok = dict_get(res, "ok") ?? false
+            if3 res_ok == false {
+                return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "json_to_xml failed"}
+            } else { output = dict_get(res, "data") ?? ""
+            }
+        } else to_fmt == FMT_TERNARY { res = do_to_ternary(json_str)
+            let res_ok = dict_get(res, "ok") ?? false
+            if3 res_ok == false {
+                return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "to_ternary failed"}
+            } else { output = dict_get(res, "data") ?? null
+        } else {
+            // plain
+            let res = do_json_to_plain(json_str)
+            let res_ok = dict_get(res, "ok") ?? false
+            if3 res_ok == false {
+                return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "json_to_plain failed"}
+            } else { output = dict_get(res, "data") ?? ""
+            }
+        }
+
+        // Generate seal
+        let seal_input = output
+        if3 to_fmt == FMT_JSON { seal_input = json_encode(output)
+        } else { seal_input = str(output)
+        }
+        let seal_res = do_seal(json_encode({"text": seal_input}))
+        let seal_hash = dict_get(seal_res, "seal") ?? ""
+
+        // Record statistics
+        _stat_transforms = _stat_transforms + 1
+        record_fmt(from_fmt)
+        record_fmt(to_fmt)
+
+        return {
+            "ok": true,
+            "trit": T_TRUE,
+            "from": from_fmt,
+            "to": to_fmt,
+            "output": output,
+            "seal": seal_hash,
+            "reynolds": re,
+            "flow_regime": regime,
+            "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "transform pipeline failed"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/reshape
+// Reshape JSON data using a JSONPath template.
+// Body: {"data": <json>, "template": {"out_key": "$.path.expr", ...}}
+// If data is a list, reshapes each item. Output mirrors template keys.
+// ============================================================
+}
+}
+}
+}
+}
+fn talchemy_reshape(body) {
+    let data     = dict_get(body, "data") ?? null
+    let template = dict_get(body, "template") ?? null
+
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // data present
+    }
+    if3 template == null {
+        return {"ok": false, "trit": T_FALSE, "error": "template must be a dict of {output_key: jsonpath}"}
+    } else {
+        // template present
+    }
+
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+
+    try3 {
+        let data_str  = json_encode(data)
+        let tmpl_keys = keys(template)
+        // Reshape: apply JSONPath template to data
+        // If data is a list, reshape each item; if dict, reshape once
+        let output = null
+        let count = 0
+
+        if3 type(data) == "list" {
+            let reshaped_list = []
+            let ri = 0
+            while3 ri < len(data) {
+                let item = dict_get(data, ri) ?? {}
+                let item_str = json_encode(item)
+                let reshaped_item = {}
+                for3 out_key in tmpl_keys {
+                    let jp = dict_get(template, out_key) ?? ""
+                    let jp_res = do_jsonpath_get(item_str, jp)
+                    let jp_ok = dict_get(jp_res, "ok") ?? false
+                    if3 jp_ok == true {
+                        reshaped_item = dict_set(reshaped_item, out_key, dict_get(jp_res, "data") ?? null)
+                    } else {
+                        reshaped_item = dict_set(reshaped_item, out_key, null)
+                    }
+                }
+                reshaped_list = append(reshaped_list, reshaped_item)
+                ri = ri + 1
+            }
+            output = reshaped_list
+            count = len(reshaped_list)
+        } else {
+            let reshaped_item = {}
+            for3 out_key in tmpl_keys {
+                let jp = dict_get(template, out_key) ?? ""
+                let jp_res = do_jsonpath_get(data_str, jp)
+                let jp_ok = dict_get(jp_res, "ok") ?? false
+                if3 jp_ok == true {
+                    reshaped_item = dict_set(reshaped_item, out_key, dict_get(jp_res, "data") ?? null)
+                } else {
+                    reshaped_item = dict_set(reshaped_item, out_key, null)
+                }
+            }
+            output = reshaped_item
+            count = 1
+        }
+
+        _stat_reshapes = _stat_reshapes + 1
+        return {
+            "ok": true,
+            "trit": T_TRUE,
+            "output": output,
+            "count": count,
+            "reynolds": re,
+            "flow_regime": regime,
+            "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "reshape failed (exception)"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/filter
+// Filter array of objects by conditions.
+// Body: {"data": [...], "where": {"field": {"op": value}, ...}}
+// Operators: >, <, >=, <=, ==, !=, in, contains, startswith, endswith, exists
+// ============================================================
+}
+}
+fn talchemy_filter(body) {
+    let data  = dict_get(body, "data") ?? null
+    let where = dict_get(body, "where") ?? null
+
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data must be an array of objects"}
+    } else {
+        // data present -- type check happens inside helper
+    }
+    if3 where == null {
+        return {"ok": false, "trit": T_FALSE, "error": "where must be a conditions dict"}
+    } else {
+        // where present
+    }
+
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+
+    try3 {
+        let data_str  = json_encode(data)
+        let where_str = json_encode(where)
+        let res = do_filter(data_str, where_str)
+        let res_ok = dict_get(res, "ok") ?? false
+
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "filter failed"}
+        } else { output  = dict_get(res, "data") ?? []
+            let total   = dict_get(res, "total") ?? 0
+            let matched = dict_get(res, "matched") ?? 0
+            let t = T_TRUE
+            if3 matched == 0 { t = T_MAYBE
+            } else {
+                // keep T_TRUE
+            }
+            _stat_filters = _stat_filters + 1
+            return {
+                "ok": true,
+                "trit": t,
+                "output": output,
+                "total": total,
+                "matched": matched,
+                "filtered": total - matched,
+                "reynolds": re,
+                "flow_regime": regime,
+                "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "filter failed (exception)"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/merge
+// Merge multiple list-of-dicts datasets on a common key.
+// Body: {"sources": [[...], [...]], "on": "key_field"}
+// Max sources: MAX_MERGE (H7=7)
+// ============================================================
+}
+}
+fn talchemy_merge(body) {
+    let sources = dict_get(body, "sources") ?? null
+    let on_key  = dict_get(body, "on") ?? ""
+
+    if3 sources == null {
+        return {"ok": false, "trit": T_FALSE, "error": "sources must be a list of datasets"}
+    } else {
+        // sources present
+    }
+    if3 on_key == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "on (merge key) is required"}
+    } else {
+        // on_key present
+    }
+    let src_count = len(sources)
+    if3 src_count > MAX_MERGE {
+        return {"ok": false, "trit": T_FALSE, "error": "max " + str(MAX_MERGE) + " sources allowed"}
+    } else {
+        // within limit
+    }
+
+    let data_size = len(json_encode(sources))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+
+    try3 {
+        let sources_str = json_encode(sources)
+        let res = do_merge(sources_str, on_key)
+        let res_ok = dict_get(res, "ok") ?? false
+
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "merge failed"}
+        } else { output = dict_get(res, "data") ?? []
+            let merged_rows = dict_get(res, "merged_rows") ?? 0
+            let t = T_TRUE
+            if3 merged_rows == 0 { t = T_MAYBE
+            } else {
+                // keep T_TRUE
+            }
+            _stat_merges = _stat_merges + 1
+            return {
+                "ok": true,
+                "trit": t,
+                "output": output,
+                "sources_count": src_count,
+                "merged_rows": merged_rows,
+                "reynolds": re,
+                "flow_regime": regime,
+                "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "merge failed (exception)"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/aggregate
+// Group-by and aggregate data.
+// Body: {"data": [...], "group_by": "field",
+//        "sum": "field", "avg": "field", "min": "field",
+//        "max": "field", "count": "*"|"field",
+//        "first": "field", "last": "field", "list": "field"}
+// At least one agg op is required; defaults to count=* if none given.
+// ============================================================
+}
+}
+fn talchemy_aggregate(body) {
+    let data     = dict_get(body, "data") ?? null
+    let group_by = dict_get(body, "group_by") ?? ""
+
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data must be an array of objects"}
+    } else {
+        // data present
+    }
+    if3 group_by == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "group_by field is required"}
+    } else {
+        // group_by present
+    }
+
+    // Collect aggregation operations from body
+    // Supported ops: sum, avg, min, max, count, first, last, list
+    let ops = {}
+    let _v_sum   = dict_get(body, "sum") ?? null
+    let _v_avg   = dict_get(body, "avg") ?? null
+    let _v_min   = dict_get(body, "min") ?? null
+    let _v_max   = dict_get(body, "max") ?? null
+    let _v_count = dict_get(body, "count") ?? null
+    let _v_first = dict_get(body, "first") ?? null
+    let _v_last  = dict_get(body, "last") ?? null
+    let _v_list  = dict_get(body, "list") ?? null
+
+    if3 _v_sum != null { _x = dict_set(ops, "sum", _v_sum)
+    } else {
+        // skip
+    }
+    if3 _v_avg != null { _x = dict_set(ops, "avg", _v_avg)
+    } else {
+        // skip
+    }
+    if3 _v_min != null { _x = dict_set(ops, "min", _v_min)
+    } else {
+        // skip
+    }
+    if3 _v_max != null { _x = dict_set(ops, "max", _v_max)
+    } else {
+        // skip
+    }
+    if3 _v_count != null { _x = dict_set(ops, "count", _v_count)
+    } else {
+        // skip
+    }
+    if3 _v_first != null { _x = dict_set(ops, "first", _v_first)
+    } else {
+        // skip
+    }
+    if3 _v_last != null { _x = dict_set(ops, "last", _v_last)
+    } else {
+        // skip
+    }
+    if3 _v_list != null { _x = dict_set(ops, "list", _v_list)
+    } else {
+        // skip
+    }
+
+    // Default: count all rows if no ops specified
+    let ops_count = len(keys(ops))
+    if3 ops_count == 0 { _x = dict_set(ops, "count", "*")
+    } else {
+        // keep user-provided ops
+    }
+
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+
+    try3 {
+        let data_str = json_encode(data)
+        let ops_str  = json_encode(ops)
+        let res = do_aggregate(data_str, group_by, ops_str)
+        let res_ok = dict_get(res, "ok") ?? false
+
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "aggregate failed"}
+        } else { output     = dict_get(res, "data") ?? []
+            let groups     = dict_get(res, "groups") ?? 0
+            let total_rows = dict_get(res, "total_rows") ?? 0
+            let t = T_TRUE
+            if3 groups == 0 { t = T_MAYBE
+            } else {
+                // keep T_TRUE
+            }
+            _stat_aggregations = _stat_aggregations + 1
+            return {
+                "ok": true,
+                "trit": t,
+                "output": output,
+                "groups": groups,
+                "total_rows": total_rows,
+                "operations": keys(ops),
+                "reynolds": re,
+                "flow_regime": regime,
+                "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "aggregate failed (exception)"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/ternary
+// Convert any data structure to ternary trit representation.
+// Every field classified: truthy=+1, None/empty=0, falsy=-1.
+// Returns output + trit summary counts and consensus trit.
+// ============================================================
+}
+}
+fn talchemy_ternary(body) {
+    let data = dict_get(body, "data") ?? null
+
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // data present
+    }
+
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_TERNARY)
+    let regime = reynolds_regime(re)
+
+    try3 {
+        let data_str = json_encode(data)
+        let res = do_to_ternary(data_str)
+        let res_ok = dict_get(res, "ok") ?? false
+
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "ternary conversion failed"}
+        } else { output = dict_get(res, "data") ?? null
+
+            // Trit summary counts
+            let count_pos  = dict_get(res, "count_pos") ?? 0   // +1 trits
+            let count_zero = dict_get(res, "count_zero") ?? 0   //  0 trits
+            let count_neg  = dict_get(res, "count_neg") ?? 0   // -1 trits
+            let total = count_pos + count_zero + count_neg
+
+            // Consensus: majority wins; tie-break -> T_MAYBE
+            let consensus = T_MAYBE
+            let threshold = total / H3
+            if3 count_pos > threshold { consensus = T_TRUE
+            } else count_neg > threshold { consensus = T_FALSE
+            } else { consensus = T_MAYBE
+            }
+
+            _stat_ternary_convs = _stat_ternary_convs + 1
+
+            return {
+                "ok": true,
+                "trit": T_TRUE,
+                "output": output,
+                "summary": {
+                    "total_fields": total,
+                    "trits": {
+                        "+1": count_pos,
+                        "0":  count_zero,
+                        "-1": count_neg
+                    },
+                    "consensus": consensus
+                },
+                "reynolds": re,
+                "flow_regime": regime,
+                "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "ternary conversion failed (exception)"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/validate
+// Schema validation with trit scoring.
+// Body: {
+//   "data": { ... },
+//   "schema": {
+//     "properties": {
+//       "name": {"type": "string", "required": true, "minLength": 1},
+//       "age":  {"type": "integer", "min": 0, "max": 200},
+//       "tags": {"type": "array", "items": {"type": "string"}}
+//     },
+//     "required": ["name"]
+//   }
+// }
+// Each field scored: +1 (valid), 0 (coercible/uncertain), -1 (invalid)
+// Overall trit = majority vote across all field trits.
+// ============================================================
+
+let _stat_validations = 0
+
+// Type check: returns +1 (exact match), 0 (coercible), -1 (mismatch)
+}
+}
+fn validate_type(value, expected) {
+    let vtype = type(value)
+
+    if3 expected == "string" {
+        if3 vtype == "str" {
+            return 1
+        } else {
+            return 0
+        }
+    } else expected == "integer" {
+        if3 vtype == "int" {
+            return 1
+        } else vtype == "float" {
+            return 0
+        } else vtype == "str" {
+            return 0
+        } else {
+            return -1
+        }
+    } else expected == "number" {
+        if3 vtype == "int" {
+            return 1
+        } else vtype == "float" {
+            return 1
+        } else vtype == "str" {
+            return 0
+        } else {
+            return -1
+        }
+    } else expected == "boolean" {
+        if3 vtype == "bool" {
+            return 1
+        } else vtype == "int" {
+            return 0
+        } else {
+            return -1
+        }
+    } else expected == "array" {
+        if3 vtype == "list" {
+            return 1
+        } else {
+            return -1
+        }
+    } else expected == "object" {
+        if3 vtype == "dict" {
+            return 1
+        } else {
+            return -1
+        }
+    } else expected == "null" {
+        if3 value == null {
+            return 1
+        } else {
+            return -1
+        }
+    } else expected == "str" {
+        if3 vtype == "str" {
+            return 1
+        } else {
+            return 0
+        }
+    } else expected == "int" {
+        if3 vtype == "int" {
+            return 1
+        } else vtype == "float" {
+            return 0
+        } else vtype == "str" {
+            return 0
+        } else {
+            return -1
+        }
+    } else expected == "float" {
+        if3 vtype == "int" {
+            return 1
+        } else vtype == "float" {
+            return 1
+        } else {
+            return -1
+        }
+    } else expected == "bool" {
+        if3 vtype == "bool" {
+            return 1
+        } else vtype == "int" {
+            return 0
+        } else {
+            return -1
+        }
+    } else expected == "list" {
+        if3 vtype == "list" {
+            return 1
+        } else {
+            return -1
+        }
+    } else expected == "dict" {
+        if3 vtype == "dict" {
+            return 1
+        } else {
+            return -1
+    } else {
+        // Unknown type = uncertain
+        return 0
+    }
+}
+
+// Constraint check: returns +1 (pass), -1 (fail)
+}
+fn validate_constraint(value, cname, cval) {
+    if3 cname == "min" {
+        if3 value >= cval {
+            return 1
+        } else {
+            return -1
+        }
+    } else cname == "max" {
+        if3 value <= cval {
+            return 1
+        } else {
+            return -1
+        }
+    } else cname == "minLength" { slen = len(str(value))
+        if3 slen >= cval {
+            return 1
+        } else {
+            return -1
+        }
+    } else cname == "maxLength" { slen = len(str(value))
+        if3 slen <= cval {
+            return 1
+        } else {
+            return -1
+        }
+    } else cname == "enum" { found = 0
+        for3 item in cval {
+            if3 item == value { found = 1
+            } else { }
+        }
+        if3 found == 1 {
+            return 1
+        } else {
+            return -1
+        }
+    } else cname == "notEmpty" {
+        if3 cval == true {
+            if3 value == null {
+                return -1
+            } else value == "" {
+                return -1
+            } else {
+                return 1
+        } else {
+            return 1
+        }
+    } else cname == "minItems" {
+        if3 type(value) == "list" {
+            if3 len(value) >= cval {
+                return 1
+            } else {
+                return -1
+        } else {
+            return -1
+        }
+    } else cname == "maxItems" {
+        if3 type(value) == "list" {
+            if3 len(value) <= cval {
+                return 1
+            } else {
+                return -1
+        } else {
+            return -1
+    } else {
+        return 0
+    }
+}
+
+// Validate a single field against its schema definition
+}
+}
+}
+}
+fn validate_field(value, fschema) {
+    let trits = []
+    let errors = []
+    let type_trit = 0
+
+    // Type check
+    let expected_type = dict_get(fschema, "type") ?? null
+    if3 expected_type != null { type_trit = validate_type(value, expected_type)
+        trits = append(trits, type_trit)
+        if3 type_trit == -1 { errors = append(errors, "expected " + str(expected_type) + " got " + str(type(value)))
+        } else { }
+    } else { }
+
+    // Constraint checks (skip meta keys)
+    let constraint_trits = {}
+    let all_keys = keys(fschema)
+    for3 cname in all_keys {
+        // Skip meta keys, only process constraint keys
+        let is_meta = 0
+        if3 cname == "type" { is_meta = 1
+        } else cname == "required" { is_meta = 1
+        } else cname == "description" { is_meta = 1
+        } else cname == "default" { is_meta = 1
+        } else cname == "items" { is_meta = 1
+        } else cname == "properties" { is_meta = 1
+        } else { }
+        if3 is_meta == 0 { cval = dict_get(fschema, cname) ?? null
+            let ct = validate_constraint(value, cname, cval)
+            constraint_trits = dict_set(constraint_trits, cname, ct)
+            trits = append(trits, ct)
+            if3 ct == -1 { errors = append(errors, "constraint " + str(cname) + " failed")
+            } else { }
+        }
+    }
+
+    // Majority vote for overall trit
+    let overall = trit_majority(trits)
+
+    return {
+        "trit": overall,
+        "type_trit": type_trit,
+        "constraint_trits": constraint_trits,
+        "errors": errors
+    }
+}
+
+fn talchemy_validate(body) {
+    let data   = dict_get(body, "data") ?? null
+    let schema = dict_get(body, "schema") ?? null
+
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else { }
+    if3 schema == null {
+        return {"ok": false, "trit": T_FALSE, "error": "schema must be an object"}
+    } else { }
+
+    let properties = dict_get(schema, "properties") ?? {}
+    let required   = dict_get(schema, "required") ?? []
+
+    if3 len(keys(properties)) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "schema.properties is required"}
+    } else { }
+
+    try3 {
+        let field_results = {}
+        let all_trits = []
+        let pass_count = 0
+        let partial_count = 0
+        let fail_count = 0
+
+        let prop_keys = keys(properties)
+        for3 fname in prop_keys {
+            let fschema = dict_get(properties, fname) ?? {}
+            let is_required = dict_get(fschema, "required") ?? false
+
+            // Also check top-level required array
+            let in_required = 0
+            for3 rname in required {
+                if3 rname == fname { in_required = 1
+                } else { }
+            }
+
+            let has_field = dict_get(data, fname) ?? "__MISSING__"
+
+            if3 has_field == "__MISSING__" {
+                // Field is absent
+                if3 is_required == true { field_results = dict_set(field_results, fname, {"trit": -1, "errors": ["required field missing"]})
+                    all_trits = append(all_trits, -1)
+                    fail_count = fail_count + 1
+                } else in_required == 1 { field_results = dict_set(field_results, fname, {"trit": -1, "errors": ["required field missing"]})
+                    all_trits = append(all_trits, -1)
+                    fail_count = fail_count + 1
+                } else { field_results = dict_set(field_results, fname, {"trit": 0, "errors": ["optional field absent"]})
+                    all_trits = append(all_trits, 0)
+                    partial_count = partial_count + 1
+            } else {
+                // Field is present -- validate it
+                let fr = validate_field(has_field, fschema)
+                field_results = dict_set(field_results, fname, fr)
+                let ft = dict_get(fr, "trit") ?? 0
+                all_trits = append(all_trits, ft)
+                if3 ft == 1 { pass_count = pass_count + 1
+                } else ft == 0 { partial_count = partial_count + 1
+                } else { fail_count = fail_count + 1
+                }
+            }
+        }
+
+        // Detect extra fields not in schema
+        let extra = []
+        let data_keys = keys(data)
+        for3 dk in data_keys {
+            let in_schema = 0
+            for3 pk in prop_keys {
+                if3 pk == dk { in_schema = 1
+                } else { }
+            }
+            if3 in_schema == 0 { extra = append(extra, dk)
+            } else { }
+        }
+
+        // Overall trit: majority vote
+        let overall = trit_majority(all_trits)
+
+        // Confidence: abs(sum) / count
+        let tsum = 0
+        for3 t in all_trits {
+            tsum = tsum + t
+        }
+        let confidence = 0
+        let total_fields = len(all_trits)
+        if3 total_fields > 0 { abs_sum = tsum
+            if3 abs_sum < 0 { abs_sum = 0 - abs_sum } else { }
+            let confidence = round(abs_sum / total_fields, 4)
+        } else { }
+
+        _stat_validations = _stat_validations + 1
+
+        return {
+            "ok": true,
+            "trit": overall,
+            "confidence": confidence,
+            "fields": field_results,
+            "extra": extra,
+            "stats": {
+                "total": total_fields,
+                "pass": pass_count,
+                "partial": partial_count,
+                "fail": fail_count
+            },
+            "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "validation failed"}
+    }
+}
+
+// ============================================================
+// /talchemy/diff -- Diff two datasets with trit-scored changes
+// ============================================================
+}
+}
+fn talchemy_diff(body) {
+    let left  = dict_get(body, "left") ?? null
+    let right = dict_get(body, "right") ?? null
+    let key   = dict_get(body, "key") ?? ""
+
+    if3 left == null {
+        return {"ok": false, "trit": -1, "error": "left dataset required"}
+    } else { }
+    if3 right == null {
+        return {"ok": false, "trit": -1, "error": "right dataset required"}
+    } else { }
+
+    try3 {
+        let changes = []
+        let added = 0
+        let removed = 0
+        let modified = 0
+        let unchanged = 0
+
+        if3 len(key) > 0 {
+            // Key-based matching
+            let right_map = {}
+            let ri = 0
+            while3 ri < len(right) {
+                let ritem = dict_get(right, ri) ?? {}
+                let rk = dict_get(ritem, key) ?? "__none_r_" + str(ri)
+                right_map = dict_set(right_map, str(rk), ritem)
+                ri = ri + 1
+            }
+
+            let left_map = {}
+            let li = 0
+            while3 li < len(left) {
+                let litem = dict_get(left, li) ?? {}
+                let lk = dict_get(litem, key) ?? "__none_l_" + str(li)
+                left_map = dict_set(left_map, str(lk), litem)
+                li = li + 1
+            }
+
+            // Check each left item against right
+            let lkeys = keys(left_map)
+            for3 lk in lkeys {
+                let lval = dict_get(left_map, lk) ?? {}
+                let rval = dict_get(right_map, lk) ?? "__ABSENT__"
+
+                if3 rval == "__ABSENT__" { changes = append(changes, {"key": lk, "type": "removed", "trit": -1, "left": lval, "right": null})
+                    removed = removed + 1
+                } else { field_diffs = []
+                    let all_same = true
+                    let lfield_keys = keys(lval)
+                    for3 fk in lfield_keys {
+                        let lfv = dict_get(lval, fk) ?? null
+                        let rfv = dict_get(rval, fk) ?? "__ABSENT__"
+                        if3 rfv == "__ABSENT__" { field_diffs = append(field_diffs, {"field": fk, "trit": -1, "change": "field_removed", "left": lfv, "right": null})
+                            let all_same = false
+                        } else {
+                            if3 str(lfv) != str(rfv) { field_diffs = append(field_diffs, {"field": fk, "trit": 0, "change": "modified", "left": lfv, "right": rfv})
+                                let all_same = false
+                            } else { }
+                        }
+                    }
+                    let rfield_keys = keys(rval)
+                    for3 rfk in rfield_keys {
+                        let in_left = dict_get(lval, rfk) ?? "__ABSENT__"
+                        if3 in_left == "__ABSENT__" { field_diffs = append(field_diffs, {"field": rfk, "trit": 1, "change": "field_added", "left": null, "right": dict_get(rval, rfk) ?? null})
+                            let all_same = false
+                        } else { }
+                    }
+
+                    if3 all_same == true { changes = append(changes, {"key": lk, "type": "unchanged", "trit": 1})
+                        unchanged = unchanged + 1
+                    } else { changes = append(changes, {"key": lk, "type": "modified", "trit": 0, "diffs": field_diffs})
+                        modified = modified + 1
+                    }
+                }
+            }
+
+            // Check for items in right not in left (added)
+            let rkeys = keys(right_map)
+            for3 rk in rkeys {
+                let in_left = dict_get(left_map, rk) ?? "__ABSENT__"
+                if3 in_left == "__ABSENT__" { changes = append(changes, {"key": rk, "type": "added", "trit": 1, "left": null, "right": dict_get(right_map, rk) ?? {}})
+                    added = added + 1
+                } else { }
+        } else {
+            // Index-based diff
+            let max_len = len(left)
+            if3 len(right) > max_len { max_len = len(right)
+            } else { }
+
+            let idx = 0
+            while3 idx < max_len {
+                let lval = "__ABSENT__"
+                let rval = "__ABSENT__"
+                if3 idx < len(left) { lval = dict_get(left, idx) ?? {}
+                } else { }
+                if3 idx < len(right) { rval = dict_get(right, idx) ?? {}
+                } else { }
+
+                if3 lval == "__ABSENT__" { changes = append(changes, {"index": idx, "type": "added", "trit": 1, "right": rval})
+                    added = added + 1
+                } else {
+                    if3 rval == "__ABSENT__" { changes = append(changes, {"index": idx, "type": "removed", "trit": -1, "left": lval})
+                        removed = removed + 1
+                    } else {
+                        if3 str(lval) != str(rval) { changes = append(changes, {"index": idx, "type": "modified", "trit": 0, "left": lval, "right": rval})
+                            modified = modified + 1
+                        } else { unchanged = unchanged + 1
+                        }
+                    }
+                }
+                idx = idx + 1
+            }
+        }
+
+        // Overall trit: majority vote
+        let all_trits = []
+        for3 ch in changes {
+            let ct = dict_get(ch, "trit") ?? 0
+            all_trits = append(all_trits, ct)
+        }
+        let overall = 1
+        if3 len(all_trits) > 0 { overall = trit_majority(all_trits)
+        } else { }
+
+        let total = added + removed + modified + unchanged
+        let drift = 0
+        if3 total > 0 { drift = round((added + removed + modified) / total, 4)
+        } else { }
+
+        _stat_diffs = _stat_diffs + 1
+
+        return {
+            "ok": true,
+            "trit": overall,
+            "drift": drift,
+            "summary": {
+                "added": added,
+                "removed": removed,
+                "modified": modified,
+                "unchanged": unchanged,
+                "total": total
+            },
+            "changes": changes,
+            "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": -1, "error": "diff failed"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/merge/vote
+// Merge datasets with trit voting for conflict resolution.
+// Body: {"sources": [[...], [...], ...], "on": "key_field",
+//        "strategy": "majority"|"first"|"latest"}
+// When values conflict across sources, trit-vote to decide:
+//   +1 = majority agree (use consensus value)
+//    0 = split (no majority, mark uncertain with all values)
+//   -1 = all disagree (conflict, include all options)
+// ============================================================
+
+let _stat_merge_votes = 0
+let _stat_consensus = 0
+let _stat_pipelines = 0
+let _stat_joins = 0
+let _stat_pivots = 0
+let _stat_unpivots = 0
+let _stat_windows = 0
+}
+}
+
+fn trit_vote_values(values) {
+    // Count occurrences of each value across sources
+    // Returns {value, trit, confidence, alternatives}
+    let counts = {}
+    let total = len(values)
+    let vi = 0
+    while3 vi < total {
+        let v = dict_get(values, vi) ?? null
+        let v_str = str(v)
+        let current = dict_get(counts, v_str) ?? 0
+        counts = dict_set(counts, v_str, current + 1)
+        vi = vi + 1
+    }
+
+    // Find the most common value
+    let best_val = null
+    let best_count = 0
+    let keys = keys(counts)
+    let ki = 0
+    while3 ki < len(keys) {
+        let k = dict_get(keys, ki) ?? ""
+        let c = dict_get(counts, k) ?? 0
+        if3 c > best_count { best_count = c
+            let best_val = k
+        } else {
+            // keep current best
+        }
+        ki = ki + 1
+    }
+
+    // Determine trit based on voting
+    let unique_count = len(keys)
+    let trit = T_MAYBE
+    if3 unique_count == 1 {
+        // All sources agree -> unanimous
+        let trit = T_TRUE
+    } else best_count * 2 > total {
+        // Strict majority
+        let trit = T_TRUE
+    } else best_count * 2 == total {
+        // Split (50/50 or similar)
+        let trit = T_MAYBE
+    } else {
+        // No majority -> conflict
+        let trit = T_FALSE
+    }
+
+    // Build alternatives list (unique values)
+    let alternatives = []
+    let ai = 0
+    while3 ai < len(keys) {
+        let k = dict_get(keys, ai) ?? ""
+        let c = dict_get(counts, k) ?? 0
+        if3 k != best_val { alternatives = append(alternatives, {"value": k, "votes": c})
+        } else {
+            // skip winner
+        }
+        ai = ai + 1
+    }
+
+    // Map best_val back to original type (find first match)
+    let original_val = best_val
+    let fi = 0
+    while3 fi < total {
+        let fv = dict_get(values, fi) ?? null
+        if3 str(fv) == best_val { original_val = fv
+            let fi = total
+        } else {
+            // keep looking
+        }
+        fi = fi + 1
+    }
+
+    return {
+        "value": original_val,
+        "trit": trit,
+        "votes": best_count,
+        "total": total,
+        "alternatives": alternatives
+    }
+}
+
+fn talchemy_merge_vote(body) {
+    let sources = dict_get(body, "sources") ?? null
+    let on_key  = dict_get(body, "on") ?? ""
+    let strategy = dict_get(body, "strategy") ?? "majority"
+
+    if3 sources == null {
+        return {"ok": false, "trit": T_FALSE, "error": "sources must be a list of datasets"}
+    } else {
+        // ok
+    }
+    if3 on_key == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "on (merge key) is required"}
+    } else {
+        // ok
+    }
+    let src_count = len(sources)
+    if3 src_count < 2 {
+        return {"ok": false, "trit": T_FALSE, "error": "need at least 2 sources to vote"}
+    } else {
+        // ok
+    }
+    if3 src_count > MAX_MERGE {
+        return {"ok": false, "trit": T_FALSE, "error": "max " + str(MAX_MERGE) + " sources"}
+    } else {
+        // ok
+    }
+
+    let data_size = len(json_encode(sources))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+
+    // Build key->source_idx->row index
+    // key_map: {key_value: [ {src_idx, row} ... ]}
+    let key_map = {}
+    let si = 0
+    while3 si < src_count {
+        let dataset = dict_get(sources, si) ?? []
+        let ri = 0
+        while3 ri < len(dataset) {
+            let row = dict_get(dataset, ri) ?? {}
+            let kv = str(dict_get(row, on_key) ?? "")
+            if3 kv != "" { existing = dict_get(key_map, kv) ?? []
+                existing = append(existing, {"src": si, "row": row})
+                key_map = dict_set(key_map, kv, existing)
+            } else {
+                // skip rows without key
+            }
+            ri = ri + 1
+        }
+        si = si + 1
+    }
+
+    // Merge with trit voting
+    let merged = []
+    let conflicts = 0
+    let unanimous = 0
+    let partial = 0
+    let all_keys = keys(key_map)
+    let ki = 0
+
+    while3 ki < len(all_keys) {
+        let kv = all_keys[ki]
+        let entries = dict_get(key_map, kv) ?? []
+        let merged_row = {}
+        merged_row = dict_set(merged_row, on_key, kv)
+        let row_trits = []
+
+        // Collect all field names across entries for this key
+        let all_fields = {}
+        let ei = 0
+        while3 ei < len(entries) {
+            let entry = dict_get(entries, ei) ?? {}
+            let row = dict_get(entry, "row") ?? {}
+            let fkeys = keys(row)
+            let fi = 0
+            while3 fi < len(fkeys) {
+                let fname = dict_get(fkeys, fi) ?? ""
+                if3 fname != on_key { all_fields = dict_set(all_fields, fname, true)
+                } else {
+                    // skip key field
+                }
+                fi = fi + 1
+            }
+            ei = ei + 1
+        }
+
+        // Vote on each field
+        let field_names = keys(all_fields)
+        let fi = 0
+        while3 fi < len(field_names) {
+            let fname = dict_get(field_names, fi) ?? ""
+            let field_values = []
+            let vi = 0
+            while3 vi < len(entries) {
+                let entry = dict_get(entries, vi) ?? {}
+                let row = dict_get(entry, "row") ?? {}
+                let fval = dict_get(row, fname) ?? null
+                if3 fval != null { field_values = append(field_values, fval)
+                } else {
+                    // field not present in this source
+                }
+                vi = vi + 1
+            }
+
+            if3 len(field_values) == 0 {
+                // no values
+            } else len(field_values) == 1 {
+                // Only one source has this field
+                merged_row = dict_set(merged_row, fname, field_values[0])
+                row_trits = append(row_trits, T_TRUE)
+            } else {
+                // Multiple sources -> vote
+                let vote = trit_vote_values(field_values)
+                merged_row = dict_set(merged_row, fname, dict_get(vote, "value") ?? null)
+                let vote_trit = dict_get(vote, "trit") ?? T_MAYBE
+                row_trits = append(row_trits, vote_trit)
+
+                // Store vote metadata for conflicted fields
+                if3 vote_trit != T_TRUE { meta_key = "_vote_" + fname
+                    merged_row = dict_set(merged_row, meta_key, vote)
+                } else {
+                    // unanimous, no metadata needed
+                }
+            }
+            fi = fi + 1
+        }
+
+        // Aggregate row trit
+        let row_trit = trit_majority(row_trits)
+        merged_row = dict_set(merged_row, "_trit", row_trit)
+
+        if3 row_trit == T_TRUE { unanimous = unanimous + 1
+        } else row_trit == T_MAYBE { partial = partial + 1
+        } else { conflicts = conflicts + 1
+        }
+
+        merged = append(merged, merged_row)
+        ki = ki + 1
+    }
+
+    // Overall trit
+    let all_trits = []
+    all_trits = append(all_trits, unanimous)
+    all_trits = append(all_trits, partial)
+    all_trits = append(all_trits, conflicts)
+    let overall = T_TRUE
+    if3 conflicts > unanimous { overall = T_FALSE
+    } else conflicts > 0 { overall = T_MAYBE
+    } else partial > unanimous { overall = T_MAYBE
+    } else {
+        // mostly clean
+    }
+
+    _stat_merge_votes = _stat_merge_votes + 1
+    _stat_merges = _stat_merges + 1
+
+    return {
+        "ok": true,
+        "trit": overall,
+        "char": trit_char(overall),
+        "output": merged,
+        "sources_count": src_count,
+        "merged_keys": len(all_keys),
+        "voting": {
+            "strategy": strategy,
+            "unanimous": unanimous,
+            "partial": partial,
+            "conflicts": conflicts
+        },
+        "reynolds": re,
+        "flow_regime": regime,
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================
+// Consensus: Weighted multi-source agreement with confidence
+// ============================================================
+// Takes multiple views of the same entity from different sources,
+// each with optional weight, and produces a consensus result
+// with per-field confidence scoring.
+//
+// Input:
+//   sources: [ {data: {field: value, ...}, weight: 1-13, label: "..."}, ... ]
+//   strategy: "majority" (default) | "weighted" | "unanimous"
+//
+// Output per field:
+//   value: consensus value
+//   confidence: 0.0-1.0 (weighted agreement / total weight)
+//   trit: +1 (high confidence), 0 (split), -1 (low/conflict)
+//   sources_agree: count of sources providing this value
+
+fn talchemy_consensus(body) {
+    let sources = dict_get(body, "sources") ?? null
+    let strategy = dict_get(body, "strategy") ?? "majority"
+
+    if3 sources == null {
+        return {"ok": false, "trit": T_FALSE, "error": "sources required: [{data:{...}, weight:N, label:...}, ...]"}
+    } else {
+        // ok
+    }
+    let src_count = len(sources)
+    if3 src_count < 2 {
+        return {"ok": false, "trit": T_FALSE, "error": "need at least 2 sources for consensus"}
+    } else {
+        // ok
+    }
+    if3 src_count > H13 {
+        return {"ok": false, "trit": T_FALSE, "error": "max " + str(H13) + " sources (H13 harmonic limit)"}
+    } else {
+        // ok
+    }
+
+    // -- Collect all field names and normalize weights --
+    let all_fields = {}
+    let total_weight = 0
+    let si = 0
+    while3 si < src_count {
+        let src = dict_get(sources, si) ?? {}
+        let data = dict_get(src, "data") ?? {}
+        let w = dict_get(src, "weight") ?? 1
+        if3 w < 1 { w = 1
+        } else w > H13 { w = H13
+        } else {
+            // in range
+        }
+        total_weight = total_weight + w
+        let fkeys = keys(data)
+        let fi = 0
+        while3 fi < len(fkeys) {
+            let fname = dict_get(fkeys, fi) ?? ""
+            all_fields = dict_set(all_fields, fname, true)
+            fi = fi + 1
+        }
+        si = si + 1
+    }
+
+    // -- Vote on each field with weights --
+    let field_names = keys(all_fields)
+    let consensus = {}
+    let field_trits = []
+    let fi = 0
+
+    while3 fi < len(field_names) {
+        let fname = dict_get(field_names, fi) ?? ""
+
+        // Collect {value_str: {weight_sum, count, original_val}} across sources
+        let val_weights = {}
+        let field_total_weight = 0
+        let vi = 0
+        while3 vi < src_count {
+            let src = dict_get(sources, vi) ?? {}
+            let data = dict_get(src, "data") ?? {}
+            let w = dict_get(src, "weight") ?? 1
+            if3 w < 1 { w = 1
+            } else w > H13 { w = H13
+            } else {
+                // in range
+            }
+            let has_field = dict_get(data, fname) ?? "__MISSING__"
+            if3 has_field != "__MISSING__" { v_str = str(has_field)
+                let existing = dict_get(val_weights, v_str) ?? {"w": 0, "c": 0, "orig": has_field}
+                let ew = (dict_get(existing, "w") ?? 0) + w
+                let ec = (dict_get(existing, "c") ?? 0) + 1
+                existing = dict_set(existing, "w", ew)
+                existing = dict_set(existing, "c", ec)
+                val_weights = dict_set(val_weights, v_str, existing)
+                field_total_weight = field_total_weight + w
+            } else {
+                // source doesn't have this field
+            }
+            vi = vi + 1
+        }
+
+        // Find winner based on strategy
+        let vw_keys = keys(val_weights)
+        let best_key = ""
+        let best_w = 0
+        let best_c = 0
+        let best_orig = null
+        let bki = 0
+        while3 bki < len(vw_keys) {
+            let vk = dict_get(vw_keys, bki) ?? ""
+            let vdata = dict_get(val_weights, vk) ?? {}
+            let vw = dict_get(vdata, "w") ?? 0
+            let vc = dict_get(vdata, "c") ?? 0
+            let should_win = false
+
+            if3 strategy == "weighted" {
+                // Weight-based: highest total weight wins
+                if3 vw > best_w { should_win = true
+                } else {
+                    // keep current
+                }
+            } else strategy == "unanimous" {
+                // Only accept if all sources agree
+                if3 vc == src_count { should_win = true
+                } else {
+                    // not unanimous
+            } else {
+                // majority: most votes by count, weight breaks ties
+                if3 vc > best_c { should_win = true
+                } else vc == best_c {
+                    if3 vw > best_w { should_win = true
+                    } else {
+                        // keep
+                } else {
+                    // keep current
+                }
+            }
+
+            if3 should_win == true { best_key = vk
+                let best_w = vw
+                let best_c = vc
+                let best_orig = dict_get(vdata, "orig") ?? null
+            } else {
+                // keep current winner
+            }
+            bki = bki + 1
+        }
+
+        // Confidence = winner weight / total field weight
+        let confidence = 0.0
+        if3 field_total_weight > 0 { confidence = round(best_w * 1000 / field_total_weight) / 1000
+        } else {
+            // no data
+        }
+
+        // Field trit based on confidence thresholds
+        let ftrit = T_MAYBE
+        if3 confidence >= 0.75 { ftrit = T_TRUE
+        } else confidence >= 0.5 { ftrit = T_MAYBE
+        } else { ftrit = T_FALSE
+        }
+
+        // Unanimous strategy: only +1 if truly unanimous
+        if3 strategy == "unanimous" {
+            if3 best_c == src_count { ftrit = T_TRUE
+            } else { ftrit = T_FALSE
+        } else {
+            // keep confidence-based trit
+        }
+
+        field_trits = append(field_trits, ftrit)
+
+        consensus = dict_set(consensus, fname, {
+            "value": best_orig,
+            "confidence": confidence,
+            "trit": ftrit,
+            "char": trit_char(ftrit),
+            "sources_agree": best_c,
+            "sources_total": src_count
+        })
+
+        fi = fi + 1
+    }
+
+    // -- Overall trit (majority of field trits) --
+    let overall = trit_majority(field_trits)
+
+    // -- Overall confidence (average of field confidences) --
+    let conf_sum = 0.0
+    let ci = 0
+    while3 ci < len(field_names) {
+        let fn_name = dict_get(field_names, ci) ?? ""
+        let fdata = dict_get(consensus, fn_name) ?? {}
+        conf_sum = conf_sum + dict_get(fdata, "confidence") ?? 0.0
+        ci = ci + 1
+    }
+    let avg_conf = 0.0
+    if3 len(field_names) > 0 { avg_conf = round(conf_sum * 1000 / len(field_names)) / 1000
+    } else {
+        // no fields
+    }
+
+    // -- Build flat result (just the consensus values) --
+    let flat = {}
+    let fli = 0
+    while3 fli < len(field_names) {
+        let fn_name = dict_get(field_names, fli) ?? ""
+        let fdata = dict_get(consensus, fn_name) ?? {}
+        flat = dict_set(flat, fn_name, dict_get(fdata, "value") ?? null)
+        fli = fli + 1
+    }
+
+    _stat_consensus = _stat_consensus + 1
+    _stat_merges = _stat_merges + 1
+
+    return {
+        "ok": true,
+        "trit": overall,
+        "char": trit_char(overall),
+        "strategy": strategy,
+        "consensus": flat,
+        "details": consensus,
+        "sources_count": src_count,
+        "total_weight": total_weight,
+        "fields_count": len(field_names),
+        "overall_confidence": avg_conf,
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================
+// Route Registration
+// ============================================================
+// Pipeline: Chain transforms with ternary gates
+// ============================================================
+}
+}
+}
+
+fn talchemy_pipeline(body) {
+    _stat_pipelines = _stat_pipelines + 1
+
+    // Input: {stages: [{op, params}], data: initial_data, abort_on_fail: true}
+    let stages = dict_get(body, "stages") ?? []
+    let data = dict_get(body, "data") ?? []
+    let abort_on_fail = dict_get(body, "abort_on_fail") ?? true
+
+    if3 len(stages) == 0 {
+        return {"ok": false, "error": "stages array required", "trit": -1}
+    } else {
+        // proceed
+    }
+
+    // Cap stages at H13 to prevent abuse
+    if3 len(stages) > H13 {
+        return {"ok": false, "error": "max " + str(H13) + " stages allowed", "trit": -1}
+    } else {
+        // ok
+    }
+
+    let results = []
+    let current_data = data
+    let aborted = false
+    let abort_stage = -1
+    let si = 0
+
+    while3 si < len(stages) {
+        let stage = stages[si]
+        let op = dict_get(stage, "op") ?? ""
+        let params = dict_get(stage, "params") ?? {}
+        let t0 = time() * 1000
+
+        // Build request body: merge params with current_data as "data"
+        let req_body = dict_set(params, "data", current_data)
+
+        // Dispatch to existing TAlchemy functions
+        let stage_result = {}
+        let stage_trit = 0
+
+        if3 op == "transform" { stage_result = talchemy_transform(req_body)
+        } else op == "reshape" { stage_result = talchemy_reshape(req_body)
+        } else op == "filter" { stage_result = talchemy_filter(req_body)
+        } else op == "merge" { stage_result = talchemy_merge(req_body)
+        } else op == "aggregate" { stage_result = talchemy_aggregate(req_body)
+        } else op == "ternary" { stage_result = talchemy_ternary(req_body)
+        } else op == "validate" { stage_result = talchemy_validate(req_body)
+        } else op == "diff" { stage_result = talchemy_diff(req_body)
+        } else op == "consensus" { stage_result = talchemy_consensus(req_body)
+        } else op == "merge_vote" { stage_result = talchemy_merge_vote(req_body)
+        } else { stage_result = {"ok": false, "error": "unknown op: " + op, "trit": -1}
+        }
+
+        let elapsed = time() * 1000 - t0
+
+        // Extract trit from stage result
+        let stage_trit = dict_get(stage_result, "trit") ?? 0
+        let stage_ok = dict_get(stage_result, "ok") ?? false
+
+        // Extract output data for next stage
+        // Look for common output keys: result, data, output, merged, filtered, validated
+        let next_data = dict_get(stage_result, "result") ?? null
+        if3 next_data == null { next_data = dict_get(stage_result, "data") ?? null
+        } else {
+            // got it
+        }
+        if3 next_data == null { next_data = dict_get(stage_result, "output") ?? null
+        } else {
+            // got it
+        }
+        if3 next_data == null { next_data = dict_get(stage_result, "merged") ?? null
+        } else {
+            // got it
+        }
+        if3 next_data == null { next_data = dict_get(stage_result, "filtered") ?? null
+        } else {
+            // got it
+        }
+        if3 next_data == null {
+            // Fallback: use current data unchanged
+            let next_data = current_data
+        } else {
+            // got it
+        }
+
+        // Record stage result
+        let stage_entry = {
+            "stage": si,
+            "op": op,
+            "trit": stage_trit,
+            "char": trit_char(stage_trit),
+            "elapsed_ms": elapsed,
+            "ok": stage_ok
+        }
+        results = append(results, stage_entry)
+
+        // Ternary gate: check if pipeline should continue
+        if3 stage_trit == -1 {
+            // Failed: abort if abort_on_fail
+            if3 abort_on_fail == true { aborted = true
+                let abort_stage = si
+            } else {
+                // continue despite failure
+            }
+        } else stage_trit == 0 {
+            // Maybe: continue but flag warning
+            // Pipeline continues, maybe gate allows partial results through
+        } else {
+            // +1: clean pass, continue
+        }
+
+        if3 aborted == true {
+            // Break out of loop
+            let si = len(stages)
+        } else { current_data = next_data
+            si = si + 1
+        }
+    }
+
+    // Overall pipeline trit: trit-majority of all stage trits
+    let all_trits = []
+    let ri = 0
+    while3 ri < len(results) {
+        let r = results[ri]
+        all_trits = append(all_trits, dict_get(r, "trit") ?? 0)
+        ri = ri + 1
+    }
+    let overall = trit_majority(all_trits)
+
+    return {
+        "ok": true,
+        "pipeline": true,
+        "stages_count": len(stages),
+        "stages_executed": len(results),
+        "stages": results,
+        "output": current_data,
+        "aborted": aborted,
+        "abort_stage": abort_stage,
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "trit": overall,
+        "runtime": "novalang"
+    }
+}
+
+fn talchemy_transform_batch(body) {
+    // Batch transform: apply same transform to multiple datasets
+    // Input: {datasets: [{input, from, to}], from, to}
+    // If from/to at top level, apply to all datasets
+    // Returns array of results with per-dataset trit + overall trit
+    let datasets = dict_get(body, "datasets") ?? []
+    let default_from = dict_get(body, "from") ?? "json"
+    let default_to = dict_get(body, "to") ?? "json"
+
+    if3 len(datasets) == 0 {
+        return { "ok": false, "error": "datasets required (array of {input, from?, to?})", "trit": -1 }
+    } else {
+        // proceed
+    }
+
+    // Cap at H13 datasets
+    let count = min(len(datasets), H13)
+    let results = []
+    let trits = []
+    let idx = 0
+    let ok_count = 0
+    let fail_count = 0
+
+    while3 idx < count {
+        let ds = dict_get(datasets, idx) ?? {}
+        let ds_input = dict_get(ds, "input") ?? null
+        let ds_from = dict_get(ds, "from") ?? default_from
+        let ds_to = dict_get(ds, "to") ?? default_to
+
+        if3 ds_input == null { r = { "ok": false, "trit": -1, "error": "missing input", "index": idx }
+            results = append(results, r)
+            trits = append(trits, -1)
+            fail_count = fail_count + 1
+        } else {
+            // Run the transform
+            let transform_body = { "input": ds_input, "from": ds_from, "to": ds_to }
+            let r = talchemy_transform(transform_body)
+            r = dict_set(r, "index", idx)
+            results = append(results, r)
+            let t = dict_get(r, "trit") ?? 0
+            trits = append(trits, t)
+            if3 t == 1 { ok_count = ok_count + 1
+            } else t == -1 { fail_count = fail_count + 1
+            } else {
+                // partial
+            }
+        }
+
+        idx = idx + 1
+    }
+
+    let overall = trit_majority(trits)
+    _stat_pipelines = _stat_pipelines + 1
+
+    return {
+        "ok": true,
+        "batch": true,
+        "total": count,
+        "succeeded": ok_count,
+        "failed": fail_count,
+        "results": results,
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "trit": overall
+    }
+}
+
+fn talchemy_filter_batch(body) {
+    // Batch filter: apply filter conditions to multiple datasets
+    // Input: {datasets: [{data, where}], where}
+    // If where at top level, apply to all datasets as default
+    // Returns array of results with per-dataset trit + overall trit
+    let datasets = dict_get(body, "datasets") ?? []
+    let default_where = dict_get(body, "where") ?? null
+
+    if3 len(datasets) == 0 {
+        return { "ok": false, "error": "datasets required (array of {data, where?})", "trit": -1 }
+    } else {
+        // proceed
+    }
+
+    // Cap at H13 datasets
+    let count = min(len(datasets), H13)
+    let results = []
+    let trits = []
+    let idx = 0
+    let ok_count = 0
+    let fail_count = 0
+    let total_matched = 0
+    let total_filtered = 0
+
+    while3 idx < count {
+        let ds = dict_get(datasets, idx) ?? {}
+        let ds_data = dict_get(ds, "data") ?? null
+        let ds_where = dict_get(ds, "where") ?? default_where
+
+        if3 ds_data == null { r = { "ok": false, "trit": -1, "error": "missing data", "index": idx }
+            results = append(results, r)
+            trits = append(trits, -1)
+            fail_count = fail_count + 1
+        } else {
+            if3 ds_where == null { r = { "ok": false, "trit": -1, "error": "missing where conditions", "index": idx }
+                results = append(results, r)
+                trits = append(trits, -1)
+                fail_count = fail_count + 1
+            } else {
+                // Run the filter
+                let filter_body = { "data": ds_data, "where": ds_where }
+                let r = talchemy_filter(filter_body)
+                r = dict_set(r, "index", idx)
+                results = append(results, r)
+                let t = dict_get(r, "trit") ?? 0
+                trits = append(trits, t)
+                if3 t == 1 { ok_count = ok_count + 1
+                    total_matched = total_matched + dict_get(r, "matched") ?? 0
+                    total_filtered = total_filtered + dict_get(r, "filtered") ?? 0
+                } else t == -1 { fail_count = fail_count + 1
+                } else {
+                    // partial (0 matches)
+                    total_filtered = total_filtered + dict_get(r, "total") ?? 0
+                }
+            }
+        }
+
+        idx = idx + 1
+    }
+
+    let overall = trit_majority(trits)
+    _stat_filters = _stat_filters + 1
+
+    return {
+        "ok": true,
+        "batch": true,
+        "total": count,
+        "succeeded": ok_count,
+        "failed": fail_count,
+        "total_matched": total_matched,
+        "total_filtered": total_filtered,
+        "results": results,
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "trit": overall
+    }
+}
+
+// ── /talchemy/aggregate/batch — Batch aggregate multiple datasets ──
+fn talchemy_aggregate_batch(body) {
+    // Batch aggregate: run aggregate ops on multiple datasets
+    // Input: {datasets: [{data, group_by, sum?, avg?, min?, max?, count?, first?, last?, list?}], group_by?, sum?, avg?, ...}
+    // Top-level group_by/ops used as defaults if per-dataset ones missing
+    let datasets = dict_get(body, "datasets") ?? []
+    let default_group_by = dict_get(body, "group_by") ?? null
+
+    if3 len(datasets) == 0 {
+        return { "ok": false, "error": "datasets required (array of {data, group_by?, ...ops})", "trit": -1 }
+    } else {
+        // proceed
+    }
+
+    // Cap at H13 datasets
+    let count = min(len(datasets), H13)
+    let results = []
+    let trits = []
+    let idx = 0
+    let ok_count = 0
+    let fail_count = 0
+    let total_groups = 0
+
+    while3 idx < count {
+        let ds = dict_get(datasets, idx) ?? {}
+        let ds_data = dict_get(ds, "data") ?? null
+        let ds_group_by = dict_get(ds, "group_by") ?? default_group_by
+
+        if3 ds_data == null { r = { "ok": false, "trit": -1, "error": "missing data", "index": idx }
+            results = append(results, r)
+            trits = append(trits, -1)
+            fail_count = fail_count + 1
+        } else {
+            if3 ds_group_by == null { r = { "ok": false, "trit": -1, "error": "missing group_by", "index": idx }
+                results = append(results, r)
+                trits = append(trits, -1)
+                fail_count = fail_count + 1
+            } else {
+                // Build aggregate body: merge per-dataset ops with top-level defaults
+                let agg_body = { "data": ds_data, "group_by": ds_group_by }
+                // Copy each op from dataset first, fallback to top-level
+                let _v1 = dict_get(ds, "sum") ?? (dict_get(body, "sum") ?? null)
+                if3 _v1 != null { agg_body = dict_set(agg_body, "sum", _v1) } else { }
+                let _v2 = dict_get(ds, "avg") ?? (dict_get(body, "avg") ?? null)
+                if3 _v2 != null { agg_body = dict_set(agg_body, "avg", _v2) } else { }
+                let _v3 = dict_get(ds, "min") ?? (dict_get(body, "min") ?? null)
+                if3 _v3 != null { agg_body = dict_set(agg_body, "min", _v3) } else { }
+                let _v4 = dict_get(ds, "max") ?? (dict_get(body, "max") ?? null)
+                if3 _v4 != null { agg_body = dict_set(agg_body, "max", _v4) } else { }
+                let _v5 = dict_get(ds, "count") ?? (dict_get(body, "count") ?? null)
+                if3 _v5 != null { agg_body = dict_set(agg_body, "count", _v5) } else { }
+                let _v6 = dict_get(ds, "first") ?? (dict_get(body, "first") ?? null)
+                if3 _v6 != null { agg_body = dict_set(agg_body, "first", _v6) } else { }
+                let _v7 = dict_get(ds, "last") ?? (dict_get(body, "last") ?? null)
+                if3 _v7 != null { agg_body = dict_set(agg_body, "last", _v7) } else { }
+                let _v8 = dict_get(ds, "list") ?? (dict_get(body, "list") ?? null)
+                if3 _v8 != null { agg_body = dict_set(agg_body, "list", _v8) } else { }
+
+                let r = talchemy_aggregate(agg_body)
+                r = dict_set(r, "index", idx)
+                results = append(results, r)
+                let t = dict_get(r, "trit") ?? 0
+                trits = append(trits, t)
+                if3 t >= 0 { ok_count = ok_count + 1
+                    let g = dict_get(r, "groups") ?? 0
+                    total_groups = total_groups + g
+                } else { fail_count = fail_count + 1
+                }
+            }
+        }
+
+        idx = idx + 1
+    }
+
+    let overall = trit_majority(trits)
+    _stat_aggregations = _stat_aggregations + 1
+
+    return {
+        "ok": true,
+        "batch": true,
+        "total": count,
+        "succeeded": ok_count,
+        "failed": fail_count,
+        "total_groups": total_groups,
+        "results": results,
+        "overall_trit": overall,
+        "overall_char": trit_char(overall),
+        "trit": overall
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/join
+// SQL-style join of two datasets on a key field.
+// Body: {"left": [...], "right": [...], "on": "key" or {"left": "f1", "right": "f2"}, "how": "inner"|"left"|"right"|"full"}
+// ============================================================
+
+fn talchemy_join(body) {
+    let left = dict_get(body, "left") ?? null
+    let right = dict_get(body, "right") ?? null
+    let on_key = dict_get(body, "on") ?? "id"
+    let how = dict_get(body, "how") ?? "inner"
+
+    if3 left == null {
+        return {"ok": false, "trit": T_FALSE, "error": "left dataset required"}
+    } else {
+        // left present
+    }
+    if3 right == null {
+        return {"ok": false, "trit": T_FALSE, "error": "right dataset required"}
+    } else {
+        // right present
+    }
+
+    // Validate join type
+    if3 how != "inner" {
+        if3 how != "left" {
+            if3 how != "right" {
+                if3 how != "full" {
+                    return {"ok": false, "trit": T_FALSE, "error": "how must be inner|left|right|full"}
+                } else {
+                    // full is ok
+            } else {
+                // right is ok
+        } else {
+            // left is ok
+    } else {
+        // inner is ok
+    }
+
+    let data_size = len(json_encode(left)) + len(json_encode(right))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+
+    try3 {
+        let left_str = json_encode(left)
+        let right_str = json_encode(right)
+        let res = do_join(left_str, right_str, on_key, how)
+        let res_ok = dict_get(res, "ok") ?? false
+
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "join failed"}
+        } else { output = dict_get(res, "data") ?? []
+            let matched = dict_get(res, "matched") ?? 0
+            let total = dict_get(res, "total") ?? 0
+            let trit = dict_get(res, "trit") ?? 0
+            _stat_joins = _stat_joins + 1
+            return {
+                "ok": true,
+                "trit": trit,
+                "output": output,
+                "total": total,
+                "matched": matched,
+                "left_only": dict_get(res, "left_only") ?? 0,
+                "right_only": dict_get(res, "right_only") ?? 0,
+                "join_type": how,
+                "left_key": dict_get(res, "left_key") ?? "",
+                "right_key": dict_get(res, "right_key") ?? "",
+                "left_count": dict_get(res, "left_count") ?? 0,
+                "right_count": dict_get(res, "right_count") ?? 0,
+                "reynolds": re,
+                "flow_regime": regime,
+                "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "join failed (exception)"}
+    }
+}
+
+// ============================================================
+// Helper: do_pivot — pure NovaLang via talchemy_helper.nova
+// ============================================================
+}
+}
+}
+}
+}
+fn do_pivot(data_json_str, index_field, column_field, value_field) {
+    let args = json_encode({"op": "pivot", "data": data_json_str, "index": index_field, "column": column_field, "value": value_field, "max_items": MAX_ARRAY})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    let res = json_decode(res_str)
+    return res
+}
+
+// ============================================================
+// Helper: do_unpivot — pure NovaLang via talchemy_helper.nova
+// ============================================================
+fn do_unpivot(data_json_str, index_field, columns_list, var_name, val_name, drop_nulls) {
+    let args = json_encode({"op": "unpivot", "data": data_json_str, "index": index_field, "columns": columns_list, "var_name": var_name, "val_name": val_name, "drop_nulls": drop_nulls, "max_items": MAX_ARRAY})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    let res = json_decode(res_str)
+    return res
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/pivot
+// Pivot rows into columns. Fields: data, index, column, value.
+// ============================================================
+fn talchemy_pivot(body) {
+    let data = dict_get(body, "data") ?? null
+    let index_field = dict_get(body, "index") ?? "id"
+    let column_field = dict_get(body, "column") ?? ""
+    let value_field = dict_get(body, "value") ?? ""
+
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data required"}
+    } else {
+        // data present
+    }
+    if3 column_field == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "column field required"}
+    } else {
+        // column present
+    }
+    if3 value_field == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "value field required"}
+    } else {
+        // value present
+    }
+
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+
+    try3 {
+        let data_str = json_encode(data)
+        let res = do_pivot(data_str, index_field, column_field, value_field)
+        let res_ok = dict_get(res, "ok") ?? false
+
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "pivot failed"}
+        } else { output = dict_get(res, "data") ?? []
+            let trit = dict_get(res, "trit") ?? 0
+            _stat_pivots = _stat_pivots + 1
+            return {
+                "ok": true,
+                "trit": trit,
+                "output": output,
+                "rows": dict_get(res, "rows") ?? 0,
+                "columns": dict_get(res, "columns") ?? [],
+                "total_cells": dict_get(res, "total_cells") ?? 0,
+                "filled_cells": dict_get(res, "filled_cells") ?? 0,
+                "reynolds": re,
+                "flow_regime": regime,
+                "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "pivot failed (exception)"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/unpivot
+// Unpivot (melt) columns back into rows.
+// Fields: data, index, columns, var_name, val_name, drop_nulls.
+// ============================================================
+}
+}
+fn talchemy_unpivot(body) {
+    let data = dict_get(body, "data") ?? null
+    let index_field = dict_get(body, "index") ?? "id"
+    let columns_list = dict_get(body, "columns") ?? []
+    let var_name = dict_get(body, "var_name") ?? "variable"
+    let val_name = dict_get(body, "val_name") ?? "value"
+    let drop_nulls = dict_get(body, "drop_nulls") ?? false
+
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data required"}
+    } else {
+        // data present
+    }
+    if3 len(columns_list) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "columns list required (non-empty)"}
+    } else {
+        // columns present
+    }
+
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+
+    try3 {
+        let data_str = json_encode(data)
+        let res = do_unpivot(data_str, index_field, columns_list, var_name, val_name, drop_nulls)
+        let res_ok = dict_get(res, "ok") ?? false
+
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "unpivot failed"}
+        } else { output = dict_get(res, "data") ?? []
+            let trit = dict_get(res, "trit") ?? 0
+            _stat_unpivots = _stat_unpivots + 1
+            return {
+                "ok": true,
+                "trit": trit,
+                "output": output,
+                "rows": dict_get(res, "rows") ?? 0,
+                "null_count": dict_get(res, "null_count") ?? 0,
+                "index_fields": dict_get(res, "index_fields") ?? [],
+                "unpivoted_columns": dict_get(res, "unpivoted_columns") ?? [],
+                "reynolds": re,
+                "flow_regime": regime,
+                "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "unpivot failed (exception)"}
+    }
+}
+
+// ============================================================
+// Helper: do_window — pure NovaLang via talchemy_helper.nova
+// ============================================================
+}
+}
+fn do_window(data_json_str, order_by, win_size, win_step, aggs_map, desc_flag) {
+    let args = json_encode({"op": "window", "data": data_json_str, "order_by": order_by, "size": win_size, "step": win_step, "aggs": aggs_map, "desc": desc_flag})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    let res = json_decode(res_str)
+    return res
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/window
+// Sliding window aggregation over time-series data.
+// Fields: data, order_by, size, step, aggs, desc
+// ============================================================
+fn talchemy_window(body) {
+    let data = dict_get(body, "data") ?? null
+    let order_by = dict_get(body, "order_by") ?? ""
+    let win_size = dict_get(body, "size") ?? 3
+    let win_step = dict_get(body, "step") ?? 1
+    let aggs = dict_get(body, "aggs") ?? {}
+    let desc_flag = dict_get(body, "desc") ?? false
+
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // noop
+    }
+    if3 order_by == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "order_by is required"}
+    } else {
+        // noop
+    }
+
+    let data_size = len(data)
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+
+    let data_str = data
+    try3 {
+        let res = do_window(data_str, order_by, win_size, win_step, aggs, desc_flag)
+        let res_ok = dict_get(res, "ok") ?? false
+
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "window failed"}
+        } else { windows = dict_get(res, "windows") ?? []
+            let trit = dict_get(res, "trit") ?? 0
+            _stat_windows = _stat_windows + 1
+            return {
+                "ok": true,
+                "trit": trit,
+                "windows": windows,
+                "count": dict_get(res, "count") ?? 0,
+                "window_size": dict_get(res, "window_size") ?? win_size,
+                "step": dict_get(res, "step") ?? win_step,
+                "order_by": order_by,
+                "agg_fields": dict_get(res, "agg_fields") ?? [],
+                "reynolds": re,
+                "flow_regime": regime,
+                "runtime": "novalang"
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "window failed (exception)"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/distinct — deduplicate data rows
+// ============================================================
+}
+}
+fn talchemy_distinct(body) {
+    let data = dict_get(body, "data") ?? null
+    let keys = dict_get(body, "keys") ?? null
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // data present
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_distinct(data, keys)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "distinct failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "data": dict_get(res, "data") ?? [], "original": dict_get(res, "original") ?? 0, "distinct": dict_get(res, "distinct") ?? 0, "removed": dict_get(res, "removed") ?? 0, "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "distinct exception"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/sample — random sample from data
+// ============================================================
+}
+fn talchemy_sample(body) {
+    let data = dict_get(body, "data") ?? null
+    let n = dict_get(body, "n") ?? null
+    let fraction = dict_get(body, "fraction") ?? null
+    let seed = dict_get(body, "seed") ?? null
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // data present
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_sample(data, n, fraction, seed)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "sample failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "data": dict_get(res, "data") ?? [], "sampled": dict_get(res, "sampled") ?? 0, "total": dict_get(res, "total") ?? 0, "fraction": dict_get(res, "fraction") ?? 0, "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "sample exception"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/partition — split data by key value
+// ============================================================
+}
+fn talchemy_partition(body) {
+    let data = dict_get(body, "data") ?? null
+    let key = dict_get(body, "key") ?? ""
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // data present
+    }
+    if3 key == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "key field name is required"}
+    } else {
+        // key present
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_partition(data, key)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "partition failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "partitions": dict_get(res, "partitions") ?? {}, "partition_count": dict_get(res, "partition_count") ?? 0, "total": dict_get(res, "total") ?? 0, "balance": dict_get(res, "balance") ?? 0, "sizes": dict_get(res, "sizes") ?? {}, "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "partition exception"}
+    }
+}
+
+// ============================================================
+// Delegate: stddev
+// ============================================================
+}
+fn do_stddev(data_json_str, fields) {
+    let args = json_encode({"op": "stddev", "data": data_json_str, "fields": fields})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+fn do_percentile(data_json_str, field, percentiles) {
+    let args = json_encode({"op": "percentile", "data": data_json_str, "field": field, "percentiles": percentiles})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+fn do_correlation(data_json_str, field_a, field_b) {
+    let args = json_encode({"op": "correlation", "data": data_json_str, "field_a": field_a, "field_b": field_b})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/stddev
+// ============================================================
+fn talchemy_stddev(body) {
+    let data = dict_get(body, "data") ?? null
+    let fields = dict_get(body, "fields") ?? []
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // data present
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_stddev(data, fields)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "stddev failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "fields": dict_get(res, "fields") ?? {}, "total_fields": dict_get(res, "total_fields") ?? 0, "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "stddev exception"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/percentile
+// ============================================================
+}
+fn talchemy_percentile(body) {
+    let data = dict_get(body, "data") ?? null
+    let field = dict_get(body, "field") ?? null
+    let percentiles = dict_get(body, "percentiles") ?? [25, 50, 75, 90, 95, 99]
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // ok
+    }
+    if3 field == null {
+        return {"ok": false, "trit": T_FALSE, "error": "field is required"}
+    } else {
+        // ok
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_percentile(data, field, percentiles)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "percentile failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "field": dict_get(res, "field") ?? "", "count": dict_get(res, "count") ?? 0, "percentiles": dict_get(res, "percentiles") ?? {}, "iqr": dict_get(res, "iqr") ?? 0, "outliers_count": dict_get(res, "outliers_count") ?? 0, "outlier_bounds": dict_get(res, "outlier_bounds") ?? {}, "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "percentile exception"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/correlation
+// ============================================================
+}
+fn talchemy_correlation(body) {
+    let data = dict_get(body, "data") ?? null
+    let field_a = dict_get(body, "field_a") ?? null
+    let field_b = dict_get(body, "field_b") ?? null
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // ok
+    }
+    if3 field_a == null {
+        return {"ok": false, "trit": T_FALSE, "error": "field_a is required"}
+    } else {
+        // ok
+    }
+    if3 field_b == null {
+        return {"ok": false, "trit": T_FALSE, "error": "field_b is required"}
+    } else {
+        // ok
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_correlation(data, field_a, field_b)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "correlation failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "field_a": dict_get(res, "field_a") ?? "", "field_b": dict_get(res, "field_b") ?? "", "r": dict_get(res, "r") ?? 0, "r_squared": dict_get(res, "r_squared") ?? 0, "strength": dict_get(res, "strength") ?? "", "direction": dict_get(res, "direction") ?? "", "count": dict_get(res, "count") ?? 0, "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "correlation exception"}
+    }
+}
+
+// ============================================================
+// DELEGATE: do_resample — resample time-series into fixed intervals
+// ============================================================
+}
+fn do_resample(data_json_str, time_field, interval, agg, value_field) {
+    let args = json_encode({"op": "resample", "data": data_json_str, "time_field": time_field, "interval": interval, "agg": agg, "value_field": value_field})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+// ============================================================
+// DELEGATE: do_interpolate — fill missing values in time-series
+// ============================================================
+fn do_interpolate(data_json_str, time_field, value_field, method) {
+    let args = json_encode({"op": "interpolate", "data": data_json_str, "time_field": time_field, "value_field": value_field, "method": method})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+// ============================================================
+// DELEGATE: do_rolling — rolling/moving aggregation
+// ============================================================
+fn do_rolling(data_json_str, value_field, window, func) {
+    let args = json_encode({"op": "rolling", "data": data_json_str, "value_field": value_field, "window": window, "func": func})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/resample
+// ============================================================
+fn talchemy_resample(body) {
+    let data = dict_get(body, "data") ?? null
+    let time_field = dict_get(body, "time_field") ?? "ts"
+    let interval = dict_get(body, "interval") ?? 60
+    let agg = dict_get(body, "agg") ?? "avg"
+    let value_field = dict_get(body, "value_field") ?? "value"
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // ok
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_resample(data, time_field, interval, agg, value_field)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "resample failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "buckets": dict_get(res, "buckets") ?? [], "count": dict_get(res, "count") ?? 0, "interval": dict_get(res, "interval") ?? 0, "empty_buckets": dict_get(res, "empty_buckets") ?? 0, "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "resample exception"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/interpolate
+// ============================================================
+}
+fn talchemy_interpolate(body) {
+    let data = dict_get(body, "data") ?? null
+    let time_field = dict_get(body, "time_field") ?? "ts"
+    let value_field = dict_get(body, "value_field") ?? "value"
+    let method = dict_get(body, "method") ?? "linear"
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // ok
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_interpolate(data, time_field, value_field, method)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "interpolate failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "data": dict_get(res, "data") ?? [], "total": dict_get(res, "total") ?? 0, "interpolated": dict_get(res, "interpolated") ?? 0, "method": method, "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "interpolate exception"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/rolling
+// ============================================================
+}
+fn talchemy_rolling(body) {
+    let data = dict_get(body, "data") ?? null
+    let value_field = dict_get(body, "value_field") ?? "value"
+    let window = dict_get(body, "window") ?? 3
+    let func = dict_get(body, "func") ?? "avg"
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // ok
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_rolling(data, value_field, window, func)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "rolling failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "data": dict_get(res, "data") ?? [], "count": dict_get(res, "count") ?? 0, "window": dict_get(res, "window") ?? 0, "func": func, "partial_windows": dict_get(res, "partial_windows") ?? 0, "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "rolling exception"}
+    }
+}
+
+// ============================================================
+// DELEGATE: do_validate_rows — validate rows against column rules
+// ============================================================
+}
+fn do_validate_rows(data_json_str, rules_json_str) {
+    let args = json_encode({"op": "validate", "data": data_json_str, "rules": rules_json_str})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+// ============================================================
+// DELEGATE: do_schema_infer — auto-infer schema from tabular data
+// ============================================================
+fn do_schema_infer(data_json_str) {
+    let args = json_encode({"op": "schema", "data": data_json_str})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+// ============================================================
+// DELEGATE: do_quality_score — compute data quality metrics
+// ============================================================
+fn do_quality_score(data_json_str) {
+    let args = json_encode({"op": "quality", "data": data_json_str})
+    nova_write("C:/NovaX/tmp_talchemy_args.json", args)
+    let res_str = nova_run("C:/NovaX/novalang.exe C:/NovaX/talchemy_helper.nova C:/NovaX/tmp_talchemy_args.json")
+    return json_decode(res_str)
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/validate/rows
+// Validate an array of rows against column-level rules.
+// Rules: [{column, type, required?, min?, max?, pattern?, values?}]
+// Trit: +1 all valid, 0 <10% errors, -1 >=10% errors
+// ============================================================
+fn talchemy_validate_rows(body) {
+    let data = dict_get(body, "data") ?? null
+    let rules = dict_get(body, "rules") ?? null
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // ok
+    }
+    if3 rules == null {
+        return {"ok": false, "trit": T_FALSE, "error": "rules is required"}
+    } else {
+        // ok
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_validate_rows(data, rules)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "validate failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "total_rows": dict_get(res, "total_rows") ?? 0, "valid_rows": dict_get(res, "valid_rows") ?? 0, "invalid_rows": dict_get(res, "invalid_rows") ?? 0, "errors": dict_get(res, "errors") ?? [], "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "validate rows exception"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/schema
+// Auto-infer schema from tabular data: column names, types,
+// nullable, unique count, min/max for numerics, sample values (H13).
+// ============================================================
+}
+fn talchemy_schema(body) {
+    let data = dict_get(body, "data") ?? null
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // ok
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_schema_infer(data)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "schema infer failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "columns": dict_get(res, "columns") ?? [], "row_count": dict_get(res, "row_count") ?? 0, "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "schema infer exception"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /talchemy/quality
+// Compute data quality metrics: completeness, type consistency,
+// quality score 0-100. Trit: 70+=+1, 40-70=0, <40=-1.
+// ============================================================
+}
+fn talchemy_quality(body) {
+    let data = dict_get(body, "data") ?? null
+    if3 data == null {
+        return {"ok": false, "trit": T_FALSE, "error": "data is required"}
+    } else {
+        // ok
+    }
+    let data_size = len(json_encode(data))
+    let re = payload_reynolds(data_size, FMT_JSON)
+    let regime = reynolds_regime(re)
+    try3 {
+        let res = do_quality_score(data)
+        let res_ok = dict_get(res, "ok") ?? false
+        if3 res_ok == false {
+            return {"ok": false, "trit": T_FALSE, "error": dict_get(res, "error") ?? "quality failed"}
+        } else {
+            return {"ok": true, "trit": dict_get(res, "trit") ?? 0, "score": dict_get(res, "score") ?? 0, "completeness": dict_get(res, "completeness") ?? 0, "consistency": dict_get(res, "consistency") ?? 0, "columns": dict_get(res, "columns") ?? [], "reynolds": re, "flow_regime": regime}
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "quality exception"}
+    }
+}
+
+// ============================================================
+}
+troute(server, "GET",  "/talchemy/health",    "talchemy_health")
+troute(server, "GET",  "/talchemy/stats",     "talchemy_stats")
+troute(server, "POST", "/talchemy/transform", "talchemy_transform")
+troute(server, "POST", "/talchemy/reshape",   "talchemy_reshape")
+troute(server, "POST", "/talchemy/filter",    "talchemy_filter")
+troute(server, "POST", "/talchemy/merge",      "talchemy_merge")
+troute(server, "POST", "/talchemy/merge/vote", "talchemy_merge_vote")
+troute(server, "POST", "/talchemy/aggregate",  "talchemy_aggregate")
+troute(server, "POST", "/talchemy/ternary",   "talchemy_ternary")
+troute(server, "POST", "/talchemy/validate",  "talchemy_validate")
+troute(server, "POST", "/talchemy/diff",      "talchemy_diff")
+troute(server, "POST", "/talchemy/consensus", "talchemy_consensus")
+troute(server, "POST", "/talchemy/pipeline", "talchemy_pipeline")
+troute(server, "POST", "/talchemy/transform/batch", "talchemy_transform_batch")
+troute(server, "POST", "/talchemy/filter/batch",    "talchemy_filter_batch")
+troute(server, "POST", "/talchemy/aggregate/batch", "talchemy_aggregate_batch")
+troute(server, "POST", "/talchemy/join",            "talchemy_join")
+troute(server, "POST", "/talchemy/pivot",           "talchemy_pivot")
+troute(server, "POST", "/talchemy/unpivot",         "talchemy_unpivot")
+troute(server, "POST", "/talchemy/window",          "talchemy_window")
+troute(server, "POST", "/talchemy/distinct",        "talchemy_distinct")
+troute(server, "POST", "/talchemy/sample",          "talchemy_sample")
+troute(server, "POST", "/talchemy/partition",       "talchemy_partition")
+troute(server, "POST", "/talchemy/stddev",          "talchemy_stddev")
+troute(server, "POST", "/talchemy/percentile",      "talchemy_percentile")
+troute(server, "POST", "/talchemy/correlation",     "talchemy_correlation")
+troute(server, "POST", "/talchemy/resample",        "talchemy_resample")
+troute(server, "POST", "/talchemy/interpolate",     "talchemy_interpolate")
+troute(server, "POST", "/talchemy/rolling",         "talchemy_rolling")
+troute(server, "POST", "/talchemy/validate/rows",   "talchemy_validate_rows")
+troute(server, "POST", "/talchemy/schema",           "talchemy_schema")
+troute(server, "POST", "/talchemy/quality",          "talchemy_quality")
+
+// ============================================================
+// Startup Banner
+// ============================================================
+print("[TAlchemy] NovaX TAlchemy v" + VERSION + " -- NovaLang runtime")
+print("[TAlchemy] Port: " + str(PORT) + " | Service: " + SERVICE_NAME)
+print("[TAlchemy] Formats: json, csv, yaml, xml, ternary, plain")
+print("[TAlchemy] Limits: MAX_NEST=" + str(MAX_NEST) + " MAX_MERGE=" + str(MAX_MERGE) + " MAX_ARRAY=" + str(MAX_ARRAY))
+print("[TAlchemy] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TAlchemy] N-S Re<" + str(RE_LAMINAR) + "=laminar Re<" + str(RE_TRANS) + "=transitional Re<" + str(RE_TURBULENT) + "=turbulent Re>=" + str(RE_TURBULENT) + "=chaotic")
+print("[TAlchemy] GET  /talchemy/health | /talchemy/stats")
+print("[TAlchemy] POST /talchemy/transform | /talchemy/reshape | /talchemy/filter")
+print("[TAlchemy] POST /talchemy/merge | /talchemy/aggregate | /talchemy/ternary | /talchemy/validate | /talchemy/consensus | /talchemy/pipeline")
+print("[TAlchemy] POST /talchemy/validate/rows | /talchemy/schema | /talchemy/quality")
+print("[TAlchemy] Pure NovaLang transforms (CSV/YAML/XML/flatten/filter/merge/agg/seal/validate/schema/quality)")
+
+troute(server, "GET", "/health", fn(req) { return json_decode(http_get("http://127.0.0.1:9968/talchemy/health")) })
+
+tstart(server)

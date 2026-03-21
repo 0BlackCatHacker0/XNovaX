@@ -1,0 +1,229 @@
+// Nova Bitnet Fleet Service v2.0
+// Port 9926 | Ternary BitNet model fleet management
+// Manages BitNet 1.58-bit model instances, warm pool, scaling, benchmarks
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9926
+let SERVICE_NAME = "nova-bitnet-fleet"
+let VERSION = "2.0.0"
+
+// 3-5-7-13 Harmonic Constants
+
+// Fleet state
+let _fleet = {}
+let _warm_pool = []
+let _scaling_rules = {"min_instances": 1, "max_instances": H13, "cooldown": H7 * 10}
+let _benchmarks = []
+let _stats = {"queries": 0, "inferences": 0, "warm_hits": 0, "cold_starts": 0, "t0": time()}
+
+// BitNet model registry — known models and their specs
+let _known_models = {
+    "BitNet-b1.58-2B-4T": {"params": "2B", "bits": 1.58, "tokens": "4T", "ram_mb": 512, "speed_tok_s": 10.5},
+    "BitNet-b1.58-700M": {"params": "700M", "bits": 1.58, "tokens": "1T", "ram_mb": 256, "speed_tok_s": 25.0},
+    "BitNet-b1.58-3B": {"params": "3B", "bits": 1.58, "tokens": "3T", "ram_mb": 768, "speed_tok_s": 7.2}
+}
+
+// ── Discovery: probe local BitNet instances ──
+fn discover_fleet(req) {
+    // Check if bitnet llama-server is running on port 9925
+    let bitnet_health = try3 { http_get("http://127.0.0.1:9925/health") } fail { null }
+    if3 bitnet_health != null {
+        _fleet = dict_set(_fleet, "bitnet-primary", {
+            "port": 9925,
+            "model": "BitNet-b1.58-2B-4T",
+            "state": 1,
+            "last_seen": time(),
+            "trit": 1
+        })
+        return {"ok": true, "discovered": 1, "trit": 1}
+    } else3 {
+        return {"ok": true, "discovered": 0, "trit": 0}
+    }
+}
+
+// ── Health ──
+fn handle_health(req) {
+    let fleet_size = len(dict_keys(_fleet))
+    let hot_count = 0
+    let fkeys = dict_keys(_fleet)
+    let i = 0
+    while3 i < len(fkeys) {
+        let k = fkeys[i]
+        let entry = dict_get(_fleet, k) ?? {}
+        if3 dict_get(entry, "state") ?? -1 == 1 {
+            hot_count = hot_count + 1
+        }
+        i = i + 1
+    }
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "fleet_size", fleet_size)
+    resp = dict_set(resp, "hot_instances", hot_count)
+    resp = dict_set(resp, "warm_pool", len(_warm_pool))
+    resp = dict_set(resp, "queries", dict_get(_stats, "queries") ?? 0)
+    resp = dict_set(resp, "inferences", dict_get(_stats, "inferences") ?? 0)
+    return resp
+}
+
+// ── Fleet Status ──
+fn handle_fleet_status(req) {
+    return {
+        "ok": true,
+        "fleet": _fleet,
+        "warm_pool": _warm_pool,
+        "scaling_rules": _scaling_rules,
+        "known_models": len(dict_keys(_known_models)),
+        "trit": 1
+    }
+}
+
+// ── List Models ──
+fn handle_fleet_models(req) {
+    let models = []
+    let mkeys = dict_keys(_known_models)
+    let i = 0
+    while3 i < len(mkeys) {
+        let name = mkeys[i]
+        let spec = dict_get(_known_models, name) ?? {}
+        models = append(models, {"name": name, "params": dict_get(spec, "params") ?? "", "bits": dict_get(spec, "bits") ?? 0, "ram_mb": dict_get(spec, "ram_mb") ?? 0})
+        i = i + 1
+    }
+    return {"ok": true, "models": models, "count": len(models), "trit": 1}
+}
+
+// ── Warm Pool ──
+fn handle_fleet_warm(req) {
+    return {"ok": true, "warm_pool": _warm_pool, "count": len(_warm_pool), "trit": 1}
+}
+
+// ── Scaling Rules ──
+fn handle_fleet_scaling(req) {
+    return {"ok": true, "scaling_rules": _scaling_rules, "trit": 1}
+}
+
+// ── Set Scaling ──
+fn handle_set_scaling(req) {
+    let min_i = dict_get(req, "min_instances") ?? (dict_get(_scaling_rules, "min_instances") ?? 1)
+    let max_i = dict_get(req, "max_instances") ?? (dict_get(_scaling_rules, "max_instances") ?? H13)
+    let cd = dict_get(req, "cooldown") ?? (dict_get(_scaling_rules, "cooldown") ?? H7 * 10)
+    _scaling_rules = {"min_instances": min_i, "max_instances": max_i, "cooldown": cd}
+    return {"ok": true, "scaling_rules": _scaling_rules, "trit": 1}
+}
+
+// ── Benchmark ──
+fn handle_fleet_benchmark(req) {
+    let model_name = dict_get(req, "model") ?? "BitNet-b1.58-2B-4T"
+    let prompt = dict_get(req, "prompt") ?? "The meaning of life is"
+    let tokens = dict_get(req, "tokens") ?? 32
+
+    // Try to run inference on bitnet primary
+    let t_start = time()
+    let result = try3 {
+        http_post("http://127.0.0.1:9925/completion", {"prompt": prompt, "n_predict": tokens})
+    } fail { null }
+    let t_end = time()
+    let elapsed = t_end - t_start
+
+    if3 result != null { tok_s = 0.0
+        if3 elapsed > 0 {
+            tok_s = round(float(tokens) / elapsed, 2)
+        }
+        let bench = {"model": model_name, "tokens": tokens, "time_s": round(elapsed, 3), "tok_s": tok_s, "timestamp": time()}
+        _benchmarks = append(_benchmarks, bench)
+        _stats = dict_set(_stats, "inferences", (dict_get(_stats, "inferences") ?? 0) + 1)
+        return {"ok": true, "benchmark": bench, "trit": 1}
+    } else3 {
+        return {"ok": false, "error": "bitnet instance unreachable", "trit": -1}
+    }
+}
+
+// ── Versions ──
+fn handle_fleet_versions(req) {
+    let versions = {}
+    let fkeys = dict_keys(_fleet)
+    let i = 0
+    while3 i < len(fkeys) {
+        let k = fkeys[i]
+        let entry = dict_get(_fleet, k) ?? {}
+        versions = dict_set(versions, k, dict_get(entry, "model") ?? "unknown")
+        i = i + 1
+    }
+    return {"ok": true, "versions": versions, "trit": 1}
+}
+
+// ── Snapshot ──
+fn handle_fleet_snapshot(req) {
+    return {
+        "ok": true,
+        "snapshot": {
+            "fleet": _fleet,
+            "warm_pool": _warm_pool,
+            "scaling": _scaling_rules,
+            "stats": _stats,
+            "benchmarks": _benchmarks,
+            "timestamp": time()
+        },
+        "trit": 1
+    }
+}
+
+// ── Inference (route to bitnet instance) ──
+fn handle_inference(req) {
+    let prompt = dict_get(req, "prompt") ?? ""
+    if3 prompt == "" {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    } else3 {
+        _stats = dict_set(_stats, "queries", (dict_get(_stats, "queries") ?? 0) + 1)
+        let result = try3 {
+            http_post("http://127.0.0.1:9925/completion", {"prompt": prompt, "n_predict": 128})
+        } fail { null }
+        if3 result != null {
+            _stats = dict_set(_stats, "inferences", (dict_get(_stats, "inferences") ?? 0) + 1)
+            return {"ok": true, "result": result, "model": "BitNet-b1.58-2B-4T", "trit": 1}
+        } else3 {
+            return {"ok": false, "error": "no bitnet instance available", "trit": -1}
+        }
+    }
+}
+
+// ── Warm (pre-load model) ──
+fn handle_warm_model(req) {
+    let model = dict_get(req, "model") ?? "BitNet-b1.58-2B-4T"
+    // Send 1-token probe to force model load
+    let result = try3 {
+        http_post("http://127.0.0.1:9925/completion", {"prompt": "test", "n_predict": 1})
+    } fail { null }
+    if3 result != null {
+        _warm_pool = append(_warm_pool, model)
+        _stats = dict_set(_stats, "warm_hits", (dict_get(_stats, "warm_hits") ?? 0) + 1)
+        return {"ok": true, "warmed": model, "trit": 1}
+    } else3 {
+        return {"ok": false, "error": "failed to warm " + model, "trit": -1}
+    }
+}
+
+// Server setup
+let server = tserve(PORT, SERVICE_NAME)
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/fleet/health", "handle_health")
+troute(server, "GET", "/fleet/status", "handle_fleet_status")
+troute(server, "GET", "/fleet/models", "handle_fleet_models")
+troute(server, "GET", "/fleet/warm", "handle_fleet_warm")
+troute(server, "GET", "/fleet/scaling", "handle_fleet_scaling")
+troute(server, "GET", "/fleet/benchmark", "handle_fleet_benchmark")
+troute(server, "GET", "/fleet/versions", "handle_fleet_versions")
+troute(server, "GET", "/fleet/snapshot", "handle_fleet_snapshot")
+troute(server, "POST", "/fleet/benchmark", "handle_fleet_benchmark")
+troute(server, "POST", "/fleet/scaling", "handle_set_scaling")
+troute(server, "POST", "/fleet/inference", "handle_inference")
+troute(server, "POST", "/fleet/warm", "handle_warm_model")
+troute(server, "POST", "/fleet/discover", "discover_fleet")
+
+print("[BitNet Fleet] v" + VERSION + " on port " + str(PORT))
+print("[BitNet Fleet] Known models: " + str(len(dict_keys(_known_models))))
+print("[BitNet Fleet] Fleet management active")
+
+tstart(server)

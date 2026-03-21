@@ -1,0 +1,403 @@
+// os_integration.nova -- NovaX OS Integration (Pure NovaLang)
+// Deep Windows overlay: wallpaper, theme, protocol, context menu, file associations
+// All changes reversible. State persists in memory/os_integration_state.json
+//
+// Usage:
+//   novalang os_integration.nova <action>
+//
+// Actions: status, enable-all, disable-all,
+//          wallpaper-set, wallpaper-restore,
+//          theme-set, theme-restore,
+//          protocol-register, protocol-remove,
+//          context-menu-add, context-menu-remove,
+//          file-assoc-enable, file-assoc-disable,
+//          lockscreen-set, lockscreen-restore,
+//          discover-apps
+
+let NOVAX_ROOT = "C:\\NovaX"
+let STATE_FILE = NOVAX_ROOT + "\\memory\\os_integration_state.json"
+let WALLPAPER_PATH = NOVAX_ROOT + "\\web\\assets\\novax_wallpaper.bmp"
+let LOCKSCREEN_PATH = NOVAX_ROOT + "\\web\\assets\\novax_lockscreen.jpg"
+
+// ── State Management ──
+
+fn3 load_state() {
+    try3 {
+        let raw = read_file(STATE_FILE)
+        if3 raw != "" {
+            return parse_json(raw)
+        }
+    } catch3 e {}
+    return {}
+}
+
+fn3 save_state(state) {
+    write_file(STATE_FILE, to_json(state))
+}
+
+// ── Registry Helpers (PowerShell) ──
+
+fn3 reg_read(path, name) {
+    let cmd = "powershell -Command \"try { (Get-ItemProperty -Path 'HKCU:\\" + path + "' -Name '" + name + "' -ErrorAction Stop).'" + name + "' } catch { 'NULL' }\""
+    let result = trim(shell(cmd))
+    if3 result == "NULL" {
+        return null
+    }
+    return result
+}
+
+fn3 reg_write_dword(path, name, value) {
+    let cmd = "powershell -Command \"New-ItemProperty -Path 'HKCU:\\" + path + "' -Name '" + name + "' -Value " + to_str(value) + " -PropertyType DWord -Force | Out-Null\""
+    try3 {
+        shell(cmd)
+        return +1
+    } catch3 e {
+        return -1
+    }
+}
+
+fn3 reg_write_string(path, name, value) {
+    let cmd = "powershell -Command \"New-ItemProperty -Path 'HKCU:\\" + path + "' -Name '" + name + "' -Value '" + value + "' -PropertyType String -Force | Out-Null\""
+    try3 {
+        shell(cmd)
+        return +1
+    } catch3 e {
+        return -1
+    }
+}
+
+fn3 reg_create_key(path) {
+    let cmd = "powershell -Command \"New-Item -Path 'HKCU:\\" + path + "' -Force | Out-Null\""
+    try3 {
+        shell(cmd)
+        return +1
+    } catch3 e {
+        return -1
+    }
+}
+
+fn3 reg_delete_key(path) {
+    let cmd = "powershell -Command \"Remove-Item -Path 'HKCU:\\" + path + "' -Recurse -Force -ErrorAction SilentlyContinue\""
+    try3 {
+        shell(cmd)
+        return +1
+    } catch3 e {
+        return -1
+    }
+}
+
+// ── 1. Desktop Wallpaper ──
+
+fn3 set_wallpaper() {
+    let state = load_state()
+    // Save original
+    if3 dict_get(state, "original_wallpaper") ?? null == null {
+        let orig = reg_read("Control Panel\\Desktop", "Wallpaper")
+        let state = dict_set(state, "original_wallpaper", orig)
+    }
+    // Set via PowerShell + user32.dll
+    let cmd = "powershell -Command \"Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport(\\\"user32.dll\\\",CharSet=CharSet.Unicode)]public static extern int SystemParametersInfo(int a,int b,string c,int d);}'; [W]::SystemParametersInfo(0x0014,0,'" + WALLPAPER_PATH + "',3)\""
+    let r = shell(cmd)
+    let state = dict_set(state, "wallpaper_set", true)
+    save_state(state)
+    return {"ok": true, "wallpaper": WALLPAPER_PATH}
+}
+
+fn3 restore_wallpaper() {
+    let state = load_state()
+    let orig = dict_get(state, "original_wallpaper") ?? ""
+    let cmd = "powershell -Command \"Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class W{[DllImport(\\\"user32.dll\\\",CharSet=CharSet.Unicode)]public static extern int SystemParametersInfo(int a,int b,string c,int d);}'; [W]::SystemParametersInfo(0x0014,0,'" + orig + "',3)\""
+    shell(cmd)
+    let state = dict_set(state, "wallpaper_set", false)
+    save_state(state)
+    return {"ok": true, "restored": orig}
+}
+
+// ── 2. Windows Theme (Dark Mode + Accent) ──
+
+let THEME_PERSONALIZE = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
+let THEME_DWM = "SOFTWARE\\Microsoft\\Windows\\DWM"
+
+fn3 set_theme() {
+    let state = load_state()
+    // Save originals
+    if3 dict_get(state, "original_theme") ?? null == null {
+        let state = dict_set(state, "original_theme", {
+            "AppsUseDarkTheme": reg_read(THEME_PERSONALIZE, "AppsUseDarkTheme"),
+            "SystemUsesLightTheme": reg_read(THEME_PERSONALIZE, "SystemUsesLightTheme"),
+            "AccentColor": reg_read(THEME_DWM, "AccentColor"),
+            "ColorPrevalence": reg_read(THEME_DWM, "ColorPrevalence")
+        })
+    }
+    // Dark mode ON
+    reg_write_dword(THEME_PERSONALIZE, "AppsUseDarkTheme", 1)
+    reg_write_dword(THEME_PERSONALIZE, "SystemUsesLightTheme", 0)
+    // NovaX cyan accent (BGR 0x00FFE500 = 16770304)
+    reg_write_dword(THEME_DWM, "AccentColor", 16770304)
+    reg_write_dword(THEME_DWM, "ColorizationColor", 16770304)
+    reg_write_dword(THEME_DWM, "ColorPrevalence", 1)
+    let state = dict_set(state, "theme_set", true)
+    save_state(state)
+    return {"ok": true, "dark_mode": true, "accent": "#00E5FF"}
+}
+
+fn3 restore_theme() {
+    let state = load_state()
+    let orig = dict_get(state, "original_theme") ?? {}
+    let v = dict_get(orig, "AppsUseDarkTheme") ?? null
+    if3 v != null { reg_write_dword(THEME_PERSONALIZE, "AppsUseDarkTheme", int(v)) }
+    let v = dict_get(orig, "SystemUsesLightTheme") ?? null
+    if3 v != null { reg_write_dword(THEME_PERSONALIZE, "SystemUsesLightTheme", int(v)) }
+    let v = dict_get(orig, "AccentColor") ?? null
+    if3 v != null { reg_write_dword(THEME_DWM, "AccentColor", int(v)) }
+    let v = dict_get(orig, "ColorPrevalence") ?? null
+    if3 v != null { reg_write_dword(THEME_DWM, "ColorPrevalence", int(v)) }
+    let state = dict_set(state, "theme_set", false)
+    save_state(state)
+    return {"ok": true, "restored": true}
+}
+
+// ── 3. Protocol Handler (novax://) ──
+
+fn3 register_protocol() {
+    let handler = NOVAX_ROOT + "\\installer\\novax_protocol.nova"
+    let novalang = NOVAX_ROOT + "\\ai_env\\Scripts\\python.exe"
+    let interp = NOVAX_ROOT + "\\novalang.py"
+    reg_create_key("Software\\Classes\\novax")
+    reg_write_string("Software\\Classes\\novax", "", "URL:NovaX Protocol")
+    reg_write_string("Software\\Classes\\novax", "URL Protocol", "")
+    reg_create_key("Software\\Classes\\novax\\DefaultIcon")
+    reg_write_string("Software\\Classes\\novax\\DefaultIcon", "", novalang + ",0")
+    reg_create_key("Software\\Classes\\novax\\shell\\open\\command")
+    let cmd_val = "\"" + novalang + "\" \"" + interp + "\" \"" + handler + "\" \"%1\""
+    reg_write_string("Software\\Classes\\novax\\shell\\open\\command", "", cmd_val)
+    let state = load_state()
+    let state = dict_set(state, "protocol_registered", true)
+    save_state(state)
+    return {"ok": true, "protocol": "novax://"}
+}
+
+fn3 remove_protocol() {
+    reg_delete_key("Software\\Classes\\novax")
+    let state = load_state()
+    let state = dict_set(state, "protocol_registered", false)
+    save_state(state)
+    return {"ok": true, "removed": true}
+}
+
+// ── 4. Context Menu ──
+
+fn3 add_context_menu() {
+    let novalang = NOVAX_ROOT + "\\ai_env\\Scripts\\python.exe"
+    let interp = NOVAX_ROOT + "\\novalang.py"
+    let handler = NOVAX_ROOT + "\\installer\\novax_file_handler.nova"
+
+    // "Open with NovaX" on files
+    reg_create_key("Software\\Classes\\*\\shell\\NovaX")
+    reg_write_string("Software\\Classes\\*\\shell\\NovaX", "", "Open with NovaX")
+    reg_write_string("Software\\Classes\\*\\shell\\NovaX", "Icon", NOVAX_ROOT + "\\web\\assets\\novax_icon.ico")
+    reg_create_key("Software\\Classes\\*\\shell\\NovaX\\command")
+    let cmd_val = "\"" + novalang + "\" \"" + interp + "\" \"" + handler + "\" \"%1\""
+    reg_write_string("Software\\Classes\\*\\shell\\NovaX\\command", "", cmd_val)
+
+    // "Ask NovaX AI" on files
+    reg_create_key("Software\\Classes\\*\\shell\\NovaXAI")
+    reg_write_string("Software\\Classes\\*\\shell\\NovaXAI", "", "Ask NovaX AI")
+    reg_write_string("Software\\Classes\\*\\shell\\NovaXAI", "Icon", NOVAX_ROOT + "\\web\\assets\\novax_icon.ico")
+    reg_create_key("Software\\Classes\\*\\shell\\NovaXAI\\command")
+    let cmd_ai = "\"" + novalang + "\" \"" + interp + "\" \"" + handler + "\" --ask \"%1\""
+    reg_write_string("Software\\Classes\\*\\shell\\NovaXAI\\command", "", cmd_ai)
+
+    // "Open folder in NovaX" on directories
+    reg_create_key("Software\\Classes\\Directory\\shell\\NovaX")
+    reg_write_string("Software\\Classes\\Directory\\shell\\NovaX", "", "Open in NovaX")
+    reg_write_string("Software\\Classes\\Directory\\shell\\NovaX", "Icon", NOVAX_ROOT + "\\web\\assets\\novax_icon.ico")
+    reg_create_key("Software\\Classes\\Directory\\shell\\NovaX\\command")
+    let cmd_dir = "\"" + novalang + "\" \"" + interp + "\" \"" + handler + "\" --dir \"%V\""
+    reg_write_string("Software\\Classes\\Directory\\shell\\NovaX\\command", "", cmd_dir)
+
+    let state = load_state()
+    let state = dict_set(state, "context_menu_added", true)
+    save_state(state)
+    return {"ok": true}
+}
+
+fn3 remove_context_menu() {
+    reg_delete_key("Software\\Classes\\*\\shell\\NovaX")
+    reg_delete_key("Software\\Classes\\*\\shell\\NovaXAI")
+    reg_delete_key("Software\\Classes\\Directory\\shell\\NovaX")
+    let state = load_state()
+    let state = dict_set(state, "context_menu_added", false)
+    save_state(state)
+    return {"ok": true, "removed": true}
+}
+
+// ── 5. File Associations ──
+
+fn3 set_file_associations() {
+    let exts = [".nova", ".nv", ".tnova"]
+    let novalang = NOVAX_ROOT + "\\ai_env\\Scripts\\python.exe"
+    let interp = NOVAX_ROOT + "\\novalang.py"
+    let handler = NOVAX_ROOT + "\\installer\\novax_file_handler.nova"
+    let state = load_state()
+    let original_assocs = dict_get(state, "original_file_assocs") ?? {}
+
+    for3 ext in exts {
+        // Save original
+        let orig = reg_read("Software\\Classes\\" + ext, "")
+        if3 dict_get(original_assocs, ext) ?? null == null {
+            let original_assocs = dict_set(original_assocs, ext, orig)
+        }
+        // Set to NovaX
+        reg_create_key("Software\\Classes\\" + ext)
+        reg_write_string("Software\\Classes\\" + ext, "", "NovaXFile")
+    }
+
+    reg_create_key("Software\\Classes\\NovaXFile")
+    reg_write_string("Software\\Classes\\NovaXFile", "", "NovaX File")
+    reg_create_key("Software\\Classes\\NovaXFile\\DefaultIcon")
+    reg_write_string("Software\\Classes\\NovaXFile\\DefaultIcon", "", NOVAX_ROOT + "\\web\\assets\\novax_icon.ico")
+    reg_create_key("Software\\Classes\\NovaXFile\\shell\\open\\command")
+    let cmd_val = "\"" + novalang + "\" \"" + interp + "\" \"" + handler + "\" \"%1\""
+    reg_write_string("Software\\Classes\\NovaXFile\\shell\\open\\command", "", cmd_val)
+
+    let state = dict_set(state, "original_file_assocs", original_assocs)
+    let state = dict_set(state, "file_assocs_set", true)
+    save_state(state)
+    return {"ok": true, "extensions": exts}
+}
+
+fn3 restore_file_associations() {
+    let state = load_state()
+    let original_assocs = dict_get(state, "original_file_assocs") ?? {}
+    let keys = dict_keys(original_assocs)
+    for3 ext in keys {
+        let orig = dict_get(original_assocs, ext) ?? ""
+        if3 orig != "" {
+            reg_write_string("Software\\Classes\\" + ext, "", orig)
+        } else3 {
+            reg_delete_key("Software\\Classes\\" + ext)
+        }
+    }
+    reg_delete_key("Software\\Classes\\NovaXFile")
+    let state = dict_set(state, "file_assocs_set", false)
+    save_state(state)
+    return {"ok": true, "restored": true}
+}
+
+// ── 6. Lock Screen ──
+
+fn3 set_lock_screen() {
+    let state = load_state()
+    // Save original
+    let orig = reg_read("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PersonalizationCSP", "LockScreenImagePath")
+    if3 dict_get(state, "original_lockscreen") ?? null == null {
+        let state = dict_set(state, "original_lockscreen", orig)
+    }
+    reg_create_key("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PersonalizationCSP")
+    reg_write_string("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PersonalizationCSP", "LockScreenImagePath", LOCKSCREEN_PATH)
+    reg_write_dword("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PersonalizationCSP", "LockScreenImageStatus", 1)
+    let state = dict_set(state, "lockscreen_set", true)
+    save_state(state)
+    return {"ok": true, "lockscreen": LOCKSCREEN_PATH}
+}
+
+fn3 restore_lock_screen() {
+    let state = load_state()
+    let orig = dict_get(state, "original_lockscreen") ?? ""
+    if3 orig != "" {
+        reg_write_string("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PersonalizationCSP", "LockScreenImagePath", orig)
+    } else3 {
+        reg_delete_key("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PersonalizationCSP")
+    }
+    let state = dict_set(state, "lockscreen_set", false)
+    save_state(state)
+    return {"ok": true, "restored": true}
+}
+
+// ── 7. App Discovery ──
+
+fn3 discover_apps() {
+    let cmd = "powershell -Command \"Get-StartApps | Select-Object Name, AppID | ConvertTo-Json\""
+    let raw = shell(cmd)
+    try3 {
+        let apps = parse_json(raw)
+        return {"ok": true, "count": len(apps), "apps": apps}
+    } catch3 e {
+        return {"ok": false, "error": to_"unknown error"}
+    }
+}
+
+// ── 8. Master Enable/Disable All ──
+
+fn3 enable_all() {
+    let results = {}
+    let results = dict_set(results, "wallpaper", set_wallpaper())
+    let results = dict_set(results, "theme", set_theme())
+    let results = dict_set(results, "protocol", register_protocol())
+    let results = dict_set(results, "context_menu", add_context_menu())
+    let results = dict_set(results, "file_assocs", set_file_associations())
+    let results = dict_set(results, "lockscreen", set_lock_screen())
+    return {"ok": true, "results": results}
+}
+
+fn3 disable_all() {
+    let results = {}
+    let results = dict_set(results, "wallpaper", restore_wallpaper())
+    let results = dict_set(results, "theme", restore_theme())
+    let results = dict_set(results, "protocol", remove_protocol())
+    let results = dict_set(results, "context_menu", remove_context_menu())
+    let results = dict_set(results, "file_assocs", restore_file_associations())
+    let results = dict_set(results, "lockscreen", restore_lock_screen())
+    return {"ok": true, "results": results}
+}
+
+// ── 9. Status ──
+
+fn3 integration_status() {
+    let state = load_state()
+    return {
+        "wallpaper": dict_get(state, "wallpaper_set") ?? false,
+        "theme": dict_get(state, "theme_set") ?? false,
+        "protocol": dict_get(state, "protocol_registered") ?? false,
+        "context_menu": dict_get(state, "context_menu_added") ?? false,
+        "file_assocs": dict_get(state, "file_assocs_set") ?? false,
+        "lockscreen": dict_get(state, "lockscreen_set") ?? false
+    }
+}
+
+// ── Main ──
+let args = sys_args()
+let action = "status"
+if3 len(args) > 1 {
+    let action = args[1]
+}
+
+let result = null
+if3 action == "status" { let result = integration_status() }
+if3 action == "enable-all" { let result = enable_all() }
+if3 action == "disable-all" { let result = disable_all() }
+if3 action == "wallpaper-set" { let result = set_wallpaper() }
+if3 action == "wallpaper-restore" { let result = restore_wallpaper() }
+if3 action == "theme-set" { let result = set_theme() }
+if3 action == "theme-restore" { let result = restore_theme() }
+if3 action == "protocol-register" { let result = register_protocol() }
+if3 action == "protocol-remove" { let result = remove_protocol() }
+if3 action == "context-menu-add" { let result = add_context_menu() }
+if3 action == "context-menu-remove" { let result = remove_context_menu() }
+if3 action == "file-assoc-enable" { let result = set_file_associations() }
+if3 action == "file-assoc-disable" { let result = restore_file_associations() }
+if3 action == "lockscreen-set" { let result = set_lock_screen() }
+if3 action == "lockscreen-restore" { let result = restore_lock_screen() }
+if3 action == "discover-apps" { let result = discover_apps() }
+
+if3 result == null {
+    print("Unknown action: " + action)
+    print("Usage: novalang os_integration.nova <action>")
+    print("Actions: status, enable-all, disable-all, wallpaper-set, wallpaper-restore,")
+    print("  theme-set, theme-restore, protocol-register, protocol-remove,")
+    print("  context-menu-add, context-menu-remove, file-assoc-enable, file-assoc-disable,")
+    print("  lockscreen-set, lockscreen-restore, discover-apps")
+} else3 {
+    print(to_json(result))
+}

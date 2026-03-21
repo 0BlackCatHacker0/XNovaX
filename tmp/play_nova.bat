@@ -1,0 +1,1 @@
+powershell -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName PresentationCore; $p = New-Object System.Windows.Media.MediaPlayer; $p.Open([Uri]\"C:\NovaX\tmp\nova_speak.mp3\"); $p.Volume = 1.0; Start-Sleep -Milliseconds 500; $p.Play(); Start-Sleep -Seconds 15; $p.Close()"

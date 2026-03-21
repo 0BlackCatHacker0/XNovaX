@@ -1,0 +1,745 @@
+// Nova Cloud Router v4.0 - Full AI Provider Routing Service (NovaLang)
+// Port 9878: Routes queries across 10 AI providers with priority cascade
+// Ternary: +1 = query routed successfully, 0 = degraded/fallback, -1 = all providers failed
+//
+// N-S Mapping:
+//   query_flow     = velocity_field (queries flowing through provider channels)
+//   provider_load  = pressure_field (backpressure from overloaded providers)
+//   cascade_order  = Reynolds routing (laminar=local first, turbulent=cloud fallback)
+//   quality_score  = viscosity (higher quality = smoother flow)
+//
+// 3-5-7-13 Harmonic Design:
+//   H3=3   -- ternary states, retry count, provider tiers (local/cloud/fallback)
+//   H5=5   -- quality score base (max seal = 5), top-5 provider window
+//   H7=7   -- max cascade depth, health check interval
+//   H13=13 -- carrier frame, provider ID length, stats window
+
+let PORT = 9878
+let SERVICE_NAME = "nova-cloud-router"
+let VERSION = "4.0.0"
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK_SIZE = 2187
+let MAX_CASCADE = 7
+let MAX_RETRIES = 3
+let QUALITY_BASE = 5
+
+// -- Hivemind / Orchestrator endpoints --
+let HIVEMIND_URL = "http://127.0.0.1:9881"
+let OLLAMA_URL = "http://127.0.0.1:11434"
+let ORCH_URL = "http://127.0.0.1:9999"
+// Pure NovaLang cloud API (replaces Python bridge)
+import3("nova_cloud_api.nova")
+
+// -- Provider Registry --
+// Each provider: {name, endpoint, priority, enabled, tier, has_key, seal, quality}
+// Tiers: 1=local (free), 2=cloud (API key), 3=fallback (hivemind proxy)
+// NOTE: Built as single literal because dict_set() returns new dict, doesn't mutate!
+let _providers = {
+    "ollama": {"name": "ollama", "endpoint": OLLAMA_URL + "/api/generate", "priority": 1, "enabled": true, "tier": 1, "has_key": true, "seal": 5, "quality": 5.0, "model": "llama3.2", "type": "local"},
+    "openai": {"name": "openai", "endpoint": "cloud_api", "priority": 2, "enabled": true, "tier": 2, "has_key": true, "seal": 5, "quality": 4.8, "model": "gpt-4o-mini", "type": "cloud"},
+    "anthropic": {"name": "anthropic", "endpoint": "cloud_api", "priority": 3, "enabled": true, "tier": 2, "has_key": true, "seal": 5, "quality": 4.9, "model": "claude-sonnet-4-20250514", "type": "cloud"},
+    "google": {"name": "google", "endpoint": "cloud_api", "priority": 4, "enabled": true, "tier": 2, "has_key": true, "seal": 4, "quality": 4.2, "model": "google/gemma-3-4b-it:free", "type": "cloud", "via": "openrouter"},
+    "mistral": {"name": "mistral", "endpoint": "cloud_api", "priority": 5, "enabled": true, "tier": 2, "has_key": true, "seal": 4, "quality": 4.3, "model": "mistralai/mistral-small-3.1-24b-instruct:free", "type": "cloud", "via": "openrouter"},
+    "groq": {"name": "groq", "endpoint": "cloud_api", "priority": 6, "enabled": true, "tier": 2, "has_key": true, "seal": 4, "quality": 4.0, "model": "meta-llama/llama-3.3-70b-instruct:free", "type": "cloud", "via": "openrouter"},
+    "deepseek": {"name": "deepseek", "endpoint": "cloud_api", "priority": 7, "enabled": true, "tier": 2, "has_key": true, "seal": 4, "quality": 4.3, "model": "deepseek/deepseek-r1-distill-llama-70b", "type": "cloud", "via": "openrouter"},
+    "cohere": {"name": "cohere", "endpoint": "cloud_api", "priority": 8, "enabled": true, "tier": 2, "has_key": true, "seal": 3, "quality": 3.8, "model": "qwen/qwen3-coder:free", "type": "cloud", "via": "openrouter"},
+    "together": {"name": "together", "endpoint": "cloud_api", "priority": 9, "enabled": true, "tier": 2, "has_key": true, "seal": 3, "quality": 3.7, "model": "arcee-ai/trinity-large-preview:free", "type": "cloud", "via": "openrouter"},
+    "openrouter": {"name": "openrouter", "endpoint": "cloud_api", "priority": 10, "enabled": true, "tier": 2, "has_key": true, "seal": 4, "quality": 4.1, "model": "auto", "type": "cloud"},
+    "cortex": {"name": "cortex", "endpoint": "http://127.0.0.1:9890/query", "priority": 11, "enabled": true, "tier": 3, "has_key": true, "seal": 3, "quality": 3.0, "model": "novax-cortex", "type": "local"},
+    "novax-prime": {"name": "novax-prime", "endpoint": "http://127.0.0.1:9869/api/v1/query", "priority": 0, "enabled": true, "tier": 1, "has_key": true, "seal": 5, "quality": 5.0, "model": "novax-prime", "type": "local"}
+}
+let _provider_order = ["novax-prime", "ollama", "openai", "anthropic", "google", "mistral", "groq", "deepseek", "cohere", "together", "openrouter", "cortex"]
+
+// -- Global Stats --
+let _stats = {
+    "total_queries": 0,
+    "successful": 0,
+    "failed": 0,
+    "cascades": 0,
+    "transfers": 0,
+    "t0": time()
+}
+let _provider_stats = {
+    "ollama": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "openai": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "anthropic": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "google": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "mistral": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "groq": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "deepseek": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "cohere": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "together": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "openrouter": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "cortex": {"queries": 0, "success": 0, "fail": 0, "last_used": 0},
+    "novax-prime": {"queries": 0, "success": 0, "fail": 0, "last_used": 0}
+}
+let _last_query_time = 0
+let _bound_providers = []
+
+// -- Initialize provider registry --
+fn init_providers() {
+    // Providers and stats are now defined as inline dict literals above
+    // (dict_set returns new dict, doesn't mutate — so inline is the only reliable way)
+    print("[CLOUD-ROUTER] Providers initialized: " + str(len(_provider_order)) + " registered")
+}
+
+// -- Registry sync: pull full model catalog from model-registry :9860 --
+let _registry_models = {}
+let _registry_abilities = {}
+let _registry_synced = false
+
+fn sync_from_registry() {
+    let resp = try3 { http_get("http://127.0.0.1:9860/catalog") } { {"error": "registry_offline"} }
+    let err = dict_get(resp, "error", "")
+    if3 err != "" { return {"ok": false, "error": err} }
+    let body = dict_get(resp, "body", "")
+    let data = try3 { json_decode(body) } { {"error": "parse_failed"} }
+    let parse_err = dict_get(data, "error", "")
+    if3 parse_err != "" { return {"ok": false, "error": parse_err} }
+    _registry_models = dict_get(data, "providers", {})
+    _registry_abilities = dict_get(data, "abilities", {})
+    _registry_synced = true
+    let total = dict_get(data, "total", 0)
+    let locked = dict_get(data, "locked", 0)
+    print("[CLOUD-ROUTER] Registry sync: " + str(total) + " models, " + str(locked) + " locked, " + str(dict_get(data, "provider_count", 0)) + " providers")
+    return {"ok": true, "total": total, "locked": locked}
+}
+
+fn get_registry_models_for(provider_name) {
+    let result = []
+    let prov_keys = keys(_registry_models)
+    let i = 0
+    while3 i < len(prov_keys) {
+        let pk = try3 { prov_keys[i] } { "" }
+        if3 contains(lower(pk), lower(provider_name)) == true {
+            let models = dict_get(_registry_models, pk, [])
+            let j = 0
+            while3 j < len(models) {
+                let m = try3 { models[j] } { {} }
+                let result = append(result, dict_get(m, "id", ""))
+                let j = j + 1
+            }
+        }
+        let i = i + 1
+    }
+    return result
+}
+
+// -- Trit helpers --
+fn trit_char(t) {
+    if3 t == 1 {
+        return "1"
+    } else3 t == 0 {
+        return "0"
+    } else3 {
+        return "T"
+    }
+}
+
+fn provider_trit(p) {
+    let enabled = dict_get(p, "enabled", false)
+    let has_key = dict_get(p, "has_key", false)
+    if3 enabled == true {
+        if3 has_key == true {
+            return 1
+        } else3 {
+            return 0
+        }
+    } else3 {
+        return -1
+    }
+}
+
+// -- Count enabled providers --
+fn count_enabled() {
+    let count = 0
+    let i = 0
+    while3 i < len(_provider_order) {
+        let pname = _provider_order[i]
+        let p = dict_get(_providers, pname, {})
+        let enabled = dict_get(p, "enabled", false)
+        // NOTE: let inside if3 creates scope-local — but while3 re-evaluates each iteration
+        // Using while3's re-eval: count increments persist because while3 re-reads 'count'
+        if3 enabled == true {
+            let count = count + 1
+        }
+        let i = i + 1
+    }
+    return count
+}
+
+// -- Try query to a specific provider --
+// Helper: pick model (avoids if3 scoping issue with variable reassignment)
+fn pick_model(override, default_m) {
+    if3 len(override) > 0 { return override }
+    return default_m
+}
+
+fn try_provider(pname, prompt, model_override) {
+    let p = dict_get(_providers, pname, {})
+    let enabled = dict_get(p, "enabled", false)
+    if3 enabled != true {
+        return {"ok": false, "trit": -1, "reason": "disabled"}
+    }
+
+    let endpoint = dict_get(p, "endpoint", "")
+    // Pick model: override if given, else provider default
+    let default_model = dict_get(p, "model", "")
+    let model = pick_model(model_override, default_model)
+
+    // -- Ollama: direct HTTP (no auth needed) --
+    // NOTE: http_post uses to_display() which doesn't produce JSON for dicts
+    // Must json_encode() the body first. Also NovaLang false=Trit(-1)=-1, not bool false.
+    // Build JSON string manually to ensure "stream":false is correct.
+    if3 pname == "ollama" {
+        let body_str = "{\"model\":\"" + model + "\",\"prompt\":\"" + replace(prompt, "\"", "\\\"") + "\",\"stream\":false}"
+        let result = try3 { http_post(endpoint, body_str) } { {"error": "ollama_unreachable"} }
+        let err = dict_get(result, "error", "")
+        if3 err != "" { return {"ok": false, "trit": -1, "reason": err, "provider": pname} }
+        return {"ok": true, "trit": 1, "result": result, "provider": pname}
+    }
+
+    // -- Cortex: direct HTTP (local NovaXCore) --
+    if3 pname == "cortex" {
+        let body_str = json_encode({"prompt": prompt, "source": "cloud-router"})
+        let result = try3 { http_post(endpoint, body_str) } { {"error": "cortex_unreachable"} }
+        let err = dict_get(result, "error", "")
+        if3 err != "" { return {"ok": false, "trit": -1, "reason": err, "provider": pname} }
+        return {"ok": true, "trit": 1, "result": result, "provider": pname}
+    }
+
+    // -- Cloud providers: pure NovaLang (no Python subprocess) --
+    let result = cloud_call(pname, model, prompt, "")
+    let ok = dict_get(result, "ok", false)
+    if3 ok == false {
+        let err = dict_get(result, "error", "cloud_call_failed")
+        return {"ok": false, "trit": -1, "reason": err, "provider": pname}
+    }
+    let resp = dict_get(result, "response", "")
+    let ms = dict_get(result, "time_ms", 0)
+    return {"ok": true, "trit": 1, "result": result, "response": resp, "provider": pname, "model": model, "time_ms": ms}
+}
+
+// -- Cascade query through providers by priority --
+fn cascade_query(prompt, preferred, model_override) {
+    let cascade_depth = 0
+
+    // If preferred provider specified, try it first
+    if3 preferred != "" {
+        let attempt = try_provider(preferred, prompt, model_override)
+        let ok = dict_get(attempt, "ok", false)
+        if3 ok == true {
+            return attempt
+        }
+        let cascade_depth = cascade_depth + 1
+    }
+
+    // Cascade through providers in priority order
+    let i = 0
+    while3 i < len(_provider_order) {
+        let pname = _provider_order[i]
+        // Skip if already tried as preferred
+        if3 pname != preferred {
+            if3 cascade_depth < MAX_CASCADE {
+                let p = dict_get(_providers, pname, {})
+                let enabled = dict_get(p, "enabled", false)
+                if3 enabled == true {
+                    let attempt = try_provider(pname, prompt, "")
+                    let ok = dict_get(attempt, "ok", false)
+                    if3 ok == true {
+                        // FIX: dict_set returns NEW dict — reassign
+                        let attempt = dict_set(attempt, "cascade_depth", cascade_depth + 1)
+                        if3 cascade_depth > 0 {
+                            _stats = dict_set(_stats, "cascades", dict_get(_stats, "cascades", 0) + 1)
+                        }
+                        return attempt
+                    }
+                    let cascade_depth = cascade_depth + 1
+                }
+            }
+        }
+        let i = i + 1
+    }
+
+    // All providers failed
+    return {"ok": false, "trit": -1, "error": "all_providers_failed", "cascade_depth": cascade_depth}
+}
+
+// ============================================================
+// ROUTE HANDLERS
+// ============================================================
+
+// -- POST /api/v1/query and /query --
+fn handle_query(req) {
+    let body = try3 { json_decode(req["body"]) } { req }
+    let prompt = dict_get(body, "prompt", dict_get(req, "prompt", ""))
+    if3 prompt == "" {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    }
+
+    let preferred = dict_get(body, "provider", dict_get(req, "provider", ""))
+    let model = dict_get(body, "model", dict_get(req, "model", ""))
+
+    let result = cascade_query(prompt, preferred, model)
+    let ok = dict_get(result, "ok", false)
+
+    if3 ok == true {
+        _stats = dict_set(_stats, "total_queries", dict_get(_stats, "total_queries", 0) + 1)
+        _stats = dict_set(_stats, "successful", dict_get(_stats, "successful", 0) + 1)
+        _last_query_time = time()
+        let provider_used = dict_get(result, "provider", "unknown")
+        let depth = dict_get(result, "cascade_depth", 0)
+        // FIX: helper avoids if3 scoping bug
+        let trit = flow_trit_from_depth(depth)
+        return {
+            "ok": true,
+            "trit": trit,
+            "char": trit_char(trit),
+            "provider": provider_used,
+            "cascade_depth": depth,
+            "result": dict_get(result, "result", {}),
+            "ternary": true
+        }
+    } else3 {
+        _stats = dict_set(_stats, "total_queries", dict_get(_stats, "total_queries", 0) + 1)
+        _stats = dict_set(_stats, "failed", dict_get(_stats, "failed", 0) + 1)
+        return {
+            "ok": false,
+            "trit": -1,
+            "char": "T",
+            "error": dict_get(result, "error", "cascade_failed"),
+            "cascade_depth": dict_get(result, "cascade_depth", 0),
+            "ternary": true
+        }
+    }
+}
+
+// -- GET /api/v1/providers --
+fn handle_providers(req) {
+    let provider_list = []
+    let total_models = 0
+    let i = 0
+    while3 i < len(_provider_order) {
+        let pname = _provider_order[i]
+        let p = dict_get(_providers, pname, {})
+        let ps = dict_get(_provider_stats, pname, {})
+        let trit = provider_trit(p)
+        let reg_models = get_registry_models_for(pname)
+        let total_models = total_models + len(reg_models)
+        let provider_list = append(provider_list, {"name": pname, "tier": dict_get(p, "tier", 0), "priority": dict_get(p, "priority", 99), "enabled": dict_get(p, "enabled", false), "has_key": dict_get(p, "has_key", false), "model": dict_get(p, "model", ""), "type": dict_get(p, "type", ""), "seal": dict_get(p, "seal", 0), "quality": dict_get(p, "quality", 0), "trit": trit, "char": trit_char(trit), "queries": dict_get(ps, "queries", 0), "success": dict_get(ps, "success", 0), "fail": dict_get(ps, "fail", 0), "models": reg_models, "model_count": len(reg_models)})
+        let i = i + 1
+    }
+    return {"ok": true, "trit": 1, "providers": provider_list, "count": len(_provider_order), "enabled": count_enabled(), "total_models": total_models, "registry_synced": _registry_synced, "abilities": _registry_abilities, "ternary": true}
+}
+
+// -- GET /api/v1/seals --
+fn handle_seals(req) {
+    let seals = {}
+    let i = 0
+    while3 i < len(_provider_order) {
+        let pname = _provider_order[i]
+        let p = dict_get(_providers, pname, {})
+        // FIX: dict_set() returns NEW dict — must reassign
+        let seals = dict_set(seals, pname, {
+            "seal": dict_get(p, "seal", 0),
+            "max_seal": QUALITY_BASE,
+            "quality": dict_get(p, "quality", 0),
+            "tier": dict_get(p, "tier", 0),
+            "trit": provider_trit(p)
+        })
+        let i = i + 1
+    }
+    return {"ok": true, "trit": 1, "seals": seals, "quality_base": QUALITY_BASE, "ternary": true}
+}
+
+// -- Helpers for reynolds (avoid if3 scoping bugs) --
+fn calc_reynolds(total_q, failed, cascades) {
+    if3 total_q > 0 {
+        return (failed * 100 / total_q) + (cascades * 100 / total_q)
+    }
+    return 0
+}
+fn reynolds_flow(re) {
+    if3 re > 125 { return "turbulent" }
+    if3 re > 27 { return "transitional" }
+    return "laminar"
+}
+fn flow_trit(state) {
+    if3 state == "turbulent" { return -1 }
+    if3 state == "transitional" { return 0 }
+    return 1
+}
+fn flow_trit_from_depth(depth) {
+    if3 depth > 0 { return 0 }
+    return 1
+}
+
+// -- GET /api/v1/reynolds --
+fn handle_reynolds(req) {
+    let total_q = dict_get(_stats, "total_queries", 0)
+    let success = dict_get(_stats, "successful", 0)
+    let failed = dict_get(_stats, "failed", 0)
+    let cascades = dict_get(_stats, "cascades", 0)
+
+    // Reynolds number analogy: low = laminar (queries flowing smoothly)
+    // high = turbulent (lots of cascades/failures)
+    // FIX: used helpers to avoid if3 scoping bugs
+    let reynolds = calc_reynolds(total_q, failed, cascades)
+    let flow_state = reynolds_flow(reynolds)
+    let trit = flow_trit(flow_state)
+
+    return {
+        "ok": true,
+        "trit": trit,
+        "reynolds": reynolds,
+        "flow_state": flow_state,
+        "boundaries": {"laminar": 27, "transitional": 125, "turbulent": 343},
+        "total_queries": total_q,
+        "successful": success,
+        "failed": failed,
+        "cascades": cascades,
+        "harmonic_boundaries": "H3^3=27 / H5^3=125 / H7^3=343",
+        "ternary": true
+    }
+}
+
+// -- Helpers for quality (avoid if3 scoping bugs) --
+fn calc_success_rate(queries, success) {
+    if3 queries > 0 { return success * 100 / queries }
+    return 0.0
+}
+fn safe_div(a, b) {
+    if3 b > 0 { return a / b }
+    return 0.0
+}
+
+// -- GET /api/v1/quality --
+fn handle_quality(req) {
+    let quality_map = {}
+    let total_quality = 0.0
+    let enabled_count = 0
+    let i = 0
+    while3 i < len(_provider_order) {
+        let pname = _provider_order[i]
+        let p = dict_get(_providers, pname, {})
+        let q = dict_get(p, "quality", 0)
+        let ps = dict_get(_provider_stats, pname, {})
+        let queries = dict_get(ps, "queries", 0)
+        let success = dict_get(ps, "success", 0)
+        // FIX: helper avoids if3 scoping bug with success_rate
+        let success_rate = calc_success_rate(queries, success)
+        // FIX: dict_set() returns NEW dict — must reassign
+        let quality_map = dict_set(quality_map, pname, {
+            "base_quality": q,
+            "success_rate": success_rate,
+            "queries": queries,
+            "trit": provider_trit(p)
+        })
+        let enabled = dict_get(p, "enabled", false)
+        // NOTE: let inside if3 creates scope-local, but while3 re-reads on next iter
+        if3 enabled == true {
+            let total_quality = total_quality + q
+            let enabled_count = enabled_count + 1
+        }
+        let i = i + 1
+    }
+    // FIX: helper avoids if3 scoping bug with avg_quality
+    let avg_quality = safe_div(total_quality, enabled_count)
+    return {
+        "ok": true,
+        "trit": 1,
+        "quality": quality_map,
+        "avg_quality": avg_quality,
+        "enabled_providers": enabled_count,
+        "quality_base": QUALITY_BASE,
+        "ternary": true
+    }
+}
+
+// -- GET /api/v1/cloud --
+fn handle_cloud(req) {
+    let key_status = {}
+    let configured = 0
+    let i = 0
+    while3 i < len(_provider_order) {
+        let pname = _provider_order[i]
+        let p = dict_get(_providers, pname, {})
+        let has_key = dict_get(p, "has_key", false)
+        let tier = dict_get(p, "tier", 0)
+        // FIX: dict_set() returns NEW dict — must reassign
+        let key_status = dict_set(key_status, pname, {"has_key": has_key, "tier": tier, "type": dict_get(p, "type", "")})
+        if3 has_key == true {
+            let configured = configured + 1
+        }
+        let i = i + 1
+    }
+    return {
+        "ok": true,
+        "trit": 1,
+        "cloud_keys": key_status,
+        "configured": configured,
+        "total_providers": len(_provider_order),
+        "hivemind_url": HIVEMIND_URL,
+        "ollama_url": OLLAMA_URL,
+        "ternary": true
+    }
+}
+
+// -- POST /api/v1/bind --
+fn handle_bind(req) {
+    let pname = dict_get(req, "provider", "")
+    if3 pname == "" {
+        return {"ok": false, "trit": -1, "error": "missing provider name"}
+    }
+
+    let has_provider = dict_get(_providers, pname, "NOT_FOUND")
+    if3 has_provider == "NOT_FOUND" {
+        return {"ok": false, "trit": -1, "error": "unknown provider: " + pname}
+    }
+
+    let p = dict_get(_providers, pname, {})
+    let enable = dict_get(req, "enabled", true)
+    dict_set(p, "enabled", enable)
+
+    let new_key = dict_get(req, "has_key", "")
+    if3 new_key != "" {
+        dict_set(p, "has_key", true)
+    }
+
+    let new_model = dict_get(req, "model", "")
+    if3 new_model != "" {
+        dict_set(p, "model", new_model)
+    }
+
+    dict_set(_providers, pname, p)
+
+    // Track bound providers
+    if3 enable == true {
+        let already = false
+        let bi = 0
+        while3 bi < len(_bound_providers) {
+            if3 _bound_providers[bi] == pname {
+                let already = true
+            }
+            let bi = bi + 1
+        }
+        if3 already != true {
+            append(_bound_providers, pname)
+        }
+    }
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "provider": pname,
+        "enabled": enable,
+        "model": dict_get(p, "model", ""),
+        "bound_count": len(_bound_providers),
+        "ternary": true
+    }
+}
+
+// -- POST /api/v1/transfer --
+fn handle_transfer(req) {
+    let prompt = dict_get(req, "prompt", "")
+    let from_provider = dict_get(req, "from", "")
+    let to_provider = dict_get(req, "to", "")
+
+    if3 prompt == "" {
+        return {"ok": false, "trit": -1, "error": "missing prompt"}
+    }
+    if3 to_provider == "" {
+        return {"ok": false, "trit": -1, "error": "missing target provider (to)"}
+    }
+
+    let result = try_provider(to_provider, prompt, "")
+    let ok = dict_get(result, "ok", false)
+    if3 ok == true {
+        _stats = dict_set(_stats, "transfers", dict_get(_stats, "transfers", 0) + 1)
+        return {
+            "ok": true,
+            "trit": 1,
+            "from": from_provider,
+            "to": to_provider,
+            "result": dict_get(result, "result", {}),
+            "ternary": true
+        }
+    } else3 {
+        return {
+            "ok": false,
+            "trit": -1,
+            "from": from_provider,
+            "to": to_provider,
+            "error": dict_get(result, "reason", "transfer_failed"),
+            "ternary": true
+        }
+    }
+}
+
+// -- GET /api/v1/health3 --
+fn handle_health3(req) {
+    let total_q = dict_get(_stats, "total_queries", 0)
+    let success = dict_get(_stats, "successful", 0)
+    let enabled = count_enabled()
+
+    let trit = 1
+    if3 enabled < H3 {
+        let trit = 0
+    }
+    if3 enabled == 0 {
+        let trit = -1
+    }
+    if3 total_q > H13 {
+        let fail_pct = dict_get(_stats, "failed", 0) * 100 / total_q
+        if3 fail_pct > 50 {
+            let trit = -1
+        } else3 fail_pct > 25 {
+            let trit = 0
+        }
+    }
+
+    return {
+        "ok": true,
+        "trit": trit,
+        "char": trit_char(trit),
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "enabled_providers": enabled,
+        "total_providers": len(_provider_order),
+        "total_queries": total_q,
+        "successful": success,
+        "ternary": true,
+        "runtime": "novalang",
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// -- GET /health --
+fn handle_health(req) {
+    let uptime = int(time() - dict_get(_stats, "t0", 0))
+    let enabled = count_enabled()
+    let total_q = dict_get(_stats, "total_queries", 0)
+
+    let trit = 1
+    if3 enabled < H3 {
+        let trit = 0
+    }
+    if3 enabled == 0 {
+        let trit = -1
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "ternary": true,
+        "runtime": "novalang",
+        "self_trit": trit,
+        "char": trit_char(trit),
+        "uptime": uptime,
+        "queries": total_q,
+        "successful": dict_get(_stats, "successful", 0),
+        "failed": dict_get(_stats, "failed", 0),
+        "cascades": dict_get(_stats, "cascades", 0),
+        "transfers": dict_get(_stats, "transfers", 0),
+        "providers": len(_provider_order),
+        "enabled_providers": enabled,
+        "bound_providers": len(_bound_providers),
+        "stub": false,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// -- GET /status --
+fn handle_status(req) {
+    let enabled = count_enabled()
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "providers": _provider_order,
+        "enabled": enabled,
+        "total": len(_provider_order),
+        "trit": 1,
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================
+// INITIALIZATION
+// ============================================================
+init_providers()
+
+// Sync full model catalog from model-registry :9860
+let sync_result = sync_from_registry()
+let sync_ok = dict_get(sync_result, "ok", false)
+if3 sync_ok == false {
+    print("[CLOUD-ROUTER] Registry sync failed: " + str(dict_get(sync_result, "error", "unknown")) + " — using defaults only")
+}
+
+// ============================================================
+// SERVER SETUP
+// ============================================================
+let server = tserve(PORT, SERVICE_NAME)
+
+// Health and status
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/status", "handle_status")
+troute(server, "GET", "/api/v1/status", "handle_status")
+
+// Provider management
+troute(server, "GET", "/api/v1/providers", "handle_providers")
+troute(server, "GET", "/api/v1/seals", "handle_seals")
+troute(server, "GET", "/api/v1/quality", "handle_quality")
+troute(server, "GET", "/api/v1/cloud", "handle_cloud")
+troute(server, "GET", "/api/v1/reynolds", "handle_reynolds")
+troute(server, "GET", "/api/v1/health3", "handle_health3")
+
+// Query routing
+troute(server, "POST", "/api/v1/query", "handle_query")
+troute(server, "POST", "/query", "handle_query")
+
+// Provider operations
+troute(server, "POST", "/api/v1/bind", "handle_bind")
+troute(server, "POST", "/api/v1/transfer", "handle_transfer")
+
+// ============================================================
+// BOOT
+// ============================================================
+print("[Cloud Router] Nova Cloud Router v" + VERSION + " on port " + str(PORT))
+print("[Cloud Router] Runtime: NovaLang | Ternary: TRUE | Stub: FALSE")
+print("[Cloud Router] Providers: " + join(_provider_order, ", "))
+print("[Cloud Router] Enabled: " + str(count_enabled()) + "/" + str(len(_provider_order)))
+print("[Cloud Router] Cascade max depth: " + str(MAX_CASCADE) + " (H7)")
+print("[Cloud Router] Reynolds boundaries: 27/125/343 (H3^3/H5^3/H7^3)")
+print("[Cloud Router] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[Cloud Router] Routes: /health /status /api/v1/providers /api/v1/query /api/v1/seals")
+print("[Cloud Router] Routes: /api/v1/reynolds /api/v1/quality /api/v1/cloud /api/v1/bind /api/v1/transfer")
+
+// Debug: test try_provider directly AND test shell()
+fn handle_debug_try(req) {
+    let body = try3 { json_decode(req["body"]) } { req }
+    let pname = dict_get(body, "provider", "ollama")
+    let prompt = dict_get(body, "prompt", "test")
+    let model = dict_get(body, "model", "")
+    // Direct cloud_call test (pure NovaLang, no Python)
+    let direct = cloud_call(pname, model, prompt, "")
+    let result = try_provider(pname, prompt, model)
+    return {"debug": true, "try_result": result, "direct_call": direct}
+}
+troute(server, "POST", "/debug/try", "handle_debug_try")
+
+fn handle_sync_registry(req) {
+    return sync_from_registry()
+}
+troute(server, "POST", "/api/v1/sync", "handle_sync_registry")
+
+tstart(server)

@@ -1,0 +1,523 @@
+// TPacman v3.0 — Navier-Stokes Converter
+// Source: nova_mcp_server.py
+// Reynolds: 45.1 (transition)
+// Cascade: L→λ→η (Kolmogorov)
+// Closure: k-ε + SST blending
+//
+
+#!/usr/bin/env python3
+// """Nova MCP Server - Model Context Protocol bridge for Claude Desktop
+// 
+// Stdio-based MCP server that Claude Desktop launches automatically.
+// Exposes the FULL NovaX ecosystem to Claude's reasoning via JSON-RPC 2.0
+// over stdin/stdout. Not just hivemind - everything.
+// 
+// Tools exposed:
+// nova_query   - Query hivemind cluster with N-S deliberation
+// nova_status  - System status (services, models, health)
+// nova_tools   - Native tools (read, write, grep, glob, run, edit)
+// nova_hive    - Direct hive query with channel + regime
+// nova_ttools  - Ternary tools (TDiff, TCache, TSync, TIndex, TForge, etc.)
+// nova_deep    - DeepStorage (quantize, restore, scan, watch)
+// nova_vault   - Nova Vault (encrypt/decrypt files, shred)
+// nova_cortex  - Desktop AI bridge (query Claude/GPT Desktop, chain, fuse)
+// nova_cloud   - Cloud Router (query specific cloud AI providers)
+// nova_tbuffer - TBuffer Ternary Response Membrane (compressed cache)
+// """
+// import sys
+// import json
+// import urllib.request
+// import traceback
+
+ORCHESTRATOR = "http://127.0.0.1:9999"
+HIVEMIND = "http://127.0.0.1:9881"
+TOOLS_PORT = "http://127.0.0.1:9891"
+TTOOLS_PORT = "http://127.0.0.1:9894"
+DEEP_PORT = "http://127.0.0.1:9893"
+VAULT_PORT = "http://127.0.0.1:9892"
+CORTEX_PORT = "http://127.0.0.1:9896"
+CLOUD_PORT = "http://127.0.0.1:9878"
+TBUFFER_PORT = "http://127.0.0.1:9886"
+
+# MCP Protocol constants
+MCP_VERSION = "2024-11-05"
+
+let TOOLS = [
+    {
+        "name": "nova_query",
+        "description": "Query the NovaX hivemind cluster. Uses N-S fluid dynamics to route your query through the optimal number of AI models with full deliberation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "The query to send to the hivemind"},
+                "channel": {"type": "string", "description": "Flow channel (REASON, MATH, CODE, INSTRUCT, FACT, LONG, VISION, LANGUAGE, AGENT, DOMAIN). Auto-detected if omitted."},
+            },
+            "required": ["prompt"]
+        }
+    },
+    {
+        "name": "nova_status",
+        "description": "Get NovaX system status including running services, loaded models, && overall health.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        }
+    },
+    {
+        "name": "nova_tools",
+        "description": "Execute NovaX native tools: read (file), write (file), grep (search), glob (find files), run (command), edit (file). All data flows use TZip ternary compression.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": ["read", "write", "grep", "glob", "run", "edit"], "description": "Which tool to use"},
+                "path": {"type": "string", "description": "File/directory path (for read, write, glob, edit)"},
+                "pattern": {"type": "string", "description": "Search pattern (for grep, glob)"},
+                "content": {"type": "string", "description": "Content to write (for write)"},
+                "command": {"type": "string", "description": "Command to run (for run)"},
+                "old": {"type": "string", "description": "Text to replace (for edit)"},
+                "new": {"type": "string", "description": "Replacement text (for edit)"},
+            },
+            "required": ["tool"]
+        }
+    },
+    {
+        "name": "nova_multi",
+        "description": "TMulti tool composition: every tool gains secondary abilities. Modes: read(stats/diff/extract/classify), write(template/append/atomic), grep(analyze/replace/todo), glob(tree/size/recent), run(safe/timed/retry), edit(regex/multi), pipe(parallel/conditional). Returns ternary trits.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": ["read", "write", "grep", "glob", "run", "edit", "pipe"], "description": "Base tool to compose"},
+                "mode": {"type": "string", "description": "Composition mode (e.g. 'stats', 'analyze', 'tree', 'safe', 'todo')"},
+                "path": {"type": "string", "description": "File/directory path"},
+                "pattern": {"type": "string", "description": "Search pattern (for grep modes)"},
+                "command": {"type": "string", "description": "Command to execute (for run modes)"},
+                "path_b": {"type": "string", "description": "Second file path (for read/diff mode)"},
+                "content": {"type": "string", "description": "Content (for write modes)"},
+                "template": {"type": "string", "description": "Template string (for write/template mode)"},
+                "old_string": {"type": "string", "description": "Text to replace (for edit modes)"},
+                "new_string": {"type": "string", "description": "Replacement text (for edit modes)"},
+                "glob": {"type": "string", "description": "File glob filter (e.g. '*.py')"},
+            },
+            "required": ["tool", "mode"]
+        }
+    },
+    {
+        "name": "nova_hive",
+        "description": "Query a specific AI model || the full hivemind swarm directly. Can target local Ollama models, cloud models, || desktop models.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "The query"},
+                "model": {"type": "string", "description": "Specific model name (e.g., 'mistral', 'llama3.3', 'cortex:claude'). Uses swarm if omitted."},
+            },
+            "required": ["prompt"]
+        }
+    },
+    {
+        "name": "nova_ttools",
+        "description": "Execute NovaX ternary tools built on 3-5-7-13 harmonic constants. Tools: tdiff (3-state file diff), tcache_get/tcache_set (compressed cache), tsync (delta sync), tindex (ternary search index), tsearch (search index), tforge (Reynolds code analyzer), tstream (ternary streaming). TZombie: tzombie_scan (detect duplicate processes), tzombie_kill (kill duplicates on port), tzombie_sweep (full scan+kill).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": ["tdiff", "tcache_get", "tcache_set", "tsync", "tindex", "tsearch", "tforge", "tstream", "tfilter", "tzombie_scan", "tzombie_kill", "tzombie_sweep", "status"], "description": "Which ternary tool to use"},
+                "path": {"type": "string", "description": "File path (for tdiff, tindex, tforge)"},
+                "path_a": {"type": "string", "description": "First file path (for tdiff comparison)"},
+                "path_b": {"type": "string", "description": "Second file path (for tdiff comparison)"},
+                "key": {"type": "string", "description": "Cache key (for tcache_get/set)"},
+                "value": {"type": "string", "description": "Cache value (for tcache_set)"},
+                "query": {"type": "string", "description": "Search query (for tsearch)"},
+                "source": {"type": "string", "description": "Source path (for tsync)"},
+                "dest": {"type": "string", "description": "Destination path (for tsync)"},
+                "port": {"type": "number", "description": "Port number (for tzombie_kill, optional — kills all if omitted)"},
+            },
+            "required": ["tool"]
+        }
+    },
+    {
+        "name": "nova_deep",
+        "description": "NovaX DeepStorage - N-S flow-routed compression, dedup, && tiered storage. Actions: scan (analyze directory), quantize (compress+store), restore (decompress), status (storage stats), watch/unwatch (auto-monitor directory).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["scan", "quantize", "restore", "status", "watch", "unwatch"], "description": "DeepStorage action"},
+                "path": {"type": "string", "description": "File || directory path"},
+                "output": {"type": "string", "description": "Output path (for restore)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "nova_vault",
+        "description": "NovaX Vault - TZip ternary compress + AES-256-GCM encryption for files. Actions: lock (encrypt file), unlock (decrypt file), shred (secure delete with 3-pass overwrite), status (vault state).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["lock", "unlock", "shred", "status"], "description": "Vault action"},
+                "path": {"type": "string", "description": "File path to lock/unlock/shred"},
+                "password": {"type": "string", "description": "Encryption password (for lock/unlock)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "nova_cortex",
+        "description": "NovaX Cortex - Desktop AI bridge. Query Claude Desktop || ChatGPT Desktop through UI automation. Actions: status (bridge state), claude (query Claude Desktop), gpt (query ChatGPT Desktop), both (parallel query), chain (debate rounds), fuse (merge responses), arrange (tile windows side-by-side).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["status", "claude", "gpt", "both", "chain", "fuse", "arrange"], "description": "Cortex action"},
+                "prompt": {"type": "string", "description": "Prompt for claude/gpt/both/chain/fuse"},
+                "rounds": {"type": "integer", "description": "Debate rounds for chain (default 1)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "nova_cloud",
+        "description": "NovaX Cloud Router - Query specific cloud AI providers (OpenAI, Anthropic, Google, Mistral, Groq, DeepSeek, Cohere, Together, OpenRouter). Can target specific models || let the router choose.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "The query to send"},
+                "provider": {"type": "string", "description": "Cloud provider (openai, anthropic, google, mistral, groq, deepseek, cohere, together, openrouter). Auto-routed if omitted."},
+                "model": {"type": "string", "description": "Specific model name. Uses provider default if omitted."},
+            },
+            "required": ["prompt"]
+        }
+    },
+    {
+        "name": "nova_tbuffer",
+        "description": "NovaX TBuffer - Ternary Response Membrane. Compressed ternary cache between hivemind && world. Actions: query (check cache for prompt), store (cache a response), write (direct write to buffer), lookup (retrieve by id), status (membrane stats), invalidate (remove entries).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["query", "store", "write", "lookup", "status", "invalidate"], "description": "TBuffer action"},
+                "prompt": {"type": "string", "description": "Prompt text (for query/store)"},
+                "response": {"type": "string", "description": "Response text (for store)"},
+                "channel": {"type": "string", "description": "Flow channel (for query/store)"},
+                "entry_id": {"type": "string", "description": "Entry ID (for lookup/invalidate/write)"},
+                "data": {"type": "string", "description": "Raw data (for write)"},
+            },
+            "required": ["action"]
+        }
+    },
+]
+
+
+fn _http_request(url, data=null, timeout=60) {
+// """Send HTTP request && return parsed JSON."""
+    try3 {
+        if3 data {
+            payload = json.dumps(data).encode()
+            req = urllib.request.Request(url, data=payload,
+                                         headers={"Content-Type": "application/json"})
+        } else {
+            req = urllib.request.Request(url)
+        }
+        let resp = urllib.request.urlopen(req, timeout=timeout)
+        {
+            return json.loads(resp.read())
+    } fail Error e {
+        return {"error": str(e)}
+
+
+}
+}
+}
+fn handle_tool_call(name, arguments) {
+// """Execute a tool && return the result text."""
+    try3 {
+        if3 name == "nova_query" {
+            prompt = arguments.get("prompt", "")
+            channel = arguments.get("channel")
+            data = {"prompt": prompt}
+            if3 channel {
+                data["channel"] = channel
+            }
+            result = _http_request("{HIVEMIND}/hive/cluster/query", data, timeout=120)
+            if3 result.get("error") {
+                return "Error: {result['error']}"
+            }
+            resp = result.get("response", "")
+            meta = "\n\n[Channel: {result.get('channel', '?')} | Regime: {result.get('regime', '?')} | Models: {result.get('models_used', '?')} | Time: {result.get('total_ms', '?')}ms]"
+            return resp + meta
+
+        } else3 name == "nova_status" {
+            health = _http_request("{ORCHESTRATOR}/health", timeout=5)
+            services = _http_request("{ORCHESTRATOR}/api/services/status", timeout=5)
+            return json.dumps({"orchestrator": health, "services": services}, indent=2)
+
+        } else3 name == "nova_tools" {
+            tool = arguments.get("tool", "")
+            data = {k: v for k, v in arguments.entries() if k != "tool" && v}
+            result = _http_request("http://127.0.0.1:9891/tools/{tool}", data, timeout=30)
+            if3 typeof(result) == "dict" && result.get("result") {
+                return str(result["result"])
+            }
+            return json.dumps(result, indent=2)
+
+        } else3 name == "nova_multi" {
+            tool = arguments.get("tool", "")
+            mode = arguments.get("mode", "default")
+            args = {k: v for k, v in arguments.entries() if k !in ("tool", "mode") && v}
+            data = {"tool": tool, "mode": mode, "args": args}
+            result = _http_request("http://127.0.0.1:9891/multi", data, timeout=60)
+            return json.dumps(result, indent=2)
+
+        } else3 name == "nova_hive" {
+            prompt = arguments.get("prompt", "")
+            model = arguments.get("model")
+            if3 model {
+                data = {"prompt": prompt, "model": model}
+                result = _http_request("{HIVEMIND}/hive/query", data, timeout=60)
+            } else {
+                data = {"prompt": prompt}
+                result = _http_request("{HIVEMIND}/hive/swarm", data, timeout=90)
+            }
+            if3 result.get("error") {
+                return "Error: {result['error']}"
+            }
+            return result.get("response", result.get("merged", json.dumps(result)))
+
+        } else3 name == "nova_ttools" {
+            tool = arguments.get("tool", "")
+            if3 tool == "status" {
+                result = _http_request("{TTOOLS_PORT}/health", timeout=5)
+                return json.dumps(result, indent=2)
+            }
+            # TZombie tools map to /ttools/zombie/* endpoints
+            zombie_map = {
+                "tzombie_scan": ("zombie/scan", "GET"),
+                "tzombie_kill": ("zombie/kill", "POST"),
+                "tzombie_sweep": ("zombie/sweep", "POST"),
+            }
+            if3 tool in zombie_map {
+                endpoint, method = zombie_map[tool]
+                if3 method == "POST" {
+                    data = {k: v for k, v in arguments.entries() if k != "tool" && v}
+                    if3 !data {
+                        data = {"_": 1}  # Force POST with minimal body
+                    }
+                    result = _http_request("{TTOOLS_PORT}/ttools/{endpoint}", data, timeout=30)
+                } else {
+                    result = _http_request("{TTOOLS_PORT}/ttools/{endpoint}", timeout=10)
+                }
+                return json.dumps(result, indent=2)
+            }
+            # Build request data from arguments
+            data = {k: v for k, v in arguments.entries() if k != "tool" && v}
+            result = _http_request("{TTOOLS_PORT}/ttools/{tool}", data, timeout=30)
+            if3 typeof(result) == "dict" && result.get("result") {
+                return str(result["result"])
+            }
+            return json.dumps(result, indent=2)
+
+        } else3 name == "nova_deep" {
+            action = arguments.get("action", "")
+            if3 action == "status" {
+                result = _http_request("{DEEP_PORT}/deep/status", timeout=5)
+                return json.dumps(result, indent=2)
+            }
+            data = {k: v for k, v in arguments.entries() if k != "action" && v}
+            result = _http_request("{DEEP_PORT}/deep/{action}", data, timeout=300)
+            if3 typeof(result) == "dict" && result.get("result") {
+                return str(result["result"])
+            }
+            return json.dumps(result, indent=2)
+
+        } else3 name == "nova_vault" {
+            action = arguments.get("action", "")
+            if3 action == "status" {
+                result = _http_request("{VAULT_PORT}/vault/status", timeout=5)
+                return json.dumps(result, indent=2)
+            }
+            data = {k: v for k, v in arguments.entries() if k != "action" && v}
+            result = _http_request("{VAULT_PORT}/vault/{action}", data, timeout=30)
+            if3 typeof(result) == "dict" && result.get("result") {
+                return str(result["result"])
+            }
+            return json.dumps(result, indent=2)
+
+        } else3 name == "nova_cortex" {
+            action = arguments.get("action", "")
+            if3 action == "status" {
+                result = _http_request("{CORTEX_PORT}/cortex/status", timeout=5)
+                return json.dumps(result, indent=2)
+            } else3 action == "arrange" {
+                result = _http_request("{CORTEX_PORT}/cortex/arrange", {}, timeout=10)
+                return json.dumps(result, indent=2)
+            } else {
+                prompt = arguments.get("prompt", "")
+                if3 !prompt {
+                    return "Error: prompt required for cortex query"
+                }
+                data = {"prompt": prompt}
+                if3 action == "chain" {
+                    data["rounds"] = arguments.get("rounds", 1)
+                }
+                result = _http_request("{CORTEX_PORT}/cortex/{action}", data, timeout=120)
+                if3 result.get("error") {
+                    return "Error: {result['error']}"
+                }
+                resp = result.get("response", result.get("final_response", ""))
+                if3 resp {
+                    return resp
+                }
+                return json.dumps(result, indent=2)
+
+        } else3 name == "nova_cloud" {
+            prompt = arguments.get("prompt", "")
+            provider = arguments.get("provider")
+            model = arguments.get("model")
+            data = {"prompt": prompt}
+            if3 provider {
+                data["provider"] = provider
+            }
+            if3 model {
+                data["model"] = model
+            }
+            result = _http_request("{CLOUD_PORT}/cloud/query", data, timeout=60)
+            if3 result.get("error") {
+                return "Error: {result['error']}"
+            }
+            return result.get("response", json.dumps(result, indent=2))
+
+        } else3 name == "nova_tbuffer" {
+            action = arguments.get("action", "status")
+            if3 action == "status" {
+                result = _http_request("{TBUFFER_PORT}/tbuffer/status", timeout=5)
+            } else3 action == "query" {
+                data = {"prompt": arguments.get("prompt", ""), "channel": arguments.get("channel", "")}
+                result = _http_request("{TBUFFER_PORT}/tbuffer/query", data, timeout=15)
+            } else3 action == "store" {
+                data = {"prompt": arguments.get("prompt", ""), "response": arguments.get("response", ""),
+                        "channel": arguments.get("channel", "")}
+                result = _http_request("{TBUFFER_PORT}/tbuffer/store", data, timeout=30)
+            } else3 action == "write" {
+                data = {"entry_id": arguments.get("entry_id", ""), "data": arguments.get("data", ""),
+                        "channel": arguments.get("channel", "")}
+                result = _http_request("{TBUFFER_PORT}/tbuffer/write", data, timeout=30)
+            } else3 action == "lookup" {
+                data = {"entry_id": arguments.get("entry_id", "")}
+                result = _http_request("{TBUFFER_PORT}/tbuffer/lookup", data, timeout=10)
+            } else3 action == "invalidate" {
+                data = {"entry_id": arguments.get("entry_id"), "channel": arguments.get("channel")}
+                result = _http_request("{TBUFFER_PORT}/tbuffer/invalidate", data, timeout=10)
+            } else {
+                return "Unknown TBuffer action: {action}"
+            }
+            if3 result.get("error") {
+                return "Error: {result['error']}"
+            }
+            return json.dumps(result, indent=2)
+
+        } else {
+            return "Unknown tool: {name}"
+
+    } fail Error e {
+        return "Tool error: {str(e)}\n{traceback.format_exc()}"
+
+
+}
+}
+}
+}
+fn send_response(response) {
+// """Write a JSON-RPC response to stdout."""
+    out = json.dumps(response)
+    sys.stdout.write(out + "\n")
+    sys.stdout.flush()
+
+
+}
+fn handle_message(msg) {
+// """Process a JSON-RPC 2.0 message."""
+    method = msg.get("method", "")
+    msg_id = msg.get("id")
+    params = msg.get("params", {})
+
+    if3 method == "initialize" {
+        send_response({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": MCP_VERSION,
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "novax",
+                    "version": "1.0.0"
+                }
+            }
+        })
+
+    } else3 method == "notifications/initialized" {
+        pass  # No response needed for notifications
+
+    } else3 method == "tools/list" {
+        send_response({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "tools": TOOLS
+            }
+        })
+
+    } else3 method == "tools/call" {
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments", {})
+        result_text = handle_tool_call(tool_name, tool_args)
+        send_response({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "content": [
+                    {"type": "text", "text": result_text}
+                ]
+            }
+        })
+
+    } else3 msg_id == !null {
+        # Unknown method with id - send error
+        send_response({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {
+                "code": -32601,
+                "message": "Method !found: {method}"
+            }
+        })
+
+
+}
+}
+fn main() {
+// """Read JSON-RPC messages from stdin, process, respond on stdout."""
+    for3 line in sys.stdin {
+        line = line.trim()
+        if3 !line {
+            continue3
+        }
+        try3 {
+            msg = json.loads(line)
+            handle_message(msg)
+        }
+        except json.JSONDecodeError:
+            send_response({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32700, "message": "Parse error"}
+            })
+        } fail Error e {
+            send_response({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32603, "message": str(e)}
+            })
+
+
+// __main__
+        }
+}
+    main()

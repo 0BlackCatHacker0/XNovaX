@@ -1,0 +1,769 @@
+// Nova TQueue v1.0 - Ternary Priority Job Queue
+// Port 9957: Async job processing with priority-based dequeuing
+//
+// 3-5-7-13 Harmonic Design:
+//   H3=3  -- max retries, backoff base (3^retry seconds)
+//   H5=5  -- timeout multiplier (H13*H5 = 65s job timeout)
+//   H7=7  -- cleaner interval, max_jobs = 3^7 = 2187
+//   H13=13 -- job ID length, carrier frame, timeout multiplier
+//
+// Priority encoding (ternary):
+//   +1 (TRUE)  = high priority
+//    0 (MAYBE) = normal priority
+//   -1 (FALSE) = low priority
+//
+// Job states (ternary):
+//   PENDING   = 0  (MAYBE)  -- waiting in queue
+//   CLAIMED   = 0  (MAYBE)  -- in-flight (transitional)
+//   COMPLETED = +1 (TRUE)   -- successfully processed
+//   FAILED    = -1 (FALSE)  -- failed (retry or dead-letter)
+//   DEAD      = -1 (FALSE)  -- exceeded max retries
+
+let PORT = 9957
+let server = tserve(PORT, "TQueue v1.0 - Ternary Priority Job Queue")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+
+let MAX_JOBS = 2187        // 3^7 = H7 composed
+let MAX_RETRIES = 3        // H3
+let JOB_TIMEOUT = 65       // H13 * H5
+let CLEANER_INTERVAL = 7   // H7 seconds
+let MAX_QUEUES = 343        // H7^H3
+
+// -- Global State --
+// _jobs: dict keyed by job_id, value = job record dict
+// _queues: dict keyed by queue_name, value = sorted list of job_ids
+// Priority buckets per queue: hi(+1), mid(0), lo(-1) each a list (FIFO)
+// Dequeue order: hi first, then mid, then lo
+let _jobs = {}
+let _queues = {}
+let _dead_letters = []
+let _seq = 0
+let _total_enqueued = 0
+let _total_completed = 0
+let _total_failed = 0
+let _total_dead = 0
+let _started_at = time()
+
+// -- Helpers --
+
+fn gen_job_id() {
+    let raw = uuid_hex()
+    return slice(raw, 0, 13)
+}
+
+fn now_ts() {
+    return time()
+}
+
+// Map integer priority to ternary slot name
+// Input: 1=high, 2=normal, 3=low  (submit convention from Python original)
+// Internally stored as trit: 1=hi, 0=mid, -1=lo
+fn priority_to_trit(p) {
+    if3 p == 1 {
+        return 1
+    } else p == 3 {
+        return -1
+    } else {
+        return 0
+    }
+}
+
+fn trit_to_priority(t) {
+    if3 t == 1 {
+        return 1
+    } else t == -1 {
+        return 3
+    } else {
+        return 2
+    }
+}
+
+fn state_trit(state) {
+    if3 state == "COMPLETED" {
+        return 1
+    } else state == "FAILED" {
+        return -1
+    } else state == "DEAD" {
+        return -1
+    } else {
+        return 0
+    }
+}
+
+// Ensure queue bucket structure exists for a queue name
+fn ensure_queue(qname) {
+    if3 dict_has(_queues, qname) {
+        return 1
+    } else {
+        let bucket = {"hi": [], "mid": [], "lo": []}
+        dict_set(_queues, qname, bucket)
+        return 0
+    }
+}
+
+// Push job_id into the correct priority bucket (FIFO within bucket)
+fn queue_push(qname, job_id, trit) {
+    ensure_queue(qname)
+    let bucket = dict_get(_queues, qname)
+    if3 trit == 1 {
+        let hi = dict_get(bucket, "hi")
+        append(hi, job_id)
+        dict_set(bucket, "hi", hi)
+    } else trit == -1 {
+        let lo = dict_get(bucket, "lo")
+        append(lo, job_id)
+        dict_set(bucket, "lo", lo)
+    } else {
+        let mid = dict_get(bucket, "mid")
+        append(mid, job_id)
+        dict_set(bucket, "mid", mid)
+    }
+    dict_set(_queues, qname, bucket)
+    return 1
+}
+
+// Pop next PENDING job_id from queue: hi first, then mid, then lo
+// Returns job_id string or "" if empty
+fn queue_pop(qname) {
+    if3 dict_has(_queues, qname) == 0 {
+        return ""
+    }
+    let bucket = dict_get(_queues, qname)
+
+    // Try hi bucket
+    let hi = dict_get(bucket, "hi")
+    while3 len(hi) > 0 {
+        let jid = slice(hi, 0, 1)
+        let jid = jid[0]
+        let hi = slice(hi, 1, len(hi))
+        dict_set(bucket, "hi", hi)
+        dict_set(_queues, qname, bucket)
+        // Verify job is still PENDING (skip stale)
+        if3 dict_has(_jobs, jid) {
+            let job = dict_get(_jobs, jid)
+            let st = dict_get(job, "state")
+            if3 st == "PENDING" {
+                return jid
+            } else {
+                // stale entry - loop continues
+            }
+        }
+    }
+
+    // Try mid bucket
+    let mid = dict_get(bucket, "mid")
+    while3 len(mid) > 0 {
+        let jid = slice(mid, 0, 1)
+        let jid = jid[0]
+        let mid = slice(mid, 1, len(mid))
+        dict_set(bucket, "mid", mid)
+        dict_set(_queues, qname, bucket)
+        if3 dict_has(_jobs, jid) {
+            let job = dict_get(_jobs, jid)
+            let st = dict_get(job, "state")
+            if3 st == "PENDING" {
+                return jid
+            }
+        }
+    }
+
+    // Try lo bucket
+    let lo = dict_get(bucket, "lo")
+    while3 len(lo) > 0 {
+        let jid = slice(lo, 0, 1)
+        let jid = jid[0]
+        let lo = slice(lo, 1, len(lo))
+        dict_set(bucket, "lo", lo)
+        dict_set(_queues, qname, bucket)
+        if3 dict_has(_jobs, jid) {
+            let job = dict_get(_jobs, jid)
+            let st = dict_get(job, "state")
+            if3 st == "PENDING" {
+                return jid
+            }
+        }
+    }
+
+    return ""
+}
+
+// Peek at next PENDING job_id without removing it
+fn queue_peek(qname) {
+    if3 dict_has(_queues, qname) == 0 {
+        return ""
+    }
+    let bucket = dict_get(_queues, qname)
+
+    let hi = dict_get(bucket, "hi")
+    let i = 0
+    while3 i < len(hi) {
+        let jid = hi[i]
+        if3 dict_has(_jobs, jid) {
+            let job = dict_get(_jobs, jid)
+            let st = dict_get(job, "state")
+            if3 st == "PENDING" {
+                return jid
+            }
+        }
+        let i = i + 1
+    }
+
+    let mid = dict_get(bucket, "mid")
+    let i = 0
+    while3 i < len(mid) {
+        let jid = mid[i]
+        if3 dict_has(_jobs, jid) {
+            let job = dict_get(_jobs, jid)
+            let st = dict_get(job, "state")
+            if3 st == "PENDING" {
+                return jid
+            }
+        }
+        let i = i + 1
+    }
+
+    let lo = dict_get(bucket, "lo")
+    let i = 0
+    while3 i < len(lo) {
+        let jid = lo[i]
+        if3 dict_has(_jobs, jid) {
+            let job = dict_get(_jobs, jid)
+            let st = dict_get(job, "state")
+            if3 st == "PENDING" {
+                return jid
+            }
+        }
+        let i = i + 1
+    }
+
+    return ""
+}
+
+// Count PENDING jobs in a queue (all buckets)
+fn queue_pending_count(qname) {
+    if3 dict_has(_queues, qname) == 0 {
+        return 0
+    }
+    let bucket = dict_get(_queues, qname)
+    let hi = dict_get(bucket, "hi")
+    let mid = dict_get(bucket, "mid")
+    let lo = dict_get(bucket, "lo")
+    let total = len(hi) + len(mid) + len(lo)
+    return total
+}
+
+// Count jobs per queue by state (returns dict)
+fn queue_state_counts(qname) {
+    let pending = 0
+    let claimed = 0
+    let completed = 0
+    let failed = 0
+    let dead = 0
+    let all_keys = keys(_jobs)
+    let i = 0
+    while3 i < len(all_keys) {
+        let jid = all_keys[i]
+        let job = dict_get(_jobs, jid)
+        let jq = dict_get(job, "queue")
+        if3 jq == qname {
+            let st = dict_get(job, "state")
+            if3 st == "PENDING" {
+                let pending = pending + 1
+            } else st == "CLAIMED" {
+                let claimed = claimed + 1
+            } else st == "COMPLETED" {
+                let completed = completed + 1
+            } else st == "FAILED" {
+                let failed = failed + 1
+            } else st == "DEAD" {
+                let dead = dead + 1
+            }
+        }
+        let i = i + 1
+    }
+    return {
+        "pending": pending,
+        "claimed": claimed,
+        "completed": completed,
+        "failed": failed,
+        "dead": dead
+    }
+}
+
+// Serialize a job for API response
+fn job_to_dict(job) {
+    let jid = dict_get(job, "job_id")
+    let q = dict_get(job, "queue")
+    let st = dict_get(job, "state")
+    let trit = state_trit(st)
+    let pri = dict_get(job, "priority")
+    let ret = dict_get(job, "retries")
+    let cat = dict_get(job, "created_at")
+    let lat = dict_get(job, "claimed_at")
+    let oat = dict_get(job, "completed_at")
+    let fat = dict_get(job, "failed_at")
+    let wrk = dict_get(job, "worker")
+    let pay = dict_get(job, "payload")
+    let res = dict_get(job, "result")
+    let err = dict_get(job, "error")
+    return {
+        "job_id": jid,
+        "queue": q,
+        "state": st,
+        "trit": trit,
+        "priority": pri,
+        "retries": ret,
+        "max_retries": MAX_RETRIES,
+        "created_at": cat,
+        "claimed_at": lat,
+        "completed_at": oat,
+        "failed_at": fat,
+        "worker": wrk,
+        "payload": pay,
+        "result": res,
+        "error": err
+    }
+}
+
+// -- Route Handlers --
+
+// POST /tqueue/enqueue -- submit a new job
+fn handle_enqueue(body) {
+    let qname = "default"
+    if3 dict_has(body, "queue") {
+        let qname = str(dict_get(body, "queue"))
+    }
+
+    let priority = 2
+    if3 dict_has(body, "priority") {
+        let priority = int(dict_get(body, "priority"))
+    }
+    // Clamp 1-3
+    if3 priority < 1 {
+        let priority = 1
+    }
+    if3 priority > 3 {
+        let priority = 3
+    }
+
+    let payload = {}
+    if3 dict_has(body, "payload") {
+        let payload = dict_get(body, "payload")
+    }
+
+    // Guard: max queues
+    let qcount = len(keys(_queues))
+    if3 dict_has(_queues, qname) == 0 {
+        if3 qcount >= MAX_QUEUES {
+            return {"ok": false, "trit": -1, "error": "max queues reached"}
+        }
+    }
+
+    // Guard: max jobs per queue
+    let pcount = queue_pending_count(qname)
+    if3 pcount >= MAX_JOBS {
+        return {"ok": false, "trit": -1, "error": "queue full"}
+    }
+
+    let job_id = gen_job_id()
+    let pri_trit = priority_to_trit(priority)
+    let created = now_ts()
+
+    let job = {
+        "job_id": job_id,
+        "queue": qname,
+        "payload": payload,
+        "priority": priority,
+        "pri_trit": pri_trit,
+        "state": "PENDING",
+        "retries": 0,
+        "created_at": created,
+        "claimed_at": 0,
+        "completed_at": 0,
+        "failed_at": 0,
+        "worker": "",
+        "result": {},
+        "error": ""
+    }
+
+    dict_set(_jobs, job_id, job)
+    queue_push(qname, job_id, pri_trit)
+    let _total_enqueued = _total_enqueued + 1
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "job_id": job_id,
+        "queue": qname,
+        "priority": priority,
+        "pri_trit": pri_trit
+    }
+}
+
+// POST /tqueue/dequeue -- claim the next highest-priority job
+fn handle_dequeue(body) {
+    let qname = "default"
+    if3 dict_has(body, "queue") {
+        let qname = str(dict_get(body, "queue"))
+    }
+    let worker = "anonymous"
+    if3 dict_has(body, "worker") {
+        let worker = str(dict_get(body, "worker"))
+    }
+
+    let jid = queue_pop(qname)
+    if3 jid == "" {
+        return {
+            "ok": true,
+            "trit": 0,
+            "msg": "queue empty or no pending jobs",
+            "queue": qname,
+            "job": {}
+        }
+    }
+
+    let job = dict_get(_jobs, jid)
+    dict_set(job, "state", "CLAIMED")
+    dict_set(job, "claimed_at", now_ts())
+    dict_set(job, "worker", worker)
+    dict_set(_jobs, jid, job)
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "queue": qname,
+        "job": job_to_dict(job)
+    }
+}
+
+// POST /tqueue/peek -- peek at next job without claiming
+fn handle_peek(body) {
+    let qname = "default"
+    if3 dict_has(body, "queue") {
+        let qname = str(dict_get(body, "queue"))
+    }
+
+    let jid = queue_peek(qname)
+    if3 jid == "" {
+        return {
+            "ok": true,
+            "trit": 0,
+            "msg": "queue empty",
+            "queue": qname,
+            "job": {}
+        }
+    }
+
+    let job = dict_get(_jobs, jid)
+    return {
+        "ok": true,
+        "trit": 1,
+        "queue": qname,
+        "job": job_to_dict(job)
+    }
+}
+
+// POST /tqueue/complete -- mark a claimed job as completed
+fn handle_complete(body) {
+    let jid = ""
+    if3 dict_has(body, "job_id") {
+        let jid = str(dict_get(body, "job_id"))
+    }
+    if3 jid == "" {
+        return {"ok": false, "trit": -1, "error": "job_id required"}
+    }
+    if3 dict_has(_jobs, jid) == 0 {
+        return {"ok": false, "trit": -1, "error": "job not found"}
+    }
+
+    let job = dict_get(_jobs, jid)
+    let st = dict_get(job, "state")
+    if3 st != "CLAIMED" {
+        let errmsg = "job not in CLAIMED state, current: " + st
+        return {"ok": false, "trit": -1, "error": errmsg}
+    }
+
+    let result = {}
+    if3 dict_has(body, "result") {
+        let result = dict_get(body, "result")
+    }
+
+    dict_set(job, "state", "COMPLETED")
+    dict_set(job, "completed_at", now_ts())
+    dict_set(job, "result", result)
+    dict_set(_jobs, jid, job)
+    let _total_completed = _total_completed + 1
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "job_id": jid,
+        "state": "COMPLETED"
+    }
+}
+
+// POST /tqueue/fail -- mark a job as failed (retry or dead-letter)
+fn handle_fail(body) {
+    let jid = ""
+    if3 dict_has(body, "job_id") {
+        let jid = str(dict_get(body, "job_id"))
+    }
+    if3 jid == "" {
+        return {"ok": false, "trit": -1, "error": "job_id required"}
+    }
+    if3 dict_has(_jobs, jid) == 0 {
+        return {"ok": false, "trit": -1, "error": "job not found"}
+    }
+
+    let job = dict_get(_jobs, jid)
+    let st = dict_get(job, "state")
+    if3 st != "CLAIMED" {
+        let errmsg = "job not in CLAIMED state, current: " + st
+        return {"ok": false, "trit": -1, "error": errmsg}
+    }
+
+    let errmsg = "unknown error"
+    if3 dict_has(body, "error") {
+        let errmsg = str(dict_get(body, "error"))
+    }
+
+    let retries = dict_get(job, "retries")
+    let retries = retries + 1
+    dict_set(job, "retries", retries)
+    dict_set(job, "failed_at", now_ts())
+    dict_set(job, "error", errmsg)
+    dict_set(job, "worker", "")
+    dict_set(job, "claimed_at", 0)
+
+    if3 retries >= MAX_RETRIES {
+        // Dead-letter: exhausted retries
+        dict_set(job, "state", "DEAD")
+        dict_set(_jobs, jid, job)
+        append(_dead_letters, job_to_dict(job))
+        let _total_dead = _total_dead + 1
+        let deadmsg = "max retries exceeded, moved to dead letter queue"
+        return {
+            "ok": true,
+            "trit": -1,
+            "job_id": jid,
+            "state": "DEAD",
+            "retries": retries,
+            "msg": deadmsg
+        }
+    }
+
+    // Re-enqueue with backoff noted in error (FIFO push, same priority)
+    // Backoff: 3^retries seconds (3, 9, 27 ...)
+    let backoff = H3
+    if3 retries == 2 {
+        let backoff = 9
+    }
+    if3 retries == 3 {
+        let backoff = 27
+    }
+
+    dict_set(job, "state", "PENDING")
+    dict_set(_jobs, jid, job)
+
+    let qname = dict_get(job, "queue")
+    let pri_trit = dict_get(job, "pri_trit")
+    queue_push(qname, jid, pri_trit)
+    let _total_failed = _total_failed + 1
+
+    let retrymsg = "retry " + str(retries) + "/" + str(MAX_RETRIES) + ", backoff " + str(backoff) + "s"
+    return {
+        "ok": true,
+        "trit": 0,
+        "job_id": jid,
+        "state": "PENDING",
+        "retries": retries,
+        "max_retries": MAX_RETRIES,
+        "backoff_seconds": backoff,
+        "msg": retrymsg
+    }
+}
+
+// POST /tqueue/status -- get status of a specific job by job_id
+fn handle_status(body) {
+    let jid = ""
+    if3 dict_has(body, "job_id") {
+        let jid = str(dict_get(body, "job_id"))
+    }
+    if3 jid == "" {
+        return {"ok": false, "trit": -1, "error": "job_id required"}
+    }
+    if3 dict_has(_jobs, jid) == 0 {
+        return {"ok": false, "trit": -1, "error": "job not found"}
+    }
+
+    let job = dict_get(_jobs, jid)
+    let st = dict_get(job, "state")
+    return {
+        "ok": true,
+        "trit": state_trit(st),
+        "job": job_to_dict(job)
+    }
+}
+
+// GET /tqueue/queues -- list all queues with depth and state counts
+fn handle_queues() {
+    let qnames = keys(_queues)
+    let result = {}
+    let i = 0
+    while3 i < len(qnames) {
+        let qn = qnames[i]
+        let counts = queue_state_counts(qn)
+        let pend = dict_get(counts, "pending")
+        let clmd = dict_get(counts, "claimed")
+        let comp = dict_get(counts, "completed")
+        let fail = dict_get(counts, "failed")
+        let dead = dict_get(counts, "dead")
+        let total = pend + clmd + comp + fail + dead
+        dict_set(result, qn, {
+            "depth": pend,
+            "processing": clmd,
+            "completed": comp,
+            "failed": fail,
+            "dead": dead,
+            "total": total
+        })
+        let i = i + 1
+    }
+    return {
+        "ok": true,
+        "trit": 1,
+        "queues": result,
+        "queue_count": len(qnames)
+    }
+}
+
+// GET /tqueue/dead -- return dead letter queue
+fn handle_dead() {
+    let count = len(_dead_letters)
+    let trit = 1
+    if3 count > 0 {
+        let trit = -1
+    }
+    return {
+        "ok": true,
+        "trit": trit,
+        "count": count,
+        "dead_letters": _dead_letters
+    }
+}
+
+// GET /tqueue/history -- recent job history (last 50 completed/dead)
+fn handle_history() {
+    let history = []
+    let all_keys = keys(_jobs)
+    let i = 0
+    while3 i < len(all_keys) {
+        let jid = all_keys[i]
+        let job = dict_get(_jobs, jid)
+        let st = dict_get(job, "state")
+        if3 st == "COMPLETED" {
+            append(history, job_to_dict(job))
+        } else st == "DEAD" {
+            append(history, job_to_dict(job))
+        }
+        let i = i + 1
+    }
+    // Cap at 50 most recent (slice tail)
+    let hlen = len(history)
+    let start = 0
+    if3 hlen > 50 {
+        let start = hlen - 50
+    }
+    let history = slice(history, start, hlen)
+    return {
+        "ok": true,
+        "trit": 1,
+        "count": len(history),
+        "history": history
+    }
+}
+
+// GET /health -- service health
+fn health() {
+    let total_jobs = len(keys(_jobs))
+    let pending = 0
+    let claimed = 0
+    let completed = 0
+    let dead_count = len(_dead_letters)
+    let qcount = len(keys(_queues))
+
+    let all_keys = keys(_jobs)
+    let i = 0
+    while3 i < len(all_keys) {
+        let jid = all_keys[i]
+        let job = dict_get(_jobs, jid)
+        let st = dict_get(job, "state")
+        if3 st == "PENDING" {
+            let pending = pending + 1
+        } else st == "CLAIMED" {
+            let claimed = claimed + 1
+        } else st == "COMPLETED" {
+            let completed = completed + 1
+        }
+        let i = i + 1
+    }
+
+    let uptime = round(now_ts() - _started_at)
+    let trit = 1
+    if3 dead_count > 0 {
+        let trit = 0
+    }
+
+    return {
+        "ok": true,
+        "trit": trit,
+        "service": "nova-tqueue",
+        "port": PORT,
+        "version": "1.0",
+        "ternary": true,
+        "runtime": "novalang",
+        "uptime_seconds": uptime,
+        "total_jobs": total_jobs,
+        "pending": pending,
+        "claimed": claimed,
+        "completed": completed,
+        "dead_letters": dead_count,
+        "queue_count": qcount,
+        "total_enqueued": _total_enqueued,
+        "total_completed": _total_completed,
+        "total_failed": _total_failed,
+        "total_dead": _total_dead,
+        "max_jobs_per_queue": MAX_JOBS,
+        "max_retries": MAX_RETRIES,
+        "job_timeout_seconds": JOB_TIMEOUT,
+        "cleaner_interval_seconds": CLEANER_INTERVAL,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// -- Register Routes --
+troute(server, "GET",  "/health",          "health")
+troute(server, "GET",  "/tqueue/queues",   "handle_queues")
+troute(server, "GET",  "/tqueue/dead",     "handle_dead")
+troute(server, "GET",  "/tqueue/history",  "handle_history")
+troute(server, "POST", "/tqueue/enqueue",  "handle_enqueue")
+troute(server, "POST", "/tqueue/dequeue",  "handle_dequeue")
+troute(server, "POST", "/tqueue/peek",     "handle_peek")
+troute(server, "POST", "/tqueue/complete", "handle_complete")
+troute(server, "POST", "/tqueue/fail",     "handle_fail")
+troute(server, "POST", "/tqueue/status",   "handle_status")
+
+print("[TQueue] NovaLang TQueue v1.0 - Ternary Priority Job Queue")
+print("[TQueue] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TQueue] MAX_JOBS=" + str(MAX_JOBS) + " MAX_RETRIES=" + str(MAX_RETRIES) + " TIMEOUT=" + str(JOB_TIMEOUT) + "s")
+print("[TQueue] Priority: +1=high, 0=normal, -1=low | FIFO within same priority")
+print("[TQueue] Routes: /health, /tqueue/queues, /tqueue/dead, /tqueue/history")
+print("[TQueue] Routes: /tqueue/enqueue, /tqueue/dequeue, /tqueue/peek, /tqueue/complete, /tqueue/fail, /tqueue/status")
+print("[TQueue] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+
+tstart(server)

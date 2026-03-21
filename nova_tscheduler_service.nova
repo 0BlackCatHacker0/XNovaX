@@ -1,0 +1,500 @@
+// Nova TScheduler v1.0 - Lightweight Ternary Task Scheduler (NovaLang port)
+// Port 9959: Schedules recurring HTTP calls to other NovaX services
+//
+// No background threads in NovaLang. Tasks are executed on-demand via:
+//   POST /tscheduler/tick  -- called externally every second or by user
+//
+// N-S Mapping:
+//   task_flow     = velocity_field (scheduled work stream)
+//   interval_sec  = viscosity (how often a task flows)
+//   run_count     = accumulated_flow (total executions)
+//   fail_count    = turbulent_energy (error pressure)
+//   Reynolds = fail_count / max(1, run_count)
+//
+// MAX_TASKS = H13 * H7 = 91
+// Endpoints:
+//   GET  /health                -- standard ternary health
+//   GET  /tscheduler/health     -- alias
+//   POST /tscheduler/add        -- add a task
+//   POST /tscheduler/remove     -- remove a task by name
+//   POST /tscheduler/pause      -- pause a task by name
+//   POST /tscheduler/resume     -- resume a paused task
+//   GET  /tscheduler/list       -- list all tasks
+//   GET  /tscheduler/history    -- last 91 execution results
+//   POST /tscheduler/tick       -- execute all due tasks (call every second)
+//   POST /tscheduler/clear      -- remove all tasks (reset)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9959
+let server = tserve(PORT, "TScheduler v1.0 - Ternary Task Scheduler")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary constants --
+let TRUE  =  1
+let MAYBE =  0
+let FALSE = -1
+
+// -- Scheduler limits --
+let MAX_TASKS    = 91    // H13 * H7
+let HTTP_TIMEOUT = 5     // H5 seconds
+let MIN_INTERVAL = 3     // H3 seconds minimum interval
+let HISTORY_MAX  = 91    // H13 * H7 ring size
+
+// -- Global state --
+// tasks: name -> {name, url, method, body, interval_sec, enabled, last_run,
+//                 last_result_trit, next_run, run_count, fail_count, created_at}
+let tasks = {}
+
+// history: list of result dicts (oldest first, trimmed to HISTORY_MAX)
+let history = []
+
+// aggregate counters
+let total_ticks  = 0
+let total_runs   = 0
+let total_fails  = 0
+
+// -- trit_char helper --
+fn trit_char(t) {
+    if3 t == 1 {
+        return "+"
+    } else t == 0 {
+        return "~"
+    } else {
+        return "-"
+    }
+}
+
+// -- make_task: build a task dict --
+fn make_task(name, url, method, interval_sec, body) {
+    let iv = int(interval_sec)
+    if3 iv < MIN_INTERVAL { iv = MIN_INTERVAL
+    }
+    let now = time()
+    return {
+        "name":             name,
+        "url":              url,
+        "method":           method,
+        "body":             body,
+        "interval_sec":     iv,
+        "enabled":          true,
+        "last_run":         0,
+        "last_result_trit": MAYBE,
+        "next_run":         now,
+        "run_count":        0,
+        "fail_count":       0,
+        "created_at":       now
+    }
+}
+
+// -- fire_task: execute one HTTP call --
+// Returns {trit, status, elapsed_ms, error}
+fn fire_task(task) {
+    let url    = dict_get(task, "url") ?? ""
+    let method = dict_get(task, "method") ?? "GET"
+    let body   = dict_get(task, "body") ?? {}
+    let t0     = time()
+
+    if3 method == "POST" {
+        try3 {
+            let resp    = http_post(url, body, HTTP_TIMEOUT)
+            let elapsed = round((time() - t0) * 1000, 2)
+            return {"trit": TRUE, "status": 200, "elapsed_ms": elapsed, "error": ""}
+        } catch3 {
+            let elapsed = round((time() - t0) * 1000, 2)
+            return {"trit": FALSE, "status": 0, "elapsed_ms": elapsed, "error": "post_failed"}
+    } else {
+        try3 {
+            let resp    = http_get(url, HTTP_TIMEOUT)
+            let elapsed = round((time() - t0) * 1000, 2)
+            return {"trit": TRUE, "status": 200, "elapsed_ms": elapsed, "error": ""}
+        } catch3 {
+            let elapsed = round((time() - t0) * 1000, 2)
+            return {"trit": FALSE, "status": 0, "elapsed_ms": elapsed, "error": "get_failed"}
+        }
+    }
+}
+
+// -- task_view: serialise a task for JSON responses --
+}
+fn task_view(task) {
+    let now        = time()
+    let next_run   = dict_get(task, "next_run") ?? now
+    let secs_until = round(max(0, next_run - now), 1)
+    let trit       = dict_get(task, "last_result_trit") ?? MAYBE
+    return {
+        "name":              dict_get(task, "name") ?? "",
+        "url":               dict_get(task, "url") ?? "",
+        "method":            dict_get(task, "method") ?? "GET",
+        "body":              dict_get(task, "body") ?? {},
+        "interval_sec":      dict_get(task, "interval_sec") ?? H13,
+        "enabled":           dict_get(task, "enabled") ?? true,
+        "last_run":          dict_get(task, "last_run") ?? 0,
+        "last_result_trit":  trit,
+        "last_result_char":  trit_char(trit),
+        "next_run_in_sec":   secs_until,
+        "run_count":         dict_get(task, "run_count") ?? 0,
+        "fail_count":        dict_get(task, "fail_count") ?? 0,
+        "created_at":        dict_get(task, "created_at") ?? 0
+    }
+}
+
+// -- trim_history: keep last HISTORY_MAX entries --
+fn trim_history() {
+    if3 len(history) > HISTORY_MAX { keep = slice(history, len(history) - HISTORY_MAX, len(history))
+        history = keep
+    }
+}
+
+// -- register default tasks on startup --
+fn init_defaults() {
+    // twatch sweep every 13 seconds
+    if3 dict_has(tasks, "twatch-sweep") == false { t = make_task("twatch-sweep", "http://127.0.0.1:9950/twatch/sweep", "POST", H13, {})
+        tasks = dict_set(tasks, "twatch-sweep", t)
+    }
+    // orchestrator health every 7 seconds
+    if3 dict_has(tasks, "orchestrator-health") == false { t = make_task("orchestrator-health", "http://127.0.0.1:9999/health", "GET", H7, {})
+        tasks = dict_set(tasks, "orchestrator-health", t)
+    }
+}
+
+// -- Route: GET /health --
+fn health() {
+    let task_keys    = keys(tasks)
+    let task_total   = len(task_keys)
+    let task_enabled = 0
+    let i = 0
+    while3 i < task_total {
+        let k = task_keys[i]
+        let t = dict_get(tasks, k) ?? {}
+        let en = dict_get(t, "enabled") ?? false
+        if3 en == true { task_enabled = task_enabled + 1
+        }
+        i = i + 1
+    }
+    let trit = TRUE
+    if3 task_total == 0 { trit = MAYBE
+    }
+    let resp = ns_health_dict("nova-tscheduler", "1.0.0", PORT, {})
+    resp = dict_set(resp, "trit", trit)
+    resp = dict_set(resp, "char", trit_char(trit))
+    resp = dict_set(resp, "tasks_total", task_total)
+    resp = dict_set(resp, "tasks_enabled", task_enabled)
+    resp = dict_set(resp, "total_ticks", total_ticks)
+    resp = dict_set(resp, "total_runs", total_runs)
+    resp = dict_set(resp, "total_fails", total_fails)
+    resp = dict_set(resp, "max_tasks", MAX_TASKS)
+    resp = dict_set(resp, "history_size", len(history))
+    return resp
+}
+
+// -- Route: GET /tscheduler/list --
+fn list_tasks() {
+    let task_keys = keys(tasks)
+    let task_list = []
+    let i = 0
+    while3 i < len(task_keys) {
+        let k = task_keys[i]
+        let t = dict_get(tasks, k) ?? {}
+        let v = task_view(t)
+        task_list = append(task_list, v)
+        i = i + 1
+    }
+    let trit = TRUE
+    if3 len(task_list) == 0 { trit = MAYBE
+    }
+    return {
+        "ok":        true,
+        "count":     len(task_list),
+        "max_tasks": MAX_TASKS,
+        "tasks":     task_list,
+        "trit":      trit,
+        "char":      trit_char(trit)
+    }
+}
+
+// -- Route: GET /tscheduler/history --
+fn list_history() {
+    // Return most-recent first: reverse slice
+    let total = len(history)
+    let out   = []
+    let i     = total - 1
+    while3 i >= 0 {
+        out = append(out, history[i])
+        let i  = i - 1
+    }
+    let trit = TRUE
+    if3 total == 0 { trit = MAYBE
+    }
+    return {
+        "ok":      true,
+        "count":   total,
+        "max":     HISTORY_MAX,
+        "entries": out,
+        "trit":    trit,
+        "char":    trit_char(trit)
+    }
+}
+
+// -- Route: POST /tscheduler/add --
+fn add_task(body) {
+    let name         = dict_get(body, "name") ?? ""
+    let url          = dict_get(body, "url") ?? ""
+    let method       = dict_get(body, "method") ?? "GET"
+    let interval_sec = dict_get(body, "interval_sec") ?? H13
+    let req_body     = dict_get(body, "body") ?? {}
+
+    if3 name == "" {
+        return {"ok": false, "error": "name required", "trit": FALSE, "char": "-"}
+    }
+    if3 url == "" {
+        return {"ok": false, "error": "url required", "trit": FALSE, "char": "-"}
+    }
+
+    // Validate method
+    let m_ok = false
+    if3 method == "GET" { m_ok = true
+    }
+    if3 method == "POST" { m_ok = true
+    }
+    if3 m_ok == false {
+        return {"ok": false, "error": "method must be GET or POST", "trit": FALSE, "char": "-"}
+    }
+
+    if3 dict_has(tasks, name) == true {
+        return {"ok": false, "error": "task already exists; remove first", "trit": FALSE, "char": "-"}
+    }
+
+    let task_count = len(keys(tasks))
+    if3 task_count >= MAX_TASKS {
+        return {"ok": false, "error": "max tasks reached (91)", "trit": FALSE, "char": "-"}
+    }
+
+    let t  = make_task(name, url, method, interval_sec, req_body)
+    tasks = dict_set(tasks, name, t)
+    let v  = task_view(t)
+
+    return {
+        "ok":     true,
+        "action": "added",
+        "task":   v,
+        "trit":   TRUE,
+        "char":   "+"
+    }
+}
+
+// -- Route: POST /tscheduler/remove --
+fn remove_task(body) {
+    let name = dict_get(body, "name") ?? ""
+    if3 name == "" {
+        return {"ok": false, "error": "name required", "trit": FALSE, "char": "-"}
+    }
+    if3 dict_has(tasks, name) == false {
+        return {"ok": false, "error": "task not found", "trit": MAYBE, "char": "~"}
+    }
+    let _r = dict_del(tasks, name)
+    return {
+        "ok":     true,
+        "action": "removed",
+        "name":   name,
+        "trit":   TRUE,
+        "char":   "+"
+    }
+}
+
+// -- Route: POST /tscheduler/pause --
+fn pause_task(body) {
+    let name = dict_get(body, "name") ?? ""
+    if3 name == "" {
+        return {"ok": false, "error": "name required", "trit": FALSE, "char": "-"}
+    }
+    if3 dict_has(tasks, name) == false {
+        return {"ok": false, "error": "task not found", "trit": MAYBE, "char": "~"}
+    }
+    let t  = dict_get(tasks, name) ?? {}
+    let en = dict_get(t, "enabled") ?? true
+    if3 en == false {
+        return {"ok": true, "action": "already_paused", "name": name, "trit": MAYBE, "char": "~"}
+    }
+    t = dict_set(t, "enabled", false)
+    tasks = dict_set(tasks, name, t)
+    return {
+        "ok":     true,
+        "action": "paused",
+        "name":   name,
+        "trit":   TRUE,
+        "char":   "+"
+    }
+}
+
+// -- Route: POST /tscheduler/resume --
+fn resume_task(body) {
+    let name = dict_get(body, "name") ?? ""
+    if3 name == "" {
+        return {"ok": false, "error": "name required", "trit": FALSE, "char": "-"}
+    }
+    if3 dict_has(tasks, name) == false {
+        return {"ok": false, "error": "task not found", "trit": MAYBE, "char": "~"}
+    }
+    let t  = dict_get(tasks, name) ?? {}
+    let en = dict_get(t, "enabled") ?? false
+    if3 en == true {
+        return {"ok": true, "action": "already_running", "name": name, "trit": MAYBE, "char": "~"}
+    }
+    t  = dict_set(t, "enabled", true)
+    // Reset next_run so it fires immediately on next tick
+    let now = time()
+    t  = dict_set(t, "next_run", now)
+    tasks  = dict_set(tasks, name, t)
+    return {
+        "ok":     true,
+        "action": "resumed",
+        "name":   name,
+        "trit":   TRUE,
+        "char":   "+"
+    }
+}
+
+// -- Route: POST /tscheduler/clear --
+fn clear_tasks(body) {
+    let task_keys = keys(tasks)
+    let removed   = len(task_keys)
+    let i = 0
+    while3 i < removed {
+        let k  = task_keys[i]
+        let _r = dict_del(tasks, k)
+        let i  = i + 1
+    }
+    return {
+        "ok":      true,
+        "action":  "cleared",
+        "removed": removed,
+        "trit":    TRUE,
+        "char":    "+"
+    }
+}
+
+// -- Route: POST /tscheduler/tick --
+// Execute all due tasks. Call this every second from outside.
+fn tick(body) {
+    total_ticks = total_ticks + 1
+    let now         = time()
+    let task_keys   = keys(tasks)
+    let fired       = 0
+    let succeeded   = 0
+    let failed_now  = 0
+    let tick_log    = []
+
+    let i = 0
+    while3 i < len(task_keys) {
+        let k = task_keys[i]
+        let t = dict_get(tasks, k) ?? {}
+
+        let enabled  = dict_get(t, "enabled") ?? false
+        let next_run = dict_get(t, "next_run") ?? (now + 9999)
+
+        if3 enabled == true {
+            if3 now >= next_run {
+                // Fire this task
+                let result = fire_task(t)
+                let trit   = dict_get(result, "trit") ?? FALSE
+                let elms   = dict_get(result, "elapsed_ms") ?? 0
+                let err    = dict_get(result, "error") ?? ""
+
+                // Update task state
+                t = dict_set(t, "last_run", now)
+                t = dict_set(t, "last_result_trit", trit)
+                let rc = dict_get(t, "run_count") ?? 0
+                t = dict_set(t, "run_count", rc + 1)
+                let iv = dict_get(t, "interval_sec") ?? H13
+                t = dict_set(t, "next_run", now + iv)
+
+                if3 trit == FALSE { fc = dict_get(t, "fail_count") ?? 0
+                    t = dict_set(t, "fail_count", fc + 1)
+                    let failed_now  = failed_now + 1
+                    total_fails = total_fails + 1
+                } else { succeeded = succeeded + 1
+                }
+
+                tasks   = dict_set(tasks, k, t)
+                fired = fired + 1
+                total_runs = total_runs + 1
+
+                // Build history entry
+                let name   = dict_get(t, "name") ?? k
+                let url    = dict_get(t, "url") ?? ""
+                let method = dict_get(t, "method") ?? "GET"
+                let entry  = {
+                    "name":        name,
+                    "url":         url,
+                    "method":      method,
+                    "trit":        trit,
+                    "char":        trit_char(trit),
+                    "elapsed_ms":  elms,
+                    "error":       err,
+                    "ts":          now
+                }
+                history = append(history, entry)
+                tick_log = append(tick_log, entry)
+            }
+        }
+
+        i = i + 1
+    }
+
+    // Trim history ring buffer
+    trim_history()
+
+    // Ternary result for this tick
+    let tick_trit = TRUE
+    if3 fired == 0 { tick_trit = MAYBE
+    }
+    if3 failed_now > 0 {
+        if3 failed_now >= fired { tick_trit = FALSE
+        }
+    }
+
+    return {
+        "ok":        true,
+        "tick":      total_ticks,
+        "fired":     fired,
+        "succeeded": succeeded,
+        "failed":    failed_now,
+        "results":   tick_log,
+        "trit":      tick_trit,
+        "char":      trit_char(tick_trit)
+    }
+}
+
+// -- Register routes --
+troute(server, "GET",  "/health",              "health")
+troute(server, "GET",  "/tscheduler/health",   "health")
+troute(server, "GET",  "/tscheduler/list",     "list_tasks")
+troute(server, "GET",  "/tscheduler/history",  "list_history")
+troute(server, "POST", "/tscheduler/add",      "add_task")
+troute(server, "POST", "/tscheduler/remove",   "remove_task")
+troute(server, "POST", "/tscheduler/pause",    "pause_task")
+troute(server, "POST", "/tscheduler/resume",   "resume_task")
+troute(server, "POST", "/tscheduler/clear",    "clear_tasks")
+troute(server, "POST", "/tscheduler/tick",     "tick")
+
+// -- Bootstrap: register default tasks --
+init_defaults()
+
+print("[TScheduler] NovaLang TScheduler v1.0 - Ternary Task Scheduler")
+print("[TScheduler] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TScheduler] MAX_TASKS=" + str(MAX_TASKS) + " (H13*H7=13*7)")
+print("[TScheduler] MIN_INTERVAL=" + str(MIN_INTERVAL) + "s | HTTP_TIMEOUT=" + str(HTTP_TIMEOUT) + "s")
+print("[TScheduler] Default tasks: twatch-sweep (every 13s), orchestrator-health (every 7s)")
+print("[TScheduler] Tick endpoint: POST /tscheduler/tick -- call every second externally")
+print("[TScheduler] Routes: /health, /tscheduler/health, /tscheduler/list, /tscheduler/history")
+print("[TScheduler]         /tscheduler/add, /tscheduler/remove, /tscheduler/pause, /tscheduler/resume")
+print("[TScheduler]         /tscheduler/clear, /tscheduler/tick")
+
+tstart(server)

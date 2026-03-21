@@ -1,0 +1,701 @@
+// Nova TAudit v1.0 - Ternary Security Audit Trail
+// Port 9974: Immutable, tamper-evident audit log for the NovaX ecosystem.
+//
+// Records all security-relevant events: auth attempts, file access,
+// config changes, service restarts, error spikes, permission changes.
+//
+// Every entry is chained via SHA-256 hash linking:
+//   hash = sha256(prev_hash + event + service + timestamp)
+//   First entry prev_hash = "GENESIS"
+//
+// Tamper detection: POST /taudit/verify walks the chain.
+//   Returns trit: TRUE(+1) if intact, FALSE(-1) if any link is broken.
+//
+// In-memory buffer: MAX_ENTRIES = H13 * H7 * H3 = 13 * 7 * 3 = 273 entries.
+// Persistent append-only file: C:\NovaX\data\audit\taudit.jsonl
+//
+// Severity trits:
+//   info     = TRUE  (+1)
+//   warn     = MAYBE  (0)
+//   critical = FALSE (-1)
+//
+// Endpoints:
+//   GET  /health          -- standard NovaX health check
+//   GET  /taudit/health   -- same as /health
+//   POST /taudit/record   -- record a security event
+//   GET  /taudit/query    -- filter by service/event/severity/since/limit
+//   GET  /taudit/chain    -- last N entries with hash chain
+//   POST /taudit/verify   -- verify hash chain integrity (returns trit)
+//   GET  /taudit/stats    -- totals, per-service, per-severity, chain length
+//   GET  /taudit/alerts   -- recent critical events (last hour)
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3 (ternary base), H5=5 (TZip pack), H7=7 (composition), H13=13 (carrier)
+//   BLOCK = 3^7 = 2187
+//   MAX_ENTRIES = H13 * H7 * H3 = 273
+//   MAX_BODY = BLOCK * H3 = 6561 bytes
+//
+// N-S Reynolds boundaries:
+//   Re < 27  = laminar (quiet, few ops/min)
+//   Re < 125 = transitional
+//   Re < 343 = turbulent
+//   Re >= 343 = chaotic (high event rate)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9974
+let server = tserve(PORT, "TAudit v1.0 - Ternary Security Audit Trail")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3   = 3
+let H5   = 5
+let H7   = 7
+let H13  = 13
+let BLOCK = 2187
+
+// -- Ternary Values --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds Boundaries --
+let RE_LAMINAR     = 27    // H3^3
+let RE_TRANSITION  = 125   // H5^3
+let RE_TURBULENT   = 343   // H7^3
+
+// -- Constants --
+let VERSION      = "1.0"
+let SERVICE_NAME = "nova-taudit"
+let AUDIT_LOG    = "C:\\NovaX\\data\\audit\\taudit.jsonl"
+let GENESIS_HASH = "GENESIS"
+let MAX_ENTRIES  = 273     // H13 * H7 * H3
+let MAX_BODY     = 6561    // BLOCK * H3
+let ALERTS_WINDOW = 3600   // 1 hour in seconds
+
+// -- Audit State --
+let audit_chain_list = []  // in-memory ring buffer (trimmed at MAX_ENTRIES)
+let entry_counter    = 0   // monotonic entry ID
+
+// -- Stats State --
+let stat_t0            = time()
+let stat_total         = 0
+let stat_info_count    = 0
+let stat_warn_count    = 0
+let stat_critical_count = 0
+let stat_op_times      = []   // timestamps of recent ops (for Reynolds calc)
+
+// -- Per-service and per-event counters stored as flat dicts --
+// key = "svc:<name>" or "evt:<name>", value = count
+let stat_by_service = {}
+let stat_by_event   = {}
+
+
+// -- Helper: tchar - convert trit to display char --
+fn tchar(t) {
+    if3 t > 0 {
+        return "+"
+    }
+    if3 t < 0 {
+        return "T"
+    }
+    return "0"
+}
+
+
+// -- Helper: severity string -> trit --
+fn severity_trit(sev) {
+    if3 sev == "info" {
+        return T_TRUE
+    }
+    if3 sev == "warn" {
+        return T_MAYBE
+    }
+    if3 sev == "critical" {
+        return T_FALSE
+    }
+    return T_MAYBE
+}
+
+
+// -- Helper: is severity valid --
+fn severity_valid(sev) {
+    if3 sev == "info" {
+        return T_TRUE
+    }
+    if3 sev == "warn" {
+        return T_TRUE
+    }
+    if3 sev == "critical" {
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+
+// -- Helper: compute flow regime from Reynolds number --
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+
+// -- Helper: count recent ops in last 60 seconds (Reynolds number) --
+fn calc_reynolds() {
+    let now = time()
+    let cutoff = now - 60
+    let count = 0
+    let total = len(stat_op_times)
+    let i = 0
+    while3 i < total {
+        let ts = stat_op_times[i]
+        if3 ts > cutoff {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+
+// -- Helper: trim op_times to last 3600 entries --
+fn trim_op_times() {
+    let sz = len(stat_op_times)
+    if3 sz > 3600 {
+        stat_op_times = slice(stat_op_times, sz - 3600, sz)
+    }
+}
+
+
+// -- Helper: get tail of audit chain (last entry) --
+fn chain_tail_hash() {
+    let sz = len(audit_chain_list)
+    if3 sz == 0 {
+        return GENESIS_HASH
+    }
+    let last = audit_chain_list[sz - 1]
+    return dict_get(last, "hash") ?? GENESIS_HASH
+}
+
+
+// -- Helper: trim audit chain to MAX_ENTRIES --
+fn trim_chain() {
+    let sz = len(audit_chain_list)
+    if3 sz > MAX_ENTRIES {
+        audit_chain_list = slice(audit_chain_list, sz - MAX_ENTRIES, sz)
+    }
+}
+
+
+// -- Helper: increment flat dict counter --
+fn incr_counter(d, key) {
+    let cur = dict_get(d, key) ?? 0
+    d = dict_set(d, key, cur + 1)
+}
+
+
+// -- Helper: compute SHA-256 chain hash --
+// hash = sha256(prev_hash + event + service + timestamp_str)
+fn compute_hash(prev_h, ev, svc, ts_str) {
+    let payload = prev_h + ev + svc + ts_str
+    return sha256(payload)
+}
+
+
+// -- Helper: persist entry to JSONL file --
+fn persist_entry(entry) {
+    // nova_write appends when called with existing path;
+    // encode as JSON line and write via nova_write.
+    // We encode and append. NovaLang nova_write overwrites the target,
+    // so we read existing, append line, and write back.
+    // Use try3 so a disk error never crashes the service.
+    try3 {
+        let existing = nova_read(AUDIT_LOG)
+        let line = json_encode(entry) + "\n"
+        nova_write(AUDIT_LOG, existing + line)
+    } catch3 {
+        // Disk errors must never crash the audit service.
+    }
+}
+
+
+// -- Core: record a security event --
+fn audit_record(body) {
+    let ev      = dict_get(body, "event") ?? ""
+    let svc     = dict_get(body, "service") ?? ""
+    let detail  = dict_get(body, "detail") ?? {}
+    let sev_raw = dict_get(body, "severity") ?? "info"
+    let sev     = lower(str(sev_raw))
+
+    // Validation: event required
+    if3 len(str(ev)) == 0 {
+        return {
+            "ok": false,
+            "error": "missing event",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    }
+
+    // Validation: service required
+    if3 len(str(svc)) == 0 {
+        return {
+            "ok": false,
+            "error": "missing service",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    }
+
+    // Validation: severity must be info/warn/critical
+    let sev_ok = severity_valid(sev)
+    if3 sev_ok == T_FALSE {
+        return {
+            "ok": false,
+            "error": "invalid severity, use info/warn/critical",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    }
+
+    let now     = time()
+    entry_counter = entry_counter + 1
+    let eid     = entry_counter
+    let sev_t   = severity_trit(sev)
+    let ts_str  = str(now)
+
+    // Build hash chain link
+    let prev_h  = chain_tail_hash()
+    let h       = compute_hash(prev_h, str(ev), str(svc), ts_str)
+
+    let entry = {
+        "id":        eid,
+        "timestamp": now,
+        "event":     str(ev),
+        "service":   str(svc),
+        "detail":    detail,
+        "severity":  sev,
+        "hash":      h,
+        "prev_hash": prev_h,
+        "trit":      sev_t,
+        "char":      tchar(sev_t)
+    }
+
+    // Append to in-memory chain
+    audit_chain_list = append(audit_chain_list, entry)
+    trim_chain()
+
+    // Update stats
+    stat_total = stat_total + 1
+    if3 sev == "info" {
+        stat_info_count = stat_info_count + 1
+    }
+    if3 sev == "warn" {
+        stat_warn_count = stat_warn_count + 1
+    }
+    if3 sev == "critical" {
+        stat_critical_count = stat_critical_count + 1
+    }
+
+    incr_counter(stat_by_service, str(svc))
+    incr_counter(stat_by_event,   str(ev))
+
+    stat_op_times = append(stat_op_times, now)
+    trim_op_times()
+
+    // Persist to disk
+    persist_entry(entry)
+
+    return {
+        "ok":        true,
+        "id":        eid,
+        "event":     str(ev),
+        "service":   str(svc),
+        "severity":  sev,
+        "hash":      h,
+        "prev_hash": prev_h,
+        "trit":      sev_t,
+        "char":      tchar(sev_t)
+    }
+}
+
+
+// -- Query: filter audit entries --
+// Body params: service, event, severity, since (unix ts float), limit (int)
+fn audit_query(body) {
+    let filter_svc  = dict_get(body, "service") ?? ""
+    let filter_evt  = dict_get(body, "event") ?? ""
+    let filter_sev  = dict_get(body, "severity") ?? ""
+    let since_val   = dict_get(body, "since") ?? 0
+    let limit_val   = dict_get(body, "limit") ?? 100
+
+    let svc_s  = str(filter_svc)
+    let evt_s  = str(filter_evt)
+    let sev_s  = lower(str(filter_sev))
+    let lim    = int(limit_val)
+    let since  = float(since_val)
+
+    if3 lim < 1 {
+        let lim = 1
+    }
+    if3 lim > MAX_ENTRIES {
+        let lim = MAX_ENTRIES
+    }
+
+    let results   = []
+    let total     = len(audit_chain_list)
+    // Walk in reverse (newest first)
+    let i = total - 1
+    while3 i >= 0 {
+        let entry     = audit_chain_list[i]
+        let e_svc     = dict_get(entry, "service") ?? ""
+        let e_evt     = dict_get(entry, "event") ?? ""
+        let e_sev     = dict_get(entry, "severity") ?? ""
+        let e_ts      = dict_get(entry, "timestamp") ?? 0
+
+        // Apply filters
+        let skip = false
+        if3 len(svc_s) > 0 {
+            if3 e_svc != svc_s {
+                let skip = true
+            }
+        }
+        if3 len(evt_s) > 0 {
+            if3 e_evt != evt_s {
+                let skip = true
+            }
+        }
+        if3 len(sev_s) > 0 {
+            if3 e_sev != sev_s {
+                let skip = true
+            }
+        }
+        if3 since > 0 {
+            if3 e_ts < since {
+                let skip = true
+            }
+        }
+
+        if3 skip == false {
+            results = append(results, entry)
+        }
+
+        if3 len(results) >= lim {
+            let i = -1
+        }
+
+        if3 i >= 0 {
+            i = i - 1
+        }
+    }
+
+    let t = T_MAYBE
+    if3 len(results) > 0 {
+        let t = T_TRUE
+    }
+
+    return {
+        "ok":      true,
+        "entries": results,
+        "count":   len(results),
+        "filters": {
+            "service":  svc_s,
+            "event":    evt_s,
+            "severity": sev_s,
+            "since":    since,
+            "limit":    lim
+        },
+        "trit": t,
+        "char": tchar(t)
+    }
+}
+
+
+// -- Chain: return last N entries with hash chain for inspection --
+// Body params: limit (int, default 50)
+fn audit_chain_view(body) {
+    let limit_val = dict_get(body, "limit") ?? 50
+    let lim = int(limit_val)
+    if3 lim < 1 {
+        let lim = 1
+    }
+    if3 lim > MAX_ENTRIES {
+        let lim = MAX_ENTRIES
+    }
+
+    let total = len(audit_chain_list)
+    let start = total - lim
+    if3 start < 0 {
+        let start = 0
+    }
+    let entries = slice(audit_chain_list, start, total)
+
+    let t = T_MAYBE
+    if3 len(entries) > 0 {
+        let t = T_TRUE
+    }
+
+    return {
+        "ok":           true,
+        "entries":      entries,
+        "count":        len(entries),
+        "chain_length": total,
+        "max_entries":  MAX_ENTRIES,
+        "genesis_hash": GENESIS_HASH,
+        "trit":         t,
+        "char":         tchar(t)
+    }
+}
+
+
+// -- Verify: walk the chain and check every hash link --
+fn audit_verify(body) {
+    let total = len(audit_chain_list)
+
+    if3 total == 0 {
+        return {
+            "ok":           true,
+            "chain_length": 0,
+            "valid":        true,
+            "trit":         T_TRUE,
+            "char":         "+",
+            "note":         "empty chain is trivially valid"
+        }
+    }
+
+    let broken      = false
+    let broken_idx  = -1
+    let broken_id   = -1
+    let broken_type = ""
+    let expected_prev = GENESIS_HASH
+
+    let i = 0
+    while3 i < total {
+        let entry    = audit_chain_list[i]
+        let e_prev   = dict_get(entry, "prev_hash") ?? ""
+        let e_hash   = dict_get(entry, "hash") ?? ""
+        let e_evt    = dict_get(entry, "event") ?? ""
+        let e_svc    = dict_get(entry, "service") ?? ""
+        let e_ts     = dict_get(entry, "timestamp") ?? 0
+        let e_id     = dict_get(entry, "id") ?? -1
+
+        // Check prev_hash linkage
+        if3 e_prev != expected_prev {
+            let broken      = true
+            let broken_idx  = i
+            let broken_id   = e_id
+            let broken_type = "prev_hash_mismatch"
+            let i           = total  // break
+        }
+
+        // Recompute hash and verify
+        if3 broken == false {
+            let recomputed = compute_hash(e_prev, e_evt, e_svc, str(e_ts))
+            if3 recomputed != e_hash {
+                let broken      = true
+                let broken_idx  = i
+                let broken_id   = e_id
+                let broken_type = "hash_mismatch"
+                let i           = total  // break
+            }
+        }
+
+        if3 broken == false {
+            let expected_prev = e_hash
+        }
+
+        if3 i < total {
+            i = i + 1
+        }
+    }
+
+    if3 broken == true {
+        return {
+            "ok":           true,
+            "chain_length": total,
+            "valid":        false,
+            "broken_at": {
+                "index":    broken_idx,
+                "entry_id": broken_id,
+                "type":     broken_type
+            },
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    }
+
+    // Collect first and last hash for confirmation
+    let first_entry = audit_chain_list[0]
+    let last_entry  = audit_chain_list[total - 1]
+    let first_hash  = dict_get(first_entry, "hash") ?? ""
+    let last_hash   = dict_get(last_entry,  "hash") ?? ""
+
+    return {
+        "ok":           true,
+        "chain_length": total,
+        "valid":        true,
+        "first_hash":   first_hash,
+        "last_hash":    last_hash,
+        "trit":         T_TRUE,
+        "char":         "+"
+    }
+}
+
+
+// -- Stats: return audit trail statistics --
+fn audit_stats(body) {
+    let now     = time()
+    let uptime  = now - stat_t0
+    let re_num  = calc_reynolds()
+    let regime  = flow_regime(re_num)
+    let total   = len(audit_chain_list)
+
+    let eps = 0
+    if3 uptime > 0 {
+        let eps = stat_total / uptime
+    }
+
+    let t = T_MAYBE
+    if3 stat_total > 0 {
+        let t = T_TRUE
+    }
+
+    let fill_pct = 0
+    if3 MAX_ENTRIES > 0 {
+        let fill_pct = round((total / MAX_ENTRIES) * 100, 2)
+    }
+
+    return {
+        "ok":              true,
+        "total_events":    stat_total,
+        "chain_length":    total,
+        "max_entries":     MAX_ENTRIES,
+        "buffer_fill_pct": fill_pct,
+        "by_severity": {
+            "info":     stat_info_count,
+            "warn":     stat_warn_count,
+            "critical": stat_critical_count
+        },
+        "events_per_sec":  round(eps, 4),
+        "audit_log_file":  AUDIT_LOG,
+        "uptime":          int(uptime),
+        "reynolds":        re_num,
+        "flow_regime":     regime,
+        "quality": {
+            "strong":  stat_info_count,
+            "partial": stat_warn_count,
+            "failed":  stat_critical_count
+        },
+        "harmonics": {
+            "H3":  H3,
+            "H5":  H5,
+            "H7":  H7,
+            "H13": H13
+        },
+        "trit": t,
+        "char": tchar(t)
+    }
+}
+
+
+// -- Alerts: return critical events from the last hour --
+fn audit_alerts(body) {
+    let now    = time()
+    let cutoff = now - ALERTS_WINDOW
+
+    let results = []
+    let total   = len(audit_chain_list)
+    // Walk newest-first; stop once past the window
+    let i = total - 1
+    while3 i >= 0 {
+        let entry = audit_chain_list[i]
+        let e_ts  = dict_get(entry, "timestamp") ?? 0
+        let e_sev = dict_get(entry, "severity") ?? ""
+
+        if3 e_ts < cutoff {
+            let i = -1  // break: past the 1-hour window
+        }
+
+        if3 i >= 0 {
+            if3 e_sev == "critical" {
+                results = append(results, entry)
+            }
+            i = i - 1
+        }
+    }
+
+    // Alerts present = bad (T_FALSE), no alerts = good (T_TRUE)
+    let t = T_TRUE
+    if3 len(results) > 0 {
+        let t = T_FALSE
+    }
+
+    let status_msg = "no critical events"
+    if3 len(results) > 0 {
+        let status_msg = "critical events detected"
+    }
+
+    return {
+        "ok":            true,
+        "alerts":        results,
+        "count":         len(results),
+        "window_seconds": ALERTS_WINDOW,
+        "window_human":  "1 hour",
+        "trit":          t,
+        "char":          tchar(t),
+        "status":        status_msg
+    }
+}
+
+
+// -- Health endpoint --
+fn health(body) {
+    let total   = len(audit_chain_list)
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "total_events", stat_total)
+    resp = dict_set(resp, "chain_length", total)
+    resp = dict_set(resp, "max_entries", MAX_ENTRIES)
+    resp = dict_set(resp, "audit_log", AUDIT_LOG)
+    resp = dict_set(resp, "quality", {
+        "strong":  stat_info_count,
+        "partial": stat_warn_count,
+        "failed":  stat_critical_count
+    })
+    return resp
+}
+
+
+// -- Route registrations --
+troute(server, "GET",  "/health",         "health")
+troute(server, "GET",  "/taudit/health",  "health")
+troute(server, "POST", "/taudit/record",  "audit_record")
+troute(server, "GET",  "/taudit/query",   "audit_query")
+troute(server, "GET",  "/taudit/chain",   "audit_chain_view")
+troute(server, "POST", "/taudit/verify",  "audit_verify")
+troute(server, "GET",  "/taudit/stats",   "audit_stats")
+troute(server, "GET",  "/taudit/alerts",  "audit_alerts")
+
+
+// -- Startup banner --
+print("[TAudit v" + VERSION + "] Ternary Security Audit Trail -- Port " + str(PORT))
+print("[TAudit] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TAudit] Re boundaries: " + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT))
+print("[TAudit] Chain buffer: " + str(MAX_ENTRIES) + " entries (H13*H7*H3 = 13*7*3)")
+print("[TAudit] Genesis hash: " + GENESIS_HASH)
+print("[TAudit] Audit log: " + AUDIT_LOG)
+print("[TAudit] Severities: info=+1 warn=0 critical=-1")
+print("[TAudit] Alerts window: " + str(ALERTS_WINDOW) + "s (1 hour)")
+print("[TAudit] Routes GET:  /health /taudit/health /taudit/query /taudit/chain /taudit/stats /taudit/alerts")
+print("[TAudit] Routes POST: /taudit/record /taudit/verify")
+print("[TAudit] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

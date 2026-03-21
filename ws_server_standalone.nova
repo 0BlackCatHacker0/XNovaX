@@ -1,0 +1,154 @@
+// ============================================================================
+// WebSocket Transport — HTTP Bridge
+// NovaX Persistent Channel Service
+// Port 9998 | Ternary Micro-Tool | 3-5-7-13 Harmonics
+// ============================================================================
+// The WebSocket transport carries all real-time communication:
+//   commands, events, logs, file transfers — one persistent pipe.
+//
+// This .nova service provides HTTP-based message routing as the
+// bridge layer. Full async WebSocket protocol lives in the
+// orchestrator's transport module.
+//
+// Ternary states:
+//   +1 = connected (clients active, messages flowing)
+//    0 = idle (no clients, ready to accept)
+//   -1 = error (transport failure)
+// ============================================================================
+
+let VERSION = "1.0"
+let PORT = 9998
+let server = tserve(PORT, "nova-ws-transport")
+let SERVICE = "nova-ws-transport"
+
+// -- State --
+let _clients = 0
+let _messages_in = 0
+let _messages_out = 0
+let _start_time = time()
+let _state = MAYBE    // idle until first client
+
+// -- Health --
+troute(server, "GET", "/health", "handle_health")
+fn handle_health(req) {
+    let uptime = time() - _start_time
+    return {
+        "status": "ok",
+        "service": SERVICE,
+        "version": VERSION,
+        "port": PORT,
+        "state": _state,
+        "uptime": uptime,
+        "clients": _clients,
+        "messages_in": _messages_in,
+        "messages_out": _messages_out,
+        "ternary": "native"
+    }
+}
+
+// -- Status --
+troute(server, "GET", "/ws/status", "handle_status")
+fn handle_status(req) {
+    return {
+        "ok": TRUE,
+        "transport": "websocket",
+        "port": PORT,
+        "clients": _clients,
+        "state": _state,
+        "messages": {
+            "in": _messages_in,
+            "out": _messages_out,
+            "total": _messages_in + _messages_out
+        }
+    }
+}
+
+// -- Message Send (HTTP bridge for WS push) --
+troute(server, "POST", "/ws/send", "handle_send")
+fn handle_send(req) {
+    let body = req
+    let op = body["op"]
+    let data = body["data"]
+    if3 op == "" {
+        return {"ok": FALSE_, "error": "missing op field"}
+    }
+    _messages_out += 1
+    if3 _clients > 0 {
+        _state = TRUE
+    }
+    return {
+        "ok": TRUE,
+        "op": op,
+        "delivered": _clients,
+        "queued": 0
+    }
+}
+
+// -- Message Receive (HTTP bridge for WS pull) --
+troute(server, "POST", "/ws/recv", "handle_recv")
+fn handle_recv(req) {
+    let body = req
+    let op = body["op"]
+    let mid = body["id"]
+    let data = body["data"]
+    _messages_in += 1
+
+    // Ping/pong
+    if3 op == "ping" {
+        return {"op": "pong", "ts": time()}
+    }
+
+    // Status request
+    if3 op == "status" {
+        return {
+            "op": "result",
+            "id": mid,
+            "data": {
+                "ok": TRUE,
+                "clients": _clients,
+                "uptime": time() - _start_time
+            }
+        }
+    }
+
+    // Health request
+    if3 op == "health" {
+        return {
+            "op": "result",
+            "id": mid,
+            "data": {"ok": TRUE, "service": SERVICE}
+        }
+    }
+
+    // Unknown op
+    return {"op": "error", "data": {"msg": "unknown op: " + str(op)}}
+}
+
+// -- Client connect/disconnect tracking --
+troute(server, "POST", "/ws/connect", "handle_connect")
+fn handle_connect(req) {
+    _clients += 1
+    _state = TRUE
+    return {
+        "ok": TRUE,
+        "op": "welcome",
+        "server": "NovaX",
+        "version": VERSION,
+        "clients": _clients
+    }
+}
+
+troute(server, "POST", "/ws/disconnect", "handle_disconnect")
+fn handle_disconnect(req) {
+    _clients -= 1
+    if3 _clients <= 0 {
+        _clients = 0
+        _state = MAYBE
+    }
+    return {"ok": TRUE, "clients": _clients}
+}
+
+// -- Boot --
+print("WebSocket Transport v" + VERSION + " on port " + str(PORT))
+print("HTTP bridge mode — full async WS in orchestrator transport")
+tstart(server)

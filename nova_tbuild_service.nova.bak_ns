@@ -1,0 +1,1298 @@
+// nova_tbuild_service.nova -- NovaX TBuild v2.0 -- Ternary Build System (port 9909)
+//
+// 7 ternary-native build tools on 3-5-7-13 harmonic constants:
+//   1. /tbuild/deps     -- List project dependencies (package.json, requirements.txt, Cargo.toml, etc.)
+//   2. /tbuild/order    -- Determine build order from file dependencies (topological sort)
+//   3. /tbuild/diff     -- Show changed files since last build (mtime/git-based)
+//   4. /tbuild/status   -- Project build status (artifacts, lock files, build dirs)
+//   5. /tbuild/lint     -- Basic linting: Python syntax check, JS bracket validation
+//   6. /tbuild/vcs      -- Version control status (git branch, changes, recent commits)
+//   7. /tbuild/compile  -- Run a build command (params: path, command, timeout)
+//
+// N-S Mapping:
+//   source files = flow field; dependencies = pressure gradient
+//   build order  = streamline integration; lint score = viscous dissipation
+//   Reynolds boundaries: 27 (laminar), 125 (transitional), 343 (turbulent)
+//
+// Harmonics:
+//   H3=3  H5=5  H7=7  H13=13  BLOCK=3^7=2187
+//   RE_LAMINAR=3^3=27  RE_TRANSITION=5^3=125  RE_TURBULENT=7^3=343
+
+let PORT = 9909
+let server = tserve(PORT, "TBuild v2.0 - Ternary Build System")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+let BLOCK = 2187
+
+// -- Service Identity --
+let VERSION      = "2.0.0"
+let SERVICE_NAME = "nova-tbuild"
+let TOOLS_COUNT  = 7
+
+// -- Ternary Truth Values --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- N-S Reynolds Boundaries --
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+// -- Temp file base (all temp files go here) --
+let TMP_BASE = "C:\\NovaX\\data"
+
+// -- Stats State --
+let stat_ops        = 0
+let stat_t0         = time()
+let stat_trit_true  = 0
+let stat_trit_maybe = 0
+let stat_trit_false = 0
+let stat_deps       = 0
+let stat_order      = 0
+let stat_diff       = 0
+let stat_status     = 0
+let stat_lint       = 0
+let stat_vcs        = 0
+let stat_compile    = 0
+
+// ============================================================================
+// HELPER: record_op -- update stats counters for a completed operation
+// ============================================================================
+
+fn record_op(tool_name, trit_val) {
+    stat_ops = stat_ops + 1
+    if3 trit_val == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    } else trit_val == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    } else {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "deps" {
+        stat_deps = stat_deps + 1
+    } else tool_name == "order" {
+        stat_order = stat_order + 1
+    } else tool_name == "diff" {
+        stat_diff = stat_diff + 1
+    } else tool_name == "status" {
+        stat_status = stat_status + 1
+    } else tool_name == "lint" {
+        stat_lint = stat_lint + 1
+    } else tool_name == "vcs" {
+        stat_vcs = stat_vcs + 1
+    } else {
+        stat_compile = stat_compile + 1
+    }
+    return T_TRUE
+}
+
+// ============================================================================
+// HELPER: trit_char -- ternary character symbol (+1->"1", 0->"0", -1->"T")
+// ============================================================================
+
+fn trit_char(t) {
+    if3 t == T_TRUE {
+        return "1"
+    } else t == T_MAYBE {
+        return "0"
+    } else {
+        return "T"
+    }
+}
+
+// ============================================================================
+// HELPER: bt_from_trits -- balanced-ternary string from a list of trit values
+// ============================================================================
+
+fn bt_from_trits(trits) {
+    let out = ""
+    let i   = 0
+    let n   = len(trits)
+    while3 i < n {
+        let t = dict_get(trits, i, 0)
+        if3 t == T_TRUE {
+            let out = out + "1"
+        } else t == T_FALSE {
+            let out = out + "T"
+        } else {
+            let out = out + "0"
+        }
+        let i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+// HELPER: flow_regime -- N-S Reynolds number to flow regime name
+// ============================================================================
+
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    } else re_num < RE_TRANSITION {
+        return "transitional"
+    } else re_num < RE_TURBULENT {
+        return "turbulent"
+    } else {
+        return "chaotic"
+    }
+}
+
+// ============================================================================
+// HELPER: esc_path -- escape backslashes in a Windows path for embedding
+//         in a python -c single-line command string.
+//         Uses replace() which is a NovaLang builtin.
+// ============================================================================
+
+fn esc_path(p) {
+    return replace(p, "\\", "\\\\")
+}
+
+// ============================================================================
+// HELPER: ensure_tmp_dir -- make sure C:\NovaX\data exists
+// ============================================================================
+
+fn ensure_tmp_dir() {
+    let chk = nova_run("python -c \"import os; os.makedirs('C:\\\\NovaX\\\\data', exist_ok=True); print('ok')\"", 10)
+    return T_TRUE
+}
+
+// ============================================================================
+// TOOL 1: DEPENDENCY LISTER
+// POST /tbuild/deps
+// Body: {"path": "/abs/project/dir"}
+// Reads package.json, requirements.txt, Cargo.toml, go.mod, Pipfile, pyproject.toml
+// Returns: {deps: {file: [list]}, count: N, trit: 1/0/-1}
+// ============================================================================
+
+fn tbuild_deps(body) {
+    let t0   = time()
+    let path = str(dict_get(body, "path", ""))
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else {
+        // path provided
+    }
+
+    let raw = nova_run("python \"C:\\NovaX\\scripts\\tbuild_deps.py\" \"" + path + "\"", 30)
+
+    let overall = T_MAYBE
+    let found_deps = {}
+    let dep_count = 0
+
+    if3 len(trim(raw)) == 0 {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("deps", T_FALSE)
+        return {"ok": false, "error": "No output from deps scanner. Is path valid?", "path": path, "trit": T_FALSE, "ms": elapsed}
+    } else {
+        // have output
+    }
+
+    try3 {
+        let parsed    = json_decode(raw)
+        let found_deps = dict_get(parsed, "deps",  {})
+        let dep_count  = dict_get(parsed, "count", 0)
+        let trit_raw   = dict_get(parsed, "trit",  T_MAYBE)
+        let overall    = trit_raw
+    } else {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("deps", T_FALSE)
+        return {"ok": false, "error": "Deps parse failed: " + raw, "trit": T_FALSE, "ms": elapsed}
+    }
+
+    // Detect which manifest files were found
+    let manifests_found = keys(found_deps)
+
+    // Build Reynolds number: dep_count as "flow load"
+    let re_num = dep_count
+    let regime = flow_regime(re_num)
+
+    // Trit list from per-file dep presence
+    let mf_keys = keys(found_deps)
+    let trit_list = []
+    let mi = 0
+    let mn = len(mf_keys)
+    while3 mi < mn {
+        let mk = dict_get(mf_keys, mi, "")
+        let mv = dict_get(found_deps, mk, [])
+        if3 len(mv) > 0 {
+            append(trit_list, T_TRUE)
+        } else {
+            append(trit_list, T_MAYBE)
+        }
+        let mi = mi + 1
+    }
+
+    let bt_str = bt_from_trits(trit_list)
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    let _r = record_op("deps", overall)
+
+    return {
+        "ok":       true,
+        "path":     path,
+        "deps":     found_deps,
+        "count":    dep_count,
+        "manifests": manifests_found,
+        "reynolds": re_num,
+        "regime":   regime,
+        "bt":       bt_str,
+        "trit":     overall,
+        "ms":       elapsed
+    }
+}
+
+// ============================================================================
+// TOOL 2: BUILD ORDER
+// POST /tbuild/order
+// Body: {"path": "/abs/project/dir", "pattern": "*.py"}
+// Scans files matching pattern, reads import/require statements,
+// performs topological sort (Kahn's algorithm), returns build order.
+// Uses nova_write + temp .py for complex logic.
+// ============================================================================
+
+fn tbuild_order(body) {
+    let t0      = time()
+    let path    = str(dict_get(body, "path", ""))
+    let pattern = str(dict_get(body, "pattern", "*.py"))
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else {
+        // path provided
+    }
+
+    let _d = ensure_tmp_dir()
+
+    // Write temp Python script for order computation
+    let script_path = TMP_BASE + "\\tbuild_order_script.py"
+    let script_body = "import sys, json, os, glob, re\n"
+    let script_body = script_body + "path = sys.argv[1]\n"
+    let script_body = script_body + "pattern = sys.argv[2]\n"
+    let script_body = script_body + "\n"
+    let script_body = script_body + "# Gather files matching pattern (recursive)\n"
+    let script_body = script_body + "all_files = []\n"
+    let script_body = script_body + "for root, dirs, fnames in os.walk(path):\n"
+    let script_body = script_body + "    dirs[:] = [d for d in dirs if d not in {'.git','node_modules','__pycache__','ai_env','venv','.venv'}]\n"
+    let script_body = script_body + "    for f in fnames:\n"
+    let script_body = script_body + "        fp = os.path.join(root, f)\n"
+    let script_body = script_body + "        if glob.fnmatch.fnmatch(f, pattern):\n"
+    let script_body = script_body + "            all_files.append(fp)\n"
+    let script_body = script_body + "\n"
+    let script_body = script_body + "# Build relative names for cleaner output\n"
+    let script_body = script_body + "def rel(fp):\n"
+    let script_body = script_body + "    try: return os.path.relpath(fp, path)\n"
+    let script_body = script_body + "    except: return fp\n"
+    let script_body = script_body + "\n"
+    let script_body = script_body + "# Extract local dependencies from each file\n"
+    let script_body = script_body + "def get_local_deps(fp):\n"
+    let script_body = script_body + "    deps = set()\n"
+    let script_body = script_body + "    ext = os.path.splitext(fp)[1].lower()\n"
+    let script_body = script_body + "    try:\n"
+    let script_body = script_body + "        src = open(fp, 'r', encoding='utf-8', errors='replace').read()\n"
+    let script_body = script_body + "    except:\n"
+    let script_body = script_body + "        return deps\n"
+    let script_body = script_body + "    if ext == '.py':\n"
+    let script_body = script_body + "        for m in re.finditer(r'^\\s*from\\s+\\.([\\w.]+)\\s+import|^\\s*import\\s+\\.([\\w.]+)', src, re.MULTILINE):\n"
+    let script_body = script_body + "            name = (m.group(1) or m.group(2) or '').split('.')[0]\n"
+    let script_body = script_body + "            if name:\n"
+    let script_body = script_body + "                candidate = os.path.join(os.path.dirname(fp), name + '.py')\n"
+    let script_body = script_body + "                if os.path.exists(candidate):\n"
+    let script_body = script_body + "                    deps.add(candidate)\n"
+    let script_body = script_body + "        for m in re.finditer(r'^from\\s+(\\w+)\\s+import|^import\\s+(\\w+)', src, re.MULTILINE):\n"
+    let script_body = script_body + "            name = (m.group(1) or m.group(2) or '')\n"
+    let script_body = script_body + "            candidate = os.path.join(path, name + '.py')\n"
+    let script_body = script_body + "            if os.path.exists(candidate) and candidate in all_files:\n"
+    let script_body = script_body + "                deps.add(candidate)\n"
+    let script_body = script_body + "    elif ext in ('.js', '.ts', '.jsx', '.tsx'):\n"
+    let script_body = script_body + "        for m in re.finditer(r'''(?:import|require)\\s*[\\('\"]+([./][^'\"\\s)]+)['\")]+''', src):\n"
+    let script_body = script_body + "            name = m.group(1)\n"
+    let script_body = script_body + "            for ext2 in ('', '.js', '.ts', '/index.js', '/index.ts'):\n"
+    let script_body = script_body + "                candidate = os.path.normpath(os.path.join(os.path.dirname(fp), name + ext2))\n"
+    let script_body = script_body + "                if os.path.exists(candidate) and candidate in all_files:\n"
+    let script_body = script_body + "                    deps.add(candidate)\n"
+    let script_body = script_body + "                    break\n"
+    let script_body = script_body + "    return deps\n"
+    let script_body = script_body + "\n"
+    let script_body = script_body + "# Build graph\n"
+    let script_body = script_body + "graph = {fp: get_local_deps(fp) for fp in all_files}\n"
+    let script_body = script_body + "\n"
+    let script_body = script_body + "# Kahn's topological sort\n"
+    let script_body = script_body + "in_deg = {n: 0 for n in graph}\n"
+    let script_body = script_body + "adj = {n: set() for n in graph}\n"
+    let script_body = script_body + "for node, deps in graph.items():\n"
+    let script_body = script_body + "    for dep in deps:\n"
+    let script_body = script_body + "        if dep in adj:\n"
+    let script_body = script_body + "            adj[dep].add(node)\n"
+    let script_body = script_body + "            in_deg[node] = in_deg.get(node, 0) + 1\n"
+    let script_body = script_body + "\n"
+    let script_body = script_body + "from collections import deque\n"
+    let script_body = script_body + "queue = deque(n for n in graph if in_deg.get(n, 0) == 0)\n"
+    let script_body = script_body + "order = []\n"
+    let script_body = script_body + "while queue:\n"
+    let script_body = script_body + "    node = queue.popleft()\n"
+    let script_body = script_body + "    order.append(node)\n"
+    let script_body = script_body + "    for nb in adj.get(node, set()):\n"
+    let script_body = script_body + "        in_deg[nb] -= 1\n"
+    let script_body = script_body + "        if in_deg[nb] == 0:\n"
+    let script_body = script_body + "            queue.append(nb)\n"
+    let script_body = script_body + "\n"
+    let script_body = script_body + "has_cycle = len(order) < len(graph)\n"
+    let script_body = script_body + "cycle_nodes = [rel(n) for n in graph if n not in set(order)]\n"
+    let script_body = script_body + "order_rel = [rel(n) for n in order]\n"
+    let script_body = script_body + "\n"
+    let script_body = script_body + "edges = sum(len(d) for d in graph.values())\n"
+    let script_body = script_body + "nodes = len(graph)\n"
+    let script_body = script_body + "re_num = round(edges * nodes / max(1, 3), 2)\n"
+    let script_body = script_body + "regime = 'laminar' if re_num < 27 else ('transitional' if re_num < 125 else ('turbulent' if re_num < 343 else 'chaotic'))\n"
+    let script_body = script_body + "trit = -1 if has_cycle else (0 if edges == 0 else 1)\n"
+    let script_body = script_body + "\n"
+    let script_body = script_body + "print(json.dumps({\n"
+    let script_body = script_body + "    'order': order_rel,\n"
+    let script_body = script_body + "    'nodes': nodes,\n"
+    let script_body = script_body + "    'edges': edges,\n"
+    let script_body = script_body + "    'has_cycle': has_cycle,\n"
+    let script_body = script_body + "    'cycle_nodes': cycle_nodes,\n"
+    let script_body = script_body + "    'pattern': pattern,\n"
+    let script_body = script_body + "    'reynolds': re_num,\n"
+    let script_body = script_body + "    'regime': regime,\n"
+    let script_body = script_body + "    'trit': trit\n"
+    let script_body = script_body + "}))\n"
+
+    let _w = nova_write(script_path, script_body)
+    let ep = esc_path(path)
+    let cmd = "python \"" + script_path + "\" \"" + path + "\" \"" + pattern + "\""
+    let raw = nova_run(cmd, 60)
+
+    if3 len(trim(raw)) == 0 {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("order", T_FALSE)
+        return {"ok": false, "error": "Build order script produced no output", "path": path, "trit": T_FALSE, "ms": elapsed}
+    } else {
+        // have output
+    }
+
+    try3 {
+        let parsed      = json_decode(raw)
+        let order_list  = dict_get(parsed, "order",       [])
+        let nodes_count = dict_get(parsed, "nodes",       0)
+        let edges_count = dict_get(parsed, "edges",       0)
+        let has_cycle   = dict_get(parsed, "has_cycle",   false)
+        let cycle_nodes = dict_get(parsed, "cycle_nodes", [])
+        let re_num      = dict_get(parsed, "reynolds",    0)
+        let regime      = dict_get(parsed, "regime",      "laminar")
+        let trit_raw    = dict_get(parsed, "trit",        T_MAYBE)
+
+        let trit_list = [trit_raw]
+        let bt_str    = bt_from_trits(trit_list)
+
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("order", trit_raw)
+
+        return {
+            "ok":          has_cycle == false,
+            "path":        path,
+            "pattern":     pattern,
+            "order":       order_list,
+            "nodes":       nodes_count,
+            "edges":       edges_count,
+            "has_cycle":   has_cycle,
+            "cycle_nodes": cycle_nodes,
+            "reynolds":    re_num,
+            "regime":      regime,
+            "bt":          bt_str,
+            "trit":        trit_raw,
+            "ms":          elapsed
+    } else {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("order", T_FALSE)
+        return {"ok": false, "error": "Build order failed: " + raw, "trit": T_FALSE, "ms": elapsed}
+    }
+}
+
+// ============================================================================
+// TOOL 3: DIFF (changed files since last build)
+// POST /tbuild/diff
+// Body: {"path": "/abs/project/dir", "since": <unix_timestamp>}
+//    OR {"path": "/abs/project/dir", "reference": "HEAD~1"}
+// Returns list of files modified after timestamp or since git ref.
+// ============================================================================
+}
+
+fn tbuild_diff(body) {
+    let t0        = time()
+    let path      = str(dict_get(body, "path", ""))
+    let since_ts  = dict_get(body, "since", 0)
+    let reference = str(dict_get(body, "reference", ""))
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else {
+        // path provided
+    }
+
+    let _d = ensure_tmp_dir()
+    let ep = esc_path(path)
+
+    // Branch: git-based diff if reference given, else mtime-based
+    let use_git = false
+    if3 len(reference) > 0 {
+        let use_git = true
+    } else {
+        // mtime mode
+    }
+
+    let raw = ""
+
+    if3 use_git == true {
+        // Use git diff to find changed files since reference
+        let esc_ref = replace(reference, "\"", "")
+        let py_cmd = "python -c \"import subprocess,json,os; os.chdir('" + ep + "'); r=subprocess.run(['git','diff','--name-status','" + esc_ref + "'],capture_output=True,text=True); lines=[l for l in r.stdout.strip().split(chr(10)) if l]; changes=[]; [changes.append({'status':l.split(chr(9))[0],'file':l.split(chr(9))[-1],'trit':1 if l[0] in 'A' else(-1 if l[0]=='D' else 0)}) for l in lines if chr(9) in l]; added=sum(1 for c in changes if c['trit']==1); modified=sum(1 for c in changes if c['trit']==0); deleted=sum(1 for c in changes if c['trit']==-1); trit=1 if not changes else(0 if len(changes)<27 else -1); print(json.dumps({'mode':'git','reference':'" + esc_ref + "','changes':changes,'added':added,'modified':modified,'deleted':deleted,'total':len(changes),'trit':trit}))\""
+        let raw = nova_run(py_cmd, 30)
+    } else {
+        // mtime-based: files modified after since_ts
+        // os.walk with dir filtering requires multiline -- use nova_write temp script.
+        let since_str = str(since_ts)
+        let script_path2 = TMP_BASE + "\\tbuild_diff_mtime.py"
+        let mtime_script = "import os, json, time, sys\n"
+        let mtime_script = mtime_script + "p = sys.argv[1]\n"
+        let mtime_script = mtime_script + "since = float(sys.argv[2]) if sys.argv[2] != '0' else 0\n"
+        let mtime_script = mtime_script + "skip = {'.git','node_modules','__pycache__','ai_env','venv','.venv'}\n"
+        let mtime_script = mtime_script + "now = time.time()\n"
+        let mtime_script = mtime_script + "changes = []\n"
+        let mtime_script = mtime_script + "for root, dirs, files in os.walk(p):\n"
+        let mtime_script = mtime_script + "    dirs[:] = [d for d in dirs if d not in skip]\n"
+        let mtime_script = mtime_script + "    for f in files:\n"
+        let mtime_script = mtime_script + "        fp = os.path.join(root, f)\n"
+        let mtime_script = mtime_script + "        try:\n"
+        let mtime_script = mtime_script + "            mt = os.path.getmtime(fp)\n"
+        let mtime_script = mtime_script + "            if since == 0 or mt > since:\n"
+        let mtime_script = mtime_script + "                changes.append({'file': os.path.relpath(fp, p), 'mtime': round(mt, 2), 'age_s': round(now - mt, 1), 'trit': 1})\n"
+        let mtime_script = mtime_script + "        except:\n"
+        let mtime_script = mtime_script + "            pass\n"
+        let mtime_script = mtime_script + "changes.sort(key=lambda x: -x['mtime'])\n"
+        let mtime_script = mtime_script + "total = len(changes)\n"
+        let mtime_script = mtime_script + "trit = 1 if not changes else (0 if total < 27 else -1)\n"
+        let mtime_script = mtime_script + "print(json.dumps({'mode': 'mtime', 'since': since, 'changes': changes[:343], 'total': total, 'truncated': total > 343, 'trit': trit}))\n"
+        let _w2 = nova_write(script_path2, mtime_script)
+        let raw = nova_run("python \"" + script_path2 + "\" \"" + path + "\" \"" + since_str + "\"", 30)
+    }
+
+    if3 len(trim(raw)) == 0 {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("diff", T_FALSE)
+        return {"ok": false, "error": "Diff produced no output", "path": path, "trit": T_FALSE, "ms": elapsed}
+    } else {
+        // have output
+    }
+
+    try3 {
+        let parsed    = json_decode(raw)
+        let mode      = dict_get(parsed, "mode",      "mtime")
+        let changes   = dict_get(parsed, "changes",   [])
+        let total_ch  = dict_get(parsed, "total",     0)
+        let truncated = dict_get(parsed, "truncated", false)
+        let trit_raw  = dict_get(parsed, "trit",      T_MAYBE)
+
+        // Build bt from per-change trits (up to H13)
+        let trit_list = []
+        let ci = 0
+        let cn = len(changes)
+        let ct_max = H13
+        if3 cn < ct_max {
+            let ct_max = cn
+        } else {
+            // cap at H13
+        }
+        while3 ci < ct_max {
+            let ce = dict_get(changes, ci, {})
+            let ct = dict_get(ce, "trit", T_MAYBE)
+            append(trit_list, ct)
+            let ci = ci + 1
+        }
+        let bt_str = bt_from_trits(trit_list)
+
+        // Reynolds: total change count as flow metric
+        let re_num = total_ch
+        let regime = flow_regime(re_num)
+
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("diff", trit_raw)
+
+        return {
+            "ok":       true,
+            "path":     path,
+            "mode":     mode,
+            "changes":  changes,
+            "total":    total_ch,
+            "truncated": truncated,
+            "reynolds": re_num,
+            "regime":   regime,
+            "bt":       bt_str,
+            "trit":     trit_raw,
+            "ms":       elapsed
+    } else {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("diff", T_FALSE)
+        return {"ok": false, "error": "Diff parse failed: " + raw, "trit": T_FALSE, "ms": elapsed}
+    }
+}
+
+// ============================================================================
+// TOOL 4: BUILD STATUS
+// POST /tbuild/status
+// Body: {"path": "/abs/project/dir"}
+// Checks for build artifacts, lock files, build directories, outdated build.
+// Returns: {has_build_dir, has_lock_file, artifacts, build_fresh, trit}
+// ============================================================================
+}
+
+fn tbuild_status(body) {
+    let t0   = time()
+    let path = str(dict_get(body, "path", ""))
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else {
+        // path provided
+    }
+
+    let ep = esc_path(path)
+
+    // Logic requires os.walk with dir filtering -- must use nova_write temp script.
+    let status_script = TMP_BASE + "\\tbuild_status_script.py"
+    let status_body = "import os, json, time, sys\n"
+    let status_body = status_body + "p = sys.argv[1]\n"
+    let status_body = status_body + "now = time.time()\n"
+    let status_body = status_body + "build_dirs = ['dist','build','out','target','_build','.next','.nuxt','__pycache__']\n"
+    let status_body = status_body + "lock_files = ['package-lock.json','yarn.lock','pnpm-lock.yaml','Pipfile.lock','poetry.lock','Cargo.lock','go.sum','composer.lock','Gemfile.lock']\n"
+    let status_body = status_body + "artifact_exts = {'.pyc','.pyo','.o','.obj','.class','.jar','.war','.egg','.whl','.so','.dll','.exe','.node'}\n"
+    let status_body = status_body + "skip_src = {'.git','node_modules','ai_env','venv','.venv'}\n"
+    let status_body = status_body + "skip_art = skip_src | set(build_dirs)\n"
+    let status_body = status_body + "\n"
+    let status_body = status_body + "ls = os.listdir(p) if os.path.isdir(p) else []\n"
+    let status_body = status_body + "found_build_dirs = [d for d in build_dirs if d in ls and os.path.isdir(os.path.join(p, d))]\n"
+    let status_body = status_body + "found_locks = [f for f in lock_files if f in ls]\n"
+    let status_body = status_body + "\n"
+    let status_body = status_body + "# Collect artifacts\n"
+    let status_body = status_body + "artifacts = []\n"
+    let status_body = status_body + "art_count = 0\n"
+    let status_body = status_body + "for root, dirs, files in os.walk(p):\n"
+    let status_body = status_body + "    dirs[:] = [d for d in dirs if d not in skip_src]\n"
+    let status_body = status_body + "    for f in files:\n"
+    let status_body = status_body + "        if os.path.splitext(f)[1].lower() in artifact_exts:\n"
+    let status_body = status_body + "            artifacts.append(os.path.relpath(os.path.join(root, f), p))\n"
+    let status_body = status_body + "            art_count += 1\n"
+    let status_body = status_body + "            if art_count >= 27:\n"
+    let status_body = status_body + "                break\n"
+    let status_body = status_body + "    if art_count >= 27:\n"
+    let status_body = status_body + "        break\n"
+    let status_body = status_body + "\n"
+    let status_body = status_body + "# Find newest source file mtime\n"
+    let status_body = status_body + "newest_src = 0\n"
+    let status_body = status_body + "for root, dirs, files in os.walk(p):\n"
+    let status_body = status_body + "    dirs[:] = [d for d in dirs if d not in skip_art]\n"
+    let status_body = status_body + "    for f in files:\n"
+    let status_body = status_body + "        if os.path.splitext(f)[1].lower() not in artifact_exts:\n"
+    let status_body = status_body + "            try:\n"
+    let status_body = status_body + "                mt = os.path.getmtime(os.path.join(root, f))\n"
+    let status_body = status_body + "                if mt > newest_src:\n"
+    let status_body = status_body + "                    newest_src = mt\n"
+    let status_body = status_body + "            except:\n"
+    let status_body = status_body + "                pass\n"
+    let status_body = status_body + "\n"
+    let status_body = status_body + "# Find newest artifact mtime\n"
+    let status_body = status_body + "newest_art = 0\n"
+    let status_body = status_body + "for a in artifacts:\n"
+    let status_body = status_body + "    ap = os.path.join(p, a) if not os.path.isabs(a) else a\n"
+    let status_body = status_body + "    try:\n"
+    let status_body = status_body + "        mt = os.path.getmtime(ap)\n"
+    let status_body = status_body + "        if mt > newest_art:\n"
+    let status_body = status_body + "            newest_art = mt\n"
+    let status_body = status_body + "    except:\n"
+    let status_body = status_body + "        pass\n"
+    let status_body = status_body + "\n"
+    let status_body = status_body + "build_fresh = None\n"
+    let status_body = status_body + "if newest_art > 0 and newest_src > 0:\n"
+    let status_body = status_body + "    build_fresh = newest_art >= newest_src\n"
+    let status_body = status_body + "\n"
+    let status_body = status_body + "has_build = bool(found_build_dirs)\n"
+    let status_body = status_body + "has_lock = bool(found_locks)\n"
+    let status_body = status_body + "has_arts = art_count > 0\n"
+    let status_body = status_body + "score = sum([has_build, has_lock, has_arts, build_fresh is True])\n"
+    let status_body = status_body + "trit = 1 if score >= 3 else (0 if score >= 1 else -1)\n"
+    let status_body = status_body + "\n"
+    let status_body = status_body + "print(json.dumps({\n"
+    let status_body = status_body + "    'has_build_dir': has_build,\n"
+    let status_body = status_body + "    'build_dirs': found_build_dirs,\n"
+    let status_body = status_body + "    'has_lock_file': has_lock,\n"
+    let status_body = status_body + "    'lock_files': found_locks,\n"
+    let status_body = status_body + "    'artifact_count': art_count,\n"
+    let status_body = status_body + "    'artifacts': artifacts[:13],\n"
+    let status_body = status_body + "    'build_fresh': build_fresh,\n"
+    let status_body = status_body + "    'newest_src': round(newest_src, 2),\n"
+    let status_body = status_body + "    'newest_artifact': round(newest_art, 2),\n"
+    let status_body = status_body + "    'health_score': score,\n"
+    let status_body = status_body + "    'trit': trit\n"
+    let status_body = status_body + "}))\n"
+
+    let _w = nova_write(status_script, status_body)
+    let raw = nova_run("python \"" + status_script + "\" \"" + path + "\"", 30)
+
+    if3 len(trim(raw)) == 0 {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("status", T_FALSE)
+        return {"ok": false, "error": "Status scan produced no output", "path": path, "trit": T_FALSE, "ms": elapsed}
+    } else {
+        // have output
+    }
+
+    try3 {
+        let parsed    = json_decode(raw)
+        let hbd       = dict_get(parsed, "has_build_dir",   false)
+        let bdirs     = dict_get(parsed, "build_dirs",      [])
+        let hlf       = dict_get(parsed, "has_lock_file",   false)
+        let lfiles    = dict_get(parsed, "lock_files",      [])
+        let art_cnt   = dict_get(parsed, "artifact_count",  0)
+        let arts      = dict_get(parsed, "artifacts",       [])
+        let bfresh    = dict_get(parsed, "build_fresh",     false)
+        let nsrc      = dict_get(parsed, "newest_src",      0)
+        let nart      = dict_get(parsed, "newest_artifact", 0)
+        let hscore    = dict_get(parsed, "health_score",    0)
+        let trit_raw  = dict_get(parsed, "trit",            T_MAYBE)
+
+        // Health bt: has_build, has_lock, has_arts, build_fresh
+        let h0 = T_FALSE
+        if3 hbd == true {
+            let h0 = T_TRUE
+        } else {
+            // no build dir
+        }
+        let h1 = T_FALSE
+        if3 hlf == true {
+            let h1 = T_TRUE
+        } else {
+            // no lock file
+        }
+        let h2 = T_FALSE
+        if3 art_cnt > 0 {
+            let h2 = T_TRUE
+        } else {
+            // no artifacts
+        }
+        let h3 = T_MAYBE
+        if3 bfresh == true {
+            let h3 = T_TRUE
+        } else bfresh == false {
+            let h3 = T_FALSE
+        } else {
+            // null/unknown
+        }
+
+        let health_trits = [h0, h1, h2, h3]
+        let bt_str = bt_from_trits(health_trits)
+
+        // Reynolds: health score scaled
+        let re_num = hscore * H7
+        let regime = flow_regime(re_num)
+
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("status", trit_raw)
+
+        return {
+            "ok":              true,
+            "path":            path,
+            "has_build_dir":   hbd,
+            "build_dirs":      bdirs,
+            "has_lock_file":   hlf,
+            "lock_files":      lfiles,
+            "artifact_count":  art_cnt,
+            "artifacts":       arts,
+            "build_fresh":     bfresh,
+            "newest_src":      nsrc,
+            "newest_artifact": nart,
+            "health_score":    hscore,
+            "reynolds":        re_num,
+            "regime":          regime,
+            "bt":              bt_str,
+            "trit":            trit_raw,
+            "ms":              elapsed
+    } else {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("status", T_FALSE)
+        return {"ok": false, "error": "Status parse failed: " + raw, "trit": T_FALSE, "ms": elapsed}
+    }
+}
+
+// ============================================================================
+// TOOL 5: LINT
+// POST /tbuild/lint
+// Body: {"path": "/abs/path", "language": "python"|"javascript"|"auto"}
+// Python: py_compile syntax check on all .py files
+// JS/TS:  bracket balance + basic validation on all .js/.ts files
+// Returns: {files_checked, errors, warnings, trit}
+// ============================================================================
+}
+
+fn tbuild_lint(body) {
+    let t0   = time()
+    let path = str(dict_get(body, "path", ""))
+    let lang = str(dict_get(body, "language", "auto"))
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else {
+        // path provided
+    }
+
+    let _d = ensure_tmp_dir()
+
+    let lint_script = TMP_BASE + "\\tbuild_lint_script.py"
+    let lint_body = "import sys, json, os, py_compile\n"
+    let lint_body = lint_body + "path = sys.argv[1]\n"
+    let lint_body = lint_body + "lang = sys.argv[2]  # 'python', 'javascript', 'auto'\n"
+    let lint_body = lint_body + "skip = {'.git','node_modules','__pycache__','ai_env','venv','.venv'}\n"
+    let lint_body = lint_body + "\n"
+    let lint_body = lint_body + "py_exts = {'.py'}\n"
+    let lint_body = lint_body + "js_exts = {'.js', '.ts', '.jsx', '.tsx', '.mjs'}\n"
+    let lint_body = lint_body + "\n"
+    let lint_body = lint_body + "# Collect files to lint\n"
+    let lint_body = lint_body + "files = []\n"
+    let lint_body = lint_body + "if os.path.isfile(path):\n"
+    let lint_body = lint_body + "    files = [path]\n"
+    let lint_body = lint_body + "elif os.path.isdir(path):\n"
+    let lint_body = lint_body + "    for root, dirs, fnames in os.walk(path):\n"
+    let lint_body = lint_body + "        dirs[:] = [d for d in dirs if d not in skip]\n"
+    let lint_body = lint_body + "        for f in fnames:\n"
+    let lint_body = lint_body + "            ext = os.path.splitext(f)[1].lower()\n"
+    let lint_body = lint_body + "            if lang == 'python' and ext in py_exts:\n"
+    let lint_body = lint_body + "                files.append(os.path.join(root, f))\n"
+    let lint_body = lint_body + "            elif lang == 'javascript' and ext in js_exts:\n"
+    let lint_body = lint_body + "                files.append(os.path.join(root, f))\n"
+    let lint_body = lint_body + "            elif lang == 'auto' and (ext in py_exts or ext in js_exts):\n"
+    let lint_body = lint_body + "                files.append(os.path.join(root, f))\n"
+    let lint_body = lint_body + "        if len(files) >= 343:\n"
+    let lint_body = lint_body + "            break\n"
+    let lint_body = lint_body + "\n"
+    let lint_body = lint_body + "results = []\n"
+    let lint_body = lint_body + "total_errors = 0\n"
+    let lint_body = lint_body + "total_warnings = 0\n"
+    let lint_body = lint_body + "\n"
+    let lint_body = lint_body + "for fp in files[:343]:\n"
+    let lint_body = lint_body + "    ext = os.path.splitext(fp)[1].lower()\n"
+    let lint_body = lint_body + "    rel = fp\n"
+    let lint_body = lint_body + "    try:\n"
+    let lint_body = lint_body + "        if os.path.isdir(path):\n"
+    let lint_body = lint_body + "            rel = os.path.relpath(fp, path)\n"
+    let lint_body = lint_body + "    except:\n"
+    let lint_body = lint_body + "        pass\n"
+    let lint_body = lint_body + "\n"
+    let lint_body = lint_body + "    if ext in py_exts:\n"
+    let lint_body = lint_body + "        # Python: compile-time syntax check via py_compile\n"
+    let lint_body = lint_body + "        try:\n"
+    let lint_body = lint_body + "            py_compile.compile(fp, doraise=True)\n"
+    let lint_body = lint_body + "            # Also check for common style issues\n"
+    let lint_body = lint_body + "            src = open(fp, 'r', encoding='utf-8', errors='replace').read()\n"
+    let lint_body = lint_body + "            warnings = []\n"
+    let lint_body = lint_body + "            lines = src.splitlines()\n"
+    let lint_body = lint_body + "            for i, line in enumerate(lines, 1):\n"
+    let lint_body = lint_body + "                if len(line) > 120:\n"
+    let lint_body = lint_body + "                    warnings.append({'line': i, 'col': 0, 'msg': f'Line too long ({len(line)} chars)', 'type': 'style'})\n"
+    let lint_body = lint_body + "            total_warnings += len(warnings)\n"
+    let lint_body = lint_body + "            trit = 0 if warnings else 1\n"
+    let lint_body = lint_body + "            results.append({'file': rel, 'language': 'python', 'errors': [], 'warnings': warnings[:5], 'trit': trit})\n"
+    let lint_body = lint_body + "        except py_compile.PyCompileError as e:\n"
+    let lint_body = lint_body + "            msg = str(e)\n"
+    let lint_body = lint_body + "            # Extract line number if present\n"
+    let lint_body = lint_body + "            import re\n"
+    let lint_body = lint_body + "            lm = re.search(r'line (\\d+)', msg)\n"
+    let lint_body = lint_body + "            lno = int(lm.group(1)) if lm else 0\n"
+    let lint_body = lint_body + "            err = {'line': lno, 'col': 0, 'msg': msg[:200].split('\\n')[0], 'type': 'syntax'}\n"
+    let lint_body = lint_body + "            total_errors += 1\n"
+    let lint_body = lint_body + "            results.append({'file': rel, 'language': 'python', 'errors': [err], 'warnings': [], 'trit': -1})\n"
+    let lint_body = lint_body + "\n"
+    let lint_body = lint_body + "    elif ext in js_exts:\n"
+    let lint_body = lint_body + "        # JavaScript/TypeScript: bracket balance + basic checks\n"
+    let lint_body = lint_body + "        try:\n"
+    let lint_body = lint_body + "            src = open(fp, 'r', encoding='utf-8', errors='replace').read()\n"
+    let lint_body = lint_body + "            errors = []\n"
+    let lint_body = lint_body + "            warnings = []\n"
+    let lint_body = lint_body + "            # Bracket balance (outside strings -- approximate)\n"
+    let lint_body = lint_body + "            opens = src.count('{') + src.count('(') + src.count('[')\n"
+    let lint_body = lint_body + "            closes = src.count('}') + src.count(')') + src.count(']')\n"
+    let lint_body = lint_body + "            if opens != closes:\n"
+    let lint_body = lint_body + "                errors.append({'line': 0, 'col': 0, 'msg': f'Unbalanced brackets: {opens} opens, {closes} closes', 'type': 'syntax'})\n"
+    let lint_body = lint_body + "                total_errors += 1\n"
+    let lint_body = lint_body + "            # Long lines\n"
+    let lint_body = lint_body + "            lines = src.splitlines()\n"
+    let lint_body = lint_body + "            for i, line in enumerate(lines, 1):\n"
+    let lint_body = lint_body + "                if len(line) > 120:\n"
+    let lint_body = lint_body + "                    warnings.append({'line': i, 'col': 0, 'msg': f'Line too long ({len(line)} chars)', 'type': 'style'})\n"
+    let lint_body = lint_body + "            total_warnings += len(warnings)\n"
+    let lint_body = lint_body + "            trit = -1 if errors else (0 if warnings else 1)\n"
+    let lint_body = lint_body + "            results.append({'file': rel, 'language': 'javascript', 'errors': errors, 'warnings': warnings[:5], 'trit': trit})\n"
+    let lint_body = lint_body + "        except Exception as e:\n"
+    let lint_body = lint_body + "            total_errors += 1\n"
+    let lint_body = lint_body + "            results.append({'file': rel, 'language': 'javascript', 'errors': [{'line': 0, 'col': 0, 'msg': str(e)[:200], 'type': 'io'}], 'warnings': [], 'trit': -1})\n"
+    let lint_body = lint_body + "\n"
+    let lint_body = lint_body + "# Overall trit\n"
+    let lint_body = lint_body + "trits = [r['trit'] for r in results]\n"
+    let lint_body = lint_body + "if not trits:\n"
+    let lint_body = lint_body + "    overall = 0\n"
+    let lint_body = lint_body + "elif -1 in trits:\n"
+    let lint_body = lint_body + "    overall = -1\n"
+    let lint_body = lint_body + "elif all(t == 1 for t in trits):\n"
+    let lint_body = lint_body + "    overall = 1\n"
+    let lint_body = lint_body + "else:\n"
+    let lint_body = lint_body + "    overall = 0\n"
+    let lint_body = lint_body + "\n"
+    let lint_body = lint_body + "print(json.dumps({\n"
+    let lint_body = lint_body + "    'files_checked': len(results),\n"
+    let lint_body = lint_body + "    'total_errors': total_errors,\n"
+    let lint_body = lint_body + "    'total_warnings': total_warnings,\n"
+    let lint_body = lint_body + "    'results': results[:27],\n"
+    let lint_body = lint_body + "    'trit': overall\n"
+    let lint_body = lint_body + "}))\n"
+
+    let _w = nova_write(lint_script, lint_body)
+    let cmd = "python \"" + lint_script + "\" \"" + path + "\" \"" + lang + "\""
+    let raw = nova_run(cmd, 60)
+
+    if3 len(trim(raw)) == 0 {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("lint", T_FALSE)
+        return {"ok": false, "error": "Lint produced no output", "path": path, "trit": T_FALSE, "ms": elapsed}
+    } else {
+        // have output
+    }
+
+    try3 {
+        let parsed   = json_decode(raw)
+        let fc       = dict_get(parsed, "files_checked",   0)
+        let te       = dict_get(parsed, "total_errors",    0)
+        let tw       = dict_get(parsed, "total_warnings",  0)
+        let results  = dict_get(parsed, "results",         [])
+        let trit_raw = dict_get(parsed, "trit",            T_MAYBE)
+
+        // Build bt from results trits (up to H13)
+        let trit_list = []
+        let ri = 0
+        let rn = len(results)
+        let rt_max = H13
+        if3 rn < rt_max {
+            let rt_max = rn
+        } else {
+            // cap
+        }
+        while3 ri < rt_max {
+            let re_e = dict_get(results, ri, {})
+            let rt   = dict_get(re_e, "trit", T_MAYBE)
+            append(trit_list, rt)
+            let ri = ri + 1
+        }
+        let bt_str = bt_from_trits(trit_list)
+
+        // Reynolds: error count as turbulence
+        let re_num = te * H5
+        let regime = flow_regime(re_num)
+
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("lint", trit_raw)
+
+        return {
+            "ok":             trit_raw != T_FALSE,
+            "path":           path,
+            "language":       lang,
+            "files_checked":  fc,
+            "total_errors":   te,
+            "total_warnings": tw,
+            "results":        results,
+            "reynolds":       re_num,
+            "regime":         regime,
+            "bt":             bt_str,
+            "trit":           trit_raw,
+            "ms":             elapsed
+    } else {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("lint", T_FALSE)
+        return {"ok": false, "error": "Lint parse failed: " + raw, "trit": T_FALSE, "ms": elapsed}
+    }
+}
+
+// ============================================================================
+// TOOL 6: VCS STATUS
+// POST /tbuild/vcs
+// Body: {"path": "/abs/repo/dir"}
+// Returns: {branch, changes (count), recent_commits (list), staged, untracked, trit}
+// Pattern from instructions: single-line python with subprocess + git commands.
+// ============================================================================
+}
+
+fn tbuild_vcs(body) {
+    let t0   = time()
+    let path = str(dict_get(body, "path", ""))
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else {
+        // path provided
+    }
+
+    let ep = esc_path(path)
+
+    // Check .git exists first (single-line)
+    let git_chk = nova_run("python -c \"import os; print('yes' if os.path.isdir(os.path.join('" + ep + "','.git')) else 'no')\"", 10)
+    let git_chk = trim(git_chk)
+
+    if3 git_chk != "yes" {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("vcs", T_FALSE)
+        return {"ok": false, "error": "Not a git repository: " + path, "trit": T_FALSE, "ms": elapsed}
+    } else {
+        // has .git
+    }
+
+    // Single-line python: run git branch, status, log via subprocess
+    let py_cmd = "python -c \"import subprocess,json,os; os.chdir('" + ep + "'); b=subprocess.run(['git','branch','--show-current'],capture_output=True,text=True).stdout.strip(); s=subprocess.run(['git','status','--porcelain'],capture_output=True,text=True).stdout.strip(); log=subprocess.run(['git','log','--oneline','-5'],capture_output=True,text=True).stdout.strip(); st_lines=[l for l in s.split(chr(10)) if l]; staged=[l[3:] for l in st_lines if l[0] not in(' ','?')]; modified=[l[3:] for l in st_lines if l[1] in('M','D') and l[0]==' ']; untracked=[l[3:] for l in st_lines if l[:2]=='??']; commits=log.split(chr(10)) if log else []; changes=len(st_lines); ab=subprocess.run(['git','rev-list','--left-right','--count','HEAD...@{upstream}'],capture_output=True,text=True).stdout.strip(); ahead=0; behind=0; [(lambda ab2=ab.split(chr(9)): [None for _ in [None] if _ is None and not True] or setattr(type('X',[],{}),'_',(exec('global ahead,behind') or None)))() if chr(9) in ab else None]; ahead_raw=ab.split(chr(9))[0] if chr(9) in ab else '0'; behind_raw=ab.split(chr(9))[1] if chr(9) in ab else '0'; ahead=int(ahead_raw) if ahead_raw.isdigit() else 0; behind=int(behind_raw) if behind_raw.isdigit() else 0; trit=1 if changes==0 else(0 if changes<27 else -1); print(json.dumps({'branch':b,'changes':changes,'staged':staged[:13],'modified':modified[:13],'untracked':untracked[:13],'recent_commits':commits[:5],'ahead':ahead,'behind':behind,'trit':trit}))\""
+
+    let raw = nova_run(py_cmd, 30)
+
+    if3 len(trim(raw)) == 0 {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("vcs", T_FALSE)
+        return {"ok": false, "error": "VCS command produced no output", "path": path, "trit": T_FALSE, "ms": elapsed}
+    } else {
+        // have output
+    }
+
+    try3 {
+        let parsed   = json_decode(raw)
+        let branch   = dict_get(parsed, "branch",         "unknown")
+        let changes  = dict_get(parsed, "changes",        0)
+        let staged   = dict_get(parsed, "staged",         [])
+        let modified = dict_get(parsed, "modified",       [])
+        let untracked = dict_get(parsed, "untracked",     [])
+        let commits  = dict_get(parsed, "recent_commits", [])
+        let ahead    = dict_get(parsed, "ahead",          0)
+        let behind   = dict_get(parsed, "behind",         0)
+        let trit_raw = dict_get(parsed, "trit",           T_MAYBE)
+
+        // bt: clean=1, few changes=0, many changes=T
+        let trit_list = [trit_raw]
+        let bt_str = bt_from_trits(trit_list)
+
+        // Reynolds: change count as flow
+        let re_num = changes * H3
+        let regime = flow_regime(re_num)
+
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("vcs", trit_raw)
+
+        return {
+            "ok":             true,
+            "path":           path,
+            "branch":         branch,
+            "changes":        changes,
+            "staged":         staged,
+            "modified":       modified,
+            "untracked":      untracked,
+            "recent_commits": commits,
+            "ahead":          ahead,
+            "behind":         behind,
+            "clean":          changes == 0,
+            "reynolds":       re_num,
+            "regime":         regime,
+            "bt":             bt_str,
+            "trit":           trit_raw,
+            "ms":             elapsed
+    } else {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("vcs", T_FALSE)
+        return {"ok": false, "error": "VCS parse failed: " + raw, "trit": T_FALSE, "ms": elapsed}
+    }
+}
+
+// ============================================================================
+// TOOL 7: COMPILE (run a build command)
+// POST /tbuild/compile
+// Body: {"path": "/abs/project/dir", "command": "npm run build", "timeout": 120}
+// Runs the given command in the given directory, captures stdout/stderr.
+// Returns: {exit_code, stdout, stderr, success, trit}
+// ============================================================================
+}
+
+fn tbuild_compile(body) {
+    let t0      = time()
+    let path    = str(dict_get(body, "path", ""))
+    let command = str(dict_get(body, "command", ""))
+    let timeout = dict_get(body, "timeout", 60)
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else {
+        // path provided
+    }
+
+    if3 len(command) == 0 {
+        return {"ok": false, "error": "command required", "trit": T_FALSE}
+    } else {
+        // command provided
+    }
+
+    // Cap timeout at RE_TURBULENT=343 seconds for safety
+    let use_timeout = timeout
+    if3 use_timeout > RE_TURBULENT {
+        let use_timeout = RE_TURBULENT
+    } else use_timeout < 1 {
+        let use_timeout = 1
+    } else {
+        // timeout in range
+    }
+
+    let _d = ensure_tmp_dir()
+
+    // Write a runner script that captures stdout+stderr separately
+    let runner_script = TMP_BASE + "\\tbuild_compile_runner.py"
+    let runner_body = "import sys, json, subprocess, os, time\n"
+    let runner_body = runner_body + "path = sys.argv[1]\n"
+    let runner_body = runner_body + "cmd = sys.argv[2]\n"
+    let runner_body = runner_body + "timeout = int(sys.argv[3])\n"
+    let runner_body = runner_body + "\n"
+    let runner_body = runner_body + "t0 = time.time()\n"
+    let runner_body = runner_body + "try:\n"
+    let runner_body = runner_body + "    result = subprocess.run(\n"
+    let runner_body = runner_body + "        cmd,\n"
+    let runner_body = runner_body + "        shell=True,\n"
+    let runner_body = runner_body + "        cwd=path,\n"
+    let runner_body = runner_body + "        capture_output=True,\n"
+    let runner_body = runner_body + "        text=True,\n"
+    let runner_body = runner_body + "        timeout=timeout\n"
+    let runner_body = runner_body + "    )\n"
+    let runner_body = runner_body + "    elapsed = round(time.time() - t0, 3)\n"
+    let runner_body = runner_body + "    exit_code = result.returncode\n"
+    let runner_body = runner_body + "    stdout_lines = result.stdout.splitlines()\n"
+    let runner_body = runner_body + "    stderr_lines = result.stderr.splitlines()\n"
+    let runner_body = runner_body + "    success = exit_code == 0\n"
+    let runner_body = runner_body + "    trit = 1 if success else -1\n"
+    let runner_body = runner_body + "    print(json.dumps({\n"
+    let runner_body = runner_body + "        'exit_code': exit_code,\n"
+    let runner_body = runner_body + "        'stdout': stdout_lines[-50:],\n"
+    let runner_body = runner_body + "        'stderr': stderr_lines[-50:],\n"
+    let runner_body = runner_body + "        'stdout_lines': len(stdout_lines),\n"
+    let runner_body = runner_body + "        'stderr_lines': len(stderr_lines),\n"
+    let runner_body = runner_body + "        'success': success,\n"
+    let runner_body = runner_body + "        'elapsed_s': elapsed,\n"
+    let runner_body = runner_body + "        'timed_out': False,\n"
+    let runner_body = runner_body + "        'trit': trit\n"
+    let runner_body = runner_body + "    }))\n"
+    let runner_body = runner_body + "except subprocess.TimeoutExpired:\n"
+    let runner_body = runner_body + "    elapsed = round(time.time() - t0, 3)\n"
+    let runner_body = runner_body + "    print(json.dumps({\n"
+    let runner_body = runner_body + "        'exit_code': -1,\n"
+    let runner_body = runner_body + "        'stdout': [],\n"
+    let runner_body = runner_body + "        'stderr': [f'Command timed out after {timeout}s'],\n"
+    let runner_body = runner_body + "        'stdout_lines': 0,\n"
+    let runner_body = runner_body + "        'stderr_lines': 1,\n"
+    let runner_body = runner_body + "        'success': False,\n"
+    let runner_body = runner_body + "        'elapsed_s': elapsed,\n"
+    let runner_body = runner_body + "        'timed_out': True,\n"
+    let runner_body = runner_body + "        'trit': 0\n"
+    let runner_body = runner_body + "    }))\n"
+    let runner_body = runner_body + "except Exception as e:\n"
+    let runner_body = runner_body + "    elapsed = round(time.time() - t0, 3)\n"
+    let runner_body = runner_body + "    print(json.dumps({\n"
+    let runner_body = runner_body + "        'exit_code': -2,\n"
+    let runner_body = runner_body + "        'stdout': [],\n"
+    let runner_body = runner_body + "        'stderr': [str(e)],\n"
+    let runner_body = runner_body + "        'stdout_lines': 0,\n"
+    let runner_body = runner_body + "        'stderr_lines': 1,\n"
+    let runner_body = runner_body + "        'success': False,\n"
+    let runner_body = runner_body + "        'elapsed_s': elapsed,\n"
+    let runner_body = runner_body + "        'timed_out': False,\n"
+    let runner_body = runner_body + "        'trit': -1\n"
+    let runner_body = runner_body + "    }))\n"
+
+    let _w = nova_write(runner_script, runner_body)
+
+    // Pass command as argv[2] -- quote it for the python subprocess call
+    let esc_cmd = replace(command, "\"", "'")
+    let to_str  = str(use_timeout)
+    let cmd = "python \"" + runner_script + "\" \"" + path + "\" \"" + esc_cmd + "\" " + to_str
+
+    let raw = nova_run(cmd, use_timeout + 15)
+
+    if3 len(trim(raw)) == 0 {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("compile", T_FALSE)
+        return {"ok": false, "error": "Compile runner produced no output", "command": command, "trit": T_FALSE, "ms": elapsed}
+    } else {
+        // have output
+    }
+
+    try3 {
+        let parsed    = json_decode(raw)
+        let exit_code = dict_get(parsed, "exit_code",     -1)
+        let stdout    = dict_get(parsed, "stdout",        [])
+        let stderr    = dict_get(parsed, "stderr",        [])
+        let sout_cnt  = dict_get(parsed, "stdout_lines",  0)
+        let serr_cnt  = dict_get(parsed, "stderr_lines",  0)
+        let success   = dict_get(parsed, "success",       false)
+        let elapsed_s = dict_get(parsed, "elapsed_s",     0)
+        let timed_out = dict_get(parsed, "timed_out",     false)
+        let trit_raw  = dict_get(parsed, "trit",          T_FALSE)
+
+        // Build bt
+        let trit_list = [trit_raw]
+        let bt_str = bt_from_trits(trit_list)
+
+        // Reynolds: exit code * H13 as turbulence indicator
+        let re_num = 0
+        if3 success == true {
+            let re_num = RE_LAMINAR
+        } else timed_out == true {
+            let re_num = RE_TRANSITION
+        } else {
+            let re_num = RE_TURBULENT
+        }
+        let regime = flow_regime(re_num)
+
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("compile", trit_raw)
+
+        return {
+            "ok":           success,
+            "path":         path,
+            "command":      command,
+            "exit_code":    exit_code,
+            "stdout":       stdout,
+            "stderr":       stderr,
+            "stdout_lines": sout_cnt,
+            "stderr_lines": serr_cnt,
+            "success":      success,
+            "timed_out":    timed_out,
+            "elapsed_s":    elapsed_s,
+            "reynolds":     re_num,
+            "regime":       regime,
+            "bt":           bt_str,
+            "trit":         trit_raw,
+            "ms":           elapsed
+    } else {
+        let elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("compile", T_FALSE)
+        return {"ok": false, "error": "Compile result parse failed: " + raw, "command": command, "trit": T_FALSE, "ms": elapsed}
+    }
+}
+
+// ============================================================================
+// ROUTE: GET /health
+// ============================================================================
+}
+
+fn tbuild_health() {
+    let uptime = round(time() - stat_t0, 1)
+    return {
+        "ok":        true,
+        "service":   SERVICE_NAME,
+        "version":   VERSION,
+        "port":      PORT,
+        "tools":     TOOLS_COUNT,
+        "uptime_s":  uptime,
+        "harmonics": "3-5-7-13",
+        "block":     BLOCK,
+        "reynolds":  {"laminar": RE_LAMINAR, "transition": RE_TRANSITION, "turbulent": RE_TURBULENT},
+        "trit":      T_TRUE,
+        "runtime":   "novalang"
+    }
+}
+
+// ============================================================================
+// ROUTE: GET /tbuild/stats
+// ============================================================================
+
+fn tbuild_stats() {
+    let uptime = round(time() - stat_t0, 1)
+
+    let trits_obj = {}
+    let _t = dict_set(trits_obj, "true",  stat_trit_true)
+    let _t = dict_set(trits_obj, "maybe", stat_trit_maybe)
+    let _t = dict_set(trits_obj, "false", stat_trit_false)
+
+    let by_tool = {}
+    let _b = dict_set(by_tool, "deps",    stat_deps)
+    let _b = dict_set(by_tool, "order",   stat_order)
+    let _b = dict_set(by_tool, "diff",    stat_diff)
+    let _b = dict_set(by_tool, "status",  stat_status)
+    let _b = dict_set(by_tool, "lint",    stat_lint)
+    let _b = dict_set(by_tool, "vcs",     stat_vcs)
+    let _b = dict_set(by_tool, "compile", stat_compile)
+
+    let re_obj = {}
+    let _r = dict_set(re_obj, "laminar",    RE_LAMINAR)
+    let _r = dict_set(re_obj, "transition", RE_TRANSITION)
+    let _r = dict_set(re_obj, "turbulent",  RE_TURBULENT)
+
+    let consts = {}
+    let _c = dict_set(consts, "H3",         H3)
+    let _c = dict_set(consts, "H5",         H5)
+    let _c = dict_set(consts, "H7",         H7)
+    let _c = dict_set(consts, "H13",        H13)
+    let _c = dict_set(consts, "block_size", BLOCK)
+    let _c = dict_set(consts, "reynolds",   re_obj)
+
+    return {
+        "ok":        true,
+        "service":   SERVICE_NAME,
+        "version":   VERSION,
+        "port":      PORT,
+        "tools":     TOOLS_COUNT,
+        "ops":       stat_ops,
+        "trits":     trits_obj,
+        "by_tool":   by_tool,
+        "uptime_s":  uptime,
+        "constants": consts,
+        "trit":      T_TRUE,
+        "runtime":   "novalang"
+    }
+}
+
+// ============================================================================
+// ROUTE REGISTRATION
+// ============================================================================
+
+troute(server, "GET",  "/health",         "tbuild_health")
+troute(server, "GET",  "/tbuild/stats",   "tbuild_stats")
+troute(server, "POST", "/tbuild/deps",    "tbuild_deps")
+troute(server, "POST", "/tbuild/order",   "tbuild_order")
+troute(server, "POST", "/tbuild/diff",    "tbuild_diff")
+troute(server, "POST", "/tbuild/status",  "tbuild_status")
+troute(server, "POST", "/tbuild/lint",    "tbuild_lint")
+troute(server, "POST", "/tbuild/vcs",     "tbuild_vcs")
+troute(server, "POST", "/tbuild/compile", "tbuild_compile")
+
+// ============================================================================
+// STARTUP BANNER
+// ============================================================================
+
+print("[TBuild] NovaX Ternary Build System v" + VERSION + " (NovaLang)")
+print("[TBuild] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TBuild] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TBuild] Block: " + str(BLOCK) + " (3^7) | Reynolds: " + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT))
+print("[TBuild] Tools (" + str(TOOLS_COUNT) + "): deps, order, diff, status, lint, vcs, compile")
+print("[TBuild] GET  /health | /tbuild/stats")
+print("[TBuild] POST /tbuild/deps   -- project dependency list (package.json, requirements.txt, Cargo.toml, go.mod, ...)")
+print("[TBuild] POST /tbuild/order  -- topological build order from file imports (params: path, pattern)")
+print("[TBuild] POST /tbuild/diff   -- changed files since last build (params: path, since|reference)")
+print("[TBuild] POST /tbuild/status -- build artifact status (params: path)")
+print("[TBuild] POST /tbuild/lint   -- Python syntax + JS bracket validation (params: path, language)")
+print("[TBuild] POST /tbuild/vcs    -- git status, branch, recent commits (params: path)")
+print("[TBuild] POST /tbuild/compile -- run a build command (params: path, command, timeout)")
+print("[TBuild] Trit: +1=success  0=partial/unknown  -1=failed")
+print("[TBuild] Ready at http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

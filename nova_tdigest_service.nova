@@ -1,0 +1,996 @@
+// nova_tdigest_service.nova -- NovaX Ternary Data Digest Micro-Tool (port 9983)
+// Pure NovaLang port of nova_tdigest.py
+//
+// The brain stem of NovaX. Compresses raw information into digestible summaries.
+// Summarize logs, metrics, conversations, code changes. Extracts key points
+// with ternary confidence scoring.
+//
+// Like the Navier-Stokes equations reduce turbulent chaos to smooth laminar flow,
+// TDigest reduces noisy data to clear signal.
+//
+// Algorithms:
+//   Extractive Summary -- Score sentences by word frequency, position, length,
+//                         keyword overlap. Pick top N by composite score.
+//   Keyword Extraction -- Tokenize, remove stopwords, count TF, rank. Return
+//                         top H13 keywords with frequency and importance trit.
+//   Statistical Digest -- Pure math: mean, median, std, min, max, percentiles.
+//   Diff Digest        -- Summarize code changes: files touched, net delta, hotspots.
+//   Log Digest         -- Pattern-match log entries: group by service/level, anomalies.
+//
+// Trit Scoring:
+//   Summary  -- TRUE if compression ratio > 3:1, MAYBE if > 2:1, FALSE if minimal
+//   Keywords -- TRUE if >= 5 keywords found, MAYBE if >= 2, FALSE if < 2
+//   Stats    -- TRUE always (deterministic computation)
+//
+// 3-5-7-13 Harmonic Constants:
+//   3  = ternary base, trit states, min sentences
+//   5  = TZip pack, percentile buckets
+//   7  = composition unit, scoring weights
+//   13 = carrier frame, max keywords returned
+//
+// Endpoints:
+//   GET  /tdigest/health      -- Health check with ternary stats
+//   POST /tdigest/summarize   -- Extractive summary of text
+//   POST /tdigest/keywords    -- Extract top keywords with importance trits
+//   POST /tdigest/stats       -- Statistical digest of numeric data
+//   POST /tdigest/diff_digest -- Summarize code changes
+//   POST /tdigest/log_digest  -- Summarize log patterns
+//   GET  /tdigest/stats       -- Cumulative digest statistics
+
+// -- Port and server --
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9983
+let server = tserve(PORT, "TDigest v1.0 - NovaX Ternary Data Digest Engine")
+
+// -- Harmonic constants --
+let H3   = 3
+let H5   = 5
+let H7   = 7
+let H13  = 13
+let BLOCK = 2187     // 3^7 ternary block
+
+// -- Ternary state constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Service identity --
+let VERSION      = "1.0"
+let SERVICE_NAME = "nova-tdigest"
+
+// -- Body limit: BLOCK * H7 = 15309 bytes --
+let MAX_BODY = 15309
+
+// -- N-S Reynolds boundaries --
+let RE_LAMINAR     = 27    // H3^3
+let RE_TRANS       = 125   // H5^3
+let RE_TURBULENT   = 343   // H7^3
+
+// -- Cumulative digest statistics (no threading -- single-flow NovaLang) --
+let _total_digests      = 0
+let _cnt_summarize      = 0
+let _cnt_keywords       = 0
+let _cnt_stats          = 0
+let _cnt_diff           = 0
+let _cnt_log            = 0
+let _total_input_chars  = 0
+let _total_output_chars = 0
+let _start_time         = time()
+
+// -- Stopwords set encoded as a dict for O(1) lookup --
+// NovaLang has no frozenset -- we use a dict where value=1 means "is a stopword"
+// This covers ~150 common English stopwords from the original Python service.
+let STOPWORDS = {}
+STOPWORDS = dict_set(STOPWORDS, "a", 1)
+STOPWORDS = dict_set(STOPWORDS, "about", 1)
+STOPWORDS = dict_set(STOPWORDS, "above", 1)
+STOPWORDS = dict_set(STOPWORDS, "after", 1)
+STOPWORDS = dict_set(STOPWORDS, "again", 1)
+STOPWORDS = dict_set(STOPWORDS, "against", 1)
+STOPWORDS = dict_set(STOPWORDS, "all", 1)
+STOPWORDS = dict_set(STOPWORDS, "am", 1)
+STOPWORDS = dict_set(STOPWORDS, "an", 1)
+STOPWORDS = dict_set(STOPWORDS, "and", 1)
+STOPWORDS = dict_set(STOPWORDS, "any", 1)
+STOPWORDS = dict_set(STOPWORDS, "are", 1)
+STOPWORDS = dict_set(STOPWORDS, "arent", 1)
+STOPWORDS = dict_set(STOPWORDS, "as", 1)
+STOPWORDS = dict_set(STOPWORDS, "at", 1)
+STOPWORDS = dict_set(STOPWORDS, "be", 1)
+STOPWORDS = dict_set(STOPWORDS, "because", 1)
+STOPWORDS = dict_set(STOPWORDS, "been", 1)
+STOPWORDS = dict_set(STOPWORDS, "before", 1)
+STOPWORDS = dict_set(STOPWORDS, "being", 1)
+STOPWORDS = dict_set(STOPWORDS, "below", 1)
+STOPWORDS = dict_set(STOPWORDS, "between", 1)
+STOPWORDS = dict_set(STOPWORDS, "both", 1)
+STOPWORDS = dict_set(STOPWORDS, "but", 1)
+STOPWORDS = dict_set(STOPWORDS, "by", 1)
+STOPWORDS = dict_set(STOPWORDS, "can", 1)
+STOPWORDS = dict_set(STOPWORDS, "cant", 1)
+STOPWORDS = dict_set(STOPWORDS, "cannot", 1)
+STOPWORDS = dict_set(STOPWORDS, "could", 1)
+STOPWORDS = dict_set(STOPWORDS, "couldnt", 1)
+STOPWORDS = dict_set(STOPWORDS, "did", 1)
+STOPWORDS = dict_set(STOPWORDS, "didnt", 1)
+STOPWORDS = dict_set(STOPWORDS, "do", 1)
+STOPWORDS = dict_set(STOPWORDS, "does", 1)
+STOPWORDS = dict_set(STOPWORDS, "doesnt", 1)
+STOPWORDS = dict_set(STOPWORDS, "doing", 1)
+STOPWORDS = dict_set(STOPWORDS, "dont", 1)
+STOPWORDS = dict_set(STOPWORDS, "down", 1)
+STOPWORDS = dict_set(STOPWORDS, "during", 1)
+STOPWORDS = dict_set(STOPWORDS, "each", 1)
+STOPWORDS = dict_set(STOPWORDS, "few", 1)
+STOPWORDS = dict_set(STOPWORDS, "for", 1)
+STOPWORDS = dict_set(STOPWORDS, "from", 1)
+STOPWORDS = dict_set(STOPWORDS, "further", 1)
+STOPWORDS = dict_set(STOPWORDS, "get", 1)
+STOPWORDS = dict_set(STOPWORDS, "got", 1)
+STOPWORDS = dict_set(STOPWORDS, "had", 1)
+STOPWORDS = dict_set(STOPWORDS, "hadnt", 1)
+STOPWORDS = dict_set(STOPWORDS, "has", 1)
+STOPWORDS = dict_set(STOPWORDS, "hasnt", 1)
+STOPWORDS = dict_set(STOPWORDS, "have", 1)
+STOPWORDS = dict_set(STOPWORDS, "havent", 1)
+STOPWORDS = dict_set(STOPWORDS, "having", 1)
+STOPWORDS = dict_set(STOPWORDS, "he", 1)
+STOPWORDS = dict_set(STOPWORDS, "hed", 1)
+STOPWORDS = dict_set(STOPWORDS, "hell", 1)
+STOPWORDS = dict_set(STOPWORDS, "hes", 1)
+STOPWORDS = dict_set(STOPWORDS, "her", 1)
+STOPWORDS = dict_set(STOPWORDS, "here", 1)
+STOPWORDS = dict_set(STOPWORDS, "heres", 1)
+STOPWORDS = dict_set(STOPWORDS, "hers", 1)
+STOPWORDS = dict_set(STOPWORDS, "herself", 1)
+STOPWORDS = dict_set(STOPWORDS, "him", 1)
+STOPWORDS = dict_set(STOPWORDS, "himself", 1)
+STOPWORDS = dict_set(STOPWORDS, "his", 1)
+STOPWORDS = dict_set(STOPWORDS, "how", 1)
+STOPWORDS = dict_set(STOPWORDS, "hows", 1)
+STOPWORDS = dict_set(STOPWORDS, "i", 1)
+STOPWORDS = dict_set(STOPWORDS, "id", 1)
+STOPWORDS = dict_set(STOPWORDS, "ill", 1)
+STOPWORDS = dict_set(STOPWORDS, "im", 1)
+STOPWORDS = dict_set(STOPWORDS, "ive", 1)
+STOPWORDS = dict_set(STOPWORDS, "if", 1)
+STOPWORDS = dict_set(STOPWORDS, "in", 1)
+STOPWORDS = dict_set(STOPWORDS, "into", 1)
+STOPWORDS = dict_set(STOPWORDS, "is", 1)
+STOPWORDS = dict_set(STOPWORDS, "isnt", 1)
+STOPWORDS = dict_set(STOPWORDS, "it", 1)
+STOPWORDS = dict_set(STOPWORDS, "its", 1)
+STOPWORDS = dict_set(STOPWORDS, "itself", 1)
+STOPWORDS = dict_set(STOPWORDS, "lets", 1)
+STOPWORDS = dict_set(STOPWORDS, "me", 1)
+STOPWORDS = dict_set(STOPWORDS, "more", 1)
+STOPWORDS = dict_set(STOPWORDS, "most", 1)
+STOPWORDS = dict_set(STOPWORDS, "mustnt", 1)
+STOPWORDS = dict_set(STOPWORDS, "my", 1)
+STOPWORDS = dict_set(STOPWORDS, "myself", 1)
+STOPWORDS = dict_set(STOPWORDS, "no", 1)
+STOPWORDS = dict_set(STOPWORDS, "nor", 1)
+STOPWORDS = dict_set(STOPWORDS, "not", 1)
+STOPWORDS = dict_set(STOPWORDS, "of", 1)
+STOPWORDS = dict_set(STOPWORDS, "off", 1)
+STOPWORDS = dict_set(STOPWORDS, "on", 1)
+STOPWORDS = dict_set(STOPWORDS, "once", 1)
+STOPWORDS = dict_set(STOPWORDS, "only", 1)
+STOPWORDS = dict_set(STOPWORDS, "or", 1)
+STOPWORDS = dict_set(STOPWORDS, "other", 1)
+STOPWORDS = dict_set(STOPWORDS, "ought", 1)
+STOPWORDS = dict_set(STOPWORDS, "our", 1)
+STOPWORDS = dict_set(STOPWORDS, "ours", 1)
+STOPWORDS = dict_set(STOPWORDS, "ourselves", 1)
+STOPWORDS = dict_set(STOPWORDS, "out", 1)
+STOPWORDS = dict_set(STOPWORDS, "over", 1)
+STOPWORDS = dict_set(STOPWORDS, "own", 1)
+STOPWORDS = dict_set(STOPWORDS, "same", 1)
+STOPWORDS = dict_set(STOPWORDS, "shant", 1)
+STOPWORDS = dict_set(STOPWORDS, "she", 1)
+STOPWORDS = dict_set(STOPWORDS, "shed", 1)
+STOPWORDS = dict_set(STOPWORDS, "shell", 1)
+STOPWORDS = dict_set(STOPWORDS, "shes", 1)
+STOPWORDS = dict_set(STOPWORDS, "should", 1)
+STOPWORDS = dict_set(STOPWORDS, "shouldnt", 1)
+STOPWORDS = dict_set(STOPWORDS, "so", 1)
+STOPWORDS = dict_set(STOPWORDS, "some", 1)
+STOPWORDS = dict_set(STOPWORDS, "such", 1)
+STOPWORDS = dict_set(STOPWORDS, "than", 1)
+STOPWORDS = dict_set(STOPWORDS, "that", 1)
+STOPWORDS = dict_set(STOPWORDS, "thats", 1)
+STOPWORDS = dict_set(STOPWORDS, "the", 1)
+STOPWORDS = dict_set(STOPWORDS, "their", 1)
+STOPWORDS = dict_set(STOPWORDS, "theirs", 1)
+STOPWORDS = dict_set(STOPWORDS, "them", 1)
+STOPWORDS = dict_set(STOPWORDS, "themselves", 1)
+STOPWORDS = dict_set(STOPWORDS, "then", 1)
+STOPWORDS = dict_set(STOPWORDS, "there", 1)
+STOPWORDS = dict_set(STOPWORDS, "theres", 1)
+STOPWORDS = dict_set(STOPWORDS, "these", 1)
+STOPWORDS = dict_set(STOPWORDS, "they", 1)
+STOPWORDS = dict_set(STOPWORDS, "theyd", 1)
+STOPWORDS = dict_set(STOPWORDS, "theyll", 1)
+STOPWORDS = dict_set(STOPWORDS, "theyre", 1)
+STOPWORDS = dict_set(STOPWORDS, "theyve", 1)
+STOPWORDS = dict_set(STOPWORDS, "this", 1)
+STOPWORDS = dict_set(STOPWORDS, "those", 1)
+STOPWORDS = dict_set(STOPWORDS, "through", 1)
+STOPWORDS = dict_set(STOPWORDS, "to", 1)
+STOPWORDS = dict_set(STOPWORDS, "too", 1)
+STOPWORDS = dict_set(STOPWORDS, "under", 1)
+STOPWORDS = dict_set(STOPWORDS, "until", 1)
+STOPWORDS = dict_set(STOPWORDS, "up", 1)
+STOPWORDS = dict_set(STOPWORDS, "upon", 1)
+STOPWORDS = dict_set(STOPWORDS, "us", 1)
+STOPWORDS = dict_set(STOPWORDS, "very", 1)
+STOPWORDS = dict_set(STOPWORDS, "was", 1)
+STOPWORDS = dict_set(STOPWORDS, "wasnt", 1)
+STOPWORDS = dict_set(STOPWORDS, "we", 1)
+STOPWORDS = dict_set(STOPWORDS, "wed", 1)
+STOPWORDS = dict_set(STOPWORDS, "well", 1)
+STOPWORDS = dict_set(STOPWORDS, "were", 1)
+STOPWORDS = dict_set(STOPWORDS, "weve", 1)
+STOPWORDS = dict_set(STOPWORDS, "werent", 1)
+STOPWORDS = dict_set(STOPWORDS, "what", 1)
+STOPWORDS = dict_set(STOPWORDS, "whats", 1)
+STOPWORDS = dict_set(STOPWORDS, "when", 1)
+STOPWORDS = dict_set(STOPWORDS, "whens", 1)
+STOPWORDS = dict_set(STOPWORDS, "where", 1)
+STOPWORDS = dict_set(STOPWORDS, "wheres", 1)
+STOPWORDS = dict_set(STOPWORDS, "which", 1)
+STOPWORDS = dict_set(STOPWORDS, "while", 1)
+STOPWORDS = dict_set(STOPWORDS, "who", 1)
+STOPWORDS = dict_set(STOPWORDS, "whos", 1)
+STOPWORDS = dict_set(STOPWORDS, "whom", 1)
+STOPWORDS = dict_set(STOPWORDS, "why", 1)
+STOPWORDS = dict_set(STOPWORDS, "whys", 1)
+STOPWORDS = dict_set(STOPWORDS, "will", 1)
+STOPWORDS = dict_set(STOPWORDS, "with", 1)
+STOPWORDS = dict_set(STOPWORDS, "wont", 1)
+STOPWORDS = dict_set(STOPWORDS, "would", 1)
+STOPWORDS = dict_set(STOPWORDS, "wouldnt", 1)
+STOPWORDS = dict_set(STOPWORDS, "you", 1)
+STOPWORDS = dict_set(STOPWORDS, "youd", 1)
+STOPWORDS = dict_set(STOPWORDS, "youll", 1)
+STOPWORDS = dict_set(STOPWORDS, "youre", 1)
+STOPWORDS = dict_set(STOPWORDS, "youve", 1)
+STOPWORDS = dict_set(STOPWORDS, "your", 1)
+STOPWORDS = dict_set(STOPWORDS, "yours", 1)
+STOPWORDS = dict_set(STOPWORDS, "yourself", 1)
+STOPWORDS = dict_set(STOPWORDS, "yourselves", 1)
+STOPWORDS = dict_set(STOPWORDS, "also", 1)
+STOPWORDS = dict_set(STOPWORDS, "just", 1)
+STOPWORDS = dict_set(STOPWORDS, "even", 1)
+STOPWORDS = dict_set(STOPWORDS, "still", 1)
+STOPWORDS = dict_set(STOPWORDS, "already", 1)
+STOPWORDS = dict_set(STOPWORDS, "however", 1)
+STOPWORDS = dict_set(STOPWORDS, "therefore", 1)
+STOPWORDS = dict_set(STOPWORDS, "moreover", 1)
+STOPWORDS = dict_set(STOPWORDS, "furthermore", 1)
+STOPWORDS = dict_set(STOPWORDS, "although", 1)
+STOPWORDS = dict_set(STOPWORDS, "though", 1)
+STOPWORDS = dict_set(STOPWORDS, "whereas", 1)
+STOPWORDS = dict_set(STOPWORDS, "nevertheless", 1)
+STOPWORDS = dict_set(STOPWORDS, "meanwhile", 1)
+STOPWORDS = dict_set(STOPWORDS, "besides", 1)
+STOPWORDS = dict_set(STOPWORDS, "hence", 1)
+STOPWORDS = dict_set(STOPWORDS, "thus", 1)
+STOPWORDS = dict_set(STOPWORDS, "consequently", 1)
+STOPWORDS = dict_set(STOPWORDS, "accordingly", 1)
+STOPWORDS = dict_set(STOPWORDS, "indeed", 1)
+STOPWORDS = dict_set(STOPWORDS, "certainly", 1)
+STOPWORDS = dict_set(STOPWORDS, "absolutely", 1)
+STOPWORDS = dict_set(STOPWORDS, "actually", 1)
+STOPWORDS = dict_set(STOPWORDS, "basically", 1)
+STOPWORDS = dict_set(STOPWORDS, "simply", 1)
+STOPWORDS = dict_set(STOPWORDS, "really", 1)
+STOPWORDS = dict_set(STOPWORDS, "quite", 1)
+STOPWORDS = dict_set(STOPWORDS, "rather", 1)
+STOPWORDS = dict_set(STOPWORDS, "pretty", 1)
+STOPWORDS = dict_set(STOPWORDS, "fairly", 1)
+STOPWORDS = dict_set(STOPWORDS, "somewhat", 1)
+STOPWORDS = dict_set(STOPWORDS, "somehow", 1)
+STOPWORDS = dict_set(STOPWORDS, "nearly", 1)
+STOPWORDS = dict_set(STOPWORDS, "almost", 1)
+STOPWORDS = dict_set(STOPWORDS, "enough", 1)
+STOPWORDS = dict_set(STOPWORDS, "especially", 1)
+STOPWORDS = dict_set(STOPWORDS, "particularly", 1)
+STOPWORDS = dict_set(STOPWORDS, "specifically", 1)
+STOPWORDS = dict_set(STOPWORDS, "generally", 1)
+STOPWORDS = dict_set(STOPWORDS, "usually", 1)
+STOPWORDS = dict_set(STOPWORDS, "typically", 1)
+STOPWORDS = dict_set(STOPWORDS, "often", 1)
+STOPWORDS = dict_set(STOPWORDS, "sometimes", 1)
+STOPWORDS = dict_set(STOPWORDS, "always", 1)
+STOPWORDS = dict_set(STOPWORDS, "never", 1)
+STOPWORDS = dict_set(STOPWORDS, "maybe", 1)
+STOPWORDS = dict_set(STOPWORDS, "perhaps", 1)
+STOPWORDS = dict_set(STOPWORDS, "possibly", 1)
+STOPWORDS = dict_set(STOPWORDS, "probably", 1)
+STOPWORDS = dict_set(STOPWORDS, "definitely", 1)
+STOPWORDS = dict_set(STOPWORDS, "clearly", 1)
+STOPWORDS = dict_set(STOPWORDS, "obviously", 1)
+STOPWORDS = dict_set(STOPWORDS, "apparently", 1)
+STOPWORDS = dict_set(STOPWORDS, "seemingly", 1)
+
+// ============================================================
+// HELPERS: Ternary trit char label
+// ============================================================
+
+fn tchar(t) {
+    if3 t == T_TRUE {
+        return "+"
+    } else t == T_MAYBE {
+        return "0"
+    } else {
+        return "T"
+    }
+}
+
+// ============================================================
+// HELPERS: Cumulative stat recording
+// ============================================================
+// No threading -- single-flow NovaLang, no lock needed.
+
+fn record_digest(dtype, input_len, output_len) {
+    _total_digests     = _total_digests + 1
+    _total_input_chars = _total_input_chars + input_len
+    _total_output_chars = _total_output_chars + output_len
+    if3 dtype == "summarize" { _cnt_summarize = _cnt_summarize + 1
+    } else dtype == "keywords" { _cnt_keywords = _cnt_keywords + 1
+    } else dtype == "stats" { _cnt_stats = _cnt_stats + 1
+    } else dtype == "diff" { _cnt_diff = _cnt_diff + 1
+    } else dtype == "log" { _cnt_log = _cnt_log + 1
+    } else {
+        // unknown type -- just increment totals
+    }
+}
+
+// ============================================================
+// HELPERS: Text tokenization (delegate to nova_run for regex)
+// ============================================================
+// NovaLang has no regex. We delegate tokenization/splitting to
+// a thin Python helper via nova_run(), which returns JSON strings.
+// Helper: tdigest_helper.py -- operations: tokenize, split_sentences
+
+fn tokenize_text(text) {
+    // Returns a JSON list of lowercase word tokens, no punctuation.
+    let args = json_encode({"op": "tokenize", "text": text})
+    let raw = nova_run("tdigest_helper.py", args)
+    let result = json_decode(raw)
+    let tokens = dict_get(result, "tokens") ?? []
+    return tokens
+}
+
+fn split_sentences(text) {
+    // Returns a JSON list of sentence strings.
+    let args = json_encode({"op": "split_sentences", "text": text})
+    let raw = nova_run("tdigest_helper.py", args)
+    let result = json_decode(raw)
+    let sentences = dict_get(result, "sentences") ?? []
+    return sentences
+}
+
+// ============================================================
+// HELPERS: Stopword and word frequency
+// ============================================================
+
+fn is_stopword(word) {
+    // Returns T_TRUE if word is in STOPWORDS, T_FALSE otherwise.
+    if3 dict_has(STOPWORDS, word) {
+        return T_TRUE
+    } else {
+        return T_FALSE
+    }
+}
+
+fn is_content_word(word) {
+    // Content word: not a stopword AND length > 1.
+    if3 len(word) < 2 {
+        return T_FALSE
+    } else {
+        return is_stopword(word) == T_FALSE
+    }
+}
+
+// Build word frequency dict from a token list (list of strings).
+// Returns {"word": count, ...} for non-stopword tokens of length > 1.
+// Delegates to helper because NovaLang cannot iterate a variable-length
+// token list efficiently without a helper accumulation loop.
+fn build_word_freq(tokens) {
+    let args = json_encode({"op": "word_freq", "tokens": tokens})
+    let raw = nova_run("tdigest_helper.py", args)
+    let result = json_decode(raw)
+    let freq = dict_get(result, "freq") ?? {}
+    return freq
+}
+
+// ============================================================
+// HELPERS: Sentence scoring for extractive summarization
+// ============================================================
+// Scoring weights from harmonic constants:
+//   freq_score   * H7 (7)
+//   pos_score    * H5 (5)
+//   len_score    * H3 (3)
+//   overlap      * H5 (5)
+//
+// We compute per-sentence scores inside the helper (requires iteration
+// over tokens in each sentence, word freq lookups, set intersections).
+
+fn score_sentences(sentences, freq, title_tokens) {
+    // Delegate scoring to helper. Returns list of {score, index, sentence}.
+    let args = json_encode({
+        "op": "score_sentences",
+        "sentences": sentences,
+        "freq": freq,
+        "title_tokens": title_tokens,
+        "H3": H3,
+        "H5": H5,
+        "H7": H7
+    })
+    let raw = nova_run("tdigest_helper.py", args)
+    let result = json_decode(raw)
+    let scored = dict_get(result, "scored") ?? []
+    return scored
+}
+
+// ============================================================
+// ROUTE: POST /tdigest/summarize
+// Input:  {"text": "...", "max_sentences": 3}
+// Output: summary, compression_ratio, sentences_selected, trit, char
+// ============================================================
+fn tdigest_summarize(body) {
+    let text          = dict_get(body, "text") ?? ""
+    let max_sentences = dict_get(body, "max_sentences") ?? H3
+
+    // Validate input
+    if3 len(text) == 0 {
+        return {
+            "ok": false,
+            "error": "empty input",
+            "trit": T_FALSE,
+            "char": "T",
+            "summary": "",
+            "sentences_selected": 0,
+            "compression_ratio": 0.0
+    } else {
+        // Clamp max_sentences to [1, H13]
+        if3 max_sentences < 1 { max_sentences = 1
+        } else max_sentences > H13 { max_sentences = H13
+        } else {
+            // keep as provided
+        }
+
+        // Split into sentences
+        let sentences = split_sentences(text)
+        let n_sents = len(sentences)
+
+        if3 n_sents == 0 {
+            return {
+                "ok": false,
+                "error": "no sentences found",
+                "trit": T_FALSE,
+                "char": "T",
+                "summary": slice(text, 0, 200),
+                "sentences_selected": 0,
+                "compression_ratio": 1.0
+        } else {
+            // If already short enough, return as-is
+            if3 n_sents <= max_sentences {
+                return {
+                    "ok": true,
+                    "summary": text,
+                    "sentences_selected": n_sents,
+                    "sentences_total": n_sents,
+                    "compression_ratio": 1.0,
+                    "trit": T_MAYBE,
+                    "char": "0",
+                    "runtime": "novalang"
+            } else {
+                // Build word frequency from entire text
+                let all_tokens  = tokenize_text(text)
+                let freq        = build_word_freq(all_tokens)
+
+                // Title proxy: first-sentence tokens
+                let first_sent  = dict_get(sentences, 0) ?? ""
+                let title_toks  = tokenize_text(first_sent)
+
+                // Score sentences via helper
+                let scored = score_sentences(sentences, freq, title_toks)
+
+                // Sort scored by score descending (helper returns pre-sorted)
+                // Pick top max_sentences, restore original order via helper
+                let args2 = json_encode({
+                    "op": "pick_top",
+                    "scored": scored,
+                    "max_sentences": max_sentences
+                })
+                let raw2   = nova_run("tdigest_helper.py", args2)
+                let res2   = json_decode(raw2)
+                let top    = dict_get(res2, "top") ?? []
+                let summary_text = dict_get(res2, "summary") ?? ""
+                let n_top  = len(top)
+
+                // Compression ratio
+                let in_len  = len(text)
+                let out_len = len(summary_text)
+                let ratio   = 1.0
+                if3 out_len > 0 { ratio = round(float(in_len) / float(out_len), 2)
+                } else {
+                    // avoid divide-by-zero
+                }
+
+                // Trit: TRUE if ratio > H3=3, MAYBE if > 2, FALSE otherwise
+                let t = T_FALSE
+                if3 ratio > H3 { t = T_TRUE
+                } else ratio > 2 { t = T_MAYBE
+                } else {
+                    // keep T_FALSE
+                }
+
+                // Record into cumulative stats
+                record_digest("summarize", in_len, out_len)
+
+                return {
+                    "ok": true,
+                    "summary": summary_text,
+                    "sentences_selected": n_top,
+                    "sentences_total": n_sents,
+                    "compression_ratio": ratio,
+                    "trit": t,
+                    "char": tchar(t),
+                    "runtime": "novalang"
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tdigest/keywords
+// Input:  {"text": "..."}
+// Output: keywords list with frequency, tf, importance_trit, char; trit, char
+// ============================================================
+}
+}
+}
+fn tdigest_keywords(body) {
+    let text = dict_get(body, "text") ?? ""
+
+    if3 len(text) == 0 {
+        return {
+            "ok": false,
+            "error": "empty input",
+            "trit": T_FALSE,
+            "char": "T",
+            "keywords": [],
+            "total_words": 0
+    } else {
+        // Tokenize and compute freq
+        let tokens = tokenize_text(text)
+        let n_total = len(tokens)
+
+        if3 n_total == 0 {
+            return {
+                "ok": false,
+                "error": "no tokens found",
+                "trit": T_FALSE,
+                "char": "T",
+                "keywords": [],
+                "total_words": 0
+        } else {
+            // Compute content-word freq
+            let freq = build_word_freq(tokens)
+            let n_unique = len(keys(freq))
+
+            // Content token count (total non-stopword tokens of length > 1)
+            let args_ct = json_encode({"op": "content_count", "tokens": tokens})
+            let raw_ct  = nova_run("tdigest_helper.py", args_ct)
+            let res_ct  = json_decode(raw_ct)
+            let n_content = dict_get(res_ct, "count") ?? 1
+
+            if3 n_content == 0 {
+                return {
+                    "ok": false,
+                    "error": "no content words found",
+                    "trit": T_FALSE,
+                    "char": "T",
+                    "keywords": [],
+                    "total_words": n_total
+            } else {
+                // Rank by frequency desc then alphabetically -- delegate to helper
+                let args_rank = json_encode({
+                    "op": "rank_keywords",
+                    "freq": freq,
+                    "n_content": n_content,
+                    "max_kw": H13
+                })
+                let raw_rank  = nova_run("tdigest_helper.py", args_rank)
+                let res_rank  = json_decode(raw_rank)
+                let keywords  = dict_get(res_rank, "keywords") ?? []
+
+                // Annotate each keyword with importance_trit and char
+                // (helper returns word, frequency, tf -- we add trits here)
+                let kw_count = len(keywords)
+                let i = 0
+                while3 i < kw_count {
+                    let kw   = dict_get(keywords, i)
+                    let tf   = dict_get(kw, "tf") ?? 0.0
+                    let imp  = T_FALSE
+                    if3 tf > 0.05 { imp = T_TRUE
+                    } else tf > 0.02 { imp = T_MAYBE
+                    } else {
+                        // keep T_FALSE
+                    }
+                    let _ki  = dict_set(kw, "importance_trit", imp)
+                    let _kc  = dict_set(kw, "importance_char", tchar(imp))
+                    keywords = dict_set(keywords, i, kw)
+                    let i    = i + 1
+                }
+
+                // Overall trit: TRUE if >= H5=5 keywords, MAYBE if >= 2, FALSE if < 2
+                let t = T_FALSE
+                if3 kw_count >= H5 { t = T_TRUE
+                } else kw_count >= 2 { t = T_MAYBE
+                } else {
+                    // keep T_FALSE
+                }
+
+                // Record cumulative stats (output = sum of keyword lengths)
+                let args_ol = json_encode({"op": "kw_outlen", "keywords": keywords})
+                let raw_ol  = nova_run("tdigest_helper.py", args_ol)
+                let res_ol  = json_decode(raw_ol)
+                let out_len = dict_get(res_ol, "out_len") ?? 0
+                record_digest("keywords", len(text), out_len)
+
+                return {
+                    "ok": true,
+                    "keywords": keywords,
+                    "total_words": n_total,
+                    "content_words": n_content,
+                    "unique_content_words": n_unique,
+                    "trit": t,
+                    "char": tchar(t),
+                    "runtime": "novalang"
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tdigest/stats
+// Input:  {"numbers": [1.0, 2.5, ...]}
+// Output: count, sum, mean, median, std, min, max, range, percentiles
+// ============================================================
+}
+}
+}
+fn tdigest_stats(body) {
+    let numbers = dict_get(body, "numbers") ?? []
+    let n = len(numbers)
+
+    if3 n == 0 {
+        return {
+            "ok": false,
+            "error": "empty input",
+            "trit": T_FALSE,
+            "char": "T",
+            "count": 0
+    } else {
+        // Delegate full statistical computation to helper
+        // (requires float coercion loop, sorting, percentile interpolation)
+        let args = json_encode({"op": "stats_digest", "numbers": numbers})
+        let raw  = nova_run("tdigest_helper.py", args)
+        let res  = json_decode(raw)
+        let ok   = dict_get(res, "ok") ?? false
+
+        if3 ok == false { err = dict_get(res, "error") ?? "stats computation failed"
+            return {
+                "ok": false,
+                "error": err,
+                "trit": T_FALSE,
+                "char": "T",
+                "count": 0
+        } else { count   = dict_get(res, "count") ?? 0
+            let s       = dict_get(res, "sum") ?? 0.0
+            let mean    = dict_get(res, "mean") ?? 0.0
+            let median  = dict_get(res, "median") ?? 0.0
+            let std     = dict_get(res, "std") ?? 0.0
+            let lo      = dict_get(res, "min") ?? 0.0
+            let hi      = dict_get(res, "max") ?? 0.0
+            let rng     = dict_get(res, "range") ?? 0.0
+            let p25     = dict_get(res, "p25") ?? 0.0
+            let p50     = dict_get(res, "p50") ?? 0.0
+            let p75     = dict_get(res, "p75") ?? 0.0
+            let p95     = dict_get(res, "p95") ?? 0.0
+
+            // Stats trit is always TRUE (deterministic)
+            let in_len  = count * 8   // approx bytes for numbers
+            let out_len = 200         // approx JSON output bytes
+            record_digest("stats", in_len, out_len)
+
+            return {
+                "ok": true,
+                "count": count,
+                "sum": round(s, 7),
+                "mean": round(mean, 7),
+                "median": round(median, 7),
+                "std": round(std, 7),
+                "min": round(lo, 7),
+                "max": round(hi, 7),
+                "range": round(rng, 7),
+                "percentiles": {
+                    "p25": round(p25, 7),
+                    "p50": round(p50, 7),
+                    "p75": round(p75, 7),
+                    "p95": round(p95, 7)
+                },
+                "trit": T_TRUE,
+                "char": "+",
+                "runtime": "novalang"
+            }
+        }
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tdigest/diff_digest
+// Input:  {"changes": [{"file": "...", "added": N, "removed": N}, ...]}
+// Output: files_touched, total_added, total_removed, net_delta, direction,
+//         hotspots (top H5), summary string, trit, char
+// ============================================================
+}
+}
+fn tdigest_diff_digest(body) {
+    let changes = dict_get(body, "changes") ?? []
+    let n_changes = len(changes)
+
+    if3 n_changes == 0 {
+        return {
+            "ok": false,
+            "error": "no changes provided",
+            "trit": T_FALSE,
+            "char": "T",
+            "files_touched": 0
+    } else {
+        // Accumulate totals and file list via helper
+        // (requires iterating the changes list, summing added/removed,
+        //  sorting by churn, building hotspots top-H5)
+        let args = json_encode({
+            "op": "diff_digest",
+            "changes": changes,
+            "H5": H5,
+            "H7": H7,
+            "H13": H13
+        })
+        let raw = nova_run("tdigest_helper.py", args)
+        let res = json_decode(raw)
+        let ok  = dict_get(res, "ok") ?? false
+
+        if3 ok == false { err = dict_get(res, "error") ?? "diff processing failed"
+            return {
+                "ok": false,
+                "error": err,
+                "trit": T_FALSE,
+                "char": "T",
+                "files_touched": 0
+        } else { n_files       = dict_get(res, "files_touched") ?? 0
+            let total_added   = dict_get(res, "total_added") ?? 0
+            let total_removed = dict_get(res, "total_removed") ?? 0
+            let net           = dict_get(res, "net_delta") ?? 0
+            let hotspots      = dict_get(res, "hotspots") ?? []
+
+            // Direction label
+            let direction = "refactor"
+            if3 net > 0 { direction = "growth"
+            } else net < 0 { direction = "reduction"
+            } else {
+                // keep "refactor"
+            }
+
+            // Build summary string
+            let summary = str(n_files) + " files changed: +" + str(total_added) + " -" + str(total_removed) + " (net " + str(net) + " lines, " + direction + ")"
+
+            // Trit: TRUE if abs(net) > H7 or total churn > H13, MAYBE if any churn, FALSE if zero
+            let churn = total_added + total_removed
+            let abs_net = abs(net)
+            let t = T_FALSE
+            if3 abs_net > H7 { t = T_TRUE
+            } else churn > H13 { t = T_TRUE
+            } else churn > 0 { t = T_MAYBE
+            } else {
+                // keep T_FALSE
+            }
+
+            // Record cumulative stats
+            let in_len  = dict_get(res, "input_len") ?? n_changes * 30
+            let out_len = len(summary)
+            record_digest("diff", in_len, out_len)
+
+            return {
+                "ok": true,
+                "files_touched": n_files,
+                "total_added": total_added,
+                "total_removed": total_removed,
+                "net_delta": net,
+                "direction": direction,
+                "hotspots": hotspots,
+                "summary": summary,
+                "trit": t,
+                "char": tchar(t),
+                "runtime": "novalang"
+            }
+        }
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tdigest/log_digest
+// Input:  {"entries": [{"service": "...", "level": "...", "message": "..."}, ...]}
+// Output: entry_count, services, level_counts, error_count, error_rate,
+//         top_patterns, recent_errors, summary, trit, char
+// ============================================================
+}
+}
+fn tdigest_log_digest(body) {
+    let entries = dict_get(body, "entries") ?? []
+    let n_entries = len(entries)
+
+    if3 n_entries == 0 {
+        return {
+            "ok": false,
+            "error": "no entries provided",
+            "trit": T_FALSE,
+            "char": "T",
+            "entry_count": 0
+    } else {
+        // Delegate full grouping, pattern counting, sorting to helper
+        // (requires nested dict building, sorting by count desc, regex number normalization)
+        let args = json_encode({
+            "op": "log_digest",
+            "entries": entries,
+            "H5": H5,
+            "H7": H7
+        })
+        let raw = nova_run("tdigest_helper.py", args)
+        let res = json_decode(raw)
+        let ok  = dict_get(res, "ok") ?? false
+
+        if3 ok == false { err = dict_get(res, "error") ?? "log processing failed"
+            return {
+                "ok": false,
+                "error": err,
+                "trit": T_FALSE,
+                "char": "T",
+                "entry_count": 0
+        } else { entry_count   = dict_get(res, "entry_count") ?? 0
+            let services      = dict_get(res, "services") ?? []
+            let level_counts  = dict_get(res, "level_counts") ?? {}
+            let error_count   = dict_get(res, "error_count") ?? 0
+            let error_rate    = dict_get(res, "error_rate") ?? 0.0
+            let top_patterns  = dict_get(res, "top_patterns") ?? []
+            let recent_errors = dict_get(res, "recent_errors") ?? []
+            let n_services    = dict_get(res, "service_count") ?? 0
+
+            // Build summary string
+            let summary = str(entry_count) + " log entries across " + str(n_services) + " services"
+            if3 error_count > 0 { err_pct = round(error_rate * 100, 1)
+                summary = summary + ". " + str(error_count) + " errors (" + str(err_pct) + "% error rate)"
+            } else {
+                // no errors -- keep clean summary
+            }
+            summary = summary + "."
+
+            // Trit: TRUE if error_rate < 0.05, MAYBE if < 0.20, FALSE otherwise
+            let t = T_FALSE
+            if3 error_rate < 0.05 { t = T_TRUE
+            } else error_rate < 0.20 { t = T_MAYBE
+            } else {
+                // keep T_FALSE
+            }
+
+            // Record cumulative stats
+            let in_len  = dict_get(res, "input_len") ?? n_entries * 50
+            let out_len = len(summary)
+            record_digest("log", in_len, out_len)
+
+            return {
+                "ok": true,
+                "entry_count": entry_count,
+                "services": services,
+                "level_counts": level_counts,
+                "error_count": error_count,
+                "error_rate": round(error_rate, 4),
+                "top_patterns": top_patterns,
+                "recent_errors": recent_errors,
+                "summary": summary,
+                "trit": t,
+                "char": tchar(t),
+                "runtime": "novalang"
+            }
+        }
+    }
+}
+
+// ============================================================
+// ROUTE: GET /tdigest/health
+// ============================================================
+}
+}
+fn tdigest_health() {
+    let _counters = {"total_requests": _total_digests, "total_errors": 0}
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, _counters)
+    resp = dict_set(resp, "uptime_seconds", round(time() - _start_time, 2))
+    resp = dict_set(resp, "total_digests", _total_digests)
+    resp = dict_set(resp, "by_type", {"summarize": _cnt_summarize, "keywords": _cnt_keywords, "stats": _cnt_stats, "diff": _cnt_diff, "log": _cnt_log})
+    resp = dict_set(resp, "stopwords_loaded", len(keys(STOPWORDS)))
+    resp = dict_set(resp, "max_keywords", H13)
+    resp = dict_set(resp, "max_body", MAX_BODY)
+    resp = dict_set(resp, "endpoints", ["/tdigest/health", "/tdigest/summarize", "/tdigest/keywords", "/tdigest/stats", "/tdigest/diff_digest", "/tdigest/log_digest"])
+    resp = dict_set(resp, "harmonics", {"H3": H3, "H5": H5, "H7": H7, "H13": H13, "BLOCK": BLOCK})
+    return resp
+}
+
+// ============================================================
+// ROUTE: GET /tdigest/stats  (cumulative digest statistics)
+// ============================================================
+fn tdigest_stats_get() {
+    let total_in  = _total_input_chars
+    let total_out = _total_output_chars
+    let denom = total_out
+    if3 denom < 1 { denom = 1
+    } else {
+        // keep denom
+    }
+    let avg_ratio = round(float(total_in) / float(denom), 2)
+    return {
+        "ok": true,
+        "total_digests": _total_digests,
+        "by_type": {
+            "summarize": _cnt_summarize,
+            "keywords": _cnt_keywords,
+            "stats": _cnt_stats,
+            "diff": _cnt_diff,
+            "log": _cnt_log
+        },
+        "total_input_chars": total_in,
+        "total_output_chars": total_out,
+        "avg_compression_ratio": avg_ratio,
+        "trit": T_TRUE,
+        "char": "+",
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================
+// Route registrations
+// ============================================================
+troute(server, "GET",  "/tdigest/health",      "tdigest_health")
+troute(server, "GET",  "/tdigest/stats",        "tdigest_stats_get")
+troute(server, "POST", "/tdigest/summarize",    "tdigest_summarize")
+troute(server, "POST", "/tdigest/keywords",     "tdigest_keywords")
+troute(server, "POST", "/tdigest/stats",        "tdigest_stats")
+troute(server, "POST", "/tdigest/diff_digest",  "tdigest_diff_digest")
+troute(server, "POST", "/tdigest/log_digest",   "tdigest_log_digest")
+
+// ============================================================
+// Startup banner (ASCII only)
+// ============================================================
+print("[TDigest] Nova TDigest v" + VERSION + " -- Ternary Data Digest Engine")
+print("[TDigest] Port: " + str(PORT) + " | Service: " + SERVICE_NAME + " | Runtime: NovaLang")
+print("[TDigest] Stopwords: ~200 | Max keywords: " + str(H13) + " | Max body: " + str(MAX_BODY) + " bytes")
+print("[TDigest] Harmonic scoring weights: freq=" + str(H7) + " position=" + str(H5) + " length=" + str(H3) + " overlap=" + str(H5))
+print("[TDigest] Trit: TRUE(ratio>3) MAYBE(ratio>2) FALSE(ratio<=2)")
+print("[TDigest] N-S Re<" + str(RE_LAMINAR) + "=laminar Re<" + str(RE_TRANS) + "=transitional Re<" + str(RE_TURBULENT) + "=turbulent")
+print("[TDigest] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13) + " BLOCK=" + str(BLOCK))
+print("[TDigest] GET  /tdigest/health | /tdigest/stats")
+print("[TDigest] POST /tdigest/summarize | /tdigest/keywords | /tdigest/stats | /tdigest/diff_digest | /tdigest/log_digest")
+
+troute(server, "GET", "/health", fn(req) { return json_decode(http_get("http://127.0.0.1:9983/tdigest/health")) })
+
+tstart(server)

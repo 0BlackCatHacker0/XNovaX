@@ -1,0 +1,204 @@
+// NovaX Cloud Direct v1.0 -- Minimal cloud router that WORKS
+// Port 9878 -- Goes straight to Cerebras, no cascade, no complexity
+// Once queries flow, Tripple and cascade get added back
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9878
+let VERSION = "1.0-direct"
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+
+// Provider configs loaded from cloud_config.json
+let _config = try3 { json_decode(read_file("C:/NovaX/cloud_config.json")) } fail { {} }
+let _cerebras_key = dict_get(dict_get(_config, "cerebras_direct") ?? {}, "key") ?? ""
+let _openai_key = dict_get(dict_get(_config, "openai") ?? {}, "key") ?? ""
+let _or_key = dict_get(dict_get(_config, "openrouter") ?? {}, "key") ?? ""
+let _samba_key = dict_get(dict_get(_config, "sambanova_direct") ?? {}, "key") ?? ""
+let _google_key = dict_get(dict_get(_config, "google_ai_studio") ?? {}, "key") ?? ""
+let _stats = {"queries": 0, "success": 0, "fail": 0}
+
+print("[CloudDirect] Keys: cerebras=" + str(len(_cerebras_key) > 5) + " openai=" + str(len(_openai_key) > 5) + " openrouter=" + str(len(_or_key) > 5) + " samba=" + str(len(_samba_key) > 5) + " google=" + str(len(_google_key) > 5))
+
+// Direct Cerebras call using http_request (HTTPS via curl, non-blocking)
+fn call_cerebras(prompt) {
+    if3 len(_cerebras_key) < 5 { return {"ok": 0, "error": "no_key"} }
+    let escaped = replace(replace(prompt, "\\", "\\\\"), "\"", "\\\"")
+    let body = "{\"model\":\"qwen-3-235b-a22b-instruct-2507\",\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}],\"max_tokens\":2048}"
+    let headers = {"Authorization": "Bearer " + _cerebras_key, "Content-Type": "application/json"}
+    let result = try3 { http_request("https://api.cerebras.ai/v1/chat/completions", body, headers, 15000) } fail { {"ok": -1, "error": "request_failed"} }
+    let raw = dict_get(result, "body") ?? ""
+    let ok_flag = dict_get(result, "ok") ?? -1
+    if3 ok_flag != 1 { return {"ok": 0, "error": dict_get(result, "error") ?? "http_failed"} }
+    if3 len(raw) < 5 { return {"ok": 0, "error": "empty_response"} }
+    let parsed = try3 { json_decode(raw) } fail { null }
+    if3 parsed == null { return {"ok": 0, "error": "parse_failed", "raw": slice(raw, 0, 100)} }
+    let choices = dict_get(parsed, "choices") ?? []
+    if3 len(choices) == 0 { return {"ok": 0, "error": "no_choices"} }
+    let msg = dict_get(choices[0], "message") ?? {}
+    let text = dict_get(msg, "content") ?? ""
+    let model = dict_get(parsed, "model") ?? "cerebras"
+    let usage = dict_get(parsed, "usage") ?? {}
+    let tokens = (dict_get(usage, "prompt_tokens") ?? 0) + (dict_get(usage, "completion_tokens") ?? 0)
+    return {"ok": 1, "response": text, "model": model, "tokens": tokens, "provider": "cerebras_direct", "time_ms": 0}
+}
+
+// Direct OpenAI call
+fn call_openai(prompt) {
+    if3 len(_openai_key) < 5 { return {"ok": 0, "error": "no_key"} }
+    let escaped = replace(replace(prompt, "\\", "\\\\"), "\"", "\\\"")
+    let body = "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}],\"max_tokens\":2048}"
+    let headers = {"Authorization": "Bearer " + _openai_key, "Content-Type": "application/json"}
+    let result = try3 { http_request("https://api.openai.com/v1/chat/completions", body, headers, 15000) } fail { {"ok": -1, "error": "request_failed"} }
+    let raw = dict_get(result, "body") ?? ""
+    let ok_flag = dict_get(result, "ok") ?? -1
+    if3 ok_flag != 1 { return {"ok": 0, "error": dict_get(result, "error") ?? "http_failed"} }
+    if3 len(raw) < 5 { return {"ok": 0, "error": "empty_response"} }
+    let parsed = try3 { json_decode(raw) } fail { null }
+    if3 parsed == null { return {"ok": 0, "error": "parse_failed"} }
+    let choices = dict_get(parsed, "choices") ?? []
+    if3 len(choices) == 0 { return {"ok": 0, "error": "no_choices"} }
+    let msg = dict_get(choices[0], "message") ?? {}
+    let text = dict_get(msg, "content") ?? ""
+    let model = dict_get(parsed, "model") ?? "gpt-4o-mini"
+    return {"ok": 1, "response": text, "model": model, "provider": "openai", "time_ms": 0}
+}
+
+// SambaNova call
+fn call_sambanova(prompt) {
+    if3 len(_samba_key) < 5 { return {"ok": 0, "error": "no_key"} }
+    let escaped = replace(replace(prompt, "\\", "\\\\"), "\"", "\\\"")
+    let body = "{\"model\":\"Meta-Llama-3.3-70B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}],\"max_tokens\":2048}"
+    let headers = {"Authorization": "Bearer " + _samba_key, "Content-Type": "application/json"}
+    let result = try3 { http_request("https://api.sambanova.ai/v1/chat/completions", body, headers, 15000) } fail { {"ok": -1} }
+    let raw = dict_get(result, "body") ?? ""
+    if3 len(raw) < 5 { return {"ok": 0, "error": "empty_response"} }
+    let parsed = try3 { json_decode(raw) } fail { null }
+    if3 parsed == null { return {"ok": 0, "error": "parse_failed"} }
+    let choices = dict_get(parsed, "choices") ?? []
+    if3 len(choices) == 0 { return {"ok": 0, "error": "no_choices"} }
+    let msg = dict_get(choices[0], "message") ?? {}
+    let text = dict_get(msg, "content") ?? ""
+    return {"ok": 1, "response": text, "model": "Meta-Llama-3.3-70B", "provider": "sambanova_direct", "time_ms": 0}
+}
+
+// Google AI Studio call
+fn call_google(prompt) {
+    if3 len(_google_key) < 5 { return {"ok": 0, "error": "no_key"} }
+    let escaped = replace(replace(prompt, "\\", "\\\\"), "\"", "\\\"")
+    let body = "{\"contents\":[{\"parts\":[{\"text\":\"" + escaped + "\"}]}],\"generationConfig\":{\"maxOutputTokens\":2048}}"
+    let headers = {"Content-Type": "application/json"}
+    let url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + _google_key
+    let result = try3 { http_request(url, body, headers, 15000) } fail { {"ok": -1} }
+    let raw = dict_get(result, "body") ?? ""
+    if3 len(raw) < 5 { return {"ok": 0, "error": "empty_response"} }
+    let parsed = try3 { json_decode(raw) } fail { null }
+    if3 parsed == null { return {"ok": 0, "error": "parse_failed"} }
+    let candidates = dict_get(parsed, "candidates") ?? []
+    if3 len(candidates) == 0 { return {"ok": 0, "error": "no_candidates"} }
+    let content = dict_get(candidates[0], "content") ?? {}
+    let parts = dict_get(content, "parts") ?? []
+    if3 len(parts) == 0 { return {"ok": 0, "error": "no_parts"} }
+    let text = dict_get(parts[0], "text") ?? ""
+    return {"ok": 1, "response": text, "model": "gemini-2.0-flash", "provider": "google_ai_studio", "time_ms": 0}
+}
+
+// OpenRouter call (routes to many providers)
+fn call_openrouter(prompt) {
+    if3 len(_or_key) < 5 { return {"ok": 0, "error": "no_key"} }
+    let escaped = replace(replace(prompt, "\\", "\\\\"), "\"", "\\\"")
+    let body = "{\"model\":\"openai/gpt-4o-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}],\"max_tokens\":2048}"
+    let headers = {"Authorization": "Bearer " + _or_key, "Content-Type": "application/json"}
+    let result = try3 { http_request("https://openrouter.ai/api/v1/chat/completions", body, headers, 15000) } fail { {"ok": -1} }
+    let raw = dict_get(result, "body") ?? ""
+    if3 len(raw) < 5 { return {"ok": 0, "error": "empty_response"} }
+    let parsed = try3 { json_decode(raw) } fail { null }
+    if3 parsed == null { return {"ok": 0, "error": "parse_failed"} }
+    let choices = dict_get(parsed, "choices") ?? []
+    if3 len(choices) == 0 { return {"ok": 0, "error": "no_choices"} }
+    let msg = dict_get(choices[0], "message") ?? {}
+    let text = dict_get(msg, "content") ?? ""
+    let model = dict_get(parsed, "model") ?? "openrouter"
+    return {"ok": 1, "response": text, "model": model, "provider": "openrouter", "time_ms": 0}
+}
+
+// 5-provider cascade: Cerebras -> Google -> SambaNova -> OpenAI -> OpenRouter
+fn query(prompt) {
+    _stats = dict_set(_stats, "queries", (dict_get(_stats, "queries") ?? 0) + 1)
+
+    let r1 = call_cerebras(prompt)
+    if3 (dict_get(r1, "ok") ?? 0) == 1 {
+        _stats = dict_set(_stats, "success", (dict_get(_stats, "success") ?? 0) + 1)
+        return dict_set(r1, "cascade_depth", 0)
+    }
+
+    let r2 = call_google(prompt)
+    if3 (dict_get(r2, "ok") ?? 0) == 1 {
+        _stats = dict_set(_stats, "success", (dict_get(_stats, "success") ?? 0) + 1)
+        return dict_set(r2, "cascade_depth", 1)
+    }
+
+    let r3 = call_sambanova(prompt)
+    if3 (dict_get(r3, "ok") ?? 0) == 1 {
+        _stats = dict_set(_stats, "success", (dict_get(_stats, "success") ?? 0) + 1)
+        return dict_set(r3, "cascade_depth", 2)
+    }
+
+    let r4 = call_openai(prompt)
+    if3 (dict_get(r4, "ok") ?? 0) == 1 {
+        _stats = dict_set(_stats, "success", (dict_get(_stats, "success") ?? 0) + 1)
+        return dict_set(r4, "cascade_depth", 3)
+    }
+
+    let r5 = call_openrouter(prompt)
+    if3 (dict_get(r5, "ok") ?? 0) == 1 {
+        _stats = dict_set(_stats, "success", (dict_get(_stats, "success") ?? 0) + 1)
+        return dict_set(r5, "cascade_depth", 4)
+    }
+
+    _stats = dict_set(_stats, "fail", (dict_get(_stats, "fail") ?? 0) + 1)
+    return {"ok": 0, "trit": -1, "error": "all_providers_failed", "cascade_depth": 5}
+}
+
+// Route handlers
+fn handle_query(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let prompt = dict_get(body, "prompt") ?? ""
+    if3 len(prompt) == 0 { return {"ok": 0, "error": "missing prompt"} }
+    let result = query(prompt)
+    let trit = 0
+    if3 (dict_get(result, "ok") ?? 0) == 1 { trit = 1 }
+    result = dict_set(result, "trit", trit)
+    result = dict_set(result, "ternary", 1)
+    return result
+}
+
+fn handle_health(req) {
+    return ns_health_dict("nova-cloud-router", VERSION, PORT, _stats)
+}
+
+fn handle_providers(req) {
+    return {"ok": 1, "providers": ["cerebras_direct", "google_ai_studio", "sambanova_direct", "openai", "openrouter"], "count": 5}
+}
+
+fn handle_stats(req) {
+    return _stats
+}
+
+// Boot
+let server = tserve(PORT, "nova-cloud-router")
+troute(server, "POST", "/api/v1/query", "handle_query")
+troute(server, "POST", "/query", "handle_query")
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/api/v1/providers", "handle_providers")
+troute(server, "GET", "/api/v1/stats", "handle_stats")
+troute(server, "GET", "/status", "handle_stats")
+
+print("[CloudDirect] Nova Cloud Direct v" + VERSION + " on port " + str(PORT))
+print("[CloudDirect] Providers: cerebras_direct -> openai -> openrouter")
+print("[CloudDirect] No cascade complexity. No parse errors. Just queries.")
+
+tstart(server)

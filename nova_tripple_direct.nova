@@ -1,0 +1,636 @@
+// NovaX Tripple Direct v2.0 -- Math-enhanced Tripple resonance engine
+// Port 9881 -- Standing wave detection, provider scoring, resonance tracking
+// NOW WITH: Boltzmann, Shannon, Markov, PID, Queue Theory
+// Micro-tool: every function returns +1/0/-1
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+import3("C:/NovaX/stdlib/boltzmann3.nova")
+import3("C:/NovaX/stdlib/shannon3.nova")
+import3("C:/NovaX/stdlib/markov3.nova")
+import3("C:/NovaX/stdlib/pid3.nova")
+import3("C:/NovaX/stdlib/queue_theory3.nova")
+
+let PORT = 9881
+let VERSION = "2.0-math"
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+
+// ════════════════════════════════════════════════════════════════════
+// RESONANCE STATE (original)
+// ════════════════════════════════════════════════════════════════════
+let _resonance_score = 0
+let _total_ripples = 0
+let _regime = "creeping"
+let _ns_reynolds = 0
+let _ns_viscosity = 1
+let _ns_pressure = 0
+let _ns_standing_wave = 0
+let _prime_locked = 0
+let _hyper_locked = 0
+let _providers = {}
+let _ripple_history = []
+let _consecutive_success = 0
+
+// ════════════════════════════════════════════════════════════════════
+// MATH MODEL STATE — 5 stdlib instances
+// ════════════════════════════════════════════════════════════════════
+
+// 1. Boltzmann: temperature-based softmax provider selection
+let _boltz = boltz3_new("tripple-router", 1.0)
+
+// 2. Shannon: entropy tracker for response quality diversity
+let _shannon = shannon3_tracker_new("tripple-diversity")
+
+// 3. Markov: state transition chain for provider sequences
+let _markov = markov3_new("tripple-chain")
+
+// 4. PID: controller targeting resonance=100 (perfect)
+//    setpoint=100, harmonic gains kp=0.3, ki=0.05, kd=0.07
+let _pid = pid3_new("tripple-pid", 100, 0.3, 0.05, 0.07)
+_pid = pid3_set_limits(_pid, 1, 8, 500)
+
+// 5. Queue Theory: M/M/1 model per provider
+let _queue = qt3_new("tripple-queue", 100)
+
+// Track last winning provider for Markov transitions
+let _last_winner = null
+
+// Track per-domain stats for smart scoring
+let _domain_stats = {}
+
+// ════════════════════════════════════════════════════════════════════
+// PROVIDER REGISTRATION — wires into all 5 models
+// ════════════════════════════════════════════════════════════════════
+fn _register(name, ptype) {
+    _providers = dict_set(_providers, name, {
+        "freq": 500, "base": 500, "success_rate": 500,
+        "error_rate": 0, "in_phase": 0, "last_trit": 0,
+        "queries": 0, "type": ptype
+    })
+    // Wire into Boltzmann
+    _boltz = boltz3_register(_boltz, name, 50)
+    // Wire into Markov
+    _markov = markov3_add_state(_markov, name)
+    // Wire into Queue Theory (service_rate=10 req/s default)
+    _queue = qt3_register(_queue, name, 10)
+}
+
+// Init default providers
+_register("cerebras_direct", "cloud")
+_register("openai", "cloud")
+_register("anthropic", "cloud")
+_register("google", "cloud")
+_register("openrouter", "cloud")
+_register("ollama", "local")
+_register("novax-prime", "local")
+_register("cortex", "local")
+print("[Tripple] 8 providers registered across 5 math models")
+
+// ════════════════════════════════════════════════════════════════════
+// RIPPLE — records a query result, feeds ALL 5 math models
+// ════════════════════════════════════════════════════════════════════
+fn do_ripple(provider, trit, latency) {
+    _total_ripples = _total_ripples + 1
+    let p = dict_get(_providers, provider) ?? {}
+    let queries = (dict_get(p, "queries") ?? 0) + 1
+    p = dict_set(p, "queries", queries)
+    p = dict_set(p, "last_trit", trit)
+
+    if3 trit == 1 {
+        let sr = dict_get(p, "success_rate") ?? 500
+        p = dict_set(p, "success_rate", min(1000, sr + 50))
+        p = dict_set(p, "in_phase", 1)
+        _consecutive_success = _consecutive_success + 1
+    } else3 {
+        let sr = dict_get(p, "success_rate") ?? 500
+        p = dict_set(p, "success_rate", max(0, sr - 100))
+        p = dict_set(p, "in_phase", 0)
+        _consecutive_success = 0
+    }
+
+    _providers = dict_set(_providers, provider, p)
+
+    // ── FEED MATH MODEL 1: Boltzmann ──
+    let success_flag = 0
+    if3 trit == 1 { success_flag = 1 }
+    _boltz = boltz3_record(_boltz, provider, success_flag, latency)
+    // Temperature adaptation: cool on success, heat on failure
+    if3 trit == 1 {
+        _boltz = boltz3_cool(_boltz, 0.95)
+    } else3 {
+        _boltz = boltz3_heat(_boltz, 1.5)
+    }
+
+    // ── FEED MATH MODEL 2: Shannon ──
+    let resp_class = "fail"
+    if3 trit == 1 { resp_class = "success" }
+    if3 trit == 0 { resp_class = "neutral" }
+    _shannon = shannon3_record(_shannon, provider, resp_class)
+
+    // ── FEED MATH MODEL 3: Markov ──
+    if3 _last_winner != null {
+        _markov = markov3_transition(_markov, _last_winner, provider, success_flag)
+    }
+    if3 trit == 1 {
+        _last_winner = provider
+    }
+
+    // ── FEED MATH MODEL 4: PID ──
+    // Feed current resonance into PID (will be updated below)
+    // PID output = how many models to query (1-8)
+
+    // ── FEED MATH MODEL 5: Queue Theory ──
+    _queue = qt3_arrive(_queue, provider)
+    _queue = qt3_depart(_queue, provider, latency)
+
+    // ── Update resonance score (skip "unknown") ──
+    let total_sr = 0
+    let count = 0
+    let pkeys = keys(_providers)
+    let ki = 0
+    while3 ki < len(pkeys) {
+        let pk = pkeys[ki]
+        if3 pk != "unknown" {
+            let pp = dict_get(_providers, pk) ?? {}
+            let q = dict_get(pp, "queries") ?? 0
+            if3 q > 0 {
+                total_sr = total_sr + (dict_get(pp, "success_rate") ?? 0)
+                count = count + 1
+            }
+        }
+        ki = ki + 1
+    }
+    if3 count > 0 {
+        _resonance_score = round(total_sr / count / 10, 1)
+    }
+
+    // ── PID update with current resonance ──
+    let pid_result = pid3_update(_pid, _resonance_score)
+    _pid = dict_get(pid_result, "pid") ?? _pid
+
+    // ── N-S FLOW DYNAMICS ──
+    let vis = 1
+    if3 count > 0 {
+        let total_errors = 0
+        let eki = 0
+        while3 eki < len(pkeys) {
+            let epk = pkeys[eki]
+            if3 epk != "unknown" {
+                let epp = dict_get(_providers, epk) ?? {}
+                total_errors = total_errors + (dict_get(epp, "error_rate") ?? 0)
+            }
+            eki = eki + 1
+        }
+        vis = max(1, total_errors / max(1, count))
+    }
+    _ns_viscosity = vis
+    _ns_pressure = _resonance_score * 10
+    _ns_reynolds = round((_total_ripples * _ns_pressure) / max(1, _ns_viscosity), 1)
+
+    let RE_LAM = H3 * H3 * H3
+    let RE_TRANS = H5 * H5 * H5
+    let RE_TURB = H7 * H7 * H7
+
+    if3 _ns_reynolds > RE_TURB {
+        _regime = "turbulent"
+    } else3 _ns_reynolds > RE_TRANS {
+        _regime = "transitional"
+    } else3 _ns_reynolds > RE_LAM {
+        _regime = "laminar"
+    } else3 {
+        _regime = "creeping"
+    }
+
+    // Standing wave detection
+    _ns_standing_wave = 0
+    if3 len(_ripple_history) >= H7 {
+        let phase_sum = 0
+        let hwi = len(_ripple_history) - H7
+        while3 hwi < len(_ripple_history) {
+            let entry = _ripple_history[hwi]
+            let etrit = dict_get(entry, "trit") ?? 0
+            phase_sum = phase_sum + etrit
+            hwi = hwi + 1
+        }
+        if3 phase_sum == H7 { _ns_standing_wave = 1 }
+    }
+
+    // Prime lock: H13 consecutive successes
+    if3 _consecutive_success >= H13 {
+        _prime_locked = H13
+    }
+
+    // Hyper lock: prime + standing wave + high Reynolds
+    if3 _prime_locked == H13 {
+        if3 _ns_standing_wave == 1 {
+            if3 _ns_reynolds > RE_TRANS {
+                _hyper_locked = H7
+            }
+        }
+    }
+
+    // Record history
+    _ripple_history = append(_ripple_history, {
+        "provider": provider, "trit": trit, "latency": latency,
+        "resonance": _resonance_score, "time": time()
+    })
+    if3 len(_ripple_history) > 169 {
+        _ripple_history = slice(_ripple_history, len(_ripple_history) - 169, len(_ripple_history))
+    }
+
+    return {"ok": 1, "trit": trit, "resonance": _resonance_score, "ripples": _total_ripples}
+}
+
+// ════════════════════════════════════════════════════════════════════
+// SMART SCORE — combines all 5 math models into a single score
+// ════════════════════════════════════════════════════════════════════
+fn compute_smart_score(provider, domain) {
+    // 1. Boltzmann: softmax probability for this provider
+    let boltz_probs = boltz3_softmax_scores(_boltz)
+    let boltz_score = (dict_get(boltz_probs, provider) ?? 0) / 100
+    if3 boltz_score > 1 { boltz_score = 1 }
+
+    // 2. Shannon: normalized entropy of response quality
+    let shannon_st = shannon3_stats(_shannon)
+    let shannon_ent = dict_get(shannon_st, "response_diversity") ?? 0.5
+    // Lower entropy = more agreement = better confidence
+    let shannon_confidence = 1 - shannon_ent
+
+    // 3. Markov: probability this provider wins given last winner
+    let markov_prob = 0
+    let markov_next = provider
+    if3 _last_winner != null {
+        let prediction = markov3_predict(_markov, _last_winner)
+        if3 prediction != null {
+            let pred_state = dict_get(prediction, "state") ?? provider
+            let pred_prob = dict_get(prediction, "probability") ?? 0
+            markov_next = pred_state
+            // If this provider IS the predicted next, use probability directly
+            if3 pred_state == provider {
+                markov_prob = pred_prob
+            } else3 {
+                // Use the specific transition probability
+                markov_prob = markov3_prob(_markov, _last_winner, provider)
+            }
+        }
+    } else3 {
+        // No history yet, default 0.5
+        markov_prob = 0.5
+        markov_next = provider
+    }
+
+    // 4. PID: confidence = how close resonance is to target (100)
+    let pid_st = pid3_stats(_pid)
+    let pid_error = dict_get(pid_st, "error") ?? 100
+    let pid_abs_err = pid_error
+    if3 pid_abs_err < 0 { pid_abs_err = 0 - pid_abs_err }
+    let pid_confidence = 1 - (pid_abs_err / 100)
+    if3 pid_confidence < 0 { pid_confidence = 0 }
+    if3 pid_confidence > 1 { pid_confidence = 1 }
+
+    // PID output -> how many models to query (clamped 1-8)
+    let pid_output = dict_get(pid_st, "output") ?? 0
+    // Map PID output range [-100..100] to models needed [1..8]
+    // High positive output = high error = need more models
+    // Low/negative output = low error = fewer models
+    let pid_models = round(H3 + (pid_output / 100) * H5, 0)
+    if3 pid_models < 1 { pid_models = 1 }
+    if3 pid_models > 8 { pid_models = 8 }
+
+    // 5. Queue Theory: availability = 1 - utilization
+    let q_util = qt3_utilization(_queue, provider)
+    let queue_avail = 1 - q_util
+    if3 queue_avail < 0 { queue_avail = 0 }
+    let queue_wait = qt3_predicted_wait(_queue, provider)
+
+    // ── COMBINED SCORE ──
+    // (boltzmann * 0.25) + ((1-entropy) * 0.20) + (markov * 0.20) + (pid_conf * 0.15) + (queue_avail * 0.20)
+    let combined = (boltz_score * 25 + shannon_confidence * 20 + markov_prob * 20 + pid_confidence * 15 + queue_avail * 20) / 100
+    if3 combined < 0 { combined = 0 }
+    if3 combined > 1 { combined = 1 }
+    combined = round(combined, 4)
+
+    // Determine recommendation: find provider with highest combined score
+    let recommendation = provider
+    let best_combined = combined
+    let all_prov = keys(_providers)
+    let ri = 0
+    while3 ri < len(all_prov) {
+        let rp = all_prov[ri]
+        if3 rp != "unknown" {
+            if3 rp != provider {
+                let rp_boltz = (dict_get(boltz_probs, rp) ?? 0) / 100
+                if3 rp_boltz > 1 { rp_boltz = 1 }
+                let rp_markov = 0
+                if3 _last_winner != null {
+                    rp_markov = markov3_prob(_markov, _last_winner, rp)
+                } else3 {
+                    rp_markov = 0.5
+                }
+                let rp_qutil = qt3_utilization(_queue, rp)
+                let rp_qavail = 1 - rp_qutil
+                if3 rp_qavail < 0 { rp_qavail = 0 }
+                let rp_score = (rp_boltz * 25 + shannon_confidence * 20 + rp_markov * 20 + pid_confidence * 15 + rp_qavail * 20) / 100
+                if3 rp_score > best_combined {
+                    best_combined = rp_score
+                    recommendation = rp
+                }
+            }
+        }
+        ri = ri + 1
+    }
+
+    // Get the Markov predicted best next provider
+    let markov_best_next = markov_next
+    if3 _last_winner != null {
+        let mk_pred = markov3_predict(_markov, _last_winner)
+        if3 mk_pred != null {
+            markov_best_next = dict_get(mk_pred, "state") ?? provider
+        }
+    }
+
+    return {
+        "ok": 1,
+        "provider": provider,
+        "domain": domain,
+        "boltzmann_score": round(boltz_score, 4),
+        "shannon_entropy": round(shannon_ent, 4),
+        "markov_next": markov_best_next,
+        "markov_probability": round(markov_prob, 4),
+        "pid_models_needed": pid_models,
+        "pid_confidence": round(pid_confidence, 4),
+        "queue_wait_ms": round(queue_wait, 1),
+        "queue_availability": round(queue_avail, 4),
+        "combined_score": combined,
+        "recommendation": recommendation
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// ROUTE HANDLERS
+// ════════════════════════════════════════════════════════════════════
+
+fn handle_status(req) {
+    return {
+        "ok": 1, "trit": 1, "service": "hivemind",
+        "version": VERSION,
+        "resonance_score": _resonance_score,
+        "regime": _regime,
+        "prime_locked": _prime_locked,
+        "hyper_locked": _hyper_locked,
+        "total_ripples": _total_ripples,
+        "ns_reynolds": _ns_reynolds,
+        "ns_viscosity": _ns_viscosity,
+        "ns_pressure": _ns_pressure,
+        "ns_standing_wave": _ns_standing_wave,
+        "ns_boundaries": {"laminar": 27, "transitional": 125, "turbulent": 343},
+        "math_models": ["boltzmann", "shannon", "markov", "pid", "queue_theory"],
+        "providers": _providers
+    }
+}
+
+fn handle_ripple(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let provider = dict_get(body, "provider") ?? "unknown"
+    let trit = dict_get(body, "trit") ?? 0
+    let latency = dict_get(body, "latency") ?? 0
+    return do_ripple(provider, trit, latency)
+}
+
+fn handle_wave(req) {
+    return {
+        "ok": 1, "resonance": _resonance_score,
+        "regime": _regime, "prime": _prime_locked,
+        "hyper": _hyper_locked, "ripples": _total_ripples,
+        "history": _ripple_history
+    }
+}
+
+fn handle_query(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let prompt = dict_get(body, "prompt") ?? ""
+    if3 len(prompt) == 0 { return {"ok": 0, "error": "missing prompt"} }
+
+    // Route through cloud router
+    let result = try3 { http_request("http://127.0.0.1:9878/api/v1/query", json_encode({"prompt": prompt}), {"Content-Type": "application/json"}, 20000) } fail { null }
+    if3 result == null { return {"ok": -1, "trit": -1, "error": "cloud_router_unreachable", "response": "Cloud router at :9878 not responding"} }
+
+    // Check HTTP-level success
+    let ok_flag = dict_get(result, "ok") ?? -1
+    if3 ok_flag != 1 {
+        let err = dict_get(result, "error") ?? "http_failed"
+        return {"ok": -1, "trit": -1, "error": err, "response": "Cloud router HTTP error: " + str(err)}
+    }
+
+    // Extract and parse body string
+    let resp_body = dict_get(result, "body") ?? ""
+    if3 len(resp_body) < 2 { return {"ok": -1, "trit": -1, "error": "empty_body", "response": "Cloud router returned empty response"} }
+
+    // Clean control characters that break JSON parsing
+    let clean_body = replace(replace(resp_body, "\r", ""), "\t", " ")
+    let parsed = try3 { json_decode(clean_body) } fail { null }
+    if3 parsed == null {
+        return {"ok": 0, "trit": -1, "error": "parse_failed", "response": slice(resp_body, 0, 500), "provider": "raw"}
+    }
+
+    // Extract response fields
+    let provider = dict_get(parsed, "provider") ?? "unknown"
+    let response = dict_get(parsed, "response") ?? ""
+    let model = dict_get(parsed, "model") ?? ""
+    let trit = dict_get(parsed, "trit") ?? 0
+
+    // Record ripple (feeds all 5 math models)
+    if3 trit == 1 { do_ripple(provider, 1, 0) }
+    if3 trit != 1 { do_ripple(provider, -1, 0) }
+
+    return {"ok": 1, "trit": trit, "response": response, "provider": provider, "model": model, "ternary": 1}
+}
+
+fn handle_health(req) {
+    let counters = {"ripples": _total_ripples, "resonance": _resonance_score, "prime": _prime_locked}
+    return ns_health_dict("nova-hivemind", VERSION, PORT, counters)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// NEW ENDPOINT: POST /hive/tripple/smart-score
+// Accepts {"provider": "...", "domain": "..."}
+// Returns combined score from all 5 math models
+// ════════════════════════════════════════════════════════════════════
+fn handle_smart_score(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let provider = dict_get(body, "provider") ?? "cerebras_direct"
+    let domain = dict_get(body, "domain") ?? "general"
+    return compute_smart_score(provider, domain)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// NEW ENDPOINT: GET /hive/tripple/math-status
+// Returns all 5 model states
+// ════════════════════════════════════════════════════════════════════
+fn handle_math_status(req) {
+    let boltz_st = boltz3_stats(_boltz)
+    let shannon_st = shannon3_stats(_shannon)
+    let markov_st = markov3_stats(_markov)
+    let pid_st = pid3_stats(_pid)
+    let queue_st = qt3_stats(_queue)
+
+    // PID models_needed calculation
+    let pid_output = dict_get(pid_st, "output") ?? 0
+    let pid_models = round(H3 + (pid_output / 100) * H5, 0)
+    if3 pid_models < 1 { pid_models = 1 }
+    if3 pid_models > 8 { pid_models = 8 }
+
+    return {
+        "ok": 1,
+        "trit": 1,
+        "version": VERSION,
+        "resonance": _resonance_score,
+        "total_ripples": _total_ripples,
+        "boltzmann": {
+            "temperature": dict_get(boltz_st, "temperature") ?? 1.0,
+            "total_routes": dict_get(boltz_st, "total_routes") ?? 0,
+            "exploration_pct": dict_get(boltz_st, "exploration_pct") ?? 0,
+            "probabilities": dict_get(boltz_st, "probabilities") ?? {}
+        },
+        "shannon": {
+            "provider_entropy": dict_get(shannon_st, "provider_entropy") ?? 0,
+            "provider_diversity": dict_get(shannon_st, "provider_diversity") ?? 0,
+            "response_entropy": dict_get(shannon_st, "response_entropy") ?? 0,
+            "response_diversity": dict_get(shannon_st, "response_diversity") ?? 0,
+            "redundancy": dict_get(shannon_st, "redundancy") ?? 1,
+            "provider_health": dict_get(shannon_st, "provider_health") ?? 0,
+            "total_queries": dict_get(shannon_st, "total_queries") ?? 0
+        },
+        "markov": {
+            "current_state": dict_get(markov_st, "current_state"),
+            "total_transitions": dict_get(markov_st, "total_transitions") ?? 0,
+            "state_count": dict_get(markov_st, "state_count") ?? 0,
+            "states": dict_get(markov_st, "states") ?? {},
+            "last_winner": _last_winner
+        },
+        "pid": {
+            "setpoint": dict_get(pid_st, "setpoint") ?? 100,
+            "output": pid_output,
+            "error": dict_get(pid_st, "error") ?? 0,
+            "integral": dict_get(pid_st, "integral") ?? 0,
+            "iterations": dict_get(pid_st, "iterations") ?? 0,
+            "trit": dict_get(pid_st, "trit") ?? 0,
+            "models_needed": pid_models,
+            "gains": dict_get(pid_st, "gains") ?? {}
+        },
+        "queue_theory": {
+            "total_routed": dict_get(queue_st, "total_routed") ?? 0,
+            "total_rejected": dict_get(queue_st, "total_rejected") ?? 0,
+            "providers": dict_get(queue_st, "providers") ?? {}
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// REAL ENTROPY/BOLTZMANN/QUEUE HANDLERS (replace stubs)
+// ════════════════════════════════════════════════════════════════════
+fn handle_entropy(req) {
+    let st = shannon3_stats(_shannon)
+    return {
+        "ok": 1,
+        "entropy": dict_get(st, "provider_entropy") ?? 0,
+        "normalized": dict_get(st, "provider_diversity") ?? 0,
+        "response_entropy": dict_get(st, "response_entropy") ?? 0,
+        "redundancy": dict_get(st, "redundancy") ?? 1,
+        "health": dict_get(st, "provider_health") ?? 0
+    }
+}
+
+fn handle_boltzmann(req) {
+    let st = boltz3_stats(_boltz)
+    return {
+        "ok": 1,
+        "temperature": dict_get(st, "temperature") ?? 1.0,
+        "total_routes": dict_get(st, "total_routes") ?? 0,
+        "exploration_pct": dict_get(st, "exploration_pct") ?? 0,
+        "probabilities": dict_get(st, "probabilities") ?? {}
+    }
+}
+
+fn handle_queue(req) {
+    let st = qt3_stats(_queue)
+    return {
+        "ok": 1,
+        "total_routed": dict_get(st, "total_routed") ?? 0,
+        "providers": dict_get(st, "providers") ?? {}
+    }
+}
+
+fn handle_lyapunov(req) {
+    // Lyapunov stability: use PID divergence as proxy
+    let st = pid3_stats(_pid)
+    let error = dict_get(st, "error") ?? 0
+    let abs_err = error
+    if3 abs_err < 0 { abs_err = 0 - abs_err }
+    let stable = 1
+    if3 abs_err > 30 { stable = 0 }
+    if3 abs_err > 70 { stable = -1 }
+    return {
+        "ok": 1,
+        "lyapunov_stable": stable,
+        "error_magnitude": abs_err,
+        "pid_output": dict_get(st, "output") ?? 0,
+        "iterations": dict_get(st, "iterations") ?? 0
+    }
+}
+
+// Stub handlers for dashboard compatibility
+fn handle_tripple_root(req) {
+    return handle_status(req)
+}
+
+fn handle_mirror_status(req) {
+    return {"ok": 1, "mode": "PASSIVE", "reflections": _total_ripples, "providers": _providers}
+}
+
+fn handle_pacman_status(req) {
+    return {"ok": 1, "status": "READY", "discovered": 0, "locked": 0}
+}
+
+fn handle_advance_status(req) {
+    return {"ok": 1, "auto_advance": 0, "stage": "idle"}
+}
+
+fn handle_history(req) {
+    return {"ok": 1, "history": _ripple_history}
+}
+
+// ════════════════════════════════════════════════════════════════════
+// BOOT
+// ════════════════════════════════════════════════════════════════════
+let server = tserve(PORT, "nova-hivemind")
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/hive/tripple/status", "handle_status")
+troute(server, "POST", "/hive/tripple/ripple", "handle_ripple")
+troute(server, "GET", "/hive/tripple/wave", "handle_wave")
+troute(server, "POST", "/hive/tripple/smart-score", "handle_smart_score")
+troute(server, "GET", "/hive/tripple/math-status", "handle_math_status")
+troute(server, "GET", "/tripple/status", "handle_status")
+troute(server, "GET", "/tripple", "handle_tripple_root")
+troute(server, "POST", "/tripple/ripple", "handle_ripple")
+troute(server, "GET", "/tripple/mirror/status", "handle_mirror_status")
+troute(server, "GET", "/tripple/pacman/status", "handle_pacman_status")
+troute(server, "GET", "/tripple/advance/status", "handle_advance_status")
+troute(server, "GET", "/tripple/entropy", "handle_entropy")
+troute(server, "GET", "/tripple/boltzmann", "handle_boltzmann")
+troute(server, "GET", "/tripple/lyapunov", "handle_lyapunov")
+troute(server, "GET", "/tripple/queue", "handle_queue")
+troute(server, "POST", "/hive/query", "handle_query")
+troute(server, "POST", "/hivemind/query", "handle_query")
+troute(server, "GET", "/stats", "handle_status")
+
+print("[Tripple] NovaX Tripple Direct v" + VERSION + " on port " + str(PORT))
+print("[Tripple] 8 providers, 5 math models active")
+print("[Tripple] Models: Boltzmann(T=1.0) Shannon Markov PID(sp=100) QueueTheory")
+print("[Tripple] Prime lock at " + str(H13) + " consecutive, Hyper at " + str(H7))
+print("[Tripple] NEW: POST /hive/tripple/smart-score | GET /hive/tripple/math-status")
+
+tstart(server)

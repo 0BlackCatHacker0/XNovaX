@@ -1,0 +1,1359 @@
+// nova_tmemory_service.nova -- NovaX Persistent Conversation Memory (port 9978)
+// Pure NovaLang port of nova_tmemory.py
+//
+// The hippocampus of NovaX. Stores conversation summaries, learned facts,
+// user preferences, and contextual insights that persist across sessions.
+// Every memory carries ternary state: TRUE=stored/recalled, MAYBE=partial,
+// FALSE=failed/not-found.
+//
+// Storage: in-memory list + persisted to C:\NovaX\data\tmemory.json
+// Loaded on startup via nova_read(), saved on every write via nova_write().
+//
+// Recall algorithm:
+//   score = relevance * 0.5 + importance * 0.3 + recency * 0.2
+//   relevance = word overlap between query and content (Jaccard recall)
+//   recency = 1.0 - (age_hours / 720) clamped [0, 1] -- 30-day decay
+//
+// Eviction (when at capacity):
+//   Evict lowest importance first; among equal, evict oldest first.
+//
+// Consolidation:
+//   Find memories with >60% word overlap, merge content, keep higher
+//   importance, union tags. Trit: TRUE=consolidated, MAYBE=found-not-merged,
+//   FALSE=nothing to consolidate.
+//
+// Harmonics:
+//   MAX_MEMORIES = 3^7 = 2187 (harmonic block boundary)
+//   Decay window = 720 hours (30 days)
+//   Consolidation threshold = 0.6 (60% word overlap)
+//   Autosave replaced by POST /tmemory/save (on-demand -- no threading)
+//
+// N-S Mapping:
+//   memories = fluid particles
+//   importance = density
+//   recall = pressure-driven flow toward query attractor
+//   Re = total_memories / MAX_MEMORIES * 343
+
+let PORT = 9978
+let server = tserve(PORT, "TMemory v1.0 - NovaX Persistent Conversation Memory")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3   = 3
+let H5   = 5
+let H7   = 7
+let H13  = 13
+let BLOCK = 2187   // 3^7
+
+// -- Ternary Constants --
+let TRUE  =  1
+let MAYBE =  0
+let FALSE = -1
+
+// -- N-S Reynolds Boundaries --
+let RE_LAMINAR      = 27    // H3^3
+let RE_TRANSITIONAL = 125   // H5^3
+let RE_TURBULENT    = 343   // H7^3
+
+// -- Service Constants --
+let VERSION               = "1.0"
+let MAX_MEMORIES          = 2187   // 3^7 = BLOCK
+let DECAY_HOURS           = 720    // 30-day recency decay window
+let CONSOLIDATION_THRESH  = 0.6    // 60% word overlap to consider merge
+let MAX_CONTENT_LEN       = 4096   // max content length in chars
+let MAX_TAGS              = 20     // max tags per memory
+let DATA_FILE             = "C:\\NovaX\\data\\tmemory.json"
+
+// -- Memory State --
+// _memories: list of memory dicts
+// Each memory: {id, timestamp, category, content, tags, importance,
+//               access_count, last_accessed}
+let _memories = []
+let _dirty    = 0   // 1 = unsaved changes exist, 0 = clean
+
+// ---------------------------------------------------------------------------
+// -- Helpers: trit char display --
+
+fn trit_char(t) {
+    if3 t == 1 {
+        return "+"
+    } else t == 0 {
+        return "~"
+    } else {
+        return "-"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Persistence --
+
+// load_memories: read DATA_FILE and populate _memories on startup
+// Returns count of loaded memories.
+fn load_memories() {
+    let raw = nova_read(DATA_FILE)
+    if3 len(raw) == 0 {
+        // File does not exist or is empty -- start fresh
+        let _memories = []
+        return 0
+    } else {
+        let parsed = json_decode(raw)
+        // Support both {memories: [...]} wrapper and bare list formats
+        let is_dict = dict_has(parsed, "memories")
+        if3 is_dict == TRUE {
+            let _memories = dict_get(parsed, "memories", [])
+        } else {
+            // Assume bare list -- but json_decode may return a dict; default
+            let _memories = dict_get(parsed, "memories", [])
+        }
+        return len(_memories)
+    }
+}
+
+// save_memories: write _memories to DATA_FILE atomically via nova_write
+// Builds a wrapper dict with version, saved_at, count, and the list.
+fn save_memories() {
+    let now_ts = str(round(time(), 0))
+    let payload = {
+        "version":   VERSION,
+        "saved_at":  now_ts,
+        "count":     len(_memories),
+        "memories":  _memories
+    }
+    let encoded = json_encode(payload)
+    nova_write(DATA_FILE, encoded)
+    let _dirty = 0
+    return TRUE
+}
+
+// mark_dirty: flag that in-memory state has unsaved changes
+fn mark_dirty() {
+    let _dirty = 1
+}
+
+// ---------------------------------------------------------------------------
+// -- ID and Timestamp Helpers --
+
+// gen_id: generate a short unique memory ID using uuid_hex
+fn gen_id() {
+    let raw = uuid_hex(12)
+    return "mem_" + raw
+}
+
+// now_secs: current Unix time as integer seconds
+fn now_secs() {
+    return round(time(), 0)
+}
+
+// ---------------------------------------------------------------------------
+// -- Tokenization Helpers (Jaccard word-overlap) --
+// NovaLang has no regex or set operations; we use split() and manual
+// de-duplication via a dict to approximate a word-set.
+
+// tokenize: split text into lowercase space-separated word list (no regex,
+// so punctuation stays attached -- good enough for Jaccard approximation).
+fn tokenize(text) {
+    if3 len(text) == 0 {
+        return []
+    } else {
+        let low = lower(text)
+        let words = split(low, " ")
+        return words
+    }
+}
+
+// word_set_dict: build a dict of word -> 1 from a word list (de-duplicate)
+fn word_set_dict(words) {
+    let d = {}
+    let i = 0
+    while3 i < len(words) {
+        let w = dict_get(words, i, "")
+        if3 len(w) > 0 {
+            dict_set(d, w, 1)
+        }
+        let i = i + 1
+    }
+    return d
+}
+
+// intersection_count: count words in set_a dict also in set_b dict
+fn intersection_count(set_a, set_b) {
+    let a_keys = keys(set_a)
+    let count = 0
+    let i = 0
+    while3 i < len(a_keys) {
+        let w = dict_get(a_keys, i, "")
+        if3 dict_has(set_b, w) == TRUE {
+            let count = count + 1
+        }
+        let i = i + 1
+    }
+    return count
+}
+
+// union_count: |A| + |B| - |A intersect B|
+fn union_count(set_a, set_b, inter) {
+    return len(keys(set_a)) + len(keys(set_b)) - inter
+}
+
+// jaccard: compute Jaccard coefficient between two text strings
+fn jaccard(text_a, text_b) {
+    let wa = tokenize(text_a)
+    let wb = tokenize(text_b)
+    if3 len(wa) == 0 {
+        return 0.0
+    } else {
+        if3 len(wb) == 0 {
+            return 0.0
+        } else {
+            let sa = word_set_dict(wa)
+            let sb = word_set_dict(wb)
+            let inter = intersection_count(sa, sb)
+            let uni = union_count(sa, sb, inter)
+            if3 uni == 0 {
+                return 0.0
+            } else {
+                return float(inter) / float(uni)
+            }
+        }
+    }
+}
+
+// relevance_score: fraction of query words found in content (recall-oriented)
+fn relevance_score(query, content) {
+    let qwords = tokenize(query)
+    if3 len(qwords) == 0 {
+        return 0.0
+    } else {
+        let cwords = tokenize(content)
+        if3 len(cwords) == 0 {
+            return 0.0
+        } else {
+            let sq = word_set_dict(qwords)
+            let sc = word_set_dict(cwords)
+            let matches = intersection_count(sq, sc)
+            let q_size = len(keys(sq))
+            if3 q_size == 0 {
+                return 0.0
+            } else {
+                return float(matches) / float(q_size)
+            }
+        }
+    }
+}
+
+// recency_score: 1.0 = just now, 0.0 = 30+ days old
+// timestamp stored as Unix seconds float string
+fn recency_score(ts_secs) {
+    let ts = float(ts_secs)
+    if3 ts == 0.0 {
+        return 0.0
+    } else {
+        let now = time()
+        let age_secs = now - ts
+        let age_hours = age_secs / 3600.0
+        let score = 1.0 - (age_hours / float(DECAY_HOURS))
+        if3 score < 0.0 {
+            return 0.0
+        } else {
+            if3 score > 1.0 {
+                return 1.0
+            } else {
+                return score
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Eviction --
+// evict_until_room: scan _memories and remove lowest-importance (then
+// oldest) entries until len(_memories) < MAX_MEMORIES.
+// Because NovaLang has no in-place list mutation helpers besides append and
+// pop, we rebuild the list after each eviction (linear scan each time,
+// acceptable given infrequent calls).
+
+fn evict_until_room() {
+    while3 len(_memories) >= MAX_MEMORIES {
+        // Find index of worst memory (lowest importance, tie: oldest ts)
+        let worst_idx = 0
+        let worst_imp = dict_get(dict_get(_memories, 0, {}), "importance", 1)
+        let worst_ts  = dict_get(dict_get(_memories, 0, {}), "timestamp", "0")
+        let i = 1
+        while3 i < len(_memories) {
+            let m = dict_get(_memories, i, {})
+            let m_imp = dict_get(m, "importance", 1)
+            let m_ts  = dict_get(m, "timestamp", "0")
+            let is_worse_imp = m_imp < worst_imp
+            let is_same_imp  = m_imp == worst_imp
+            let is_older     = m_ts < worst_ts
+            if3 is_worse_imp == TRUE {
+                let worst_idx = i
+                let worst_imp = m_imp
+                let worst_ts  = m_ts
+            } else {
+                if3 is_same_imp == TRUE {
+                    if3 is_older == TRUE {
+                        let worst_idx = i
+                        let worst_imp = m_imp
+                        let worst_ts  = m_ts
+                    } else {
+                        // keep current worst
+                } else {
+                    // keep current worst
+                }
+            }
+            let i = i + 1
+        }
+        // Rebuild _memories without the worst entry
+        let evicted = dict_get(_memories, worst_idx, {})
+        let evicted_id = dict_get(evicted, "id", "?")
+        let new_list = []
+        let j = 0
+        while3 j < len(_memories) {
+            if3 j == worst_idx {
+                // skip -- this is the eviction
+            } else {
+                append(new_list, dict_get(_memories, j, {}))
+            }
+            let j = j + 1
+        }
+        let _memories = new_list
+        print("[TMemory] Evicted " + evicted_id + " (importance=" + str(worst_imp) + ")")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- N-S Reynolds for memory fill level --
+}
+
+fn calc_reynolds() {
+    let fill = float(len(_memories)) / float(MAX_MEMORIES)
+    let re = round(fill * 343.0, 2)
+    let regime = "laminar"
+    if3 re >= float(RE_TURBULENT) {
+        let regime = "chaotic"
+    } else {
+        if3 re >= float(RE_TRANSITIONAL) {
+            let regime = "turbulent"
+        } else {
+            if3 re >= float(RE_LAMINAR) {
+                let regime = "transitional"
+            } else {
+                // laminar -- keep default
+            }
+        }
+    }
+    return {"reynolds": re, "regime": regime}
+}
+
+// ---------------------------------------------------------------------------
+// -- Category validation helper --
+
+fn is_valid_category(cat) {
+    if3 cat == "fact" {
+        return TRUE
+    } else {
+        if3 cat == "preference" {
+            return TRUE
+        } else {
+            if3 cat == "conversation" {
+                return TRUE
+            } else {
+                if3 cat == "insight" {
+                    return TRUE
+                } else {
+                    return FALSE
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: GET /tmemory/health --
+
+fn tmemory_health() {
+    let ns = calc_reynolds()
+    let mem_count = len(_memories)
+    return {
+        "ok":           true,
+        "trit":         TRUE,
+        "service":      "nova-tmemory",
+        "port":         PORT,
+        "version":      VERSION,
+        "memories":     mem_count,
+        "max_memories": MAX_MEMORIES,
+        "storage":      DATA_FILE,
+        "dirty":        _dirty,
+        "reynolds":     dict_get(ns, "reynolds", 0),
+        "regime":       dict_get(ns, "regime", "laminar"),
+        "runtime":      "novalang"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: POST /tmemory/store --
+// Required: content (str)
+// Optional: category (str, default "fact"), tags (list), importance (int 1-3)
+
+fn tmemory_store(body) {
+    let content = dict_get(body, "content", "")
+    if3 len(content) == 0 {
+        return {"ok": false, "trit": FALSE, "error": "content required"}
+    } else {
+        if3 len(content) > MAX_CONTENT_LEN {
+            return {"ok": false, "trit": FALSE,
+                    "error": "content too long (max 4096 chars)"}
+        } else {
+            let category = lower(dict_get(body, "category", "fact"))
+            if3 is_valid_category(category) == FALSE {
+                return {"ok": false, "trit": FALSE,
+                        "error": "invalid category: must be fact|preference|conversation|insight"}
+            } else {
+                // importance: clamp 1-3
+                let importance = int(dict_get(body, "importance", 1))
+                if3 importance < 1 {
+                    let importance = 1
+                } else {
+                    // keep
+                }
+                if3 importance > 3 {
+                    let importance = 3
+                } else {
+                    // keep
+                }
+
+                // tags: read from body as JSON array (already decoded by tserve)
+                // In NovaLang we cannot iterate over an incoming list field directly;
+                // we store whatever is provided as-is (tserve decodes JSON body).
+                let tags = dict_get(body, "tags", [])
+
+                let now = round(time(), 0)
+                let mem_id = gen_id()
+                let memory = {
+                    "id":           mem_id,
+                    "timestamp":    str(now),
+                    "category":     category,
+                    "content":      content,
+                    "tags":         tags,
+                    "importance":   importance,
+                    "access_count": 0,
+                    "last_accessed": str(now)
+                }
+
+                evict_until_room()
+                append(_memories, memory)
+                mark_dirty()
+                save_memories()
+
+                return {
+                    "ok":        true,
+                    "trit":      TRUE,
+                    "id":        mem_id,
+                    "category":  category,
+                    "importance": importance,
+                    "stored_at": str(now)
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: POST /tmemory/recall --
+// Required: query (str)
+// Optional: category (str, default "all"), limit (int, default 10)
+// Scoring: relevance * 0.5 + importance * 0.3 + recency * 0.2
+
+fn tmemory_recall(body) {
+    let query = dict_get(body, "query", "")
+    if3 len(query) == 0 {
+        return {"ok": false, "trit": FALSE, "error": "query required"}
+    } else {
+        let category = lower(dict_get(body, "category", "all"))
+        let limit = int(dict_get(body, "limit", 10))
+        if3 limit < 1 {
+            let limit = 1
+        } else {
+            // keep
+        }
+        if3 limit > 100 {
+            let limit = 100
+        } else {
+            // keep
+        }
+
+        // Collect candidates (filter by category if specified)
+        let candidates = []
+        let i = 0
+        while3 i < len(_memories) {
+            let m = dict_get(_memories, i, {})
+            let m_cat = dict_get(m, "category", "fact")
+            if3 category == "all" {
+                append(candidates, m)
+            } else {
+                if3 m_cat == category {
+                    append(candidates, m)
+                } else {
+                    // skip
+                }
+            }
+            let i = i + 1
+        }
+
+        if3 len(candidates) == 0 {
+            return {
+                "ok":      true,
+                "trit":    MAYBE,
+                "query":   query,
+                "category": category,
+                "results": [],
+                "count":   0
+        } else {
+            // Score each candidate: relevance*0.5 + norm_importance*0.3 + recency*0.2
+            // Store as parallel lists: scores[], indices[] referencing candidates
+            let scores   = []
+            let rels     = []
+            let ci = 0
+            while3 ci < len(candidates) {
+                let m = dict_get(candidates, ci, {})
+                let m_content = dict_get(m, "content", "")
+                let m_imp     = dict_get(m, "importance", 1)
+                let m_ts      = dict_get(m, "timestamp", "0")
+
+                let rel  = relevance_score(query, m_content)
+                let norm_imp = (float(m_imp) - 1.0) / 2.0
+                let rec  = recency_score(m_ts)
+                let score = rel * 0.5 + norm_imp * 0.3 + rec * 0.2
+
+                append(scores, score)
+                append(rels, rel)
+                let ci = ci + 1
+            }
+
+            // Bubble-sort candidates by score descending (small N, acceptable)
+            // We sort indices into candidates by swapping parallel arrays.
+            let sorted_idx = []
+            let si = 0
+            while3 si < len(candidates) {
+                append(sorted_idx, si)
+                let si = si + 1
+            }
+
+            // Insertion sort descending on scores (stable, simple)
+            let n = len(sorted_idx)
+            let oi = 1
+            while3 oi < n {
+                let key_idx = dict_get(sorted_idx, oi, 0)
+                let key_score = dict_get(scores, key_idx, 0.0)
+                let pos = oi - 1
+                while3 pos >= 0 {
+                    let cur_idx = dict_get(sorted_idx, pos, 0)
+                    let cur_score = dict_get(scores, cur_idx, 0.0)
+                    if3 cur_score < key_score {
+                        // shift cur right
+                        dict_set(sorted_idx, pos + 1, cur_idx)
+                        let pos = pos - 1
+                    } else {
+                        let pos = -1   // break
+                    }
+                }
+                dict_set(sorted_idx, pos + 1, key_idx)
+                let oi = oi + 1
+            }
+
+            // Take top limit results and update access counts
+            let results = []
+            let taken = 0
+            let now = round(time(), 0)
+            let ri = 0
+            while3 ri < len(sorted_idx) {
+                if3 taken < limit {
+                    let ci2 = dict_get(sorted_idx, ri, 0)
+                    let m = dict_get(candidates, ci2, {})
+                    let m_id = dict_get(m, "id", "")
+                    let m_score = round(dict_get(scores, ci2, 0.0), 4)
+                    let m_rel   = round(dict_get(rels, ci2, 0.0), 4)
+
+                    // Update access count on the actual _memories entry
+                    let ui = 0
+                    while3 ui < len(_memories) {
+                        let mem = dict_get(_memories, ui, {})
+                        if3 dict_get(mem, "id", "") == m_id {
+                            let old_ac = dict_get(mem, "access_count", 0)
+                            dict_set(mem, "access_count", old_ac + 1)
+                            dict_set(mem, "last_accessed", str(now))
+                            dict_set(_memories, ui, mem)
+                            let ui = len(_memories)   // break
+                        } else {
+                            let ui = ui + 1
+                        }
+                    }
+
+                    append(results, {
+                        "id":           m_id,
+                        "content":      dict_get(m, "content", ""),
+                        "category":     dict_get(m, "category", "fact"),
+                        "tags":         dict_get(m, "tags", []),
+                        "importance":   dict_get(m, "importance", 1),
+                        "timestamp":    dict_get(m, "timestamp", "0"),
+                        "access_count": dict_get(m, "access_count", 0),
+                        "score":        m_score,
+                        "relevance":    m_rel
+                    })
+                    let taken = taken + 1
+                } else {
+                    // limit reached
+                }
+                let ri = ri + 1
+            }
+
+            if3 len(results) > 0 {
+                mark_dirty()
+            } else {
+                // no access count updates needed
+            }
+
+            let result_trit = MAYBE
+            if3 len(results) > 0 {
+                let result_trit = TRUE
+            } else {
+                // keep MAYBE
+            }
+
+            return {
+                "ok":      true,
+                "trit":    result_trit,
+                "query":   query,
+                "category": category,
+                "results": results,
+                "count":   len(results)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: POST /tmemory/forget --
+// Required: id (str)
+}
+
+fn tmemory_forget(body) {
+    let mem_id = dict_get(body, "id", "")
+    if3 len(mem_id) == 0 {
+        return {"ok": false, "trit": FALSE, "error": "id required"}
+    } else {
+        let found = FALSE
+        let removed_preview = ""
+        let new_list = []
+        let i = 0
+        while3 i < len(_memories) {
+            let m = dict_get(_memories, i, {})
+            if3 dict_get(m, "id", "") == mem_id {
+                let found = TRUE
+                let m_content = dict_get(m, "content", "")
+                let preview_len = len(m_content)
+                if3 preview_len > 80 {
+                    let preview_len = 80
+                } else {
+                    // keep
+                }
+                let removed_preview = slice(m_content, 0, preview_len)
+            } else {
+                append(new_list, m)
+            }
+            let i = i + 1
+        }
+
+        if3 found == TRUE {
+            let _memories = new_list
+            mark_dirty()
+            save_memories()
+            return {
+                "ok":             true,
+                "trit":           TRUE,
+                "id":             mem_id,
+                "deleted":        true,
+                "content_preview": removed_preview
+        } else {
+            return {
+                "ok":     true,
+                "trit":   MAYBE,
+                "id":     mem_id,
+                "deleted": false,
+                "msg":    "memory not found"
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: GET /tmemory/recent and POST /tmemory/recent --
+// GET: default limit 20
+// POST: configurable limit from body
+}
+
+fn get_recent(limit) {
+    // Insertion-sort _memories by timestamp descending (stable)
+    // We build a sorted index list, then take top limit entries.
+    let n = len(_memories)
+    let idx = []
+    let ii = 0
+    while3 ii < n {
+        append(idx, ii)
+        let ii = ii + 1
+    }
+
+    // Insertion sort descending by timestamp string (ISO-comparable)
+    let oi = 1
+    while3 oi < n {
+        let key_i = dict_get(idx, oi, 0)
+        let key_ts = dict_get(dict_get(_memories, key_i, {}), "timestamp", "0")
+        let pos = oi - 1
+        while3 pos >= 0 {
+            let cur_i = dict_get(idx, pos, 0)
+            let cur_ts = dict_get(dict_get(_memories, cur_i, {}), "timestamp", "0")
+            if3 cur_ts < key_ts {
+                dict_set(idx, pos + 1, cur_i)
+                let pos = pos - 1
+            } else {
+                let pos = -1
+            }
+        }
+        dict_set(idx, pos + 1, key_i)
+        let oi = oi + 1
+    }
+
+    let results = []
+    let taken = 0
+    let ri = 0
+    while3 ri < n {
+        if3 taken < limit {
+            let mi = dict_get(idx, ri, 0)
+            let m = dict_get(_memories, mi, {})
+            append(results, {
+                "id":           dict_get(m, "id", ""),
+                "content":      dict_get(m, "content", ""),
+                "category":     dict_get(m, "category", "fact"),
+                "tags":         dict_get(m, "tags", []),
+                "importance":   dict_get(m, "importance", 1),
+                "timestamp":    dict_get(m, "timestamp", "0"),
+                "access_count": dict_get(m, "access_count", 0)
+            })
+            let taken = taken + 1
+        } else {
+            // limit reached
+        }
+        let ri = ri + 1
+    }
+
+    let res_trit = MAYBE
+    if3 len(results) > 0 {
+        let res_trit = TRUE
+    } else {
+        // keep MAYBE
+    }
+
+    return {
+        "ok":            true,
+        "trit":          res_trit,
+        "results":       results,
+        "count":         len(results),
+        "total_memories": len(_memories)
+    }
+}
+
+fn tmemory_recent_get() {
+    return get_recent(20)
+}
+
+fn tmemory_recent_post(body) {
+    let limit = int(dict_get(body, "limit", 20))
+    if3 limit < 1 {
+        let limit = 1
+    } else {
+        // keep
+    }
+    if3 limit > 100 {
+        let limit = 100
+    } else {
+        // keep
+    }
+    return get_recent(limit)
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: GET /tmemory/categories --
+// List all categories with memory counts.
+
+fn tmemory_categories() {
+    let cat_fact   = 0
+    let cat_pref   = 0
+    let cat_conv   = 0
+    let cat_ins    = 0
+    let i = 0
+    while3 i < len(_memories) {
+        let m   = dict_get(_memories, i, {})
+        let cat = dict_get(m, "category", "fact")
+        if3 cat == "fact" {
+            let cat_fact = cat_fact + 1
+        } else {
+            if3 cat == "preference" {
+                let cat_pref = cat_pref + 1
+            } else {
+                if3 cat == "conversation" {
+                    let cat_conv = cat_conv + 1
+                } else {
+                    if3 cat == "insight" {
+                        let cat_ins = cat_ins + 1
+                    } else {
+                        // unknown -- ignore
+                    }
+                }
+            }
+        }
+        let i = i + 1
+    }
+
+    let total = cat_fact + cat_pref + cat_conv + cat_ins
+
+    return {
+        "ok":    true,
+        "trit":  TRUE,
+        "categories": [
+            {"category": "conversation", "count": cat_conv},
+            {"category": "fact",         "count": cat_fact},
+            {"category": "insight",      "count": cat_ins},
+            {"category": "preference",   "count": cat_pref}
+        ],
+        "total": total
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: GET /tmemory/tags --
+// List all tags with frequency across all memories.
+
+fn tmemory_tags() {
+    // Build tag_counts dict: tag -> count
+    let tag_counts = {}
+    let tag_list   = []   // ordered list of tags seen (for iteration)
+    let i = 0
+    while3 i < len(_memories) {
+        let m    = dict_get(_memories, i, {})
+        let tags = dict_get(m, "tags", [])
+        let ti = 0
+        while3 ti < len(tags) {
+            let tag = str(dict_get(tags, ti, ""))
+            if3 len(tag) > 0 {
+                if3 dict_has(tag_counts, tag) == TRUE {
+                    let old_c = dict_get(tag_counts, tag, 0)
+                    dict_set(tag_counts, tag, old_c + 1)
+                } else {
+                    dict_set(tag_counts, tag, 1)
+                    append(tag_list, tag)
+            } else {
+                // skip empty
+            }
+            let ti = ti + 1
+        }
+        let i = i + 1
+    }
+
+    // Build output list (unsorted -- NovaLang sort() works on flat numeric lists)
+    let out = []
+    let total_uses = 0
+    let ti2 = 0
+    while3 ti2 < len(tag_list) {
+        let tag = dict_get(tag_list, ti2, "")
+        let cnt = dict_get(tag_counts, tag, 0)
+        append(out, {"tag": tag, "count": cnt})
+        let total_uses = total_uses + cnt
+        let ti2 = ti2 + 1
+    }
+
+    return {
+        "ok":            true,
+        "trit":          TRUE,
+        "tags":          out,
+        "unique_tags":   len(tag_list),
+        "total_tag_uses": total_uses
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: POST /tmemory/consolidate --
+// Find pairs with >60% word overlap (same category), merge them.
+// Optional: dry_run (bool/string, default false)
+// Trit: TRUE=consolidated, MAYBE=found-not-merged, FALSE=nothing to consolidate.
+}
+
+fn tmemory_consolidate(body) {
+    let dry_run_raw = str(dict_get(body, "dry_run", "false"))
+    let dry_run = FALSE
+    if3 dry_run_raw == "true" {
+        let dry_run = TRUE
+    } else {
+        if3 dry_run_raw == "1" {
+            let dry_run = TRUE
+        } else {
+            if3 dry_run_raw == "yes" {
+                let dry_run = TRUE
+            } else {
+                // keep FALSE
+            }
+        }
+    }
+
+    if3 len(_memories) < 2 {
+        return {
+            "ok":    true,
+            "trit":  FALSE,
+            "msg":   "not enough memories to consolidate",
+            "merged": 0
+    } else {
+        // Find similar pairs: O(n^2) scan
+        // Pairs stored as list of {ai, bi, overlap}
+        let pair_ai      = []
+        let pair_bi      = []
+        let pair_overlap = []
+
+        let n = len(_memories)
+        let i = 0
+        while3 i < n {
+            let mi = dict_get(_memories, i, {})
+            let mi_content  = dict_get(mi, "content", "")
+            let mi_category = dict_get(mi, "category", "fact")
+            let j = i + 1
+            while3 j < n {
+                let mj = dict_get(_memories, j, {})
+                let mj_content  = dict_get(mj, "content", "")
+                let mj_category = dict_get(mj, "category", "fact")
+                if3 mi_category == mj_category {
+                    let overlap = jaccard(mi_content, mj_content)
+                    if3 overlap >= CONSOLIDATION_THRESH {
+                        append(pair_ai, i)
+                        append(pair_bi, j)
+                        append(pair_overlap, overlap)
+                    } else {
+                        // skip
+                } else {
+                    // different category -- skip
+                }
+                let j = j + 1
+            }
+            let i = i + 1
+        }
+
+        if3 len(pair_ai) == 0 {
+            return {
+                "ok":    true,
+                "trit":  FALSE,
+                "msg":   "no similar memories found",
+                "merged": 0
+        } else {
+            // Dry run: report potential merges without executing
+            if3 dry_run == TRUE {
+                let previews = []
+                let cap = len(pair_ai)
+                if3 cap > 20 {
+                    let cap = 20
+                } else {
+                    // keep
+                }
+                let pi = 0
+                while3 pi < cap {
+                    let ai = dict_get(pair_ai, pi, 0)
+                    let bi = dict_get(pair_bi, pi, 0)
+                    let ov = dict_get(pair_overlap, pi, 0.0)
+                    let ma = dict_get(_memories, ai, {})
+                    let mb = dict_get(_memories, bi, {})
+                    let ca = dict_get(ma, "content", "")
+                    let cb = dict_get(mb, "content", "")
+                    let ca80 = slice(ca, 0, 100)
+                    let cb80 = slice(cb, 0, 100)
+                    append(previews, {
+                        "memory_a": ca80,
+                        "memory_b": cb80,
+                        "overlap":  round(ov, 3)
+                    })
+                    let pi = pi + 1
+                }
+                return {
+                    "ok":              true,
+                    "trit":            MAYBE,
+                    "msg":             "dry run -- showing potential merges",
+                    "potential_merges": len(pair_ai),
+                    "previews":        previews,
+                    "merged":          0
+            } else {
+                // Real merge: process pairs in overlap-descending order
+                // Sort pair indices by overlap descending (insertion sort)
+                let pidx = []
+                let pi2 = 0
+                while3 pi2 < len(pair_ai) {
+                    append(pidx, pi2)
+                    let pi2 = pi2 + 1
+                }
+
+                // Insertion sort descending on pair_overlap
+                let sn = len(pidx)
+                let so = 1
+                while3 so < sn {
+                    let key_pi = dict_get(pidx, so, 0)
+                    let key_ov = dict_get(pair_overlap, key_pi, 0.0)
+                    let spos = so - 1
+                    while3 spos >= 0 {
+                        let cur_pi = dict_get(pidx, spos, 0)
+                        let cur_ov = dict_get(pair_overlap, cur_pi, 0.0)
+                        if3 cur_ov < key_ov {
+                            dict_set(pidx, spos + 1, cur_pi)
+                            let spos = spos - 1
+                        } else {
+                            let spos = -1
+                        }
+                    }
+                    dict_set(pidx, spos + 1, key_pi)
+                    let so = so + 1
+                }
+
+                // Track which memory IDs have been absorbed
+                let absorbed_ids = {}
+                let merged_count = 0
+
+                let pi3 = 0
+                while3 pi3 < len(pidx) {
+                    let pp = dict_get(pidx, pi3, 0)
+                    let ai = dict_get(pair_ai, pp, 0)
+                    let bi = dict_get(pair_bi, pp, 0)
+
+                    let ma = dict_get(_memories, ai, {})
+                    let mb = dict_get(_memories, bi, {})
+                    let ma_id = dict_get(ma, "id", "")
+                    let mb_id = dict_get(mb, "id", "")
+
+                    // Skip if either already absorbed
+                    let skip = FALSE
+                    if3 dict_has(absorbed_ids, ma_id) == TRUE {
+                        let skip = TRUE
+                    } else {
+                        if3 dict_has(absorbed_ids, mb_id) == TRUE {
+                            let skip = TRUE
+                        } else {
+                            // proceed
+                        }
+                    }
+
+                    if3 skip == FALSE {
+                        // Determine keeper vs absorbed
+                        let ma_imp = dict_get(ma, "importance", 1)
+                        let mb_imp = dict_get(mb, "importance", 1)
+                        let ma_ts  = dict_get(ma, "timestamp", "0")
+                        let mb_ts  = dict_get(mb, "timestamp", "0")
+
+                        let keeper_idx = ai
+                        let absorb_idx = bi
+                        if3 mb_imp > ma_imp {
+                            let keeper_idx = bi
+                            let absorb_idx = ai
+                        } else {
+                            if3 mb_imp == ma_imp {
+                                if3 mb_ts > ma_ts {
+                                    let keeper_idx = bi
+                                    let absorb_idx = ai
+                                } else {
+                                    // keep ai as keeper
+                            } else {
+                                // ma_imp > mb_imp -- ai is keeper
+                            }
+                        }
+
+                        let keeper = dict_get(_memories, keeper_idx, {})
+                        let absorb = dict_get(_memories, absorb_idx, {})
+
+                        // Merge content: append absorbed if it adds info
+                        let k_content = dict_get(keeper, "content", "")
+                        let a_content = dict_get(absorb, "content", "")
+                        let already_in = contains(k_content, a_content)
+                        if3 already_in == FALSE {
+                            let merged_content = k_content + " | " + a_content
+                            if3 len(merged_content) <= MAX_CONTENT_LEN {
+                                dict_set(keeper, "content", merged_content)
+                            } else {
+                                // too long -- keep original
+                        } else {
+                            // absorbed content already present
+                        }
+
+                        // Keep higher importance
+                        let k_imp = dict_get(keeper, "importance", 1)
+                        let a_imp = dict_get(absorb, "importance", 1)
+                        if3 a_imp > k_imp {
+                            dict_set(keeper, "importance", a_imp)
+                        } else {
+                            // keep k_imp
+                        }
+
+                        // Sum access counts
+                        let k_ac = dict_get(keeper, "access_count", 0)
+                        let a_ac = dict_get(absorb, "access_count", 0)
+                        dict_set(keeper, "access_count", k_ac + a_ac)
+
+                        // Update keeper in _memories
+                        dict_set(_memories, keeper_idx, keeper)
+
+                        // Mark absorb as consumed
+                        let absorb_id = dict_get(absorb, "id", "")
+                        dict_set(absorbed_ids, absorb_id, 1)
+                        let merged_count = merged_count + 1
+                    } else {
+                        // skip pair
+                    }
+
+                    let pi3 = pi3 + 1
+                }
+
+                // Remove absorbed memories from _memories
+                let new_list = []
+                let ri2 = 0
+                while3 ri2 < len(_memories) {
+                    let m = dict_get(_memories, ri2, {})
+                    let m_id = dict_get(m, "id", "")
+                    if3 dict_has(absorbed_ids, m_id) == TRUE {
+                        // skip -- absorbed
+                    } else {
+                        append(new_list, m)
+                    }
+                    let ri2 = ri2 + 1
+                }
+                let _memories = new_list
+
+                mark_dirty()
+                save_memories()
+
+                let res_trit = MAYBE
+                if3 merged_count > 0 {
+                    let res_trit = TRUE
+                } else {
+                    // keep MAYBE
+                }
+
+                let removed_count = len(keys(absorbed_ids))
+
+                return {
+                    "ok":       true,
+                    "trit":     res_trit,
+                    "merged":   merged_count,
+                    "removed":  removed_count,
+                    "remaining": len(_memories)
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: GET /tmemory/stats --
+}
+}
+}
+}
+}
+}
+
+fn tmemory_stats() {
+    let ns = calc_reynolds()
+    let total = len(_memories)
+
+    // Per-category counts
+    let cat_fact = 0
+    let cat_pref = 0
+    let cat_conv = 0
+    let cat_ins  = 0
+    let imp_low  = 0
+    let imp_med  = 0
+    let imp_high = 0
+    let total_access = 0
+    let unique_tags = {}
+    let total_tag_uses = 0
+
+    let i = 0
+    while3 i < len(_memories) {
+        let m = dict_get(_memories, i, {})
+
+        let cat = dict_get(m, "category", "fact")
+        if3 cat == "fact" {
+            let cat_fact = cat_fact + 1
+        } else {
+            if3 cat == "preference" {
+                let cat_pref = cat_pref + 1
+            } else {
+                if3 cat == "conversation" {
+                    let cat_conv = cat_conv + 1
+                } else {
+                    if3 cat == "insight" {
+                        let cat_ins = cat_ins + 1
+                    } else {
+                        // unknown
+                    }
+                }
+            }
+        }
+
+        let imp = dict_get(m, "importance", 1)
+        if3 imp == 1 {
+            let imp_low = imp_low + 1
+        } else {
+            if3 imp == 2 {
+                let imp_med = imp_med + 1
+            } else {
+                let imp_high = imp_high + 1
+            }
+        }
+
+        let ac = dict_get(m, "access_count", 0)
+        let total_access = total_access + ac
+
+        // Count unique tags
+        let tags = dict_get(m, "tags", [])
+        let ti = 0
+        while3 ti < len(tags) {
+            let tag = str(dict_get(tags, ti, ""))
+            if3 len(tag) > 0 {
+                dict_set(unique_tags, tag, 1)
+                let total_tag_uses = total_tag_uses + 1
+            } else {
+                // skip
+            }
+            let ti = ti + 1
+        }
+
+        let i = i + 1
+    }
+
+    let fill_pct = 0.0
+    if3 MAX_MEMORIES > 0 {
+        let fill_pct = round(float(total) / float(MAX_MEMORIES) * 100.0, 2)
+    } else {
+        // keep 0
+    }
+
+    return {
+        "ok":            true,
+        "trit":          TRUE,
+        "total_memories": total,
+        "max_memories":  MAX_MEMORIES,
+        "fill_pct":      fill_pct,
+        "categories": {
+            "conversation": cat_conv,
+            "fact":         cat_fact,
+            "insight":      cat_ins,
+            "preference":   cat_pref
+        },
+        "importance_distribution": {
+            "low_1":    imp_low,
+            "medium_2": imp_med,
+            "high_3":   imp_high
+        },
+        "unique_tags":    len(keys(unique_tags)),
+        "total_accesses": total_access,
+        "total_tag_uses": total_tag_uses,
+        "storage_file":  DATA_FILE,
+        "dirty":         _dirty,
+        "reynolds":      dict_get(ns, "reynolds", 0),
+        "regime":        dict_get(ns, "regime", "laminar"),
+        "harmonics": {
+            "max_memories":             "3^7=2187",
+            "decay_hours":              DECAY_HOURS,
+            "consolidation_threshold":  CONSOLIDATION_THRESH,
+            "autosave":                 "on-demand via POST /tmemory/save"
+        },
+        "runtime": "novalang"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: POST /tmemory/save --
+// On-demand persistence (replaces background autosave thread).
+// Call this from an external scheduler (e.g. nova_tscheduler) every H13s.
+
+fn tmemory_save(body) {
+    if3 _dirty == 1 {
+        let result = save_memories()
+        return {
+            "ok":      true,
+            "trit":    TRUE,
+            "saved":   true,
+            "count":   len(_memories),
+            "msg":     "memories persisted to disk"
+    } else {
+        return {
+            "ok":    true,
+            "trit":  MAYBE,
+            "saved": false,
+            "count": len(_memories),
+            "msg":   "no unsaved changes"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Route: POST /tmemory/purge --
+// Danger: remove ALL memories and wipe the data file.
+}
+
+fn tmemory_purge(body) {
+    let confirm = str(dict_get(body, "confirm", ""))
+    if3 confirm == "PURGE_ALL" {
+        let old_count = len(_memories)
+        let _memories = []
+        save_memories()
+        return {
+            "ok":     true,
+            "trit":   TRUE,
+            "purged": old_count,
+            "msg":    "all memories removed and file cleared"
+    } else {
+        return {
+            "ok":    false,
+            "trit":  FALSE,
+            "error": "send confirm=PURGE_ALL to execute purge"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// -- Startup: load persisted memories --
+
+let loaded_count = load_memories()
+
+// ---------------------------------------------------------------------------
+// -- Route registration --
+}
+
+troute(server, "GET",  "/tmemory/health",      "tmemory_health")
+troute(server, "GET",  "/tmemory/recent",       "tmemory_recent_get")
+troute(server, "GET",  "/tmemory/categories",   "tmemory_categories")
+troute(server, "GET",  "/tmemory/tags",         "tmemory_tags")
+troute(server, "GET",  "/tmemory/stats",        "tmemory_stats")
+
+troute(server, "POST", "/tmemory/store",        "tmemory_store")
+troute(server, "POST", "/tmemory/recall",       "tmemory_recall")
+troute(server, "POST", "/tmemory/forget",       "tmemory_forget")
+troute(server, "POST", "/tmemory/recent",       "tmemory_recent_post")
+troute(server, "POST", "/tmemory/consolidate",  "tmemory_consolidate")
+troute(server, "POST", "/tmemory/save",         "tmemory_save")
+troute(server, "POST", "/tmemory/purge",        "tmemory_purge")
+
+// -- Startup banner --
+print("[TMemory] NovaX Persistent Conversation Memory starting in NovaLang...")
+print("[TMemory] Port: " + str(PORT) + " | Version: " + VERSION + " | Runtime: NovaLang")
+print("[TMemory] MAX_MEMORIES=3^7=" + str(MAX_MEMORIES) + " | DECAY=" + str(DECAY_HOURS) + "h | CONSOLIDATION=" + str(CONSOLIDATION_THRESH))
+print("[TMemory] Autosave: on-demand via POST /tmemory/save (no background thread)")
+print("[TMemory] Loaded " + str(loaded_count) + " memories from " + DATA_FILE)
+print("[TMemory] Ternary: TRUE=stored/recalled, MAYBE=partial, FALSE=failed")
+print("[TMemory] GET  /tmemory/health | /tmemory/recent | /tmemory/categories | /tmemory/tags | /tmemory/stats")
+print("[TMemory] POST /tmemory/store | /tmemory/recall | /tmemory/forget | /tmemory/recent | /tmemory/consolidate | /tmemory/save | /tmemory/purge")
+
+troute(server, "GET", "/health", fn(req) { return json_decode(http_get("http://127.0.0.1:9978/tmemory/health")) })
+
+tstart(server)

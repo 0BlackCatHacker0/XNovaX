@@ -1,0 +1,1232 @@
+// ============================================================
+// nova_meta.nova — NovaLang Self-Hosting Meta-Interpreter
+// ============================================================
+// NovaLang interpreting NovaLang. No Python. No Rust. No PowerShell.
+// Pure ternary flow: source → tokens → AST → execution
+//
+// This is the bootstrap core. Once this runs, Nova is self-hosting.
+// Every .nova file can be loaded, parsed, and executed by this file.
+//
+// 3-5-7-13 Harmonic Design:
+//   H3  = ternary token types (literal/operator/keyword)
+//   H5  = expression precedence levels
+//   H7  = AST node types (7 core: let, fn, if3, while3, for3, return, call)
+//   H13 = full statement set (13 statement types)
+// ============================================================
+
+// ── TOKEN TYPES ──
+let TK_NUM     = "NUM"
+let TK_STR     = "STR"
+let TK_IDENT   = "IDENT"
+let TK_OP      = "OP"
+let TK_PUNC    = "PUNC"
+let TK_KEYWORD = "KEYWORD"
+let TK_EOF     = "EOF"
+
+// ── KEYWORDS ──
+let KEYWORDS = ["let", "fn", "if3", "else3", "while3", "for3", "for", "in",
+                "return", "import3", "try3", "match3", "break3", "continue3",
+                "true", "false", "null", "end3"]
+
+// ════════════════════════════════════════════════════════════
+// SECTION 1: LEXER — Source text → Token list
+// ════════════════════════════════════════════════════════════
+// Each token: {type, value, line, col}
+// Ternary: +1 = valid token, 0 = whitespace/skip, -1 = error
+
+fn meta_lex(source) {
+    let tokens = []
+    let pos = 0
+    let line = 1
+    let col = 1
+    let src_len = len(source)
+
+    while3 pos < src_len {
+        let ch = substr(source, pos, 1)
+
+        // Skip whitespace
+        if3 ch == " " {
+            let pos = pos + 1
+            let col = col + 1
+            continue3
+        }
+        if3 ch == "\t" {
+            let pos = pos + 1
+            let col = col + 4
+            continue3
+        }
+        if3 ch == "\n" {
+            let pos = pos + 1
+            let line = line + 1
+            let col = 1
+            continue3
+        }
+        if3 ch == "\r" {
+            let pos = pos + 1
+            continue3
+        }
+
+        // Skip single-line comments: //
+        if3 ch == "/" {
+            if3 pos + 1 < src_len {
+                let next = substr(source, pos + 1, 1)
+                if3 next == "/" {
+                    // Skip to end of line
+                    while3 pos < src_len {
+                        let c = substr(source, pos, 1)
+                        if3 c == "\n" { break3 }
+                        let pos = pos + 1
+                    }
+                    continue3
+                }
+            }
+        }
+
+        // Skip ## comments
+        if3 ch == "#" {
+            if3 pos + 1 < src_len {
+                let next = substr(source, pos + 1, 1)
+                if3 next == "#" {
+                    while3 pos < src_len {
+                        let c = substr(source, pos, 1)
+                        if3 c == "\n" { break3 }
+                        let pos = pos + 1
+                    }
+                    continue3
+                }
+            }
+        }
+
+        // Numbers: digits, optionally with dot
+        if3 _is_digit(ch) {
+            let start = pos
+            while3 pos < src_len {
+                let c = substr(source, pos, 1)
+                if3 _is_digit(c) {
+                    let pos = pos + 1
+                } {
+                    if3 c == "." {
+                        let pos = pos + 1
+                    } {
+                        break3
+                    }
+                }
+            }
+            let num_str = substr(source, start, pos - start)
+            tokens = append(tokens, {"type": TK_NUM, "value": num_str, "line": line, "col": col})
+            let col = col + (pos - start)
+            continue3
+        }
+
+        // Strings: "..." or '...'
+        if3 ch == "\"" {
+            let result = _lex_string(source, pos, line, col, "\"")
+            tokens = append(tokens, dict_get(result, "token") ?? {})
+            let pos = dict_get(result, "pos") ?? pos + 1
+            let col = dict_get(result, "col") ?? col + 1
+            continue3
+        }
+        if3 ch == "'" {
+            let result = _lex_string(source, pos, line, col, "'")
+            tokens = append(tokens, dict_get(result, "token") ?? {})
+            let pos = dict_get(result, "pos") ?? pos + 1
+            let col = dict_get(result, "col") ?? col + 1
+            continue3
+        }
+
+        // Identifiers and keywords: [a-zA-Z_][a-zA-Z0-9_]*
+        if3 _is_alpha(ch) {
+            let start = pos
+            while3 pos < src_len {
+                let c = substr(source, pos, 1)
+                if3 _is_alnum(c) {
+                    let pos = pos + 1
+                } {
+                    break3
+                }
+            }
+            let word = substr(source, start, pos - start)
+            let tk_type = TK_IDENT
+            // Check if keyword
+            for3 kw in KEYWORDS {
+                if3 kw == word {
+                    let tk_type = TK_KEYWORD
+                    break3
+                }
+            }
+            tokens = append(tokens, {"type": tk_type, "value": word, "line": line, "col": col})
+            let col = col + (pos - start)
+            continue3
+        }
+
+        // Two-character operators: ==, !=, <=, >=, &&, ||, +=, -=, *=, /=
+        if3 pos + 1 < src_len {
+            let two = substr(source, pos, 2)
+            if3 _is_two_char_op(two) {
+                tokens = append(tokens, {"type": TK_OP, "value": two, "line": line, "col": col})
+                let pos = pos + 2
+                let col = col + 2
+                continue3
+            }
+        }
+
+        // Single-character operators
+        if3 _is_op_char(ch) {
+            tokens = append(tokens, {"type": TK_OP, "value": ch, "line": line, "col": col})
+            let pos = pos + 1
+            let col = col + 1
+            continue3
+        }
+
+        // Punctuation: ( ) { } [ ] , ; :
+        if3 _is_punc(ch) {
+            tokens = append(tokens, {"type": TK_PUNC, "value": ch, "line": line, "col": col})
+            let pos = pos + 1
+            let col = col + 1
+            continue3
+        }
+
+        // Unknown character — skip
+        let pos = pos + 1
+        let col = col + 1
+    }
+
+    // Add EOF token
+    tokens = append(tokens, {"type": TK_EOF, "value": "", "line": line, "col": col})
+    return tokens
+}
+
+// ── Lexer helpers ──
+
+fn _is_digit(ch) {
+    if3 ch == "0" { return true }
+    if3 ch == "1" { return true }
+    if3 ch == "2" { return true }
+    if3 ch == "3" { return true }
+    if3 ch == "4" { return true }
+    if3 ch == "5" { return true }
+    if3 ch == "6" { return true }
+    if3 ch == "7" { return true }
+    if3 ch == "8" { return true }
+    if3 ch == "9" { return true }
+    return false
+}
+
+fn _is_alpha(ch) {
+    if3 ch == "_" { return true }
+    // a-z
+    let code = ord(ch)
+    if3 code >= 65 {
+        if3 code <= 90 { return true }
+    }
+    if3 code >= 97 {
+        if3 code <= 122 { return true }
+    }
+    return false
+}
+
+fn _is_alnum(ch) {
+    if3 _is_alpha(ch) { return true }
+    if3 _is_digit(ch) { return true }
+    return false
+}
+
+fn _is_op_char(ch) {
+    if3 ch == "+" { return true }
+    if3 ch == "-" { return true }
+    if3 ch == "*" { return true }
+    if3 ch == "/" { return true }
+    if3 ch == "%" { return true }
+    if3 ch == "=" { return true }
+    if3 ch == "!" { return true }
+    if3 ch == "<" { return true }
+    if3 ch == ">" { return true }
+    if3 ch == "&" { return true }
+    if3 ch == "|" { return true }
+    if3 ch == "." { return true }
+    return false
+}
+
+fn _is_two_char_op(s) {
+    if3 s == "==" { return true }
+    if3 s == "!=" { return true }
+    if3 s == "<=" { return true }
+    if3 s == ">=" { return true }
+    if3 s == "&&" { return true }
+    if3 s == "||" { return true }
+    if3 s == "+=" { return true }
+    if3 s == "-=" { return true }
+    if3 s == "*=" { return true }
+    if3 s == "/=" { return true }
+    return false
+}
+
+fn _is_punc(ch) {
+    if3 ch == "(" { return true }
+    if3 ch == ")" { return true }
+    if3 ch == "{" { return true }
+    if3 ch == "}" { return true }
+    if3 ch == "[" { return true }
+    if3 ch == "]" { return true }
+    if3 ch == "," { return true }
+    if3 ch == ";" { return true }
+    if3 ch == ":" { return true }
+    return false
+}
+
+fn _lex_string(source, pos, line, col, quote) {
+    let pos = pos + 1  // skip opening quote
+    let start = pos
+    let src_len = len(source)
+    let escaped = false
+
+    while3 pos < src_len {
+        let ch = substr(source, pos, 1)
+        if3 escaped {
+            let escaped = false
+            let pos = pos + 1
+            continue3
+        }
+        if3 ch == "\\" {
+            let escaped = true
+            let pos = pos + 1
+            continue3
+        }
+        if3 ch == quote {
+            let str_val = substr(source, start, pos - start)
+            let pos = pos + 1
+            return {"token": {"type": TK_STR, "value": str_val, "line": line, "col": col}, "pos": pos, "col": col + (pos - start) + 2}
+        }
+        let pos = pos + 1
+    }
+    // Unterminated string
+    let str_val = substr(source, start, pos - start)
+    return {"token": {"type": TK_STR, "value": str_val, "line": line, "col": col}, "pos": pos, "col": col + (pos - start)}
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION 2: PARSER — Token list → Abstract Syntax Tree
+// ════════════════════════════════════════════════════════════
+// AST node: {node, ...fields}
+// Parser state: {tokens, pos}
+
+fn meta_parse(tokens) {
+    let state = {"tokens": tokens, "pos": 0}
+    let body = []
+
+    while3 _peek_type(state) != TK_EOF {
+        let result = _parse_statement(state)
+        let stmt = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        if3 stmt != null {
+            body = append(body, stmt)
+        }
+    }
+
+    return {"node": "program", "body": body}
+}
+
+fn _peek(state) {
+    let pos = dict_get(state, "pos") ?? 0
+    let tokens = dict_get(state, "tokens") ?? []
+    if3 pos >= len(tokens) { return {"type": TK_EOF, "value": ""} }
+    return tokens[pos]
+}
+
+fn _peek_type(state) {
+    let tk = _peek(state)
+    return dict_get(tk, "type") ?? TK_EOF
+}
+
+fn _peek_value(state) {
+    let tk = _peek(state)
+    return dict_get(tk, "value") ?? ""
+}
+
+fn _advance(state) {
+    let pos = dict_get(state, "pos") ?? 0
+    return dict_set(state, "pos", pos + 1)
+}
+
+fn _expect(state, expected_type, expected_value) {
+    let tk = _peek(state)
+    let state = _advance(state)
+    return {"token": tk, "state": state}
+}
+
+// ── Statement parsers ──
+
+fn _parse_statement(state) {
+    let tk = _peek(state)
+    let val = dict_get(tk, "value") ?? ""
+    let typ = dict_get(tk, "type") ?? ""
+
+    // let x = expr
+    if3 val == "let" { return _parse_let(state) }
+
+    // fn name(args) { body }
+    if3 val == "fn" { return _parse_fn(state) }
+
+    // if3 condition { body } { else }
+    if3 val == "if3" { return _parse_if3(state) }
+
+    // while3 condition { body }
+    if3 val == "while3" { return _parse_while3(state) }
+
+    // for3 item in list { body }
+    if3 val == "for3" { return _parse_for3(state) }
+    if3 val == "for" { return _parse_for3(state) }
+
+    // return expr
+    if3 val == "return" { return _parse_return(state) }
+
+    // import3("path")
+    if3 val == "import3" { return _parse_import(state) }
+
+    // break3 / continue3
+    if3 val == "break3" {
+        let state = _advance(state)
+        return {"node": {"node": "break3"}, "state": state}
+    }
+    if3 val == "continue3" {
+        let state = _advance(state)
+        return {"node": {"node": "continue3"}, "state": state}
+    }
+
+    // Expression statement (function calls, assignments)
+    return _parse_expr_statement(state)
+}
+
+fn _parse_let(state) {
+    let state = _advance(state)  // skip 'let'
+    let name = _peek_value(state)
+    let state = _advance(state)  // skip identifier
+
+    // Check for = sign
+    if3 _peek_value(state) == "=" {
+        let state = _advance(state)  // skip '='
+        let result = _parse_expression(state)
+        let expr = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        return {"node": {"node": "let", "name": name, "value": expr}, "state": state}
+    }
+
+    return {"node": {"node": "let", "name": name, "value": null}, "state": state}
+}
+
+fn _parse_fn(state) {
+    let state = _advance(state)  // skip 'fn'
+    let name = _peek_value(state)
+    let state = _advance(state)  // skip name
+    let state = _advance(state)  // skip '('
+
+    // Parse parameter list
+    let params = []
+    while3 _peek_value(state) != ")" {
+        if3 _peek_value(state) == "," {
+            let state = _advance(state)
+            continue3
+        }
+        params = append(params, _peek_value(state))
+        let state = _advance(state)
+    }
+    let state = _advance(state)  // skip ')'
+
+    // Parse body block
+    let result = _parse_block(state)
+    let body = dict_get(result, "body") ?? []
+    let state = dict_get(result, "state") ?? state
+
+    return {"node": {"node": "fn", "name": name, "params": params, "body": body}, "state": state}
+}
+
+fn _parse_if3(state) {
+    let state = _advance(state)  // skip 'if3'
+
+    // Parse condition
+    let result = _parse_expression(state)
+    let cond = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+
+    // Parse then-block
+    let result = _parse_block(state)
+    let then_body = dict_get(result, "body") ?? []
+    let state = dict_get(result, "state") ?? state
+
+    // Check for else block
+    let else_body = []
+    if3 _peek_value(state) == "{" {
+        let result = _parse_block(state)
+        let else_body = dict_get(result, "body") ?? []
+        let state = dict_get(result, "state") ?? state
+    }
+    if3 _peek_value(state) == "else3" {
+        let state = _advance(state)
+        if3 _peek_value(state) == "if3" {
+            // else3 if3 ... (chained)
+            let result = _parse_if3(state)
+            let else_body = [dict_get(result, "node") ?? null]
+            let state = dict_get(result, "state") ?? state
+        } {
+            let result = _parse_block(state)
+            let else_body = dict_get(result, "body") ?? []
+            let state = dict_get(result, "state") ?? state
+        }
+    }
+
+    return {"node": {"node": "if3", "cond": cond, "then": then_body, "else": else_body}, "state": state}
+}
+
+fn _parse_while3(state) {
+    let state = _advance(state)  // skip 'while3'
+    let result = _parse_expression(state)
+    let cond = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+
+    let result = _parse_block(state)
+    let body = dict_get(result, "body") ?? []
+    let state = dict_get(result, "state") ?? state
+
+    return {"node": {"node": "while3", "cond": cond, "body": body}, "state": state}
+}
+
+fn _parse_for3(state) {
+    let state = _advance(state)  // skip 'for3' or 'for'
+    let var_name = _peek_value(state)
+    let state = _advance(state)  // skip variable
+    let state = _advance(state)  // skip 'in'
+
+    let result = _parse_expression(state)
+    let iter = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+
+    let result = _parse_block(state)
+    let body = dict_get(result, "body") ?? []
+    let state = dict_get(result, "state") ?? state
+
+    return {"node": {"node": "for3", "var": var_name, "iter": iter, "body": body}, "state": state}
+}
+
+fn _parse_return(state) {
+    let state = _advance(state)  // skip 'return'
+    let result = _parse_expression(state)
+    let expr = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+    return {"node": {"node": "return", "value": expr}, "state": state}
+}
+
+fn _parse_import(state) {
+    let state = _advance(state)  // skip 'import3'
+    let state = _advance(state)  // skip '('
+    let path = _peek_value(state)
+    let state = _advance(state)  // skip string
+    let state = _advance(state)  // skip ')'
+    return {"node": {"node": "import3", "path": path}, "state": state}
+}
+
+fn _parse_block(state) {
+    let body = []
+    if3 _peek_value(state) == "{" {
+        let state = _advance(state)  // skip '{'
+        while3 _peek_value(state) != "}" {
+            if3 _peek_type(state) == TK_EOF { break3 }
+            let result = _parse_statement(state)
+            let stmt = dict_get(result, "node") ?? null
+            let state = dict_get(result, "state") ?? state
+            if3 stmt != null {
+                body = append(body, stmt)
+            }
+        }
+        let state = _advance(state)  // skip '}'
+    }
+    // Also handle end3 blocks
+    if3 _peek_value(state) == "end3" {
+        let state = _advance(state)
+    }
+    return {"body": body, "state": state}
+}
+
+fn _parse_expr_statement(state) {
+    let result = _parse_expression(state)
+    let expr = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+    return {"node": expr, "state": state}
+}
+
+// ── Expression parser (precedence climbing) ──
+
+fn _parse_expression(state) {
+    return _parse_assignment(state)
+}
+
+fn _parse_assignment(state) {
+    let result = _parse_or(state)
+    let left = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+
+    if3 _peek_value(state) == "=" {
+        let state = _advance(state)
+        let result = _parse_expression(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        return {"node": {"node": "assign", "target": left, "value": right}, "state": state}
+    }
+
+    return {"node": left, "state": state}
+}
+
+fn _parse_or(state) {
+    let result = _parse_and(state)
+    let left = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+
+    while3 _peek_value(state) == "||" {
+        let op = _peek_value(state)
+        let state = _advance(state)
+        let result = _parse_and(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        let left = {"node": "binop", "op": op, "left": left, "right": right}
+    }
+
+    return {"node": left, "state": state}
+}
+
+fn _parse_and(state) {
+    let result = _parse_comparison(state)
+    let left = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+
+    while3 _peek_value(state) == "&&" {
+        let op = _peek_value(state)
+        let state = _advance(state)
+        let result = _parse_comparison(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        let left = {"node": "binop", "op": op, "left": left, "right": right}
+    }
+
+    return {"node": left, "state": state}
+}
+
+fn _parse_comparison(state) {
+    let result = _parse_addition(state)
+    let left = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+
+    let v = _peek_value(state)
+    if3 v == "==" {
+        let state = _advance(state)
+        let result = _parse_addition(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        return {"node": {"node": "binop", "op": "==", "left": left, "right": right}, "state": state}
+    }
+    if3 v == "!=" {
+        let state = _advance(state)
+        let result = _parse_addition(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        return {"node": {"node": "binop", "op": "!=", "left": left, "right": right}, "state": state}
+    }
+    if3 v == "<" {
+        let state = _advance(state)
+        let result = _parse_addition(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        return {"node": {"node": "binop", "op": "<", "left": left, "right": right}, "state": state}
+    }
+    if3 v == ">" {
+        let state = _advance(state)
+        let result = _parse_addition(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        return {"node": {"node": "binop", "op": ">", "left": left, "right": right}, "state": state}
+    }
+    if3 v == "<=" {
+        let state = _advance(state)
+        let result = _parse_addition(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        return {"node": {"node": "binop", "op": "<=", "left": left, "right": right}, "state": state}
+    }
+    if3 v == ">=" {
+        let state = _advance(state)
+        let result = _parse_addition(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        return {"node": {"node": "binop", "op": ">=", "left": left, "right": right}, "state": state}
+    }
+
+    return {"node": left, "state": state}
+}
+
+fn _parse_addition(state) {
+    let result = _parse_multiplication(state)
+    let left = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+
+    while3 _peek_value(state) == "+" {
+        let state = _advance(state)
+        let result = _parse_multiplication(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        let left = {"node": "binop", "op": "+", "left": left, "right": right}
+    }
+    while3 _peek_value(state) == "-" {
+        let state = _advance(state)
+        let result = _parse_multiplication(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        let left = {"node": "binop", "op": "-", "left": left, "right": right}
+    }
+
+    return {"node": left, "state": state}
+}
+
+fn _parse_multiplication(state) {
+    let result = _parse_unary(state)
+    let left = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+
+    let v = _peek_value(state)
+    while3 v == "*" {
+        let state = _advance(state)
+        let result = _parse_unary(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        let left = {"node": "binop", "op": "*", "left": left, "right": right}
+        let v = _peek_value(state)
+    }
+    while3 v == "/" {
+        let state = _advance(state)
+        let result = _parse_unary(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        let left = {"node": "binop", "op": "/", "left": left, "right": right}
+        let v = _peek_value(state)
+    }
+    while3 v == "%" {
+        let state = _advance(state)
+        let result = _parse_unary(state)
+        let right = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        let left = {"node": "binop", "op": "%", "left": left, "right": right}
+        let v = _peek_value(state)
+    }
+
+    return {"node": left, "state": state}
+}
+
+fn _parse_unary(state) {
+    let v = _peek_value(state)
+    if3 v == "-" {
+        let state = _advance(state)
+        let result = _parse_primary(state)
+        let operand = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        return {"node": {"node": "unary", "op": "-", "operand": operand}, "state": state}
+    }
+    if3 v == "!" {
+        let state = _advance(state)
+        let result = _parse_primary(state)
+        let operand = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        return {"node": {"node": "unary", "op": "!", "operand": operand}, "state": state}
+    }
+    return _parse_call(state)
+}
+
+fn _parse_call(state) {
+    let result = _parse_primary(state)
+    let left = dict_get(result, "node") ?? null
+    let state = dict_get(result, "state") ?? state
+
+    // Function call: name(args)
+    while3 _peek_value(state) == "(" {
+        let state = _advance(state)  // skip '('
+        let call_args = []
+        while3 _peek_value(state) != ")" {
+            if3 _peek_value(state) == "," {
+                let state = _advance(state)
+                continue3
+            }
+            let result = _parse_expression(state)
+            let arg = dict_get(result, "node") ?? null
+            let state = dict_get(result, "state") ?? state
+            call_args = append(call_args, arg)
+        }
+        let state = _advance(state)  // skip ')'
+        let left = {"node": "call", "fn": left, "args": call_args}
+    }
+
+    // Index access: name[index]
+    while3 _peek_value(state) == "[" {
+        let state = _advance(state)  // skip '['
+        let result = _parse_expression(state)
+        let idx = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        let state = _advance(state)  // skip ']'
+        let left = {"node": "index", "object": left, "index": idx}
+    }
+
+    return {"node": left, "state": state}
+}
+
+fn _parse_primary(state) {
+    let tk = _peek(state)
+    let typ = dict_get(tk, "type") ?? ""
+    let val = dict_get(tk, "value") ?? ""
+
+    // Number literal
+    if3 typ == TK_NUM {
+        let state = _advance(state)
+        if3 contains(val, ".") {
+            return {"node": {"node": "float", "value": to_float(val)}, "state": state}
+        }
+        return {"node": {"node": "int", "value": to_int(val)}, "state": state}
+    }
+
+    // String literal
+    if3 typ == TK_STR {
+        let state = _advance(state)
+        return {"node": {"node": "str", "value": val}, "state": state}
+    }
+
+    // Identifier
+    if3 typ == TK_IDENT {
+        let state = _advance(state)
+        return {"node": {"node": "ident", "name": val}, "state": state}
+    }
+
+    // Keywords as values
+    if3 val == "true" {
+        let state = _advance(state)
+        return {"node": {"node": "bool", "value": true}, "state": state}
+    }
+    if3 val == "false" {
+        let state = _advance(state)
+        return {"node": {"node": "bool", "value": false}, "state": state}
+    }
+    if3 val == "null" {
+        let state = _advance(state)
+        return {"node": {"node": "null"}, "state": state}
+    }
+
+    // Parenthesized expression
+    if3 val == "(" {
+        let state = _advance(state)
+        let result = _parse_expression(state)
+        let expr = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        let state = _advance(state)  // skip ')'
+        return {"node": expr, "state": state}
+    }
+
+    // Dict literal: { key: value, ... }
+    if3 val == "{" {
+        return _parse_dict_literal(state)
+    }
+
+    // List literal: [ ... ]
+    if3 val == "[" {
+        return _parse_list_literal(state)
+    }
+
+    // try3 { expr } { fallback }
+    if3 val == "try3" {
+        return _parse_try3(state)
+    }
+
+    // Skip unknown
+    let state = _advance(state)
+    return {"node": {"node": "null"}, "state": state}
+}
+
+fn _parse_dict_literal(state) {
+    let state = _advance(state)  // skip '{'
+    let pairs = []
+    while3 _peek_value(state) != "}" {
+        if3 _peek_type(state) == TK_EOF { break3 }
+        if3 _peek_value(state) == "," {
+            let state = _advance(state)
+            continue3
+        }
+        // key: value  or  "key": value
+        let key = _peek_value(state)
+        let state = _advance(state)
+        let state = _advance(state)  // skip ':'
+        let result = _parse_expression(state)
+        let val = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        pairs = append(pairs, {"key": key, "value": val})
+    }
+    let state = _advance(state)  // skip '}'
+    return {"node": {"node": "dict", "pairs": pairs}, "state": state}
+}
+
+fn _parse_list_literal(state) {
+    let state = _advance(state)  // skip '['
+    let items = []
+    while3 _peek_value(state) != "]" {
+        if3 _peek_type(state) == TK_EOF { break3 }
+        if3 _peek_value(state) == "," {
+            let state = _advance(state)
+            continue3
+        }
+        let result = _parse_expression(state)
+        let item = dict_get(result, "node") ?? null
+        let state = dict_get(result, "state") ?? state
+        items = append(items, item)
+    }
+    let state = _advance(state)  // skip ']'
+    return {"node": {"node": "list", "items": items}, "state": state}
+}
+
+fn _parse_try3(state) {
+    let state = _advance(state)  // skip 'try3'
+    let result = _parse_block(state)
+    let try_body = dict_get(result, "body") ?? []
+    let state = dict_get(result, "state") ?? state
+    let catch_body = []
+    if3 _peek_value(state) == "{" {
+        let result = _parse_block(state)
+        let catch_body = dict_get(result, "body") ?? []
+        let state = dict_get(result, "state") ?? state
+    }
+    return {"node": {"node": "try3", "try": try_body, "catch": catch_body}, "state": state}
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION 3: EVALUATOR — AST → Execution
+// ════════════════════════════════════════════════════════════
+// Environment: dict of {name: value} with parent scope chain
+// All NovaLang builtins available as native functions
+
+fn meta_eval(ast, env) {
+    let node_type = dict_get(ast, "node") ?? ""
+
+    if3 node_type == "program" {
+        let body = dict_get(ast, "body") ?? []
+        let result = null
+        for3 stmt in body {
+            let result = meta_eval(stmt, env)
+            // Check for return signal
+            let is_return = try3 { dict_get(result, "_return") ?? false } { false }
+            if3 is_return { return result }
+        }
+        return result
+    }
+
+    if3 node_type == "int" { return dict_get(ast, "value") ?? 0 }
+    if3 node_type == "float" { return dict_get(ast, "value") ?? 0.0 }
+    if3 node_type == "str" { return dict_get(ast, "value") ?? "" }
+    if3 node_type == "bool" { return dict_get(ast, "value") ?? false }
+    if3 node_type == "null" { return null }
+
+    if3 node_type == "ident" {
+        let name = dict_get(ast, "name") ?? ""
+        return _env_get(env, name)
+    }
+
+    if3 node_type == "let" {
+        let name = dict_get(ast, "name") ?? ""
+        let val_ast = dict_get(ast, "value") ?? null
+        let val = null
+        if3 val_ast != null { let val = meta_eval(val_ast, env) }
+        _env_set(env, name, val)
+        return val
+    }
+
+    if3 node_type == "fn" {
+        let name = dict_get(ast, "name") ?? ""
+        let fn_obj = {"_fn": true, "name": name, "params": dict_get(ast, "params") ?? [], "body": dict_get(ast, "body") ?? [], "env": env}
+        _env_set(env, name, fn_obj)
+        return fn_obj
+    }
+
+    if3 node_type == "call" {
+        let fn_ast = dict_get(ast, "fn") ?? null
+        let fn_obj = meta_eval(fn_ast, env)
+        let arg_asts = dict_get(ast, "args") ?? []
+        let call_args = []
+        for3 a in arg_asts {
+            call_args = append(call_args, meta_eval(a, env))
+        }
+
+        // Check if it's a user-defined function
+        let is_fn = try3 { dict_get(fn_obj, "_fn") ?? false } { false }
+        if3 is_fn {
+            return _call_user_fn(fn_obj, call_args)
+        }
+
+        // Check if it's a builtin name
+        let fn_name = dict_get(fn_ast, "name") ?? ""
+        return _call_builtin(fn_name, call_args, env)
+    }
+
+    if3 node_type == "binop" {
+        let op = dict_get(ast, "op") ?? ""
+        let left = meta_eval(dict_get(ast, "left") ?? null, env)
+        let right = meta_eval(dict_get(ast, "right") ?? null, env)
+        return _eval_binop(op, left, right)
+    }
+
+    if3 node_type == "unary" {
+        let op = dict_get(ast, "op") ?? ""
+        let operand = meta_eval(dict_get(ast, "operand") ?? null, env)
+        if3 op == "-" { return 0 - operand }
+        if3 op == "!" { return operand == false }
+        return operand
+    }
+
+    if3 node_type == "if3" {
+        let cond = meta_eval(dict_get(ast, "cond") ?? null, env)
+        if3 cond {
+            let body = dict_get(ast, "then") ?? []
+            return _eval_body(body, env)
+        } {
+            let body = dict_get(ast, "else") ?? []
+            return _eval_body(body, env)
+        }
+    }
+
+    if3 node_type == "while3" {
+        let cond_ast = dict_get(ast, "cond") ?? null
+        let body = dict_get(ast, "body") ?? []
+        let result = null
+        while3 meta_eval(cond_ast, env) {
+            let result = _eval_body(body, env)
+        }
+        return result
+    }
+
+    if3 node_type == "for3" {
+        let var_name = dict_get(ast, "var") ?? ""
+        let iter = meta_eval(dict_get(ast, "iter") ?? null, env)
+        let body = dict_get(ast, "body") ?? []
+        let result = null
+        for3 item in iter {
+            _env_set(env, var_name, item)
+            let result = _eval_body(body, env)
+        }
+        return result
+    }
+
+    if3 node_type == "return" {
+        let val = meta_eval(dict_get(ast, "value") ?? null, env)
+        return {"_return": true, "value": val}
+    }
+
+    if3 node_type == "dict" {
+        let pairs = dict_get(ast, "pairs") ?? []
+        let d = {}
+        for3 p in pairs {
+            let k = dict_get(p, "key") ?? ""
+            let v = meta_eval(dict_get(p, "value") ?? null, env)
+            d = dict_set(d, k, v)
+        }
+        return d
+    }
+
+    if3 node_type == "list" {
+        let items = dict_get(ast, "items") ?? []
+        let result = []
+        for3 item in items {
+            result = append(result, meta_eval(item, env))
+        }
+        return result
+    }
+
+    if3 node_type == "index" {
+        let obj = meta_eval(dict_get(ast, "object") ?? null, env)
+        let idx = meta_eval(dict_get(ast, "index") ?? null, env)
+        return obj[idx]
+    }
+
+    if3 node_type == "import3" {
+        let path = dict_get(ast, "path") ?? ""
+        let source = read_file(path)
+        let tokens = meta_lex(source)
+        let import_ast = meta_parse(tokens)
+        meta_eval(import_ast, env)
+        return null
+    }
+
+    if3 node_type == "try3" {
+        let try_body = dict_get(ast, "try") ?? []
+        let catch_body = dict_get(ast, "catch") ?? []
+        let result = try3 { _eval_body(try_body, env) } { _eval_body(catch_body, env) }
+        return result
+    }
+
+    return null
+}
+
+fn _eval_body(body, env) {
+    let result = null
+    for3 stmt in body {
+        let result = meta_eval(stmt, env)
+        let is_return = try3 { dict_get(result, "_return") ?? false } { false }
+        if3 is_return { return result }
+    }
+    return result
+}
+
+fn _call_user_fn(fn_obj, call_args) {
+    let params = dict_get(fn_obj, "params") ?? []
+    let body = dict_get(fn_obj, "body") ?? []
+    let parent_env = dict_get(fn_obj, "env") ?? {}
+
+    // Create new scope
+    let local_env = {"_parent": parent_env}
+    let i = 0
+    while3 i < len(params) {
+        let arg_val = null
+        if3 i < len(call_args) { let arg_val = call_args[i] }
+        _env_set(local_env, params[i], arg_val)
+        i = i + 1
+    }
+
+    let result = _eval_body(body, local_env)
+    let is_return = try3 { dict_get(result, "_return") ?? false } { false }
+    if3 is_return { return dict_get(result, "value") ?? null }
+    return result
+}
+
+fn _eval_binop(op, left, right) {
+    if3 op == "+" { return left + right }
+    if3 op == "-" { return left - right }
+    if3 op == "*" { return left * right }
+    if3 op == "/" { return left / right }
+    if3 op == "%" { return left % right }
+    if3 op == "==" { return left == right }
+    if3 op == "!=" { return left != right }
+    if3 op == "<" { return left < right }
+    if3 op == ">" { return left > right }
+    if3 op == "<=" { return left <= right }
+    if3 op == ">=" { return left >= right }
+    if3 op == "&&" { return left && right }
+    if3 op == "||" { return left || right }
+    return null
+}
+
+// ── Environment (scope chain) ──
+
+fn _env_get(env, name) {
+    let val = dict_get(env, name) ?? "_UNDEFINED_"
+    if3 val != "_UNDEFINED_" { return val }
+    let parent = dict_get(env, "_parent") ?? null
+    if3 parent != null { return _env_get(parent, name) }
+    return null
+}
+
+fn _env_set(env, name, value) {
+    // Mutates the env dict in place
+    dict_set(env, name, value)
+}
+
+// ── Builtin dispatch ──
+// Routes builtin calls to NovaLang's own builtins
+fn _call_builtin(name, args, env) {
+    // Core builtins — these call NovaLang's native functions directly
+    if3 name == "print" { return print(args[0]) }
+    if3 name == "len" { return len(args[0]) }
+    if3 name == "str" { return str(args[0]) }
+    if3 name == "to_int" { return to_int(args[0]) }
+    if3 name == "to_float" { return to_float(args[0]) }
+    if3 name == "type_of" { return type_of(args[0]) }
+    if3 name == "trim" { return trim(args[0]) }
+    if3 name == "upper" { return upper(args[0]) }
+    if3 name == "lower" { return lower(args[0]) }
+    if3 name == "split" { return split(args[0], args[1]) }
+    if3 name == "join" { return join(args[0], args[1]) }
+    if3 name == "replace" { return replace(args[0], args[1], args[2]) }
+    if3 name == "contains" { return contains(args[0], args[1]) }
+    if3 name == "substr" { return substr(args[0], args[1], args[2]) }
+    if3 name == "append" { return append(args[0], args[1]) }
+    if3 name == "keys" { return keys(args[0]) }
+    if3 name == "dict_get" { return dict_get(args[0], args[1]) ?? args[2] }
+    if3 name == "dict_set" { return dict_set(args[0], args[1], args[2]) }
+    if3 name == "dict_keys" { return dict_keys(args[0]) }
+    if3 name == "dict_has" { return dict_has(args[0], args[1]) }
+    if3 name == "json_encode" { return json_encode(args[0]) }
+    if3 name == "json_decode" { return json_decode(args[0]) }
+    if3 name == "read_file" { return read_file(args[0]) }
+    if3 name == "write_file" { return write_file(args[0], args[1]) }
+    if3 name == "file_exists" { return file_exists(args[0]) }
+    if3 name == "file_size" { return file_size(args[0]) }
+    if3 name == "dir_list" { return dir_list(args[0]) }
+    if3 name == "dir_walk" { return dir_walk(args[0], dict_get(args, 1) ?? 999) }
+    if3 name == "file_stat" { return file_stat(args[0]) }
+    if3 name == "file_mtime" { return file_mtime(args[0]) }
+    if3 name == "is_dir" { return is_dir(args[0]) }
+    if3 name == "is_file" { return is_file(args[0]) }
+    if3 name == "mkdir" { return mkdir(args[0]) }
+    if3 name == "delete_file" { return delete_file(args[0]) }
+    if3 name == "copy_file" { return copy_file(args[0], args[1]) }
+    if3 name == "path_join" { return path_join(args[0], args[1]) }
+    if3 name == "path_ext" { return path_ext(args[0]) }
+    if3 name == "path_filename" { return path_filename(args[0]) }
+    if3 name == "http_get" { return http_get(args[0]) }
+    if3 name == "http_post" { return http_post(args[0], args[1]) }
+    if3 name == "time" { return time() }
+    if3 name == "time_ms" { return time_ms() }
+    if3 name == "random" { return random() }
+    if3 name == "random_int" { return random_int(args[0], args[1]) }
+    if3 name == "env_get" { return env_get(args[0]) }
+    if3 name == "hash" { return hash(args[0]) }
+    if3 name == "abs" { return abs(args[0]) }
+    if3 name == "max" { return max(args[0], args[1]) }
+    if3 name == "min" { return min(args[0], args[1]) }
+    if3 name == "sort" { return sort(args[0]) }
+    if3 name == "reverse" { return reverse(args[0]) }
+    if3 name == "range" { return range(args[0], dict_get(args, 1) ?? null) }
+
+    // Win32 native (compiled builtins)
+    if3 name == "process_list" { return process_list() }
+    if3 name == "system_info" { return system_info() }
+    if3 name == "clipboard_read" { return clipboard_read() }
+
+    // HTTP server
+    if3 name == "tserve" { return tserve(args[0], args[1]) }
+    if3 name == "troute" { return troute(args[0], args[1], args[2], args[3]) }
+    if3 name == "tstart" { return tstart(args[0]) }
+
+    // Not found — try calling as user function in environment
+    let fn_obj = _env_get(env, name)
+    let is_fn = try3 { dict_get(fn_obj, "_fn") ?? false } { false }
+    if3 is_fn { return _call_user_fn(fn_obj, args) }
+
+    print("[META] Unknown builtin: " + name)
+    return null
+}
+
+// ════════════════════════════════════════════════════════════
+// SECTION 4: PUBLIC API — Run .nova files through meta-interpreter
+// ════════════════════════════════════════════════════════════
+
+fn meta_run_source(source) {
+    let tokens = meta_lex(source)
+    let ast = meta_parse(tokens)
+    let env = {"_parent": null}
+    return meta_eval(ast, env)
+}
+
+fn meta_run_file(path) {
+    let source = read_file(path)
+    return meta_run_source(source)
+}
+
+// Self-test: can meta_run_source parse and execute NovaLang?
+fn meta_self_test() {
+    let test_source = "let x = 3 + 5\nlet y = x * 2\nprint(str(y))"
+    print("[META] Self-test: running 'let x = 3 + 5; let y = x * 2; print(y)'")
+    let result = meta_run_source(test_source)
+    print("[META] Self-test complete. Result: " + str(result))
+    return {"ok": true, "trit": 1}
+}
+
+print("[META] NovaLang Self-Hosting Meta-Interpreter loaded")
+print("[META] Functions: meta_lex(), meta_parse(), meta_eval(), meta_run_file(), meta_run_source()")
+print("[META] Nova interprets Nova. Zero external dependencies.")

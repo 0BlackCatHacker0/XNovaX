@@ -1,0 +1,686 @@
+// nova_physics_engine.nova -- NovaX Ternary Physics Engine (port 9850)
+// Pure NovaLang microservice: 7 physics tools for vector math, forces,
+// particles, fluid dynamics, collision detection, field ops, and ODE solvers.
+//
+// Every physical quantity flows through ternary gates. Motion is just
+// state change across timesteps. Forces are signed: push(+1), rest(0), pull(-1).
+//
+// N-S Mapping:
+//   velocity_field = fluid velocity grid
+//   pressure_field = pressure solve (Jacobi iteration)
+//   viscosity     = diffusion term (nu * laplacian(u))
+//   advection     = self-transport (u · grad(u))
+//   Reynolds      = inertial/viscous ratio -> determines grid resolution
+//   RE_LAMINAR=27: coarse grid, RE_TRANSITION=125: medium, RE_TURBULENT=343: fine
+//
+// Port: 9850 | Harmonics: 3-5-7-13
+
+let PORT = 9850
+let SERVICE_NAME = "physics-engine"
+let VERSION = "1.0.0"
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK_SIZE = 2187
+let RE_LAMINAR = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT = 343
+
+// -- Physical Constants --
+let GRAVITY = 9.81
+let COULOMB_K = 8987551787.0
+let PI_APPROX = 3.14159265
+
+// -- Ternary Constants --
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// -- Runtime Stats --
+let _stats = {"total": 0, "t0": time()}
+let _tool_stats = {"vector": 0, "force": 0, "particle": 0, "fluid": 0, "collide": 0, "field": 0, "solve": 0}
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+fn ns_sqrt(x) {
+    if3 x <= 0 { return 0 }
+    let guess = x / 2
+    if3 guess <= 0 { guess = 1 }
+    let guess = (guess + x / guess) / 2
+    let guess = (guess + x / guess) / 2
+    let guess = (guess + x / guess) / 2
+    let guess = (guess + x / guess) / 2
+    let guess = (guess + x / guess) / 2
+    return guess
+}
+
+fn ns_abs(x) {
+    if3 x < 0 { return 0 - x }
+    return x
+}
+
+fn vec_mag(v) {
+    let x = dict_get(v, "x") ?? 0
+    let y = dict_get(v, "y") ?? 0
+    let z = dict_get(v, "z") ?? 0
+    return ns_sqrt(x * x + y * y + z * z)
+}
+
+fn vec_normalize(v) {
+    let m = vec_mag(v)
+    if3 m <= 0 { return {"x": 0, "y": 0, "z": 0} }
+    let x = (dict_get(v, "x") ?? 0) / m
+    let y = (dict_get(v, "y") ?? 0) / m
+    let z = (dict_get(v, "z") ?? 0) / m
+    return {"x": x, "y": y, "z": z}
+}
+
+fn vec_scale(v, s) {
+    let x = (dict_get(v, "x") ?? 0) * s
+    let y = (dict_get(v, "y") ?? 0) * s
+    let z = (dict_get(v, "z") ?? 0) * s
+    return {"x": x, "y": y, "z": z}
+}
+
+fn vec_add(a, b) {
+    let x = (dict_get(a, "x") ?? 0) + (dict_get(b, "x") ?? 0)
+    let y = (dict_get(a, "y") ?? 0) + (dict_get(b, "y") ?? 0)
+    let z = (dict_get(a, "z") ?? 0) + (dict_get(b, "z") ?? 0)
+    return {"x": x, "y": y, "z": z}
+}
+
+fn vec_sub(a, b) {
+    let x = (dict_get(a, "x") ?? 0) - (dict_get(b, "x") ?? 0)
+    let y = (dict_get(a, "y") ?? 0) - (dict_get(b, "y") ?? 0)
+    let z = (dict_get(a, "z") ?? 0) - (dict_get(b, "z") ?? 0)
+    return {"x": x, "y": y, "z": z}
+}
+
+fn pseudo_random(seed) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483647
+    let next = (a * seed + c) % m
+    if3 next < 0 { next = 0 - next }
+    return next
+}
+
+fn bump_stat(tool_name) {
+    let t = (dict_get(_stats, "total") ?? 0) + 1
+    _stats = dict_set(_stats, "total", t)
+    let c = (dict_get(_tool_stats, tool_name) ?? 0) + 1
+    _tool_stats = dict_set(_tool_stats, tool_name, c)
+    return t
+}
+
+fn grid_key(x, y) {
+    let xs = to_str(x)
+    let ys = to_str(y)
+    let k = xs + "_" + ys
+    return k
+}
+
+// ============================================================
+// TOOL 1: VECTOR — POST /physics/vector
+// ============================================================
+fn handle_vector(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let op = dict_get(body, "op") ?? "add"
+    let a = dict_get(body, "a", {"x": 0, "y": 0, "z": 0})
+    let b = dict_get(body, "b", {"x": 0, "y": 0, "z": 0})
+    let scalar = dict_get(body, "scalar") ?? 1.0
+    bump_stat("vector")
+
+    if3 op == "add" {
+        return {"ok": true, "tool": "vector", "op": "add", "result": vec_add(a, b)}
+    }
+    if3 op == "sub" {
+        return {"ok": true, "tool": "vector", "op": "sub", "result": vec_sub(a, b)}
+    }
+    if3 op == "dot" { d = (dict_get(a, "x") ?? 0)*(dict_get(b, "x") ?? 0) + (dict_get(a, "y") ?? 0)*(dict_get(b, "y") ?? 0) + (dict_get(a, "z") ?? 0)*(dict_get(b, "z") ?? 0)
+        return {"ok": true, "tool": "vector", "op": "dot", "result": d}
+    }
+    if3 op == "cross" { cx = (dict_get(a, "y") ?? 0)*(dict_get(b, "z") ?? 0) - (dict_get(a, "z") ?? 0)*(dict_get(b, "y") ?? 0)
+        let cy = (dict_get(a, "z") ?? 0)*(dict_get(b, "x") ?? 0) - (dict_get(a, "x") ?? 0)*(dict_get(b, "z") ?? 0)
+        let cz = (dict_get(a, "x") ?? 0)*(dict_get(b, "y") ?? 0) - (dict_get(a, "y") ?? 0)*(dict_get(b, "x") ?? 0)
+        return {"ok": true, "tool": "vector", "op": "cross", "result": {"x": cx, "y": cy, "z": cz}}
+    }
+    if3 op == "normalize" {
+        return {"ok": true, "tool": "vector", "op": "normalize", "result": vec_normalize(a)}
+    }
+    if3 op == "magnitude" {
+        return {"ok": true, "tool": "vector", "op": "magnitude", "result": vec_mag(a)}
+    }
+    if3 op == "scale" {
+        return {"ok": true, "tool": "vector", "op": "scale", "result": vec_scale(a, scalar)}
+    }
+    return {"ok": false, "error": "unknown vector op", "valid": "add|sub|dot|cross|normalize|magnitude|scale"}
+}
+
+// ============================================================
+// TOOL 2: FORCE — POST /physics/force
+// ============================================================
+fn handle_force(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let ftype = dict_get(body, "type") ?? "gravity"
+    let mass = dict_get(body, "mass") ?? 1.0
+    let vel = dict_get(body, "velocity", {"x": 0, "y": 0, "z": 0})
+    bump_stat("force")
+
+    if3 ftype == "gravity" { fy = 0 - mass * GRAVITY
+        return {"ok": true, "tool": "force", "type": "gravity", "force": {"x": 0, "y": fy, "z": 0}}
+    }
+    if3 ftype == "friction" { mu = dict_get(body, "mu") ?? 0.3
+        let normal = dict_get(body, "normal") ?? mass * GRAVITY
+        let vn = vec_normalize(vel)
+        let fmag = 0 - mu * normal
+        let f = vec_scale(vn, fmag)
+        return {"ok": true, "tool": "force", "type": "friction", "force": f}
+    }
+    if3 ftype == "spring" { k = dict_get(body, "k") ?? 10.0
+        let disp = dict_get(body, "displacement", {"x": 0, "y": 0, "z": 0})
+        let f = vec_scale(disp, 0 - k)
+        return {"ok": true, "tool": "force", "type": "spring", "force": f}
+    }
+    if3 ftype == "drag" { cd = dict_get(body, "cd") ?? 0.47
+        let rho = dict_get(body, "rho") ?? 1.225
+        let area = dict_get(body, "area") ?? 1.0
+        let vmag = vec_mag(vel)
+        let fmag = 0 - 0.5 * cd * rho * area * vmag * vmag
+        let vn = vec_normalize(vel)
+        let f = vec_scale(vn, fmag)
+        return {"ok": true, "tool": "force", "type": "drag", "force": f}
+    }
+    if3 ftype == "electric" { ke = COULOMB_K
+        let q1 = dict_get(body, "q1") ?? 1.0
+        let q2 = dict_get(body, "q2") ?? 1.0
+        let r = dict_get(body, "r") ?? 1.0
+        if3 r <= 0 { r = 0.001 }
+        let fmag = ke * q1 * q2 / (r * r)
+        return {"ok": true, "tool": "force", "type": "electric", "magnitude": fmag}
+    }
+    return {"ok": false, "error": "unknown force type", "valid": "gravity|friction|spring|drag|electric"}
+}
+
+// ============================================================
+// TOOL 3: PARTICLE — POST /physics/particle
+// ============================================================
+fn handle_particle(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let op = dict_get(body, "op") ?? "emit"
+    let particles = dict_get(body, "particles") ?? []
+    let dt = dict_get(body, "dt") ?? 0.016
+    let count = dict_get(body, "count") ?? 10
+    let origin = dict_get(body, "origin", {"x": 0, "y": 0, "z": 0})
+    bump_stat("particle")
+
+    if3 op == "emit" { result = []
+        let seed = time() * 1000
+        let i = 0
+        while3 i < count {
+            let seed = pseudo_random(seed)
+            let vx = (seed % 200 - 100) / 100.0
+            let seed = pseudo_random(seed)
+            let vy = (seed % 200) / 100.0
+            let seed = pseudo_random(seed)
+            let vz = (seed % 200 - 100) / 100.0
+            let p = {"x": dict_get(origin, "x") ?? 0, "y": dict_get(origin, "y") ?? 0, "z": dict_get(origin, "z") ?? 0, "vx": vx, "vy": vy, "vz": vz, "life": 1.0}
+            result = append(result, p)
+            i = i + 1
+        }
+        return {"ok": true, "tool": "particle", "op": "emit", "count": count, "particles": result}
+    }
+    if3 op == "step" { updated = []
+        let alive = 0
+        let idx = 0
+        let plen = len(particles)
+        while3 idx < plen {
+            let p = particles[idx]
+            let px = (dict_get(p, "x") ?? 0) + (dict_get(p, "vx") ?? 0) * dt
+            let py = (dict_get(p, "y") ?? 0) + (dict_get(p, "vy") ?? 0) * dt
+            let pz = (dict_get(p, "z") ?? 0) + (dict_get(p, "vz") ?? 0) * dt
+            let pvy = (dict_get(p, "vy") ?? 0) - GRAVITY * dt
+            let life = (dict_get(p, "life") ?? 1.0) - dt * 0.5
+            if3 life > 0 { np = {"x": px, "y": py, "z": pz, "vx": dict_get(p, "vx") ?? 0, "vy": pvy, "vz": dict_get(p, "vz") ?? 0, "life": life}
+                updated = append(updated, np)
+                let alive = alive + 1
+            }
+            idx = idx + 1
+        }
+        return {"ok": true, "tool": "particle", "op": "step", "alive": alive, "dt": dt, "particles": updated}
+    }
+    if3 op == "state" { plen = len(particles)
+        let total_life = 0
+        let idx = 0
+        while3 idx < plen {
+            let total_life = total_life + dict_get(particles[idx], "life") ?? 0
+            idx = idx + 1
+        }
+        let avg_life = 0
+        if3 plen > 0 { avg_life = total_life / plen }
+        return {"ok": true, "tool": "particle", "op": "state", "count": plen, "avg_life": avg_life}
+    }
+    return {"ok": false, "error": "unknown particle op", "valid": "emit|step|state"}
+}
+
+// ============================================================
+// TOOL 4: FLUID — POST /physics/fluid (N-S simplified)
+// ============================================================
+fn handle_fluid(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let op = dict_get(body, "op") ?? "init"
+    let gs = dict_get(body, "grid_size") ?? H7
+    let nu = dict_get(body, "viscosity") ?? 0.1
+    let dt = dict_get(body, "dt") ?? 0.01
+    let src = dict_get(body, "source", {"x": 3, "y": 3, "vx": 1, "vy": 0})
+    let field = dict_get(body, "field") ?? {}
+    bump_stat("fluid")
+
+    if3 op == "init" { grid = {}
+        let iy = 0
+        while3 iy < gs {
+            let ix = 0
+            while3 ix < gs {
+                let k = grid_key(ix, iy)
+                grid = dict_set(grid, k, {"vx": 0, "vy": 0, "p": 0})
+                let ix = ix + 1
+            }
+            let iy = iy + 1
+        }
+        // Apply source
+        let sx = dict_get(src, "x") ?? 0
+        let sy = dict_get(src, "y") ?? 0
+        let svx = dict_get(src, "vx") ?? 0
+        let svy = dict_get(src, "vy") ?? 0
+        let sk = grid_key(sx, sy)
+        grid = dict_set(grid, sk, {"vx": svx, "vy": svy, "p": 0})
+        return {"ok": true, "tool": "fluid", "op": "init", "grid_size": gs, "cells": gs * gs, "field": grid}
+    }
+    if3 op == "step" {
+        // Simplified N-S: advection + diffusion + pressure projection
+        let new_field = {}
+        let iy = 1
+        let gm = gs - 1
+        while3 iy < gm {
+            let ix = 1
+            while3 ix < gm {
+                let k = grid_key(ix, iy)
+                let cell = dict_get(field, k, {"vx": 0, "vy": 0, "p": 0})
+                let cvx = dict_get(cell, "vx") ?? 0
+                let cvy = dict_get(cell, "vy") ?? 0
+
+                // Neighbors for laplacian
+                let kl = grid_key(ix - 1, iy)
+                let kr = grid_key(ix + 1, iy)
+                let ku = grid_key(ix, iy - 1)
+                let kd = grid_key(ix, iy + 1)
+                let cl = dict_get(field, kl, {"vx": 0, "vy": 0, "p": 0})
+                let cr = dict_get(field, kr, {"vx": 0, "vy": 0, "p": 0})
+                let cu = dict_get(field, ku, {"vx": 0, "vy": 0, "p": 0})
+                let cd = dict_get(field, kd, {"vx": 0, "vy": 0, "p": 0})
+
+                // Diffusion: nu * laplacian(u)
+                let lap_vx = (dict_get(cl, "vx") ?? 0) + (dict_get(cr, "vx") ?? 0) + (dict_get(cu, "vx") ?? 0) + (dict_get(cd, "vx") ?? 0) - 4 * cvx
+                let lap_vy = (dict_get(cl, "vy") ?? 0) + (dict_get(cr, "vy") ?? 0) + (dict_get(cu, "vy") ?? 0) + (dict_get(cd, "vy") ?? 0) - 4 * cvy
+
+                // Advection: -u . grad(u) (central diff approx)
+                let grad_vx = ((dict_get(cr, "vx") ?? 0) - (dict_get(cl, "vx") ?? 0)) / 2
+                let grad_vy = ((dict_get(cd, "vy") ?? 0) - (dict_get(cu, "vy") ?? 0)) / 2
+                let adv_vx = 0 - cvx * grad_vx
+                let adv_vy = 0 - cvy * grad_vy
+
+                // Pressure gradient (Jacobi approx)
+                let p_grad_x = ((dict_get(cr, "p") ?? 0) - (dict_get(cl, "p") ?? 0)) / 2
+                let p_grad_y = ((dict_get(cd, "p") ?? 0) - (dict_get(cu, "p") ?? 0)) / 2
+
+                // du/dt = nu*lap(u) - u.grad(u) - grad(p)
+                let nvx = cvx + dt * (nu * lap_vx + adv_vx - p_grad_x)
+                let nvy = cvy + dt * (nu * lap_vy + adv_vy - p_grad_y)
+
+                // Pressure update (divergence-free projection)
+                let div = ((dict_get(cr, "vx") ?? 0) - (dict_get(cl, "vx") ?? 0) + (dict_get(cd, "vy") ?? 0) - (dict_get(cu, "vy") ?? 0)) / 2
+                let np = 0 - div
+
+                new_field = dict_set(new_field, k, {"vx": nvx, "vy": nvy, "p": np})
+                let ix = ix + 1
+            }
+            let iy = iy + 1
+        }
+        // Copy boundary cells unchanged
+        let by = 0
+        while3 by < gs {
+            let bx = 0
+            while3 bx < gs {
+                let bk = grid_key(bx, by)
+                let exists = dict_get(new_field, bk) ?? "NONE"
+                if3 exists == "NONE" { bc = dict_get(field, bk, {"vx": 0, "vy": 0, "p": 0})
+                    new_field = dict_set(new_field, bk, bc)
+                }
+                let bx = bx + 1
+            }
+            let by = by + 1
+        }
+        // Reynolds classification
+        let max_v = 0
+        let ry = 0
+        while3 ry < gs {
+            let rx = 0
+            while3 rx < gs {
+                let rk = grid_key(rx, ry)
+                let rc = dict_get(new_field, rk, {"vx": 0, "vy": 0, "p": 0})
+                let spd = ns_abs(dict_get(rc, "vx") ?? 0) + ns_abs(dict_get(rc, "vy") ?? 0)
+                if3 spd > max_v { max_v = spd }
+                let rx = rx + 1
+            }
+            let ry = ry + 1
+        }
+        let re = max_v * gs / (nu + 0.0001)
+        let regime = "laminar"
+        if3 re > RE_LAMINAR { regime = "transition" }
+        if3 re > RE_TRANSITION { regime = "turbulent" }
+        return {"ok": true, "tool": "fluid", "op": "step", "reynolds": re, "regime": regime, "field": new_field}
+    }
+    if3 op == "query" { cell_count = 0
+        let total_vx = 0
+        let total_vy = 0
+        let qy = 0
+        while3 qy < gs {
+            let qx = 0
+            while3 qx < gs {
+                let qk = grid_key(qx, qy)
+                let qc = dict_get(field, qk, {"vx": 0, "vy": 0, "p": 0})
+                let total_vx = total_vx + ns_abs(dict_get(qc, "vx") ?? 0)
+                let total_vy = total_vy + ns_abs(dict_get(qc, "vy") ?? 0)
+                let cell_count = cell_count + 1
+                let qx = qx + 1
+            }
+            let qy = qy + 1
+        }
+        return {"ok": true, "tool": "fluid", "op": "query", "cells": cell_count, "avg_vx": total_vx / (cell_count + 0.001), "avg_vy": total_vy / (cell_count + 0.001), "field": field}
+    }
+    return {"ok": false, "error": "unknown fluid op", "valid": "init|step|query"}
+}
+
+// ============================================================
+// TOOL 5: COLLIDE — POST /physics/collide
+// ============================================================
+fn handle_collide(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let ctype = dict_get(body, "type") ?? "aabb"
+    let a = dict_get(body, "a") ?? {}
+    let b = dict_get(body, "b") ?? {}
+    bump_stat("collide")
+
+    if3 ctype == "aabb" { amin = dict_get(a, "min", {"x": 0, "y": 0, "z": 0})
+        let amax = dict_get(a, "max", {"x": 1, "y": 1, "z": 1})
+        let bmin = dict_get(b, "min", {"x": 0, "y": 0, "z": 0})
+        let bmax = dict_get(b, "max", {"x": 1, "y": 1, "z": 1})
+        let overlap_x = (dict_get(amin, "x") ?? 0) <= (dict_get(bmax, "x") ?? 0) && (dict_get(amax, "x") ?? 0) >= (dict_get(bmin, "x") ?? 0)
+        let overlap_y = (dict_get(amin, "y") ?? 0) <= (dict_get(bmax, "y") ?? 0) && (dict_get(amax, "y") ?? 0) >= (dict_get(bmin, "y") ?? 0)
+        let overlap_z = (dict_get(amin, "z") ?? 0) <= (dict_get(bmax, "z") ?? 0) && (dict_get(amax, "z") ?? 0) >= (dict_get(bmin, "z") ?? 0)
+        let hit = overlap_x && overlap_y && overlap_z
+        let trit = T_FALSE
+        if3 hit { trit = T_TRUE }
+        return {"ok": true, "tool": "collide", "type": "aabb", "collision": hit, "trit": trit}
+    }
+    if3 ctype == "sphere" { ac = dict_get(a, "center", {"x": 0, "y": 0, "z": 0})
+        let ar = dict_get(a, "radius") ?? 1.0
+        let bc = dict_get(b, "center", {"x": 0, "y": 0, "z": 0})
+        let br = dict_get(b, "radius") ?? 1.0
+        let d = vec_sub(ac, bc)
+        let dist = vec_mag(d)
+        let hit = dist <= (ar + br)
+        let penetration = (ar + br) - dist
+        let trit = T_FALSE
+        if3 hit { trit = T_TRUE }
+        return {"ok": true, "tool": "collide", "type": "sphere", "collision": hit, "distance": dist, "penetration": penetration, "trit": trit}
+    }
+    if3 ctype == "ray" {
+        // Ray-sphere intersection
+        let ro = dict_get(a, "origin", {"x": 0, "y": 0, "z": 0})
+        let rd = dict_get(a, "direction", {"x": 1, "y": 0, "z": 0})
+        let sc = dict_get(b, "center", {"x": 0, "y": 0, "z": 0})
+        let sr = dict_get(b, "radius") ?? 1.0
+        let oc = vec_sub(ro, sc)
+        // a = dot(rd, rd), b = 2*dot(oc, rd), c = dot(oc, oc) - r^2
+        let qa = (dict_get(rd, "x") ?? 0)*(dict_get(rd, "x") ?? 0) + (dict_get(rd, "y") ?? 0)*(dict_get(rd, "y") ?? 0) + (dict_get(rd, "z") ?? 0)*(dict_get(rd, "z") ?? 0)
+        let qb = 2 * ((dict_get(oc, "x") ?? 0)*(dict_get(rd, "x") ?? 0) + (dict_get(oc, "y") ?? 0)*(dict_get(rd, "y") ?? 0) + (dict_get(oc, "z") ?? 0)*(dict_get(rd, "z") ?? 0))
+        let qc = (dict_get(oc, "x") ?? 0)*(dict_get(oc, "x") ?? 0) + (dict_get(oc, "y") ?? 0)*(dict_get(oc, "y") ?? 0) + (dict_get(oc, "z") ?? 0)*(dict_get(oc, "z") ?? 0) - sr * sr
+        let disc = qb * qb - 4 * qa * qc
+        if3 disc < 0 {
+            return {"ok": true, "tool": "collide", "type": "ray", "hit": false, "trit": T_FALSE}
+        }
+        let sqrt_disc = ns_sqrt(disc)
+        let t = (0 - qb - sqrt_disc) / (2 * qa)
+        if3 t < 0 { t = (0 - qb + sqrt_disc) / (2 * qa) }
+        if3 t < 0 {
+            return {"ok": true, "tool": "collide", "type": "ray", "hit": false, "trit": T_FALSE}
+        }
+        let hx = (dict_get(ro, "x") ?? 0) + (dict_get(rd, "x") ?? 0) * t
+        let hy = (dict_get(ro, "y") ?? 0) + (dict_get(rd, "y") ?? 0) * t
+        let hz = (dict_get(ro, "z") ?? 0) + (dict_get(rd, "z") ?? 0) * t
+        return {"ok": true, "tool": "collide", "type": "ray", "hit": true, "t": t, "point": {"x": hx, "y": hy, "z": hz}, "trit": T_TRUE}
+    }
+    return {"ok": false, "error": "unknown collide type", "valid": "aabb|sphere|ray"}
+}
+
+// ============================================================
+// TOOL 6: FIELD — POST /physics/field
+// ============================================================
+fn handle_field(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let op = dict_get(body, "op") ?? "sample"
+    let pt = dict_get(body, "point", {"x": 1, "y": 2, "z": 3})
+    let dx = dict_get(body, "dx") ?? 0.01
+    bump_stat("field")
+
+    // Simple gravity-well field: F(p) = -p / |p|^3 (inverse square toward origin)
+    // For gradient/div/curl we sample this field numerically
+
+    if3 op == "sample" { ftype = dict_get(body, "field_type") ?? "gravity_well"
+        let mag = vec_mag(pt)
+        if3 mag < 0.001 { mag = 0.001 }
+        let inv3 = 1.0 / (mag * mag * mag)
+        let fx = 0 - (dict_get(pt, "x") ?? 0) * inv3
+        let fy = 0 - (dict_get(pt, "y") ?? 0) * inv3
+        let fz = 0 - (dict_get(pt, "z") ?? 0) * inv3
+        return {"ok": true, "tool": "field", "op": "sample", "point": pt, "value": {"x": fx, "y": fy, "z": fz}, "magnitude": vec_mag({"x": fx, "y": fy, "z": fz})}
+    }
+    if3 op == "gradient" {
+        // Gradient of scalar field |F| at point using central diff
+        let px = dict_get(pt, "x") ?? 0
+        let py = dict_get(pt, "y") ?? 0
+        let pz = dict_get(pt, "z") ?? 0
+        let fxp = 1.0 / (ns_sqrt((px+dx)*(px+dx) + py*py + pz*pz) + 0.0001)
+        let fxm = 1.0 / (ns_sqrt((px-dx)*(px-dx) + py*py + pz*pz) + 0.0001)
+        let fyp = 1.0 / (ns_sqrt(px*px + (py+dx)*(py+dx) + pz*pz) + 0.0001)
+        let fym = 1.0 / (ns_sqrt(px*px + (py-dx)*(py-dx) + pz*pz) + 0.0001)
+        let fzp = 1.0 / (ns_sqrt(px*px + py*py + (pz+dx)*(pz+dx)) + 0.0001)
+        let fzm = 1.0 / (ns_sqrt(px*px + py*py + (pz-dx)*(pz-dx)) + 0.0001)
+        let gx = (fxp - fxm) / (2 * dx)
+        let gy = (fyp - fym) / (2 * dx)
+        let gz = (fzp - fzm) / (2 * dx)
+        return {"ok": true, "tool": "field", "op": "gradient", "point": pt, "gradient": {"x": gx, "y": gy, "z": gz}}
+    }
+    if3 op == "divergence" {
+        // div(F) = dFx/dx + dFy/dy + dFz/dz for gravity-well field
+        let px = dict_get(pt, "x") ?? 0
+        let py = dict_get(pt, "y") ?? 0
+        let pz = dict_get(pt, "z") ?? 0
+        // Sample Fx at x+dx and x-dx
+        let m1 = ns_sqrt((px+dx)*(px+dx)+py*py+pz*pz) + 0.0001
+        let m2 = ns_sqrt((px-dx)*(px-dx)+py*py+pz*pz) + 0.0001
+        let dFxdx = ((0-(px+dx))/(m1*m1*m1) - (0-(px-dx))/(m2*m2*m2)) / (2*dx)
+        let m3 = ns_sqrt(px*px+(py+dx)*(py+dx)+pz*pz) + 0.0001
+        let m4 = ns_sqrt(px*px+(py-dx)*(py-dx)+pz*pz) + 0.0001
+        let dFydy = ((0-(py+dx))/(m3*m3*m3) - (0-(py-dx))/(m4*m4*m4)) / (2*dx)
+        let m5 = ns_sqrt(px*px+py*py+(pz+dx)*(pz+dx)) + 0.0001
+        let m6 = ns_sqrt(px*px+py*py+(pz-dx)*(pz-dx)) + 0.0001
+        let dFzdz = ((0-(pz+dx))/(m5*m5*m5) - (0-(pz-dx))/(m6*m6*m6)) / (2*dx)
+        let div = dFxdx + dFydy + dFzdz
+        return {"ok": true, "tool": "field", "op": "divergence", "point": pt, "divergence": div}
+    }
+    if3 op == "curl" {
+        // curl(F) = (dFz/dy - dFy/dz, dFx/dz - dFz/dx, dFy/dx - dFx/dy)
+        let px = dict_get(pt, "x") ?? 0
+        let py = dict_get(pt, "y") ?? 0
+        let pz = dict_get(pt, "z") ?? 0
+        // dFz/dy
+        let my1 = ns_sqrt(px*px+(py+dx)*(py+dx)+pz*pz) + 0.0001
+        let my2 = ns_sqrt(px*px+(py-dx)*(py-dx)+pz*pz) + 0.0001
+        let dFzdy = ((0-pz)/(my1*my1*my1) - (0-pz)/(my2*my2*my2)) / (2*dx)
+        // dFy/dz
+        let mz1 = ns_sqrt(px*px+py*py+(pz+dx)*(pz+dx)) + 0.0001
+        let mz2 = ns_sqrt(px*px+py*py+(pz-dx)*(pz-dx)) + 0.0001
+        let dFydz = ((0-py)/(mz1*mz1*mz1) - (0-py)/(mz2*mz2*mz2)) / (2*dx)
+        // dFx/dz
+        let dFxdz = ((0-px)/(mz1*mz1*mz1) - (0-px)/(mz2*mz2*mz2)) / (2*dx)
+        // dFz/dx
+        let mx1 = ns_sqrt((px+dx)*(px+dx)+py*py+pz*pz) + 0.0001
+        let mx2 = ns_sqrt((px-dx)*(px-dx)+py*py+pz*pz) + 0.0001
+        let dFzdx = ((0-pz)/(mx1*mx1*mx1) - (0-pz)/(mx2*mx2*mx2)) / (2*dx)
+        // dFy/dx
+        let dFydx = ((0-py)/(mx1*mx1*mx1) - (0-py)/(mx2*mx2*mx2)) / (2*dx)
+        // dFx/dy
+        let dFxdy = ((0-px)/(my1*my1*my1) - (0-px)/(my2*my2*my2)) / (2*dx)
+        let cx = dFzdy - dFydz
+        let cy = dFxdz - dFzdx
+        let cz = dFydx - dFxdy
+        return {"ok": true, "tool": "field", "op": "curl", "point": pt, "curl": {"x": cx, "y": cy, "z": cz}}
+    }
+    return {"ok": false, "error": "unknown field op", "valid": "gradient|divergence|curl|sample"}
+}
+
+// ============================================================
+// TOOL 7: SOLVE — POST /physics/solve
+// ============================================================
+fn compute_accel(state, force_type) {
+    let x = dict_get(state, "x") ?? 0
+    let v = dict_get(state, "v") ?? 0
+    if3 force_type == "gravity" { return 0 - GRAVITY }
+    if3 force_type == "spring" { return 0 - 10.0 * x }
+    // custom: simple damped harmonic
+    return 0 - 10.0 * x - 0.5 * v
+}
+
+fn handle_solve(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let method = dict_get(body, "method") ?? "euler"
+    let state = dict_get(body, "state", {"x": 0, "v": 1})
+    let dt = dict_get(body, "dt") ?? 0.01
+    let steps = dict_get(body, "steps") ?? 10
+    let ftype = dict_get(body, "force_type") ?? "gravity"
+    bump_stat("solve")
+
+    let trajectory = []
+    let x = dict_get(state, "x") ?? 0
+    let v = dict_get(state, "v") ?? 0
+    let x_old = x - v * dt
+    let i = 0
+
+    if3 method == "euler" {
+        while3 i < steps {
+            let a = compute_accel({"x": x, "v": v}, ftype)
+            let x = x + v * dt
+            let v = v + a * dt
+            trajectory = append(trajectory, {"step": i, "x": x, "v": v, "a": a})
+            i = i + 1
+        }
+        return {"ok": true, "tool": "solve", "method": "euler", "steps": steps, "final": {"x": x, "v": v}, "trajectory": trajectory}
+    }
+    if3 method == "rk4" {
+        while3 i < steps {
+            let a1 = compute_accel({"x": x, "v": v}, ftype)
+            let k1v = a1 * dt
+            let k1x = v * dt
+
+            let a2 = compute_accel({"x": x + k1x/2, "v": v + k1v/2}, ftype)
+            let k2v = a2 * dt
+            let k2x = (v + k1v/2) * dt
+
+            let a3 = compute_accel({"x": x + k2x/2, "v": v + k2v/2}, ftype)
+            let k3v = a3 * dt
+            let k3x = (v + k2v/2) * dt
+
+            let a4 = compute_accel({"x": x + k3x, "v": v + k3v}, ftype)
+            let k4v = a4 * dt
+            let k4x = (v + k3v) * dt
+
+            let x = x + (k1x + 2*k2x + 2*k3x + k4x) / 6
+            let v = v + (k1v + 2*k2v + 2*k3v + k4v) / 6
+            trajectory = append(trajectory, {"step": i, "x": x, "v": v})
+            i = i + 1
+        }
+        return {"ok": true, "tool": "solve", "method": "rk4", "steps": steps, "final": {"x": x, "v": v}, "trajectory": trajectory}
+    }
+    if3 method == "verlet" {
+        while3 i < steps {
+            let a = compute_accel({"x": x, "v": v}, ftype)
+            let x_new = 2 * x - x_old + a * dt * dt
+            let v = (x_new - x_old) / (2 * dt)
+            let x_old = x
+            let x = x_new
+            trajectory = append(trajectory, {"step": i, "x": x, "v": v, "a": a})
+            i = i + 1
+        }
+        return {"ok": true, "tool": "solve", "method": "verlet", "steps": steps, "final": {"x": x, "v": v}, "trajectory": trajectory}
+    }
+    return {"ok": false, "error": "unknown method", "valid": "euler|rk4|verlet"}
+}
+
+// ============================================================
+// HEALTH + STATUS
+// ============================================================
+fn handle_health(req) {
+    let uptime = time() - dict_get(_stats, "t0") ?? time()
+    return {"ok": true, "service": SERVICE_NAME, "version": VERSION, "port": PORT, "uptime": uptime, "trit": T_TRUE}
+}
+
+fn handle_status(req) {
+    let uptime = time() - dict_get(_stats, "t0") ?? time()
+    return {"ok": true, "service": SERVICE_NAME, "version": VERSION, "port": PORT, "uptime": uptime, "total_calls": dict_get(_stats, "total") ?? 0, "tool_stats": _tool_stats, "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13, "block": BLOCK_SIZE}, "reynolds": {"laminar": RE_LAMINAR, "transition": RE_TRANSITION, "turbulent": RE_TURBULENT}}
+}
+
+// ============================================================
+// SERVER BOOT
+// ============================================================
+let server = tserve(PORT, SERVICE_NAME)
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/status", "handle_status")
+troute(server, "POST", "/physics/vector", "handle_vector")
+troute(server, "POST", "/physics/force", "handle_force")
+troute(server, "POST", "/physics/particle", "handle_particle")
+troute(server, "POST", "/physics/fluid", "handle_fluid")
+troute(server, "POST", "/physics/collide", "handle_collide")
+troute(server, "POST", "/physics/field", "handle_field")
+troute(server, "POST", "/physics/solve", "handle_solve")
+
+print("========================================")
+print("  NovaX Physics Engine v" + VERSION)
+print("  Port: " + to_str(PORT))
+print("  Service: " + SERVICE_NAME)
+print("========================================")
+print("  Routes:")
+print("    GET  /health")
+print("    GET  /status")
+print("    POST /physics/vector   [add|sub|dot|cross|normalize|magnitude|scale]")
+print("    POST /physics/force    [gravity|friction|spring|drag|electric]")
+print("    POST /physics/particle [emit|step|state]")
+print("    POST /physics/fluid    [init|step|query]")
+print("    POST /physics/collide  [aabb|sphere|ray]")
+print("    POST /physics/field    [gradient|divergence|curl|sample]")
+print("    POST /physics/solve    [euler|rk4|verlet]")
+print("========================================")
+print("  Harmonics: 3-5-7-13")
+print("  Block: " + to_str(BLOCK_SIZE))
+print("  Reynolds: L=" + to_str(RE_LAMINAR) + " T=" + to_str(RE_TRANSITION) + " Tu=" + to_str(RE_TURBULENT))
+print("========================================")
+print("  Physics engine online. All forces ternary.")
+
+tstart(server)

@@ -1,0 +1,163 @@
+// NovaX LLM MAX HARVEST — Rotate through ALL providers and models
+// Each query targets a DIFFERENT model for maximum training diversity
+
+let _config = try3 { json_decode(read_file("C:/NovaX/cloud_config.json")) } fail { {} }
+let _cerebras_key = dict_get(dict_get(_config, "cerebras_direct") ?? {}, "key") ?? ""
+let _openai_key = dict_get(dict_get(_config, "openai") ?? {}, "key") ?? ""
+let _or_key = dict_get(dict_get(_config, "openrouter") ?? {}, "key") ?? ""
+let _samba_key = dict_get(dict_get(_config, "sambanova_direct") ?? {}, "key") ?? ""
+
+// Free OpenRouter models to rotate through
+let or_models = [
+  "openai/gpt-oss-120b:free",
+  "openai/gpt-oss-20b:free",
+  "qwen/qwen3-coder:free",
+  "qwen/qwen3-next-80b-a3b-instruct:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "nvidia/nemotron-nano-12b-v2-vl:free",
+  "arcee-ai/trinity-large-preview:free",
+  "arcee-ai/trinity-mini:free",
+  "stepfun/step-3.5-flash:free",
+  "z-ai/glm-4.5-air:free",
+  "liquid/lfm-2.5-1.2b-thinking:free",
+  "google/gemma-3n-e2b-it:free",
+  "minimax/minimax-m2.5:free"
+]
+
+// SambaNova models
+let samba_models = [
+  "Meta-Llama-3.3-70B-Instruct",
+  "DeepSeek-V3-0324",
+  "Qwen3-235B-A22B"
+]
+
+// Cerebras models
+let cerebras_models = [
+  "qwen-3-235b-a22b-instruct-2507",
+  "llama3.1-8b"
+]
+
+fn call_or_model(prompt, model) {
+  if3 len(_or_key) < 5 { return {"ok": 0, "error": "no_key"} }
+  let escaped = replace(replace(prompt, "\\", "\\\\"), "\"", "\\\"")
+  let body = "{\"model\":\"" + model + "\",\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}],\"max_tokens\":1024}"
+  let headers = {"Authorization": "Bearer " + _or_key, "Content-Type": "application/json"}
+  let result = try3 { http_request("https://openrouter.ai/api/v1/chat/completions", body, headers, 20000) } fail { {"ok": -1} }
+  let raw = dict_get(result, "body") ?? ""
+  if3 len(raw) < 10 { return {"ok": 0, "error": "empty"} }
+  let parsed = try3 { json_decode(raw) } fail { null }
+  if3 parsed == null { return {"ok": 0, "error": "parse"} }
+  let choices = dict_get(parsed, "choices") ?? []
+  if3 len(choices) == 0 { return {"ok": 0, "error": "no_choices"} }
+  let msg = dict_get(choices[0], "message") ?? {}
+  let text = dict_get(msg, "content") ?? ""
+  return {"ok": 1, "response": text, "model": model, "provider": "openrouter"}
+}
+
+fn call_samba_model(prompt, model) {
+  if3 len(_samba_key) < 5 { return {"ok": 0, "error": "no_key"} }
+  let escaped = replace(replace(prompt, "\\", "\\\\"), "\"", "\\\"")
+  let body = "{\"model\":\"" + model + "\",\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}],\"max_tokens\":1024}"
+  let headers = {"Authorization": "Bearer " + _samba_key, "Content-Type": "application/json"}
+  let result = try3 { http_request("https://api.sambanova.ai/v1/chat/completions", body, headers, 20000) } fail { {"ok": -1} }
+  let raw = dict_get(result, "body") ?? ""
+  if3 len(raw) < 10 { return {"ok": 0, "error": "empty"} }
+  let parsed = try3 { json_decode(raw) } fail { null }
+  if3 parsed == null { return {"ok": 0, "error": "parse"} }
+  let choices = dict_get(parsed, "choices") ?? []
+  if3 len(choices) == 0 { return {"ok": 0, "error": "no_choices"} }
+  let msg = dict_get(choices[0], "message") ?? {}
+  let text = dict_get(msg, "content") ?? ""
+  return {"ok": 1, "response": text, "model": model, "provider": "sambanova"}
+}
+
+fn call_cerebras_model(prompt, model) {
+  if3 len(_cerebras_key) < 5 { return {"ok": 0, "error": "no_key"} }
+  let escaped = replace(replace(prompt, "\\", "\\\\"), "\"", "\\\"")
+  let body = "{\"model\":\"" + model + "\",\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}],\"max_tokens\":1024}"
+  let headers = {"Authorization": "Bearer " + _cerebras_key, "Content-Type": "application/json"}
+  let result = try3 { http_request("https://api.cerebras.ai/v1/chat/completions", body, headers, 20000) } fail { {"ok": -1} }
+  let raw = dict_get(result, "body") ?? ""
+  if3 len(raw) < 10 { return {"ok": 0, "error": "empty"} }
+  let parsed = try3 { json_decode(raw) } fail { null }
+  if3 parsed == null { return {"ok": 0, "error": "parse"} }
+  let choices = dict_get(parsed, "choices") ?? []
+  if3 len(choices) == 0 { return {"ok": 0, "error": "no_choices"} }
+  let msg = dict_get(choices[0], "message") ?? {}
+  let text = dict_get(msg, "content") ?? ""
+  return {"ok": 1, "response": text, "model": model, "provider": "cerebras"}
+}
+
+// Prompts
+let prompts = [
+  "Define ternary logic",
+  "What is fluid dynamics",
+  "Explain neural network layers",
+  "What is cryptographic hashing",
+  "Define operating system kernel",
+  "What is model quantization",
+  "Explain database indexing",
+  "What is API rate limiting",
+  "Define load balancing",
+  "What is a compiler optimization",
+  "Explain memory management",
+  "What is distributed consensus",
+  "Define edge computing"
+]
+
+let success = 0
+let archive_id = 100
+let i = 0
+
+print("=== MAX MODEL HARVEST ===")
+print("13 prompts x 3+ providers x multiple models")
+print("")
+
+while3 i < len(prompts) {
+  let p = prompts[i] + ". Plain text only. No markdown."
+
+  // Hit Cerebras
+  let r1 = call_cerebras_model(p, cerebras_models[i % len(cerebras_models)])
+  if3 (dict_get(r1, "ok") ?? 0) == 1 {
+    let resp = dict_get(r1, "response") ?? ""
+    if3 len(resp) > 3 {
+      write_file("C:/NovaX/data/super_archive/max_" + str(archive_id) + ".json", json_encode(r1))
+      success = success + 1
+      print("  " + str(archive_id) + ": +1 cerebras/" + (dict_get(r1, "model") ?? "") + " " + str(len(resp)) + "ch")
+      archive_id = archive_id + 1
+    }
+  }
+  sleep(2000)
+
+  // Hit SambaNova with different model
+  let r2 = call_samba_model(p, samba_models[i % len(samba_models)])
+  if3 (dict_get(r2, "ok") ?? 0) == 1 {
+    let resp = dict_get(r2, "response") ?? ""
+    if3 len(resp) > 3 {
+      write_file("C:/NovaX/data/super_archive/max_" + str(archive_id) + ".json", json_encode(r2))
+      success = success + 1
+      print("  " + str(archive_id) + ": +1 samba/" + (dict_get(r2, "model") ?? "") + " " + str(len(resp)) + "ch")
+      archive_id = archive_id + 1
+    }
+  }
+  sleep(2000)
+
+  // Hit OpenRouter with rotating free model
+  let r3 = call_or_model(p, or_models[i % len(or_models)])
+  if3 (dict_get(r3, "ok") ?? 0) == 1 {
+    let resp = dict_get(r3, "response") ?? ""
+    if3 len(resp) > 3 {
+      write_file("C:/NovaX/data/super_archive/max_" + str(archive_id) + ".json", json_encode(r3))
+      success = success + 1
+      print("  " + str(archive_id) + ": +1 or/" + (dict_get(r3, "model") ?? "") + " " + str(len(resp)) + "ch")
+      archive_id = archive_id + 1
+    }
+  }
+  sleep(3000)
+
+  i = i + 1
+}
+
+print("")
+print("MAX HARVEST: " + str(success) + " samples from multiple providers and models")
+print("Archive: C:/NovaX/data/super_archive/")

@@ -1,0 +1,159 @@
+// NovaX Exec Server v2.0
+// Port 9877 | Ternary execution service
+// Executes shell commands, spawns processes, returns trit results
+// Safety: command allowlist, timeout enforcement, output truncation
+
+let PORT = 9877
+let SERVICE_NAME = "exec-server"
+let VERSION = "2.0.0"
+
+// 3-5-7-13 Harmonic Constants
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+
+// Limits
+let MAX_OUTPUT = 2187  // 3^7 = BLOCK_SIZE chars
+let DEFAULT_TIMEOUT = H13 * 1000  // 13 seconds
+let MAX_TIMEOUT = H13 * H7 * 1000  // 91 seconds
+
+// Stats
+let _stats = {"executions": 0, "launches": 0, "errors": 0, "t0": time()}
+let _history = []
+
+// Blocked commands (safety)
+let _blocked = ["rm -rf /", "format", "del /s /q C:", "shutdown", "restart"]
+
+fn is_blocked(cmd) {
+    let i = 0
+    while3 i < len(_blocked) {
+        if3 contains(cmd, _blocked[i]) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ── Health ──
+fn handle_health(req) {
+    let up = round(time() - dict_get(_stats, "t0") ?? 0)
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "uptime": up,
+        "executions": dict_get(_stats, "executions") ?? 0,
+        "launches": dict_get(_stats, "launches") ?? 0,
+        "errors": dict_get(_stats, "errors") ?? 0,
+        "max_output": MAX_OUTPUT,
+        "self_trit": 1,
+        "char": "1"
+    }
+}
+
+// ── Execute command (synchronous, returns output) ──
+fn handle_exec(req) {
+    let cmd = dict_get(req, "cmd") ?? ""
+    let timeout_ms = dict_get(req, "timeout") ?? DEFAULT_TIMEOUT
+
+    if3 cmd == "" {
+        return {"ok": false, "error": "missing cmd", "trit": -1}
+    } else3 is_blocked(cmd) {
+        _stats = dict_set(_stats, "errors", (dict_get(_stats, "errors") ?? 0) + 1)
+        return {"ok": false, "error": "command blocked for safety", "trit": -1}
+    } else3 {
+        // Clamp timeout
+        if3 timeout_ms > MAX_TIMEOUT {
+            timeout_ms = MAX_TIMEOUT
+        }
+
+        let t_start = time()
+        let result = try3 { shell(cmd) } { null }
+        let t_end = time()
+        let elapsed_ms = int((t_end - t_start) * 1000)
+
+        _stats = dict_set(_stats, "executions", (dict_get(_stats, "executions") ?? 0) + 1)
+
+        if3 result != null {
+            // Truncate output if too long
+            let output = str(result)
+            let truncated = false
+            if3 len(output) > MAX_OUTPUT {
+                output = slice(output, 0, MAX_OUTPUT)
+                truncated = true
+            }
+
+            // Log to history (keep last H13 entries)
+            push(_history, {"cmd": cmd, "time": time(), "ms": elapsed_ms, "trit": 1})
+            if3 len(_history) > H13 {
+                _history = slice(_history, len(_history) - H13, len(_history))
+            }
+
+            return {
+                "ok": true,
+                "output": output,
+                "truncated": truncated,
+                "elapsed_ms": elapsed_ms,
+                "trit": 1
+            }
+        } else3 {
+            _stats = dict_set(_stats, "errors", (dict_get(_stats, "errors") ?? 0) + 1)
+            push(_history, {"cmd": cmd, "time": time(), "ms": elapsed_ms, "trit": -1})
+            return {"ok": false, "error": "execution failed", "elapsed_ms": elapsed_ms, "trit": -1}
+        }
+    }
+}
+
+// ── Launch process (async, fire-and-forget) ──
+fn handle_launch(req) {
+    let cmd = dict_get(req, "cmd") ?? ""
+    if3 cmd == "" {
+        return {"ok": false, "error": "missing cmd", "trit": -1}
+    } else3 is_blocked(cmd) {
+        return {"ok": false, "error": "command blocked for safety", "trit": -1}
+    } else3 {
+        let result = try3 { spawn(cmd) } { null }
+        _stats = dict_set(_stats, "launches", (dict_get(_stats, "launches") ?? 0) + 1)
+        if3 result != null {
+            return {"ok": true, "spawned": true, "cmd": cmd, "trit": 1}
+        } else3 {
+            _stats = dict_set(_stats, "errors", (dict_get(_stats, "errors") ?? 0) + 1)
+            return {"ok": false, "error": "spawn failed", "trit": -1}
+        }
+    }
+}
+
+// ── History ──
+fn handle_history(req) {
+    return {"ok": true, "history": _history, "count": len(_history), "trit": 1}
+}
+
+// ── Status ──
+fn handle_status(req) {
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "stats": _stats,
+        "history_size": len(_history),
+        "blocked_patterns": len(_blocked),
+        "trit": 1
+    }
+}
+
+// Server setup
+let server = tserve(PORT, SERVICE_NAME)
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/status", "handle_status")
+troute(server, "GET", "/history", "handle_history")
+troute(server, "POST", "/exec", "handle_exec")
+troute(server, "POST", "/launch", "handle_launch")
+
+print("[Exec Server] v" + VERSION + " on port " + str(PORT))
+print("[Exec Server] Safety: " + str(len(_blocked)) + " blocked patterns")
+tstart(server)

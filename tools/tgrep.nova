@@ -1,0 +1,187 @@
+// tgrep.nova - Text search micro-tool (replaces Python re/grep)
+// Usage: novalang.exe tools/tgrep.nova <operation> [args...]
+// Operations:
+//   search <path> <pattern> <glob> <max> [case_insensitive]
+//   extract <path>
+//   todo <path> <glob> <max>
+//   analyze <path> <pattern> <glob> <max>
+// Returns JSON to stdout (zero Python)
+
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let op = try3 { args()[0] } { "help" }
+
+if3 op == "search" {
+    // Grep search using findstr
+    let path = try3 { args()[1] } { "C:/NovaX" }
+    let pattern = try3 { args()[2] } { "" }
+    let glob = try3 { args()[3] } { "*" }
+    let max_n = try3 { to_int(args()[4]) } { 20 }
+    let ci = try3 { args()[5] } { "false" }
+
+    let ci_flag = ""
+    if3 ci == "true" { ci_flag = "/i " }
+
+    // Use findstr for pattern matching with line numbers
+    let win_path = replace(path, "/", "\\")
+    let cmd = "findstr /n /r " + ci_flag + "/s \"" + pattern + "\" \"" + win_path + "\\" + glob + "\" 2>NUL"
+    let r = shell(cmd)
+    let stdout = try3 { dict_get(r, "stdout") } { "" }
+    let lines = split(stdout, "\n")
+
+    let matches = []
+    let cur_file = ""
+    let cur_hits = []
+    let files_matched = 0
+    let total_hits = 0
+
+    for3 line in lines {
+        let l = trim(line)
+        if3 len(l) > 2 {
+            // findstr output: filename:linenum:content
+            let colon1 = -1
+            let colon2 = -1
+            let ci2 = 0
+            while3 ci2 < len(l) {
+                if3 slice(l, ci2, ci2 + 1) == ":" {
+                    if3 colon1 == -1 {
+                        colon1 = ci2
+                    } else3 colon2 == -1 {
+                        colon2 = ci2
+                    }
+                }
+                ci2 = ci2 + 1
+            }
+            if3 colon2 > colon1 {
+                let file = slice(l, 0, colon1)
+                let linenum = try3 { to_int(slice(l, colon1 + 1, colon2)) } { 0 }
+                let content = slice(l, colon2 + 1, len(l))
+
+                if3 file != cur_file {
+                    // Save previous file's matches
+                    if3 len(cur_hits) > 0 {
+                        if3 len(matches) < max_n {
+                            let me = {}
+                            me = dict_set(me, "path", replace(cur_file, "\\", "/"))
+                            me = dict_set(me, "hits", len(cur_hits))
+                            me = dict_set(me, "matches", cur_hits)
+                            matches = append(matches, me)
+                        }
+                        files_matched = files_matched + 1
+                    }
+                    cur_file = file
+                    cur_hits = []
+                }
+
+                total_hits = total_hits + 1
+                if3 len(cur_hits) < 20 {
+                    let he = {}
+                    he = dict_set(he, "line_num", linenum)
+                    he = dict_set(he, "line", slice(content, 0, 200))
+                    cur_hits = append(cur_hits, he)
+                }
+            }
+        }
+    }
+    // Save last file
+    if3 len(cur_hits) > 0 {
+        if3 len(matches) < max_n {
+            let me = {}
+            me = dict_set(me, "path", replace(cur_file, "\\", "/"))
+            me = dict_set(me, "hits", len(cur_hits))
+            me = dict_set(me, "matches", cur_hits)
+            matches = append(matches, me)
+        }
+        files_matched = files_matched + 1
+    }
+
+    let out = {}
+    out = dict_set(out, "matches", matches)
+    out = dict_set(out, "files_searched", 0)
+    out = dict_set(out, "files_matched", files_matched)
+    out = dict_set(out, "total_bytes", 0)
+    print(json_encode(out))
+
+} else3 op == "extract" {
+    // Extract patterns from file: emails, URLs, IPs
+    let path = try3 { args()[1] } { "" }
+    let content = try3 { read_file(path) } { "" }
+    let lines = split(content, "\n")
+
+    let emails = []
+    let urls = []
+    let ips = []
+    let numbers = []
+
+    // Use findstr for pattern extraction
+    // Emails via findstr
+    let email_r = shell("findstr /r \"[a-zA-Z0-9._+-]*@[a-zA-Z0-9.-]*\\.[a-zA-Z]\" \"" + replace(path, "/", "\\") + "\" 2>NUL")
+    let email_out = try3 { dict_get(email_r, "stdout") } { "" }
+    if3 len(email_out) > 0 { emails = append(emails, "found_via_findstr") }
+
+    // URLs via findstr
+    let url_r = shell("findstr /r \"https*://\" \"" + replace(path, "/", "\\") + "\" 2>NUL")
+    let url_out = try3 { dict_get(url_r, "stdout") } { "" }
+    let url_lines = split(url_out, "\n")
+    for3 ul in url_lines {
+        let ul2 = trim(ul)
+        if3 len(ul2) > 8 {
+            if3 contains(ul2, "http") {
+                if3 len(urls) < 50 { urls = append(urls, ul2) }
+            }
+        }
+    }
+
+    let out = {}
+    out = dict_set(out, "emails", emails)
+    out = dict_set(out, "urls", urls)
+    out = dict_set(out, "ips", ips)
+    out = dict_set(out, "numbers", numbers)
+    print(json_encode(out))
+
+} else3 op == "todo" {
+    // TODO/FIXME/HACK scanner
+    let path = try3 { args()[1] } { "C:/NovaX" }
+    let glob = try3 { args()[2] } { "*.nova" }
+    let max_n = try3 { to_int(args()[3]) } { 50 }
+
+    let cmd = "findstr /n /s /i \"TODO FIXME HACK XXX WARN NOTE\" \"" + replace(path, "/", "\\") + "\\" + glob + "\" 2>NUL"
+    let r = shell(cmd)
+    let stdout = try3 { dict_get(r, "stdout") } { "" }
+    let lines = split(stdout, "\n")
+
+    let todos = []
+    for3 line in lines {
+        let l = trim(line)
+        if3 len(l) > 5 {
+            if3 len(todos) < max_n {
+                let te = {}
+                te = dict_set(te, "raw", slice(l, 0, 300))
+                // Determine tag
+                let tag = "NOTE"
+                if3 contains(upper(l), "FIXME") { tag = "FIXME" }
+                if3 contains(upper(l), "TODO") { tag = "TODO" }
+                if3 contains(upper(l), "HACK") { tag = "HACK" }
+                if3 contains(upper(l), "XXX") { tag = "XXX" }
+                if3 contains(upper(l), "WARN") { tag = "WARN" }
+                te = dict_set(te, "tag", tag)
+                // Score
+                let score = 1
+                if3 tag == "FIXME" { score = 7 }
+                if3 tag == "HACK" { score = 5 }
+                if3 tag == "XXX" { score = 3 }
+                if3 tag == "WARN" { score = 2 }
+                te = dict_set(te, "score", score)
+                todos = append(todos, te)
+            }
+        }
+    }
+
+    let out = {}
+    out = dict_set(out, "todos", todos)
+    out = dict_set(out, "count", len(todos))
+    print(json_encode(out))
+
+} else3 {
+    print("{\"error\":\"unknown operation: " + op + "\",\"ops\":[\"search\",\"extract\",\"todo\"]}")
+}

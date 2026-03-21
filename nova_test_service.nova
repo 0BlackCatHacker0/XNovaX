@@ -1,0 +1,134 @@
+// nova_test_service.nova -- NovaX Test Runner v1.0
+// Port 8877 | Runs .nova test files, reports trits
+
+let PORT = 8803
+let server = tserve(PORT, "Nova Test Runner v1.0")
+let TEST_DIR = "C:/NovaX/tests"
+let NOVALANG = "C:/NovaX/novalang.exe"
+let stats_tests_run = 0
+let stats_passed = 0
+let stats_warned = 0
+let stats_failed = 0
+let stats_t0 = time()
+let last_results = []
+
+fn _empty() {
+    return {}
+}
+
+fn _trit_char(t) {
+    if3 t == 1 { return "PASS" }
+    if3 t == 0 { return "WARN" }
+    return "FAIL"
+}
+
+fn _test_result(name, trit, dur, out, err) {
+    let r = _empty()
+    r = dict_set(r, "name", name)
+    r = dict_set(r, "trit", trit)
+    r = dict_set(r, "duration", dur)
+    r = dict_set(r, "output", out)
+    r = dict_set(r, "error", err)
+    return r
+}
+
+fn run_one(path) {
+    let t0 = time()
+    let cmd = NOVALANG + " " + path
+    let result = shell(cmd)
+    let dur = round(time() - t0, 3)
+    let stdout_val = dict_get(result, "stdout") ?? ""
+    let stderr_val = dict_get(result, "stderr") ?? ""
+    let code = dict_get(result, "code") ?? -1
+    let trit = -1
+    if3 code == 0 { trit = 1 }
+    stats_tests_run = stats_tests_run + 1
+    if3 trit == 1 { stats_passed = stats_passed + 1 }
+    if3 trit == 0 { stats_warned = stats_warned + 1 }
+    if3 trit == -1 { stats_failed = stats_failed + 1 }
+    return _test_result(path_filename(path), trit, dur, trim(stdout_val), trim(stderr_val))
+}
+
+fn handle_run(body) {
+    // tserve gotcha: POST body is raw string, must JSON decode
+    let parsed = try3 { json_decode(dict_get(body, "body") ?? "{}") } { body }
+    let path = dict_get(parsed, "path") ?? ""
+    if3 len(path) < 2 {
+        return {"ok": -1, "error": "Send path"}
+    }
+    let result = run_one(path)
+    let r = _empty()
+    r = dict_set(r, "ok", 1)
+    r = dict_set(r, "result", result)
+    return r
+}
+
+fn handle_suite(body) {
+    // tserve gotcha: POST body is raw string, must JSON decode
+    let parsed = try3 { json_decode(dict_get(body, "body") ?? "{}") } { body }
+    let dir = dict_get(parsed, "dir") ?? TEST_DIR
+    let files = dir_list(dir)
+    let results = []
+    let total = 0
+    let passed = 0
+    let warned = 0
+    let failed = 0
+    for3 f in files {
+        let fname = str(f)
+        let ext = path_ext(fname)
+        if3 ext == "nova" {
+            let base = path_filename(fname)
+            if3 starts_with(base, "test") {
+                let full = dir + "/" + fname
+                let result = run_one(full)
+                results = append(results, result)
+                total = total + 1
+                let t = dict_get(result, "trit") ?? -1
+                if3 t == 1 { passed = passed + 1 }
+                if3 t == 0 { warned = warned + 1 }
+                if3 t == -1 { failed = failed + 1 }
+                print("[test] " + _trit_char(t) + " " + dict_get(result, "name") ?? "?")
+            }
+        }
+    }
+    last_results = results
+    let trit = 1
+    if3 warned > 0 { trit = 0 }
+    if3 failed > 0 { trit = -1 }
+    let r = _empty()
+    r = dict_set(r, "ok", 1)
+    r = dict_set(r, "trit", trit)
+    r = dict_set(r, "total", total)
+    r = dict_set(r, "passed", passed)
+    r = dict_set(r, "warned", warned)
+    r = dict_set(r, "failed", failed)
+    r = dict_set(r, "results", results)
+    return r
+}
+
+fn handle_results(body) {
+    let r = _empty()
+    r = dict_set(r, "ok", 1)
+    r = dict_set(r, "results", last_results)
+    return r
+}
+
+fn handle_health(body) {
+    let r = _empty()
+    r = dict_set(r, "ok", 1)
+    r = dict_set(r, "service", "nova-test-runner")
+    r = dict_set(r, "version", "1.0")
+    r = dict_set(r, "port", PORT)
+    r = dict_set(r, "status", "ok")
+    r = dict_set(r, "trit", 1)
+    r = dict_set(r, "tests_run", stats_tests_run)
+    return r
+}
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/test/results", "handle_results")
+troute(server, "POST", "/test/run", "handle_run")
+troute(server, "POST", "/test/suite", "handle_suite")
+
+print("[Test Runner] v1.0 on port " + str(PORT))
+tstart(server)

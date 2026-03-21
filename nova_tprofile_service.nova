@@ -1,0 +1,890 @@
+// Nova TProfile v1.0 - Ternary Query/Request Profiler
+// Port 9980: Distributed tracing and profiling for the NovaX service mesh.
+//
+// How it works:
+//   1. A request enters the mesh -- caller POSTs /tprofile/start with a trace_id
+//   2. As spans complete, services POST /tprofile/end with timing data
+//   3. GET /tprofile/trace/:id returns the full waterfall view
+//   4. GET /tprofile/slow returns the H13 (13) slowest traces
+//   5. GET /tprofile/bottlenecks reveals which services drag the pipeline
+//   6. GET /tprofile/stats gives aggregate numbers
+//
+// N-S Mapping:
+//   trace_flow       = velocity_field (distributed request propagation)
+//   span_duration    = viscosity (resistance per service hop)
+//   error_spans      = turbulent_energy (flow disruption)
+//   Reynolds = total_spans / max(1, slow_span_count) * avg_duration_factor
+//   Re < 27  (H3^3) = laminar      (all spans fast, <100ms)
+//   Re < 125 (H5^3) = transitional (some spans medium, <1000ms)
+//   Re < 343 (H7^3) = turbulent    (slow spans detected, >=1000ms)
+//   Re >= 343        = chaotic      (bottleneck overload)
+//
+// 3-5-7-13 Harmonic Design:
+//   MAX_TRACES           = H13 * H7  = 91  (bounded trace pool, oldest evicted)
+//   MAX_SPANS_PER_TRACE  = H13 * H13 = 169 (spans per trace cap)
+//   SLOW_THRESHOLD_MS    = 1000           (traces slower than this are "slow")
+//   FAST_THRESHOLD_MS    = 100            (spans faster than this are T_TRUE)
+//   Speed trit: T_TRUE if <100ms, T_MAYBE if <1000ms, T_FALSE if >=1000ms
+//
+// Papers/foundations:
+//   - Distributed tracing (Sigelman et al., "Dapper", Google 2010)
+//   - Balanced ternary arithmetic (Knuth, TAOCP Vol 2, 4.1)
+//   - Navier-Stokes as information transport (Succi, Lattice Boltzmann)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9980
+let server = tserve(PORT, "TProfile v1.0 - Ternary Request Profiler")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let BLOCK = 2187             // 3^7
+
+// -- Reynolds Boundaries --
+let RE_LAMINAR      = 27     // H3^3
+let RE_TRANSITIONAL = 125    // H5^3
+let RE_TURBULENT    = 343    // H7^3
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Configuration --
+let VERSION           = "1.0"
+let SERVICE_NAME      = "nova-tprofile"
+let MAX_TRACES        = 91   // H13 * H7
+let MAX_SPANS         = 169  // H13 * H13
+let SLOW_THRESHOLD_MS = 1000
+let FAST_THRESHOLD_MS = 100
+let MAX_BODY_SIZE     = 6561  // BLOCK * H3
+
+// -- Global State --
+// _traces: dict of trace_id -> trace_record dict
+// Each trace_record: { trace_id, created_ts, completed, spans, total_duration_ms,
+//                      trace_trit, span_count }
+// Each span: { span_id, service, operation, start_ts, end_ts, duration_ms,
+//              status, speed_trit }
+// _trace_ids: list of trace_ids in insertion order (for FIFO eviction)
+let _traces    = {}
+let _trace_ids = []
+let _total_traces_lifetime = 0
+let _total_spans_lifetime  = 0
+let _started_at = time()
+
+// -- Speed trit classification --
+fn speed_trit(duration_ms) {
+    if3 duration_ms < FAST_THRESHOLD_MS {
+        return T_TRUE
+    }
+    if3 duration_ms < SLOW_THRESHOLD_MS {
+        return T_MAYBE
+    }
+    return T_FALSE
+}
+
+// -- Speed char from trit --
+fn speed_char(t) {
+    if3 t == 1 {
+        return "+"
+    }
+    if3 t == -1 {
+        return "T"
+    }
+    return "0"
+}
+
+// -- Trit merge: min of all trits (worst wins) --
+fn trit_merge(a, b) {
+    if3 a < b {
+        return a
+    }
+    return b
+}
+
+// -- Sanitize a trace or span ID (alphanumeric, dash, underscore only) --
+fn sanitize_id(raw) {
+    if3 raw == "" {
+        return ""
+    }
+    // NovaLang: use replace to strip illegal chars is not directly available,
+    // so we rely on the caller to pass a uuid_hex-derived ID.
+    // Trim to H13*4 = 52 chars max.
+    let safe = str(raw)
+    if3 len(safe) > 52 { safe = slice(safe, 0, 52)
+    }
+    return safe
+}
+
+// -- Generate a short trace ID (H13 = 13 hex chars) --
+fn new_trace_id() {
+    let full = uuid_hex()
+    return slice(full, 0, H13)
+}
+
+// -- Generate a span ID (H7*2 = 14 hex chars) --
+fn new_span_id() {
+    let full = uuid_hex()
+    return slice(full, 0, 14)
+}
+
+// -- Evict oldest trace if over MAX_TRACES capacity --
+fn evict_oldest() {
+    while3 len(_trace_ids) > MAX_TRACES {
+        // Pop first (oldest) trace_id from _trace_ids
+        let oldest = dict_get(_trace_ids, 0)
+        _trace_ids = slice(_trace_ids, 1, len(_trace_ids))
+        dict_del(_traces, oldest)
+    }
+    return T_TRUE
+}
+
+// -- Flow regime string from Reynolds number --
+fn flow_regime(re) {
+    if3 re < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re < RE_TRANSITIONAL {
+        return "transitional"
+    }
+    if3 re < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// -- Health trit from Reynolds number --
+fn health_trit(re) {
+    if3 re < RE_LAMINAR {
+        return T_TRUE
+    }
+    if3 re < RE_TURBULENT {
+        return T_MAYBE
+    }
+    return T_FALSE
+}
+
+// -- Compute trace-level Reynolds (slow_spans / total_spans ratio scaled) --
+fn trace_reynolds(spans) {
+    let n = len(spans)
+    if3 n == 0 {
+        return 0
+    }
+    let slow = 0
+    let i = 0
+    while3 i < n {
+        let sp = dict_get(spans, i)
+        let st = dict_get(sp, "speed_trit") ?? 0
+        if3 st == T_FALSE { slow = slow + 1
+        }
+        i = i + 1
+    }
+    // Reynolds: slow_ratio * 343 (turbulent ceiling as reference)
+    let re = (slow * RE_TURBULENT) / max(1, n)
+    return round(re, 2)
+}
+
+// ============================================================
+// Route Handlers
+// ============================================================
+
+// GET /health or GET /tprofile/health
+fn health(body) {
+    let trace_count = len(_trace_ids)
+    let uptime = round(time() - _started_at, 1)
+
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "uptime_seconds", uptime)
+    resp = dict_set(resp, "active_traces", trace_count)
+    resp = dict_set(resp, "max_traces", MAX_TRACES)
+    resp = dict_set(resp, "total_traces_lifetime", _total_traces_lifetime)
+    resp = dict_set(resp, "total_spans_lifetime", _total_spans_lifetime)
+    resp = dict_set(resp, "slow_threshold_ms", SLOW_THRESHOLD_MS)
+    resp = dict_set(resp, "fast_threshold_ms", FAST_THRESHOLD_MS)
+    return resp
+}
+
+// POST /tprofile/start -- begin a trace span
+// Body: {"trace_id": "...", "service": "...", "operation": "..."}
+// If trace_id is omitted, one is generated. Returns trace_id + span_id.
+fn handle_start(body) {
+    let trace_id = ""
+    if3 dict_has(body, "trace_id") { trace_id = sanitize_id(str(dict_get(body, "trace_id")))
+    }
+    if3 trace_id == "" { trace_id = new_trace_id()
+    }
+
+    let service = "unknown"
+    if3 dict_has(body, "service") { raw_svc = str(dict_get(body, "service"))
+        if3 len(raw_svc) > 64 { service = slice(raw_svc, 0, 64)
+        } else { service = raw_svc
+        }
+    }
+
+    let operation = "unknown"
+    if3 dict_has(body, "operation") { raw_op = str(dict_get(body, "operation"))
+        if3 len(raw_op) > 128 { operation = slice(raw_op, 0, 128)
+        } else { operation = raw_op
+        }
+    }
+
+    let span_id   = new_span_id()
+    let start_ts  = time()
+
+    let span = {
+        "span_id":    span_id,
+        "service":    service,
+        "operation":  operation,
+        "start_ts":   start_ts,
+        "end_ts":     0,
+        "duration_ms": 0,
+        "status":     "in_progress",
+        "speed_trit": T_MAYBE
+    }
+
+    // Create trace if it does not exist yet
+    if3 dict_has(_traces, trace_id) == false { new_trace = {
+            "trace_id":         trace_id,
+            "created_ts":       start_ts,
+            "completed":        false,
+            "spans":            [],
+            "total_duration_ms": 0,
+            "trace_trit":       T_MAYBE,
+            "span_count":       0
+        }
+        _traces = dict_set(_traces, trace_id, new_trace)
+        _trace_ids = append(_trace_ids, trace_id)
+        _total_traces_lifetime = _total_traces_lifetime + 1
+        let _ev = evict_oldest()
+    }
+
+    let trace = dict_get(_traces, trace_id)
+    let spans = dict_get(trace, "spans")
+    let current_span_count = len(spans)
+
+    if3 current_span_count < MAX_SPANS {
+        spans = append(spans, span)
+        trace = dict_set(trace, "spans", spans)
+        trace = dict_set(trace, "span_count", current_span_count + 1)
+        _traces = dict_set(_traces, trace_id, trace)
+        _total_spans_lifetime = _total_spans_lifetime + 1
+    }
+
+    return {
+        "ok":        true,
+        "trit":      T_TRUE,
+        "trace_id":  trace_id,
+        "span_id":   span_id,
+        "service":   service,
+        "operation": operation,
+        "started_ts": start_ts
+    }
+}
+
+// POST /tprofile/end -- end a trace span
+// Body: {"trace_id": "...", "service": "...", "duration_ms": N,
+//        "status": "ok"|"error", "span_id": "..." (optional)}
+// Matches most recent open span for that service, or by span_id if provided.
+fn handle_end(body) {
+    let trace_id = ""
+    if3 dict_has(body, "trace_id") { trace_id = sanitize_id(str(dict_get(body, "trace_id")))
+    }
+    if3 trace_id == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "trace_id required"}
+    }
+
+    let service = ""
+    if3 dict_has(body, "service") { service = str(dict_get(body, "service"))
+    }
+    if3 service == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "service required"}
+    }
+
+    let duration_ms = 0
+    if3 dict_has(body, "duration_ms") { duration_ms = float(dict_get(body, "duration_ms"))
+    }
+
+    let status = "ok"
+    if3 dict_has(body, "status") { status = str(dict_get(body, "status"))
+    }
+
+    let req_span_id = ""
+    if3 dict_has(body, "span_id") { req_span_id = sanitize_id(str(dict_get(body, "span_id")))
+    }
+
+    if3 dict_has(_traces, trace_id) == false { errmsg = "trace " + trace_id + " not found"
+        return {"ok": false, "trit": T_FALSE, "error": errmsg}
+    }
+
+    let trace  = dict_get(_traces, trace_id)
+    let spans  = dict_get(trace, "spans")
+    let end_ts = time()
+    let spd    = speed_trit(duration_ms)
+    let dur_r  = round(duration_ms, 3)
+
+    // Find matching span: by span_id if provided, else most recent in_progress
+    // for this service. We do two passes using while3.
+    let matched_idx = -1
+
+    // Pass 1: match by span_id if provided
+    if3 req_span_id != "" { pi = 0
+        while3 pi < len(spans) {
+            let sp = dict_get(spans, pi)
+            let sp_id  = dict_get(sp, "span_id") ?? ""
+            let sp_st  = dict_get(sp, "status") ?? ""
+            if3 sp_id == req_span_id {
+                if3 sp_st == "in_progress" { matched_idx = pi
+                }
+            }
+            pi = pi + 1
+        }
+    }
+
+    // Pass 2: if not matched by span_id, find most recent in_progress for service
+    if3 matched_idx == -1 { pi = len(spans) - 1
+        while3 pi >= 0 {
+            let sp     = dict_get(spans, pi)
+            let sp_svc = dict_get(sp, "service") ?? ""
+            let sp_st  = dict_get(sp, "status") ?? ""
+            if3 sp_svc == service {
+                if3 sp_st == "in_progress" { matched_idx = pi
+                    // Break by forcing loop termination
+                    let pi = -999
+                }
+            }
+            if3 pi != -999 { pi = pi - 1
+            }
+        }
+    }
+
+    if3 matched_idx == -1 { errmsg = "no open span for service " + service + " in trace " + trace_id
+        return {"ok": false, "trit": T_FALSE, "error": errmsg}
+    }
+
+    // Update the matched span in place
+    let sp = dict_get(spans, matched_idx)
+    sp = dict_set(sp, "end_ts",      end_ts)
+    sp = dict_set(sp, "duration_ms", dur_r)
+    sp = dict_set(sp, "status",      status)
+    sp = dict_set(sp, "speed_trit",  spd)
+    spans[matched_idx] = sp
+    trace = dict_set(trace, "spans", spans)
+
+    // Check if all spans are now complete (none in_progress)
+    let all_done = true
+    let ci = 0
+    while3 ci < len(spans) {
+        let sp2 = dict_get(spans, ci)
+        let st2 = dict_get(sp2, "status") ?? ""
+        if3 st2 == "in_progress" { all_done = false
+        }
+        ci = ci + 1
+    }
+
+    if3 all_done == true {
+        trace = dict_set(trace, "completed", true)
+
+        // Compute total trace duration: max(end_ts) - min(start_ts)
+        let first_start = 999999999999
+        let last_end    = 0
+        let sum_dur     = 0
+        let have_times  = false
+        let di = 0
+        while3 di < len(spans) {
+            let sp3  = dict_get(spans, di)
+            let sts  = dict_get(sp3, "start_ts") ?? 0
+            let ets  = dict_get(sp3, "end_ts") ?? 0
+            let dms  = dict_get(sp3, "duration_ms") ?? 0
+            if3 ets > 0 { have_times = true
+                if3 sts < first_start { first_start = sts
+                }
+                if3 ets > last_end { last_end = ets
+                }
+            }
+            sum_dur = sum_dur + dms
+            di = di + 1
+        }
+
+        if3 have_times == true {
+            // duration in ms from monotonic seconds
+            let total_ms = round((last_end - first_start) * 1000, 3)
+            trace = dict_set(trace, "total_duration_ms", total_ms)
+        } else {
+            trace = dict_set(trace, "total_duration_ms", round(sum_dur, 3))
+        }
+
+        // Trace-level trit: worst span speed wins
+        let trace_t = T_TRUE
+        let ti = 0
+        while3 ti < len(spans) {
+            let sp4 = dict_get(spans, ti)
+            let st4 = dict_get(sp4, "speed_trit") ?? 0
+            let trace_t = trit_merge(trace_t, st4)
+            ti = ti + 1
+        }
+        trace = dict_set(trace, "trace_trit", trace_t)
+    }
+
+    _traces = dict_set(_traces, trace_id, trace)
+    let matched_sid = dict_get(sp, "span_id") ?? ""
+
+    return {
+        "ok":              true,
+        "trit":            spd,
+        "trace_id":        trace_id,
+        "span_id":         matched_sid,
+        "service":         service,
+        "duration_ms":     dur_r,
+        "status":          status,
+        "speed_trit":      spd,
+        "speed_char":      speed_char(spd),
+        "trace_completed": all_done
+    }
+}
+
+// GET /tprofile/trace/:id -- full trace with waterfall view
+// Since NovaLang troute does not support path params natively,
+// the trace_id is passed as query param: /tprofile/trace?id=...
+// or as a POST body field for callers that need parameterized access.
+fn handle_trace(body) {
+    let trace_id = ""
+    if3 dict_has(body, "id") { trace_id = sanitize_id(str(dict_get(body, "id")))
+    }
+    if3 trace_id == "" {
+        if3 dict_has(body, "trace_id") { trace_id = sanitize_id(str(dict_get(body, "trace_id")))
+        }
+    }
+    if3 trace_id == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "trace_id required (pass ?id=... or body.trace_id)"}
+    }
+
+    if3 dict_has(_traces, trace_id) == false { errmsg = "trace " + trace_id + " not found"
+        return {"ok": false, "trit": T_FALSE, "error": errmsg}
+    }
+
+    let trace = dict_get(_traces, trace_id)
+    let spans = dict_get(trace, "spans")
+
+    // Build waterfall: sort spans by start_ts ascending
+    let sorted_spans = sort(spans)
+    let base_start   = 0
+    if3 len(sorted_spans) > 0 { first_sp   = dict_get(sorted_spans, 0)
+        let base_start = dict_get(first_sp, "start_ts") ?? 0
+    }
+
+    // Add waterfall_offset_ms to each span (relative offset from first span start)
+    let wf_spans = []
+    let wi = 0
+    while3 wi < len(sorted_spans) {
+        let sp     = dict_get(sorted_spans, wi)
+        let sts    = dict_get(sp, "start_ts") ?? 0
+        let offset = round((sts - base_start) * 1000, 3)
+        sp = dict_set(sp, "waterfall_offset_ms", offset)
+        // Remove internal monotonic timestamps for clean output
+        dict_del(sp, "start_ts")
+        dict_del(sp, "end_ts")
+        wf_spans = append(wf_spans, sp)
+        wi = wi + 1
+    }
+
+    let completed  = dict_get(trace, "completed") ?? false
+    let total_ms   = dict_get(trace, "total_duration_ms") ?? 0
+    let trace_t    = dict_get(trace, "trace_trit") ?? T_MAYBE
+    let created_ts = dict_get(trace, "created_ts") ?? 0
+    let span_count = len(wf_spans)
+
+    return {
+        "ok":               true,
+        "trit":             trace_t,
+        "trace_id":         trace_id,
+        "created_ts":       created_ts,
+        "completed":        completed,
+        "span_count":       span_count,
+        "total_duration_ms": total_ms,
+        "trace_trit":       trace_t,
+        "trace_char":       speed_char(trace_t),
+        "spans":            wf_spans
+    }
+}
+
+// GET /tprofile/slow -- top H13 (13) slowest completed traces
+fn handle_slow(body) {
+    let all_ids = _trace_ids
+    let completed_list = []
+
+    let i = 0
+    while3 i < len(all_ids) {
+        let tid = dict_get(all_ids, i)
+        let tr  = dict_get(_traces, tid)
+        let cmp = dict_get(tr, "completed") ?? false
+        let tdm = dict_get(tr, "total_duration_ms") ?? 0
+        if3 cmp == true {
+            if3 tdm > 0 {
+                completed_list = append(completed_list, tr)
+            }
+        }
+        i = i + 1
+    }
+
+    // Simple insertion sort by total_duration_ms descending (capped at 91 entries)
+    let sorted = []
+    let si = 0
+    while3 si < len(completed_list) {
+        let tr = dict_get(completed_list, si)
+        sorted = append(sorted, tr)
+        si = si + 1
+    }
+    let sorted = sort(sorted)
+    // sort is ascending; reverse for descending
+    let sorted = reverse(sorted)
+
+    // Take top H13
+    let top_n = min(H13, len(sorted))
+    let top   = slice(sorted, 0, top_n)
+
+    let results = []
+    let ri = 0
+    while3 ri < len(top) {
+        let tr    = dict_get(top, ri)
+        let spans = dict_get(tr, "spans")
+        let tid   = dict_get(tr, "trace_id") ?? ""
+        let tdm   = dict_get(tr, "total_duration_ms") ?? 0
+        let t_t   = dict_get(tr, "trace_trit") ?? T_MAYBE
+        let cre   = dict_get(tr, "created_ts") ?? 0
+
+        // Gather unique service names and find slowest span
+        let svc_seen  = {}
+        let svc_list  = []
+        let worst_dur = 0
+        let worst_svc = ""
+        let worst_op  = ""
+        let worst_spd = T_TRUE
+
+        let spi = 0
+        while3 spi < len(spans) {
+            let sp    = dict_get(spans, spi)
+            let svc   = dict_get(sp, "service") ?? ""
+            let op    = dict_get(sp, "operation") ?? ""
+            let dms   = dict_get(sp, "duration_ms") ?? 0
+            let spd   = dict_get(sp, "speed_trit") ?? T_MAYBE
+            if3 dict_has(svc_seen, svc) == false {
+                svc_seen = dict_set(svc_seen, svc, 1)
+                svc_list = append(svc_list, svc)
+            }
+            if3 dms > worst_dur { worst_dur = dms
+                let worst_svc = svc
+                let worst_op  = op
+                let worst_spd = spd
+            }
+            spi = spi + 1
+        }
+
+        let slowest_span = {
+            "service":     worst_svc,
+            "operation":   worst_op,
+            "duration_ms": worst_dur,
+            "speed_char":  speed_char(worst_spd)
+        }
+
+        append(results, {
+            "trace_id":         tid,
+            "created_ts":       cre,
+            "total_duration_ms": tdm,
+            "trace_trit":       t_t,
+            "trace_char":       speed_char(t_t),
+            "span_count":       len(spans),
+            "services":         svc_list,
+            "slowest_span":     slowest_span
+        })
+        ri = ri + 1
+    }
+
+    return {
+        "ok":            true,
+        "trit":          T_TRUE,
+        "count":         len(results),
+        "threshold_ms":  SLOW_THRESHOLD_MS,
+        "slow_traces":   results
+    }
+}
+
+// GET /tprofile/bottlenecks -- services appearing most in slow traces
+fn handle_bottlenecks(body) {
+    let svc_counts   = {}  // service -> appearances in slow traces
+    let svc_total_ms = {}  // service -> total duration_ms in slow traces
+    let svc_max_ms   = {}  // service -> worst single span duration
+    let slow_trace_count = 0
+
+    let all_ids = _trace_ids
+    let i = 0
+    while3 i < len(all_ids) {
+        let tid = dict_get(all_ids, i)
+        let tr  = dict_get(_traces, tid)
+        let cmp = dict_get(tr, "completed") ?? false
+        let tdm = dict_get(tr, "total_duration_ms") ?? 0
+
+        if3 cmp == true {
+            if3 tdm >= SLOW_THRESHOLD_MS { slow_trace_count = slow_trace_count + 1
+                let spans = dict_get(tr, "spans")
+                let svc_seen_this_trace = {}
+
+                let si = 0
+                while3 si < len(spans) {
+                    let sp  = dict_get(spans, si)
+                    let svc = dict_get(sp, "service") ?? ""
+                    let dur = dict_get(sp, "duration_ms") ?? 0
+
+                    // Count each service once per slow trace
+                    if3 dict_has(svc_seen_this_trace, svc) == false {
+                        svc_seen_this_trace = dict_set(svc_seen_this_trace, svc, 1)
+                        let prev_cnt = 0
+                        if3 dict_has(svc_counts, svc) { prev_cnt = int(dict_get(svc_counts, svc))
+                        }
+                        svc_counts = dict_set(svc_counts, svc, prev_cnt + 1)
+                    }
+
+                    // Always accumulate total ms
+                    let prev_ms = 0
+                    if3 dict_has(svc_total_ms, svc) { prev_ms = float(dict_get(svc_total_ms, svc))
+                    }
+                    svc_total_ms = dict_set(svc_total_ms, svc, prev_ms + dur)
+
+                    // Track worst span
+                    let prev_max = 0
+                    if3 dict_has(svc_max_ms, svc) { prev_max = float(dict_get(svc_max_ms, svc))
+                    }
+                    if3 dur > prev_max {
+                        svc_max_ms = dict_set(svc_max_ms, svc, dur)
+                    }
+
+                    si = si + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // Collect service names from svc_counts
+    let svc_names = keys(svc_counts)
+
+    // Build bottleneck records; sort by appearance count descending
+    // Use insertion-sort on a list of records
+    let bneck_list = []
+    let bi = 0
+    while3 bi < len(svc_names) {
+        let svc     = dict_get(svc_names, bi)
+        let cnt     = int(dict_get(svc_counts, svc))
+        let tot_ms  = round(float(dict_get(svc_total_ms, svc)), 3)
+        let max_ms  = round(float(dict_get(svc_max_ms, svc)), 3)
+        let avg_ms  = 0
+        if3 cnt > 0 { avg_ms = round(tot_ms / cnt, 3)
+        }
+        let bn_trit = speed_trit(avg_ms)
+        append(bneck_list, {
+            "service":                    svc,
+            "slow_trace_appearances":     cnt,
+            "total_time_in_slow_traces_ms": tot_ms,
+            "avg_time_per_slow_trace_ms": avg_ms,
+            "worst_span_ms":             max_ms,
+            "bottleneck_trit":           bn_trit,
+            "bottleneck_char":           speed_char(bn_trit),
+            "_sort_key":                 cnt
+        })
+        bi = bi + 1
+    }
+
+    // Sort descending by _sort_key (appearances)
+    let bneck_list = sort(bneck_list)
+    let bneck_list = reverse(bneck_list)
+
+    // Take top H13
+    let top_n = min(H13, len(bneck_list))
+    let bneck_list = slice(bneck_list, 0, top_n)
+
+    return {
+        "ok":                true,
+        "trit":              T_TRUE,
+        "slow_trace_count":  slow_trace_count,
+        "threshold_ms":      SLOW_THRESHOLD_MS,
+        "bottleneck_count":  len(bneck_list),
+        "bottlenecks":       bneck_list
+    }
+}
+
+// GET /tprofile/stats -- aggregate profiling statistics
+fn handle_stats(body) {
+    let all_ids         = _trace_ids
+    let trace_count     = len(all_ids)
+    let completed_count = 0
+    let in_progress     = 0
+    let slow_count      = 0
+    let durations       = []
+    let sum_dur         = 0
+    let max_dur         = 0
+    let min_dur         = 999999999
+
+    // Trit distribution counters
+    let trit_pos  = 0  // T_TRUE  (+1)
+    let trit_zero = 0  // T_MAYBE (0)
+    let trit_neg  = 0  // T_FALSE (-1)
+
+    // Service breakdown: svc -> {span_count, total_ms, trit_pos, trit_zero, trit_neg}
+    let svc_stats = {}
+
+    let i = 0
+    while3 i < len(all_ids) {
+        let tid = dict_get(all_ids, i)
+        let tr  = dict_get(_traces, tid)
+        let cmp = dict_get(tr, "completed") ?? false
+        let tdm = dict_get(tr, "total_duration_ms") ?? 0
+        let t_t = dict_get(tr, "trace_trit") ?? T_MAYBE
+
+        if3 cmp == true { completed_count = completed_count + 1
+            durations = append(durations, tdm)
+            sum_dur = sum_dur + tdm
+            if3 tdm > max_dur { max_dur = tdm
+            }
+            if3 tdm < min_dur { min_dur = tdm
+            }
+            if3 tdm >= SLOW_THRESHOLD_MS { slow_count = slow_count + 1
+            }
+            if3 t_t == 1 { trit_pos = trit_pos + 1
+            } else t_t == -1 { trit_neg = trit_neg + 1
+            } else { trit_zero = trit_zero + 1
+        } else { in_progress = in_progress + 1
+        }
+
+        // Service-level breakdown across all traces
+        let spans = dict_get(tr, "spans")
+        let si = 0
+        while3 si < len(spans) {
+            let sp  = dict_get(spans, si)
+            let svc = dict_get(sp, "service") ?? ""
+            let dms = dict_get(sp, "duration_ms") ?? 0
+            let spd = dict_get(sp, "speed_trit") ?? T_MAYBE
+
+            if3 dict_has(svc_stats, svc) == false {
+                svc_stats = dict_set(svc_stats, svc, {
+                    "span_count": 0,
+                    "total_ms":   0,
+                    "trit_pos":   0,
+                    "trit_zero":  0,
+                    "trit_neg":   0
+                })
+            }
+            let ss = dict_get(svc_stats, svc)
+            ss = dict_set(ss, "span_count", dict_get(ss, "span_count") + 1)
+            ss = dict_set(ss, "total_ms",   dict_get(ss, "total_ms") + dms)
+            if3 spd == 1 {
+                ss = dict_set(ss, "trit_pos", dict_get(ss, "trit_pos") + 1)
+            } else spd == -1 {
+                ss = dict_set(ss, "trit_neg", dict_get(ss, "trit_neg") + 1)
+            } else {
+                ss = dict_set(ss, "trit_zero", dict_get(ss, "trit_zero") + 1)
+            }
+            svc_stats = dict_set(svc_stats, svc, ss)
+            si = si + 1
+        }
+        i = i + 1
+    }
+
+    let avg_dur = 0
+    if3 completed_count > 0 { avg_dur = round(sum_dur / completed_count, 3)
+    }
+    if3 min_dur == 999999999 { min_dur = 0
+    }
+
+    // Compute per-service averages and health
+    let svc_names = keys(svc_stats)
+    let svi = 0
+    while3 svi < len(svc_names) {
+        let svc = dict_get(svc_names, svi)
+        let ss  = dict_get(svc_stats, svc)
+        let sc  = dict_get(ss, "span_count") ?? 0
+        let tm  = dict_get(ss, "total_ms") ?? 0
+        let avg_ms = 0
+        if3 sc > 0 { avg_ms = round(tm / sc, 3)
+        }
+        let ht = speed_trit(avg_ms)
+        ss = dict_set(ss, "avg_ms",      avg_ms)
+        ss = dict_set(ss, "total_ms",    round(tm, 3))
+        ss = dict_set(ss, "health_trit", ht)
+        ss = dict_set(ss, "health_char", speed_char(ht))
+        svc_stats = dict_set(svc_stats, svc, ss)
+        svi = svi + 1
+    }
+
+    return {
+        "ok":                    true,
+        "trit":                  T_TRUE,
+        "total_traces":          trace_count,
+        "total_traces_lifetime": _total_traces_lifetime,
+        "total_spans_lifetime":  _total_spans_lifetime,
+        "completed_traces":      completed_count,
+        "in_progress_traces":    in_progress,
+        "max_traces":            MAX_TRACES,
+        "slow_traces":           slow_count,
+        "duration": {
+            "avg_ms":            avg_dur,
+            "max_ms":            round(max_dur, 3),
+            "min_ms":            round(min_dur, 3),
+            "threshold_slow_ms": SLOW_THRESHOLD_MS,
+            "threshold_fast_ms": FAST_THRESHOLD_MS
+        },
+        "trace_trits": {
+            "+1": trit_pos,
+            "0":  trit_zero,
+            "-1": trit_neg
+        },
+        "service_breakdown": svc_stats,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// POST /tprofile/clear -- clear all trace data (admin reset)
+}
+fn handle_clear(body) {
+    let confirm = ""
+    if3 dict_has(body, "confirm") { confirm = str(dict_get(body, "confirm"))
+    }
+    if3 confirm != "yes" {
+        return {"ok": false, "trit": T_FALSE, "error": "pass confirm=yes to clear all traces"}
+    }
+    let prev_count = len(_trace_ids)
+    _traces    = {}
+    _trace_ids = []
+    return {
+        "ok":      true,
+        "trit":    T_TRUE,
+        "cleared": prev_count,
+        "msg":     "all traces cleared"
+    }
+}
+
+// ============================================================
+// Route Registration
+// ============================================================
+troute(server, "GET",  "/health",                 "health")
+troute(server, "GET",  "/tprofile/health",         "health")
+troute(server, "POST", "/tprofile/start",          "handle_start")
+troute(server, "POST", "/tprofile/end",            "handle_end")
+troute(server, "GET",  "/tprofile/trace",          "handle_trace")
+troute(server, "POST", "/tprofile/trace",          "handle_trace")
+troute(server, "GET",  "/tprofile/slow",           "handle_slow")
+troute(server, "GET",  "/tprofile/bottlenecks",    "handle_bottlenecks")
+troute(server, "GET",  "/tprofile/stats",          "handle_stats")
+troute(server, "POST", "/tprofile/clear",          "handle_clear")
+
+print("[TProfile] NovaLang TProfile v1.0 - Ternary Request Profiler")
+print("[TProfile] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TProfile] MAX_TRACES=" + str(MAX_TRACES) + " SLOW=" + str(SLOW_THRESHOLD_MS) + "ms FAST=" + str(FAST_THRESHOLD_MS) + "ms")
+print("[TProfile] Harmonics: 3-5-7-13 | Speed trits: +(<100ms) 0(<1000ms) T(>=1000ms)")
+print("[TProfile] Routes: /health, /tprofile/health, /tprofile/start, /tprofile/end")
+print("[TProfile] Routes: /tprofile/trace, /tprofile/slow, /tprofile/bottlenecks, /tprofile/stats, /tprofile/clear")
+print("[TProfile] N-S Boundaries: Re<27=laminar Re<125=transitional Re<343=turbulent Re>=343=chaotic")
+
+tstart(server)

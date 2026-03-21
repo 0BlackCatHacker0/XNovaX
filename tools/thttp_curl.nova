@@ -1,0 +1,320 @@
+// thttp_curl.nova - HTTP request micro-tool using curl (zero Python)
+// Usage: novalang.exe tools/thttp_curl.nova <operation>
+// Reads request from C:/NovaX/temp/thttp_req.json
+// Operations: get, post, head, download
+// Returns JSON to stdout matching Python requests output format
+// Replaces: python -c "import requests,json; ..." (zero Python)
+
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let op = try3 { args()[0] } { "help" }
+let REQ_FILE = "C:/NovaX/temp/thttp_req.json"
+let META_SEP = "---NOVACURLMETA---"
+let MAX_BODY = 5000
+
+// Ensure temp dir exists
+shell("mkdir C:\\NovaX\\temp 2>NUL")
+
+// Read request file
+let req_raw = try3 { read_file(REQ_FILE) } { "{}" }
+let req = json_decode(req_raw)
+
+let url = dict_get(req, "url") ?? ""
+let timeout_val = dict_get(req, "timeout") ?? 13
+let req_headers = dict_get(req, "headers") ?? {}
+
+// Build curl header flags from request headers dict
+fn build_header_flags(hdrs) {
+    let flags = ""
+    let ua = try3 { dict_get(hdrs, "User-Agent") } { "" }
+    if3 len(ua) > 0 { flags = flags + " -H \"User-Agent: " + ua + "\"" }
+    let auth = try3 { dict_get(hdrs, "Authorization") } { "" }
+    if3 len(auth) > 0 { flags = flags + " -H \"Authorization: " + auth + "\"" }
+    let accept = try3 { dict_get(hdrs, "Accept") } { "" }
+    if3 len(accept) > 0 { flags = flags + " -H \"Accept: " + accept + "\"" }
+    let ct = try3 { dict_get(hdrs, "Content-Type") } { "" }
+    if3 len(ct) > 0 { flags = flags + " -H \"Content-Type: " + ct + "\"" }
+    let xapi = try3 { dict_get(hdrs, "X-API-Key") } { "" }
+    if3 len(xapi) > 0 { flags = flags + " -H \"X-API-Key: " + xapi + "\"" }
+    return flags
+}
+
+// Parse response headers from curl -I or -D output
+fn parse_header_lines(raw) {
+    let headers = {}
+    let lines = split(raw, "\n")
+    for3 line in lines {
+        let l = trim(line)
+        if3 contains(l, ": ") {
+            let colon_pos = -1
+            let ci = 0
+            while3 ci < len(l) {
+                if3 slice(l, ci, ci + 2) == ": " {
+                    if3 colon_pos == -1 {
+                        colon_pos = ci
+                    }
+                }
+                ci = ci + 1
+            }
+            if3 colon_pos > 0 {
+                let hname = slice(l, 0, colon_pos)
+                let hval = slice(l, colon_pos + 2, len(l))
+                headers = dict_set(headers, trim(hname), trim(hval))
+            }
+        }
+    }
+    return headers
+}
+
+// Parse metadata from curl -w output after separator
+fn parse_meta(stdout, sep) {
+    let result = {}
+    result = dict_set(result, "body", stdout)
+    result = dict_set(result, "code", 0)
+    result = dict_set(result, "time", 0.0)
+    result = dict_set(result, "eff_url", "")
+    result = dict_set(result, "dl_size", 0)
+    result = dict_set(result, "ctype", "")
+
+    if3 contains(stdout, sep) {
+        let parts = split(stdout, sep)
+        let body = parts[0]
+        // Remove trailing newline before separator
+        if3 ends_with(body, "\n") {
+            body = slice(body, 0, len(body) - 1)
+        }
+        if3 ends_with(body, "\r") {
+            body = slice(body, 0, len(body) - 1)
+        }
+        result = dict_set(result, "body", body)
+
+        let meta = try3 { parts[1] } { "" }
+        let ml = split(trim(meta), "\n")
+        result = dict_set(result, "code", try3 { to_int(trim(ml[0])) } { 0 })
+        result = dict_set(result, "time", try3 { to_float(trim(ml[1])) } { 0.0 })
+        result = dict_set(result, "eff_url", try3 { trim(ml[2]) } { "" })
+        let raw_size = try3 { trim(ml[3]) } { "0" }
+        result = dict_set(result, "dl_size", try3 { to_int(to_float(raw_size)) } { 0 })
+        result = dict_set(result, "ctype", try3 { trim(ml[4]) } { "" })
+    }
+    return result
+}
+
+if3 op == "get" {
+    // HTTP GET: returns {status, body, headers, url, elapsed, encoding, content_length}
+    let hflags = build_header_flags(req_headers)
+    let wfmt = META_SEP + "\\n%{http_code}\\n%{time_total}\\n%{url_effective}\\n%{size_download}\\n%{content_type}"
+    let cmd = "curl -s -L --max-time " + str(timeout_val) + hflags + " -D C:\\NovaX\\temp\\curl_h.txt -w \"\\n" + wfmt + "\" \"" + url + "\" 2>NUL"
+    let r = shell(cmd)
+    let stdout = try3 { dict_get(r, "stdout") } { "" }
+
+    if3 len(stdout) == 0 {
+        let err = try3 { dict_get(r, "stderr") } { "connection failed" }
+        print("{\"error\":\"curl failed: " + replace(err, "\"", "'") + "\"}")
+    } else3 {
+        let m = parse_meta(stdout, META_SEP)
+        let body = dict_get(m, "body") ?? ""
+        if3 len(body) > MAX_BODY { body = slice(body, 0, MAX_BODY) }
+
+        // Read response headers from dump file
+        let hraw = try3 { read_file("C:/NovaX/temp/curl_h.txt") } { "" }
+        let hdrs = parse_header_lines(hraw)
+
+        let out = {}
+        out = dict_set(out, "status", dict_get(m, "code") ?? 0)
+        out = dict_set(out, "body", body)
+        out = dict_set(out, "headers", hdrs)
+        out = dict_set(out, "url", dict_get(m, "eff_url") ?? url)
+        out = dict_set(out, "elapsed", dict_get(m, "time") ?? 0.0)
+        out = dict_set(out, "encoding", "")
+        out = dict_set(out, "content_length", dict_get(m, "dl_size") ?? 0)
+        print(json_encode(out))
+    }
+
+} else3 op == "post" {
+    // HTTP POST: returns {status, body, headers, url, elapsed, content_length}
+    let post_body = dict_get(req, "body") ?? {}
+    let content_type = dict_get(req, "content_type") ?? "application/json"
+    let hflags = build_header_flags(req_headers)
+
+    let body_str = ""
+    let ct_flag = ""
+    if3 contains(content_type, "json") {
+        body_str = json_encode(post_body)
+        ct_flag = " -H \"Content-Type: " + content_type + "\" -d \"" + replace(body_str, "\"", "\\\"") + "\""
+    } else3 {
+        body_str = str(post_body)
+        ct_flag = " -H \"Content-Type: " + content_type + "\" -d \"" + replace(body_str, "\"", "\\\"") + "\""
+    }
+
+    let wfmt = META_SEP + "\\n%{http_code}\\n%{time_total}\\n%{url_effective}\\n%{size_download}\\n%{content_type}"
+    let cmd = "curl -s -L -X POST --max-time " + str(timeout_val) + hflags + ct_flag + " -D C:\\NovaX\\temp\\curl_h.txt -w \"\\n" + wfmt + "\" \"" + url + "\" 2>NUL"
+    let r = shell(cmd)
+    let stdout = try3 { dict_get(r, "stdout") } { "" }
+
+    if3 len(stdout) == 0 {
+        let err = try3 { dict_get(r, "stderr") } { "connection failed" }
+        print("{\"error\":\"curl failed: " + replace(err, "\"", "'") + "\"}")
+    } else3 {
+        let m = parse_meta(stdout, META_SEP)
+        let body = dict_get(m, "body") ?? ""
+        if3 len(body) > MAX_BODY { body = slice(body, 0, MAX_BODY) }
+
+        let hraw = try3 { read_file("C:/NovaX/temp/curl_h.txt") } { "" }
+        let hdrs = parse_header_lines(hraw)
+
+        let out = {}
+        out = dict_set(out, "status", dict_get(m, "code") ?? 0)
+        out = dict_set(out, "body", body)
+        out = dict_set(out, "headers", hdrs)
+        out = dict_set(out, "url", dict_get(m, "eff_url") ?? url)
+        out = dict_set(out, "elapsed", dict_get(m, "time") ?? 0.0)
+        out = dict_set(out, "content_length", dict_get(m, "dl_size") ?? 0)
+        print(json_encode(out))
+    }
+
+} else3 op == "head" {
+    // HTTP HEAD: returns {status, headers, url, elapsed}
+    let wfmt = META_SEP + "\\n%{http_code}\\n%{time_total}\\n%{url_effective}\\n%{size_download}\\n%{content_type}"
+    let cmd = "curl -s -I -L --max-time " + str(timeout_val) + " -w \"\\n" + wfmt + "\" \"" + url + "\" 2>NUL"
+    let r = shell(cmd)
+    let stdout = try3 { dict_get(r, "stdout") } { "" }
+
+    if3 len(stdout) == 0 {
+        let err = try3 { dict_get(r, "stderr") } { "connection failed" }
+        print("{\"error\":\"curl failed: " + replace(err, "\"", "'") + "\"}")
+    } else3 {
+        let m = parse_meta(stdout, META_SEP)
+        // For HEAD, the "body" is actually the header output from -I
+        let header_text = dict_get(m, "body") ?? ""
+        let hdrs = parse_header_lines(header_text)
+
+        let out = {}
+        out = dict_set(out, "status", dict_get(m, "code") ?? 0)
+        out = dict_set(out, "headers", hdrs)
+        out = dict_set(out, "url", dict_get(m, "eff_url") ?? url)
+        out = dict_set(out, "elapsed", dict_get(m, "time") ?? 0.0)
+        print(json_encode(out))
+    }
+
+} else3 op == "download" {
+    // Download file: returns {status, file_size, content_length, headers, url, elapsed}
+    let output_path = dict_get(req, "output_path") ?? ""
+    let win_path = replace(output_path, "/", "\\")
+
+    let wfmt = "%{http_code}\\n%{time_total}\\n%{url_effective}\\n%{size_download}\\n%{content_type}"
+    let cmd = "curl -s -L --max-time " + str(timeout_val) + " -D C:\\NovaX\\temp\\curl_h.txt -o \"" + win_path + "\" -w \"" + wfmt + "\" \"" + url + "\" 2>NUL"
+    let r = shell(cmd)
+    let stdout = try3 { dict_get(r, "stdout") } { "" }
+
+    // Parse metadata (no body in stdout since -o writes to file)
+    let ml = split(trim(stdout), "\n")
+    let code = try3 { to_int(trim(ml[0])) } { 0 }
+    let telapsed = try3 { to_float(trim(ml[1])) } { 0.0 }
+    let eff_url = try3 { trim(ml[2]) } { url }
+    let dl_size = try3 { to_int(to_float(trim(ml[3]))) } { 0 }
+    let ctype = try3 { trim(ml[4]) } { "" }
+
+    // Get actual file size
+    let sz_r = shell("for %I in (\"" + win_path + "\") do @echo %~zI")
+    let file_size = try3 { to_int(trim(dict_get(sz_r, "stdout"))) } { 0 }
+
+    // Read response headers
+    let hraw = try3 { read_file("C:/NovaX/temp/curl_h.txt") } { "" }
+    let hdrs = parse_header_lines(hraw)
+
+    // Get content-length header
+    let cl = try3 { dict_get(hdrs, "Content-Length") } { "" }
+    if3 len(cl) == 0 { cl = try3 { dict_get(hdrs, "content-length") } { "unknown" } }
+
+    let out = {}
+    out = dict_set(out, "status", code)
+    out = dict_set(out, "file_size", file_size)
+    out = dict_set(out, "content_length", cl)
+    out = dict_set(out, "headers", hdrs)
+    out = dict_set(out, "url", eff_url)
+    out = dict_set(out, "elapsed", telapsed)
+    print(json_encode(out))
+
+} else3 op == "status" {
+    // Lightweight reachability check via HEAD
+    let wfmt = "%{http_code}\\n%{time_total}\\n%{url_effective}"
+    let cmd = "curl -s -I -L --max-time " + str(timeout_val) + " -w \"\\n" + META_SEP + "\\n" + wfmt + "\" \"" + url + "\" 2>NUL"
+    let r = shell(cmd)
+    let stdout = try3 { dict_get(r, "stdout") } { "" }
+
+    if3 len(stdout) == 0 {
+        let err = try3 { dict_get(r, "stderr") } { "connection failed" }
+        print("{\"error\":\"curl failed: " + replace(err, "\"", "'") + "\"}")
+    } else3 {
+        // Parse header text for server/content-type
+        let header_text = stdout
+        let code = 0
+        let telapsed = 0.0
+        let eff_url = url
+
+        if3 contains(stdout, META_SEP) {
+            let parts = split(stdout, META_SEP)
+            header_text = parts[0]
+            let meta = try3 { parts[1] } { "" }
+            let ml = split(trim(meta), "\n")
+            code = try3 { to_int(trim(ml[0])) } { 0 }
+            telapsed = try3 { to_float(trim(ml[1])) } { 0.0 }
+            eff_url = try3 { trim(ml[2]) } { url }
+        }
+
+        let hdrs = parse_header_lines(header_text)
+        let server = try3 { dict_get(hdrs, "Server") } { "" }
+        if3 len(server) == 0 { server = try3 { dict_get(hdrs, "server") } { "" } }
+        let ct = try3 { dict_get(hdrs, "Content-Type") } { "" }
+        if3 len(ct) == 0 { ct = try3 { dict_get(hdrs, "content-type") } { "" } }
+
+        let out = {}
+        out = dict_set(out, "status", code)
+        out = dict_set(out, "url", eff_url)
+        out = dict_set(out, "elapsed", telapsed)
+        out = dict_set(out, "server", server)
+        out = dict_set(out, "content_type", ct)
+        print(json_encode(out))
+    }
+
+} else3 op == "headers" {
+    // Full headers inspection via HEAD
+    let cmd = "curl -s -I -L --max-time " + str(timeout_val) + " -w \"\\n" + META_SEP + "\\n%{http_code}\\n%{time_total}\\n%{url_effective}\" \"" + url + "\" 2>NUL"
+    let r = shell(cmd)
+    let stdout = try3 { dict_get(r, "stdout") } { "" }
+
+    if3 len(stdout) == 0 {
+        let err = try3 { dict_get(r, "stderr") } { "connection failed" }
+        print("{\"error\":\"curl failed: " + replace(err, "\"", "'") + "\"}")
+    } else3 {
+        let header_text = stdout
+        let code = 0
+        let telapsed = 0.0
+        let eff_url = url
+
+        if3 contains(stdout, META_SEP) {
+            let parts = split(stdout, META_SEP)
+            header_text = parts[0]
+            let meta = try3 { parts[1] } { "" }
+            let ml = split(trim(meta), "\n")
+            code = try3 { to_int(trim(ml[0])) } { 0 }
+            telapsed = try3 { to_float(trim(ml[1])) } { 0.0 }
+            eff_url = try3 { trim(ml[2]) } { url }
+        }
+
+        let hdrs = parse_header_lines(header_text)
+        let hcount = len(split(header_text, "\n"))
+
+        let out = {}
+        out = dict_set(out, "status", code)
+        out = dict_set(out, "headers", hdrs)
+        out = dict_set(out, "header_count", hcount)
+        out = dict_set(out, "url", eff_url)
+        out = dict_set(out, "elapsed", telapsed)
+        print(json_encode(out))
+    }
+
+} else3 {
+    print("{\"error\":\"unknown operation: " + op + "\",\"ops\":[\"get\",\"post\",\"head\",\"download\",\"status\",\"headers\"]}")
+}

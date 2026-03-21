@@ -1,0 +1,500 @@
+// Nova Sentinel Service v2.0 - Auto-Recovery Watchdog (NovaLang)
+// Port 9884: Monitors NovaX services, classifies threats, triggers restarts
+// On-demand sweep only (POST /sentinel/sweep) - no background threads
+//
+// N-S Mapping:
+//   service_flow    = velocity_field
+//   offline service = turbulent particle
+//   restart action  = viscous correction
+//   threat_trit     = Reynolds classification (+1 safe, 0 warn, -1 critical)
+
+let PORT = 9884
+let server = tserve(PORT, "Nova Sentinel v2.0 - Auto-Recovery Watchdog")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+
+// RE_BOUNDARY = H7^3 = 343ms - healthy/degraded threshold
+let RE_BOUNDARY = 343
+
+// Max restarts before abandoning a service
+let MAX_RESTARTS = 10
+
+// -- Global Stats --
+let stat_checks    = 0
+let stat_restarts  = 0
+let stat_start     = time()
+let auto_recovery  = TRUE
+
+// -- Event Log (capped list, newest appended) --
+let events = []
+
+// -- Health state dict: key -> status string --
+let svc_status  = {}
+let svc_trit    = {}
+let svc_ms      = {}
+let svc_restarts = {}
+let svc_down_since = {}
+let svc_last_restart = {}
+let svc_threat  = {}
+
+// -- Service registry: names and ports --
+// cmd = pythonw script path, or "" for no auto-restart
+let svc_name = {}
+let svc_port = {}
+let svc_cmd  = {}
+
+fn reg(key, name, port, cmd) {
+    dict_set(svc_name, key, name)
+    dict_set(svc_port, key, port)
+    dict_set(svc_cmd,  key, cmd)
+    dict_set(svc_status,     key, "unknown")
+    dict_set(svc_trit,       key, 0)
+    dict_set(svc_ms,         key, 0)
+    dict_set(svc_restarts,   key, 0)
+    dict_set(svc_down_since, key, 0)
+    dict_set(svc_last_restart, key, 0)
+    dict_set(svc_threat,     key, TRUE)
+    return TRUE
+}
+
+// -- Register all services --
+// cmd="" means NEVER auto-restart (orchestrator, brain)
+let PW = "C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe"
+
+let _r = reg("bridge",      "Nova Bridge",      9999,  "")
+let _r = reg("brain",       "Nova Brain",       9990,  "")
+let _r = reg("relay",       "Exec Server",      9877,  PW + " C:\\NovaX\\launchers\\exec_server.py")
+let _r = reg("ollama",      "Ollama",           11434, "ollama serve")
+let _r = reg("hivemind",    "Hive Mind",        9881,  PW + " C:\\NovaX\\nova_hivemind.py")
+let _r = reg("vpncore",     "VPN Core",         9880,  PW + " C:\\NovaX\\nova_vpn_core.py")
+let _r = reg("cloudrouter", "Cloud Router",     9878,  PW + " C:\\NovaX\\nova_cloud_router.py")
+let _r = reg("nexus",       "Nova Nexus",       9882,  PW + " C:\\NovaX\\nova_nexus.py")
+let _r = reg("ternary",     "Ternary Server",   9885,  PW + " C:\\NovaX\\nova_ternary_server.py")
+let _r = reg("tkill",       "TKill Diagnostic", 9899,  PW + " C:\\NovaX\\nova_tkill.py")
+let _r = reg("novacli",     "NovaCLI",          9887,  PW + " C:\\NovaX\\nova_cli_server.py")
+let _r = reg("closedloop",  "Closed Loop",      9888,  PW + " C:\\NovaX\\nova_closed_loop.py")
+let _r = reg("maxpatch",    "Max Patch",        9889,  PW + " C:\\NovaX\\nova_max_patch.py")
+let _r = reg("tshell",      "TShell",           9890,  PW + " C:\\NovaX\\nova_tshell.py")
+let _r = reg("novatools",   "Nova Tools",       9891,  PW + " C:\\NovaX\\nova_tools.py")
+let _r = reg("vault",       "Nova Vault",       9892,  PW + " C:\\NovaX\\nova_vault.py")
+let _r = reg("deepstorage", "DeepStorage",      9893,  PW + " C:\\NovaX\\nova_deepstorage.py")
+let _r = reg("ttools",      "Ternary Tools",    9894,  PW + " C:\\NovaX\\nova_ternary_tools.py")
+let _r = reg("tspeak",      "TSpeak",           9895,  PW + " C:\\NovaX\\nova_tspeak.py")
+let _r = reg("cortex",      "Nova Cortex",      9896,  PW + " C:\\NovaX\\nova_cortex.py")
+let _r = reg("tfetch",      "TFetch",           9897,  PW + " C:\\NovaX\\nova_tfetch.py")
+let _r = reg("stt",         "Nova STT",         9875,  PW + " C:\\NovaX\\nova_stt.py")
+let _r = reg("tsysmon",     "TSysmon",          9905,  PW + " C:\\NovaX\\nova_tsysmon.py")
+let _r = reg("tnet",        "TNet",             9906,  PW + " C:\\NovaX\\nova_tnet.py")
+let _r = reg("tsecurity",   "TSecurity",        9907,  PW + " C:\\NovaX\\nova_tsecurity.py")
+let _r = reg("tmedia",      "TMedia",           9908,  PW + " C:\\NovaX\\nova_tmedia.py")
+let _r = reg("tbuild",      "TBuild",           9909,  PW + " C:\\NovaX\\nova_tbuild.py")
+let _r = reg("tcron",       "TCron",            9910,  PW + " C:\\NovaX\\nova_tcron.py")
+let _r = reg("tquery",      "TQuery",           9911,  PW + " C:\\NovaX\\nova_tquery.py")
+let _r = reg("trelay",      "TRelay",           9985,  PW + " C:\\NovaX\\nova_trelay.py")
+
+// -- Helpers --
+
+fn log_event(level, msg) {
+    let ts = time()
+    let entry = {"time": str(ts), "level": level, "msg": msg}
+    append(events, entry)
+    // Cap log at 200 entries
+    let elen = len(events)
+    if elen > 200 {
+        let events = slice(events, elen - 200, elen)
+    }
+    print("[SENTINEL] [" + level + "] " + msg)
+    return TRUE
+}
+
+// Ternary health check via HTTP GET
+// +1 = responds quickly (< RE_BOUNDARY ms)
+// 0  = responds but slow (>= RE_BOUNDARY)
+// -1 = down / no response
+fn check_port3(port) {
+    let url = "http://127.0.0.1:" + str(port) + "/health"
+    let t0 = time()
+    let resp = ""
+    let got = MAYBE
+    try3 {
+        let resp = http_get(url)
+        let got = TRUE
+    } else {
+        let got = FALSE
+    }
+    let elapsed = (time() - t0) * 1000
+    if3 got == FALSE {
+        return {"trit": FALSE, "ms": 0}
+    } else elapsed >= RE_BOUNDARY {
+        return {"trit": MAYBE, "ms": round(elapsed, 1)}
+    } else {
+        return {"trit": TRUE, "ms": round(elapsed, 1)}
+    }
+}
+
+// Threat classification: +1=safe, 0=warning, -1=critical
+fn threat_trit(restarts, down_time) {
+    if restarts >= MAX_RESTARTS {
+        return FALSE
+    }
+    if down_time > 60 {
+        return FALSE
+    }
+    if restarts > H5 {
+        return FALSE
+    }
+    if down_time > 15 {
+        return MAYBE
+    }
+    if restarts > 0 {
+        return MAYBE
+    }
+    return TRUE
+}
+
+// Restart a single service by key
+fn do_restart(key) {
+    let cmd = dict_get(svc_cmd, key)
+    let name = dict_get(svc_name, key)
+    let port = dict_get(svc_port, key)
+    // Empty cmd = protected service, never restart
+    if len(str(cmd)) == 0 {
+        return FALSE
+    }
+    let run_cmd = "start /b " + str(cmd)
+    log_event("FIX", "Restarting " + str(name) + " on :" + str(port))
+    try3 {
+        let _out = nova_run(run_cmd, 5)
+        let prev_r = dict_get(svc_restarts, key)
+        dict_set(svc_restarts, key, prev_r + 1)
+        dict_set(svc_last_restart, key, time())
+        stat_restarts = stat_restarts + 1
+        log_event("OK", str(name) + " restart initiated (no-window)")
+        return TRUE
+    } else {
+        log_event("ERR", "Restart failed for " + str(name))
+        return FALSE
+    }
+}
+
+// -- Core sweep: check all services, classify, auto-restart if enabled --
+fn do_sweep() {
+    let svc_keys = keys(svc_name)
+    let i = 0
+    let total = len(svc_keys)
+    while3 i < total {
+        let key = svc_keys[i]
+        let port = dict_get(svc_port, key)
+        let name = dict_get(svc_name, key)
+        let result = check_port3(port)
+        let trit_val = result["trit"]
+        let ms_val   = result["ms"]
+        let now = time()
+        stat_checks = stat_checks + 1
+
+        let prev_status = dict_get(svc_status, key)
+        dict_set(svc_trit, key, trit_val)
+        dict_set(svc_ms,   key, ms_val)
+
+        if3 trit_val == TRUE {
+            dict_set(svc_status, key, "online")
+            if prev_status != "online" {
+                dict_set(svc_down_since, key, 0)
+                log_event("UP", str(name) + " ONLINE (:" + str(port) + " " + str(ms_val) + "ms)")
+            }
+        } else trit_val == MAYBE {
+            dict_set(svc_status, key, "degraded")
+            if prev_status == "online" {
+                log_event("WARN", str(name) + " DEGRADED (:" + str(port) + " " + str(ms_val) + "ms)")
+        } else {
+            // Offline
+            dict_set(svc_status, key, "offline")
+            let ds = dict_get(svc_down_since, key)
+            if prev_status == "online" {
+                dict_set(svc_down_since, key, now)
+                log_event("DOWN", str(name) + " OFFLINE (:" + str(port) + ")")
+            }
+            if prev_status == "degraded" {
+                dict_set(svc_down_since, key, now)
+                log_event("DOWN", str(name) + " OFFLINE (:" + str(port) + ")")
+            }
+            if prev_status == "unknown" {
+                let cur_ds = dict_get(svc_down_since, key)
+                if cur_ds == 0 {
+                    dict_set(svc_down_since, key, now)
+                }
+            }
+            // Auto-recovery logic
+            let cur_ds = dict_get(svc_down_since, key)
+            let restarts_n = dict_get(svc_restarts, key)
+            let last_r = dict_get(svc_last_restart, key)
+            if auto_recovery == TRUE {
+                if cur_ds > 0 {
+                    let dt = now - cur_ds
+                    let cd = now - last_r
+                    if restarts_n >= MAX_RESTARTS {
+                        let cur_st = dict_get(svc_status, key)
+                        if cur_st != "abandoned" {
+                            dict_set(svc_status, key, "abandoned")
+                            log_event("STOP", str(name) + " hit max restarts, giving up")
+                        }
+                    }
+                    if restarts_n < MAX_RESTARTS {
+                        if dt > 15 {
+                            if cd > 45 {
+                                let _ok = do_restart(key)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update threat classification
+        let cur_ds2 = dict_get(svc_down_since, key)
+        let down_t = 0
+        if cur_ds2 > 0 {
+            let down_t = now - cur_ds2
+        }
+        let restarts_n2 = dict_get(svc_restarts, key)
+        let thr = threat_trit(restarts_n2, down_t)
+        dict_set(svc_threat, key, thr)
+
+        let i = i + 1
+    }
+    return TRUE
+}
+
+// -- Build service summary dict for status response --
+}
+fn build_svc_summary() {
+    let svc_keys = keys(svc_name)
+    let total = len(svc_keys)
+    let online_n   = 0
+    let degraded_n = 0
+    let down_n     = 0
+    let i = 0
+    while3 i < total {
+        let key = svc_keys[i]
+        let st = dict_get(svc_status, key)
+        if st == "online" {
+            let online_n = online_n + 1
+        }
+        if st == "degraded" {
+            let degraded_n = degraded_n + 1
+        }
+        if st == "offline" {
+            let down_n = down_n + 1
+        }
+        if st == "abandoned" {
+            let down_n = down_n + 1
+        }
+        let i = i + 1
+    }
+    return {"online": online_n, "degraded": degraded_n, "down": down_n, "total": total}
+}
+
+// -- Route handlers --
+
+fn health(body) {
+    let summary = build_svc_summary()
+    let on_n  = summary["online"]
+    let deg_n = summary["degraded"]
+    let tot_n = summary["total"]
+    // Service-level trit: all online=+1, any degraded=0, any down=-1
+    let svc_keys = keys(svc_name)
+    let worst = TRUE
+    let i = 0
+    while3 i < len(svc_keys) {
+        let key = svc_keys[i]
+        let t = dict_get(svc_trit, key)
+        if t < worst {
+            let worst = t
+        }
+        let i = i + 1
+    }
+    return {
+        "ok":       true,
+        "service":  "sentinel",
+        "port":     PORT,
+        "version":  "2.0",
+        "ternary":  true,
+        "trit":     worst,
+        "char":     trit_char(worst),
+        "online":   on_n,
+        "degraded": deg_n,
+        "down":     summary["down"],
+        "total":    tot_n,
+        "runtime":  "novalang"
+    }
+}
+
+fn sentinel_status(body) {
+    let summary = build_svc_summary()
+    let on_n  = summary["online"]
+    let deg_n = summary["degraded"]
+    let dn_n  = summary["down"]
+    let tot_n = summary["total"]
+    let uptime_secs = int(time() - stat_start)
+    // Build per-service entries
+    let svc_keys = keys(svc_name)
+    let svc_out = {}
+    let i = 0
+    while3 i < len(svc_keys) {
+        let key = svc_keys[i]
+        let cmd_v = dict_get(svc_cmd, key)
+        let has_cmd = FALSE
+        if len(str(cmd_v)) > 0 {
+            let has_cmd = TRUE
+        }
+        let entry = {
+            "name":         dict_get(svc_name,     key),
+            "port":         dict_get(svc_port,      key),
+            "status":       dict_get(svc_status,    key),
+            "trit":         dict_get(svc_trit,      key),
+            "char":         trit_char(dict_get(svc_trit, key)),
+            "ms":           dict_get(svc_ms,        key),
+            "threat_trit":  dict_get(svc_threat,    key),
+            "restarts":     dict_get(svc_restarts,  key),
+            "cmd":          has_cmd
+        }
+        dict_set(svc_out, key, entry)
+        let i = i + 1
+    }
+    return {
+        "server":       "Nova Sentinel",
+        "version":      "2.0",
+        "port":         PORT,
+        "ternary":      true,
+        "harmonics":    {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "online":       on_n,
+        "degraded":     deg_n,
+        "down":         dn_n,
+        "total":        tot_n,
+        "checks":       stat_checks,
+        "restarts":     stat_restarts,
+        "auto_recovery": auto_recovery,
+        "uptime":       uptime_secs,
+        "services":     svc_out
+    }
+}
+
+fn sentinel_events(body) {
+    let elen = len(events)
+    let start = elen - 50
+    if start < 0 {
+        let start = 0
+    }
+    let recent = slice(events, start, elen)
+    return {"events": recent}
+}
+
+// POST /sentinel/sweep - on-demand full health sweep + auto-recovery
+fn sentinel_sweep(body) {
+    let _ok = do_sweep()
+    let summary = build_svc_summary()
+    return {
+        "ok":      true,
+        "checked": summary["total"],
+        "online":  summary["online"],
+        "degraded":summary["degraded"],
+        "down":    summary["down"],
+        "checks":  stat_checks,
+        "restarts":stat_restarts
+    }
+}
+
+// POST /sentinel/restart - manual restart of a named service
+fn sentinel_restart(body) {
+    let key = ""
+    try3 {
+        let key = body["service"]
+    } else {
+        return {"ok": false, "error": "missing service key"}
+    }
+    if dict_has(svc_name, key) == FALSE {
+        return {"ok": false, "error": "unknown service"}
+    }
+    let result = do_restart(key)
+    return {"ok": result, "service": key}
+}
+
+// POST /sentinel/toggle - flip auto-recovery on/off
+fn sentinel_toggle(body) {
+    if auto_recovery == TRUE {
+        let auto_recovery = FALSE
+        log_event("OK", "Auto-recovery OFF")
+    }
+    if auto_recovery == FALSE {
+        let auto_recovery = TRUE
+        log_event("OK", "Auto-recovery ON")
+    }
+    return {"ok": true, "auto_recovery": auto_recovery}
+}
+
+// POST /sentinel/anomaly - external anomaly injection
+fn sentinel_anomaly(body) {
+    let cat = "unknown"
+    let msg = "anomaly detected"
+    let sev = "warning"
+    try3 {
+        let cat = body["category"]
+    } else {}
+    try3 {
+        let msg = body["message"]
+    } else {}
+    try3 {
+        let sev = body["severity"]
+    } else {}
+    log_event("ANOMALY", "[" + str(sev) + "] " + str(cat) + ": " + str(msg))
+    return {"ok": true, "logged": true}
+}
+
+// POST /sentinel/self-heal - receive self-heal completion reports
+fn sentinel_selfheal(body) {
+    let heal_id  = "unknown"
+    let status   = "unknown"
+    let category = "unknown"
+    let duration = 0
+    try3 {
+        let heal_id = body["heal_id"]
+    } else {}
+    try3 {
+        let status = body["status"]
+    } else {}
+    try3 {
+        let category = body["category"]
+    } else {}
+    try3 {
+        let duration = body["duration"]
+    } else {}
+    let dur_s = round(duration, 1)
+    log_event("HEAL", "[" + str(status) + "] " + str(category) + " heal_id=" + str(heal_id) + " (" + str(dur_s) + "s)")
+    return {"ok": true, "logged": true}
+}
+
+// -- Register routes --
+troute(server, "GET",  "/health",              "health")
+troute(server, "GET",  "/sentinel/status",     "sentinel_status")
+troute(server, "GET",  "/sentinel/events",     "sentinel_events")
+troute(server, "POST", "/sentinel/sweep",      "sentinel_sweep")
+troute(server, "POST", "/sentinel/restart",    "sentinel_restart")
+troute(server, "POST", "/sentinel/toggle",     "sentinel_toggle")
+troute(server, "POST", "/sentinel/anomaly",    "sentinel_anomaly")
+troute(server, "POST", "/sentinel/self-heal",  "sentinel_selfheal")
+
+// -- Boot --
+print("[Sentinel] Nova Sentinel v2.0 - Auto-Recovery Watchdog (NovaLang)")
+print("[Sentinel] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[Sentinel] Services registered: " + str(len(keys(svc_name))))
+print("[Sentinel] Auto-recovery: ON | Max restarts: " + str(MAX_RESTARTS))
+print("[Sentinel] RE_BOUNDARY: " + str(RE_BOUNDARY) + "ms (H7^3=343)")
+print("[Sentinel] Routes: /health, /sentinel/status, /sentinel/events")
+print("[Sentinel] Routes: POST /sentinel/sweep (on-demand), /sentinel/restart, /sentinel/toggle")
+print("[Sentinel] Routes: POST /sentinel/anomaly, /sentinel/self-heal")
+
+tstart(server)

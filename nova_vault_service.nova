@@ -1,0 +1,975 @@
+// nova_vault_service.nova -- NovaX Vault v3.0 (Level 4 Crypto)
+// Port 9892 | Pure NovaLang with REAL cryptography
+//
+// UPGRADED v3.0: All crypto is now REAL and NIST-compliant:
+//   - sha256() = REAL SHA-256 (NIST FIPS 180-4)
+//   - aes_encrypt/decrypt = AES-256-GCM (NIST SP 800-38D)
+//   - pbkdf2() = PBKDF2-SHA256 100K iterations (NIST SP 800-132)
+//   - hmac_sha256() = HMAC-SHA256 (RFC 2104)
+//   - random_bytes() = OS-entropy secure random
+//
+// This vault provides REAL authenticated encryption. Level 4 security.
+//
+// Encryption model (NovaLang v1.4 native crypto):
+//   - Key derivation: sha256(sha256(password) + salt) iterated H13*H5 times
+//   - Integrity:      sha256(data + key) stored as 64-hex prefix in vault
+//   - Obfuscation:    XOR each byte with repeating key bytes via nova_run()
+//   - Vault format:   JSON envelope with hex-encoded content + sha256 checksum
+//   - Compression:    delegated to nova_run("C:\\NovaX\\core\\tzip_cli.exe ...")
+//
+// NOTE: This is a structural/management port. Lock/unlock of binary files
+//       delegates the actual XOR+tzip work to nova_run() subprocesses so that
+//       the service can orchestrate encryption without needing Python imports.
+//
+// Ternary states:
+//   +1 (T_TRUE)  = success / vault unlocked / operation completed
+//    0 (T_MAYBE) = locked but configured / partial / warning
+//   -1 (T_FALSE) = error / wrong password / vault missing
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3   H5=5   H7=7   H13=13
+//   BLOCK = 3^7 = 2187
+//   Key iterations = H13 * H5 * H7 = 455 (sha256 chain rounds)
+//   History cap  = H7 * H13 = 91
+//   Max scan files = H13 * H3 * H5 * H7 = 2730
+//
+// Endpoints:
+//   GET  /health                -- health check with ternary stats
+//   GET  /vault/status          -- session stats + password/lock state
+//   GET  /vault/scan            -- quick scan of C:\NovaX
+//   GET  /vault/list            -- list all .nova.vault files under C:\NovaX
+//   POST /vault/set-password    -- set or change master password
+//   POST /vault/unlock-session  -- unlock vault with password
+//   POST /vault/lock-session    -- lock vault (wipe key from memory)
+//   POST /vault/lock            -- encrypt + mark a single file
+//   POST /vault/unlock          -- decrypt a .nova.vault file
+//   POST /vault/lock-dir        -- encrypt eligible files in a directory
+//   POST /vault/scan-dir        -- scan directory for quantizable files
+//   POST /vault/shred           -- securely overwrite + delete a file
+
+// -- Port and version --
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9892
+let VERSION = "2.0"
+let SERVICE = "nova-vault"
+let VAULT_EXT = ".nova.vault"
+let KEY_FILE = "C:\\NovaX\\.vault_key"
+let DEFAULT_SCAN_DIR = "C:\\NovaX"
+
+// -- 3-5-7-13 Harmonic Constants --
+let BLOCK = 2187
+let KEY_ITERATIONS = 455
+let HISTORY_CAP = 91
+let MAX_SCAN_FILES = 2730
+
+// -- Ternary state symbols --
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// -- Reynolds boundaries (N-S flow routing) --
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+// -- Session state (in-memory only -- key is never written to disk) --
+let _vault_locked     = T_TRUE
+let _vault_setup      = T_FALSE
+let _vault_key_hash   = ""
+let _vault_salt       = ""
+let _vault_pw_hash    = ""
+
+// -- Lifetime counters --
+let _ops_total     = 0
+let _ops_success   = 0
+let _ops_maybe     = 0
+let _ops_fail      = 0
+let _files_locked  = 0
+let _files_unlocked = 0
+let _bytes_original = 0
+let _bytes_vaulted  = 0
+let _bytes_saved    = 0
+let _shredded      = 0
+let _errors        = 0
+
+// -- Operation history (capped at HISTORY_CAP) --
+let _history = []
+
+// -- Startup timestamp --
+let _t0 = time()
+
+// -- Server object (declare before fns so server is accessible in banner) --
+let server = tserve(PORT, "Nova Vault v2.0 - Drive Quantizer + XOR Encryption")
+
+// ============================================================
+// Helper: record op trit
+// ============================================================
+fn record_trit(trit) {
+    _ops_total = _ops_total + 1
+    if3 trit == T_TRUE { _ops_success = _ops_success + 1
+    } else trit == T_MAYBE { _ops_maybe = _ops_maybe + 1
+    } else { _ops_fail = _ops_fail + 1
+    }
+}
+
+// ============================================================
+// Helper: append to bounded history list
+// ============================================================
+fn hist_append(action, path_val) {
+    let entry = {"action": action, "path": path_val, "t": time()}
+    _history = append(_history, entry)
+    let hlen = len(_history)
+    if3 hlen > HISTORY_CAP {
+        _history = slice(_history, hlen - HISTORY_CAP, hlen)
+    }
+}
+
+// ============================================================
+// Helper: compute trit from result dict
+// Returns T_TRUE if dict has "ok":true, T_FALSE if has "error", T_MAYBE otherwise
+// ============================================================
+fn result_trit(res) {
+    let ok_val = dict_get(res, "ok") ?? false
+    let err_val = dict_get(res, "error") ?? ""
+    if3 ok_val == true {
+        return T_TRUE
+    }
+    if3 len(str(err_val)) > 0 {
+        return T_FALSE
+    }
+    return T_MAYBE
+}
+
+// ============================================================
+// Helper: trit char (+1 -> "1", 0 -> "0", -1 -> "T")
+// ============================================================
+fn trit_char(trit) {
+    if3 trit == T_TRUE {
+        return "1"
+    }
+    if3 trit == T_MAYBE {
+        return "0"
+    }
+    return "T"
+}
+
+// ============================================================
+// Helper: derive key from password + salt using sha256 chain
+// Returns 64-char hex string (sha256 output = 256 bits)
+// Chain: sha256(sha256(pass) + salt) repeated KEY_ITERATIONS times
+// ============================================================
+fn derive_key(password, salt) {
+    // PBKDF2-SHA256 with 100,000 iterations (NIST SP 800-132)
+    // Returns 64-char hex string (256-bit key for AES-256-GCM)
+    return pbkdf2(password, salt, 100000, 32)
+}
+
+// ============================================================
+// Key derivation helper: build integrity seal from data + key
+// Returns sha256(data_str + key) -- 64-char hex
+// ============================================================
+fn make_seal(data_str, key) {
+    // HMAC-SHA256 seal — tamper-proof integrity verification
+    return hmac_sha256(key, data_str)
+}
+
+// ============================================================
+// POST /vault/set-password
+// Body: {"password": "..."}
+// Sets or changes the master password. Derives key and stores
+// verification hash + salt to disk. Unlocks the vault session.
+// ============================================================
+fn handle_set_password(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let pw = dict_get(body, "password") ?? ""
+    if3 len(pw) < 4 {
+        let res = {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                   "error": "Password must be at least 4 characters"}
+        record_trit(T_FALSE)
+        return res
+    }
+
+    // Generate salt from cryptographic random bytes (16 bytes = 32 hex chars)
+    let salt = random_bytes(16)
+
+    // Derive key
+    let key = derive_key(pw, salt)
+
+    // Verification hash: sha256 of the derived key (never store the key itself)
+    let pw_hash = sha256(key)
+
+    // Persist verification data (not the key)
+    let save_data = json_encode({
+        "pw_hash": pw_hash,
+        "salt": salt,
+        "iterations": KEY_ITERATIONS,
+        "created": time()
+    })
+    write_file(KEY_FILE, save_data)
+
+    // Update in-memory state
+    _vault_pw_hash   = pw_hash
+    _vault_salt      = salt
+    _vault_key_hash  = key
+    _vault_locked    = T_FALSE
+    _vault_setup     = T_TRUE
+
+    hist_append("set-password", KEY_FILE)
+    record_trit(T_TRUE)
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "trit_char": "1",
+        "message": "Password set -- vault unlocked",
+        "salt_prefix": slice(salt, 0, 8)
+    }
+}
+
+// ============================================================
+// POST /vault/unlock-session
+// Body: {"password": "..."}
+// Verifies password and loads derived key into session memory.
+// ============================================================
+fn handle_unlock_session(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let pw = dict_get(body, "password") ?? ""
+
+    if3 _vault_setup != T_TRUE {
+        let res = {"ok": false, "trit": T_MAYBE, "trit_char": "0",
+                   "error": "No password set yet -- use set-password first"}
+        record_trit(T_MAYBE)
+        return res
+    }
+
+    // Load saved verification data from disk
+    let raw = read_file(KEY_FILE)
+    if3 len(raw) == 0 {
+        let res = {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                   "error": "Vault key file missing or unreadable"}
+        record_trit(T_FALSE)
+        return res
+    }
+
+    let saved = json_decode(raw)
+    let saved_pw_hash = dict_get(saved, "pw_hash") ?? ""
+    let saved_salt    = dict_get(saved, "salt") ?? ""
+
+    // Derive key candidate from supplied password
+    let key_candidate = derive_key(pw, saved_salt)
+    let check_hash    = sha256(key_candidate)
+
+    if3 check_hash != saved_pw_hash {
+        _errors = _errors + 1
+        let res = {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                   "error": "Wrong password"}
+        record_trit(T_FALSE)
+        return res
+    }
+
+    // Correct password -- load key into session
+    _vault_key_hash = key_candidate
+    _vault_salt     = saved_salt
+    _vault_pw_hash  = saved_pw_hash
+    _vault_locked   = T_FALSE
+    _vault_setup    = T_TRUE
+
+    hist_append("unlock-session", "session")
+    record_trit(T_TRUE)
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "trit_char": "1",
+        "message": "Vault unlocked"
+    }
+}
+
+// ============================================================
+// POST /vault/lock-session
+// Body: {} (no params needed)
+// Wipes the in-memory key. Vault remains configured on disk.
+// ============================================================
+fn handle_lock_session(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    _vault_key_hash = ""
+    _vault_locked   = T_TRUE
+
+    hist_append("lock-session", "session")
+    record_trit(T_TRUE)
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "trit_char": "1",
+        "message": "Vault locked -- key wiped from memory"
+    }
+}
+
+// ============================================================
+// Helper: check if vault session is unlocked
+// Returns T_TRUE if unlocked, T_FALSE if locked/not set up
+// ============================================================
+fn check_unlocked() {
+    if3 _vault_locked == T_FALSE {
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+// ============================================================
+// POST /vault/lock
+// Body: {"path": "/some/file.txt", "shred": false}
+// Encrypts a single file using XOR + sha256 key via nova_run().
+// Creates <path>.nova.vault JSON envelope beside the original.
+// ============================================================
+fn handle_lock(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let file_path = dict_get(body, "path") ?? ""
+    let shred_flag = dict_get(body, "shred") ?? false
+
+    if3 len(file_path) == 0 {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T", "error": "missing 'path'"}
+    }
+
+    let unlocked = check_unlocked()
+    if3 unlocked != T_TRUE {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                "error": "Vault is locked -- unlock-session first"}
+    }
+
+    // Safety: reject .nova.vault, .exe, .dll, .sys files
+    if3 contains(file_path, ".nova.vault") {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T", "error": "File is already vaulted"}
+    }
+    if3 contains(lower(file_path), ".exe") {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T", "error": "Cannot vault .exe files"}
+    }
+    if3 contains(lower(file_path), ".dll") {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T", "error": "Cannot vault .dll files"}
+    }
+    if3 contains(lower(file_path), ".sys") {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T", "error": "Cannot vault .sys files"}
+    }
+
+    // Native AES-256-GCM encryption (no subprocess needed)
+    let t_start = time()
+
+    // Read original file
+    let file_data = read_file(file_path)
+    if3 len(file_data) == 0 {
+        _errors = _errors + 1
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                "error": "Cannot read file: " + file_path}
+    }
+
+    let orig_size = len(file_data)
+
+    // Encrypt with AES-256-GCM (key is already 64 hex = 256 bits from PBKDF2)
+    let encrypted = aes_encrypt(file_data, _vault_key_hash)
+    if3 starts_with(encrypted, "ERROR") {
+        _errors = _errors + 1
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                "error": "Encryption failed: " + encrypted}
+    }
+
+    // Build vault envelope with metadata
+    let seal = hmac_sha256(_vault_key_hash, encrypted)
+    let vault_data = json_encode({
+        "version": 3,
+        "algorithm": "AES-256-GCM",
+        "kdf": "PBKDF2-SHA256-100K",
+        "original_name": file_path,
+        "original_size": orig_size,
+        "original_hash": sha256(file_data),
+        "ciphertext": encrypted,
+        "seal": seal,
+        "created": time()
+    })
+
+    // Write .nova.vault file
+    let vault_path = file_path + VAULT_EXT
+    write_file(vault_path, vault_data)
+
+    // Shred original if requested
+    if3 shred_flag == true {
+        shred_file(file_path)
+        _shredded = _shredded + 1
+    }
+
+    let vault_size = len(vault_data)
+    _files_locked = _files_locked + 1
+    _bytes_original = _bytes_original + orig_size
+    _bytes_vaulted = _bytes_vaulted + vault_size
+    hist_append("lock", file_path)
+    record_trit(T_TRUE)
+
+    let elapsed_ms = round((time() - t_start) * 1000, 2)
+    return {
+        "ok": true, "trit": T_TRUE, "trit_char": "1",
+        "message": "File encrypted with AES-256-GCM",
+        "original_size": orig_size,
+        "vault_size": vault_size,
+        "vault_path": vault_path,
+        "algorithm": "AES-256-GCM",
+        "ms": elapsed_ms
+    }
+}
+
+// ============================================================
+// POST /vault/unlock
+// Body: {"path": "/some/file.txt.nova.vault", "output": "/optional/out.txt"}
+// Decrypts a .nova.vault file back to the original.
+// ============================================================
+fn handle_unlock(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let vault_path  = dict_get(body, "path") ?? ""
+    let output_path = dict_get(body, "output") ?? ""
+
+    if3 len(vault_path) == 0 {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T", "error": "missing 'path'"}
+    }
+
+    let unlocked = check_unlocked()
+    if3 unlocked != T_TRUE {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                "error": "Vault is locked -- unlock-session first"}
+    }
+
+    let t_start = time()
+
+    // Read vault envelope
+    let raw = read_file(vault_path)
+    if3 len(raw) == 0 {
+        _errors = _errors + 1
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                "error": "Cannot read vault file: " + vault_path}
+    }
+
+    let envelope = json_decode(raw)
+    let version = dict_get(envelope, "version") ?? 0
+    let ciphertext = dict_get(envelope, "ciphertext") ?? ""
+    let stored_seal = dict_get(envelope, "seal") ?? ""
+
+    // Verify HMAC seal before decryption (tamper detection)
+    let check_seal = hmac_sha256(_vault_key_hash, ciphertext)
+    if3 check_seal != stored_seal {
+        _errors = _errors + 1
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                "error": "TAMPER DETECTED: seal mismatch — file may have been modified"}
+    }
+
+    // Decrypt with AES-256-GCM (authenticated — also detects wrong key)
+    let plaintext = aes_decrypt(ciphertext, _vault_key_hash)
+    if3 starts_with(plaintext, "ERROR") {
+        _errors = _errors + 1
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                "error": "Decryption failed (wrong key or tampered): " + plaintext}
+    }
+
+    // Verify integrity against original hash
+    let orig_hash = dict_get(envelope, "original_hash") ?? ""
+    if3 len(orig_hash) > 0 {
+        let decrypted_hash = sha256(plaintext)
+        if3 decrypted_hash != orig_hash {
+            _errors = _errors + 1
+            record_trit(T_FALSE)
+            return {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                    "error": "INTEGRITY FAILURE: decrypted data hash mismatch"}
+        }
+    }
+
+    // Determine output path
+    let out_path = output_path
+    if3 len(out_path) == 0 {
+        // Strip .nova.vault extension
+        let orig_name = dict_get(envelope, "original_name") ?? ""
+        if3 len(orig_name) > 0 {
+            out_path = orig_name
+        } else3 {
+            out_path = replace(vault_path, VAULT_EXT, "")
+        }
+    }
+
+    // Write decrypted file
+    write_file(out_path, plaintext)
+
+    let elapsed_ms = round((time() - t_start) * 1000, 2)
+    _files_unlocked = _files_unlocked + 1
+    hist_append("unlock", vault_path)
+    record_trit(T_TRUE)
+
+    return {
+        "ok": true, "trit": T_TRUE, "trit_char": "1",
+        "message": "File decrypted with AES-256-GCM",
+        "output_path": out_path,
+        "original_size": len(plaintext),
+        "algorithm": "AES-256-GCM",
+        "integrity": "verified",
+        "ms": elapsed_ms
+    }
+}
+
+// ============================================================
+// POST /vault/lock-dir
+// Body: {"path": "C:\\some\\dir", "shred": false, "max_files": 500}
+// Calls handle_lock() on eligible files discovered via nova_run("dir /s /b /a-d ...").
+// Excludes: .exe .dll .sys .bat .cmd .msi .drv .nova.vault
+// ============================================================
+fn handle_lock_dir(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let dir_path  = dict_get(body, "path") ?? ""
+    let shred_flag = dict_get(body, "shred") ?? false
+    let max_files = dict_get(body, "max_files") ?? 500
+
+    if3 len(dir_path) == 0 {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T", "error": "missing 'path'"}
+    }
+
+    let unlocked = check_unlocked()
+    if3 unlocked != T_TRUE {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T",
+                "error": "Vault is locked -- unlock-session first"}
+    }
+
+    // Get file list via dir /s /b /a-d (files only, recursive)
+    let list_cmd = "cmd /c dir /s /b /a-d \"" + dir_path + "\""
+    let dir_out = nova_run(list_cmd)
+
+    // Split on newline -- raw output line per file
+    let all_lines = split(dir_out, "\n")
+    let total_lines = len(all_lines)
+
+    let locked_list  = []
+    let skipped_list = []
+    let error_list   = []
+    let count        = 0
+
+    let i = 0
+    while3 i < total_lines {
+        if3 count >= max_files {
+            i = total_lines
+        }
+        if3 count < max_files {
+            let fpath = replace(all_lines[i], "\r", "")
+            // Skip blank lines and already-vaulted files
+            if3 len(fpath) > 0 {
+                if3 contains(fpath, ".nova.vault") == false {
+                    // Skip system extensions
+                    let skip = false
+                    let fpl = lower(fpath)
+                    if3 contains(fpl, ".exe") {
+                        skip = true
+                    }
+                    if3 contains(fpl, ".dll") {
+                        skip = true
+                    }
+                    if3 contains(fpl, ".sys") {
+                        skip = true
+                    }
+                    if3 contains(fpl, ".bat") {
+                        skip = true
+                    }
+                    if3 contains(fpl, ".cmd") {
+                        skip = true
+                    }
+                    if3 contains(fpl, ".msi") {
+                        skip = true
+                    }
+                    if3 contains(fpl, ".drv") {
+                        skip = true
+                    }
+                    // Skip excluded directories (check path contains them)
+                    if3 contains(fpath, "\\node_modules\\") {
+                        skip = true
+                    }
+                    if3 contains(fpath, "\\__pycache__\\") {
+                        skip = true
+                    }
+                    if3 contains(fpath, "\\ai_env\\") {
+                        skip = true
+                    }
+                    if3 contains(fpath, "\\venv\\") {
+                        skip = true
+                    }
+                    if3 contains(fpath, "\\Windows\\") {
+                        skip = true
+                    }
+
+                    if3 skip == true {
+                        skipped_list = append(skipped_list, {"path": fpath, "reason": "excluded"})
+                    } else skip == false {
+                        // Delegate to handle_lock
+                        let sub_body = {"path": fpath, "shred": shred_flag}
+                        let sub_res = handle_lock(sub_body)
+                        let sub_ok = dict_get(sub_res, "ok") ?? false
+                        if3 sub_ok == true {
+                            let saved_b = dict_get(sub_res, "saved_bytes") ?? 0
+                            let ratio   = dict_get(sub_res, "total_ratio") ?? "?"
+                            locked_list = append(locked_list, {"path": fpath, "saved": saved_b, "ratio": ratio})
+                        }
+                        if3 sub_ok != true {
+                            let sub_err = dict_get(sub_res, "error") ?? "unknown error"
+                            error_list = append(error_list, {"path": fpath, "error": sub_err})
+                        }
+                        count = count + 1
+                    } else {
+                        // should not reach -- skip == false branch covers it
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    let total_saved = 0
+    let li = 0
+    while3 li < len(locked_list) {
+        let entry = locked_list[li]
+        let sv = dict_get(entry, "saved") ?? 0
+        total_saved = total_saved + sv
+        li = li + 1
+    }
+    let saved_mb = round(total_saved / 1048576, 2)
+
+    record_trit(T_TRUE)
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "trit_char": "1",
+        "directory": dir_path,
+        "files_locked": len(locked_list),
+        "files_skipped": len(skipped_list),
+        "files_errored": len(error_list),
+        "total_saved_bytes": total_saved,
+        "total_saved_mb": saved_mb,
+        "details": {
+            "locked": locked_list,
+            "skipped": skipped_list,
+            "errors": error_list
+        }
+    }
+}
+
+// ============================================================
+// POST /vault/scan-dir  and  GET /vault/scan
+// Body: {"path": "...", "extensions": [...]}   (POST form)
+// Scans a directory, reports eligible files and estimated savings.
+// Uses nova_run("dir /s /b /a-d ...") for file discovery.
+// ============================================================
+fn do_scan_dir(dir_path) {
+    // Enumerate files via dir /s /b
+    let list_cmd = "cmd /c dir /s /b /a-d \"" + dir_path + "\""
+    let dir_out = nova_run(list_cmd)
+    let all_lines = split(dir_out, "\n")
+    let total_lines = len(all_lines)
+
+    let eligible  = []
+    let total_size = 0
+    let already_vaulted = 0
+    let skipped_count   = 0
+
+    let i = 0
+    while3 i < total_lines {
+        let fpath = replace(all_lines[i], "\r", "")
+        if3 len(fpath) > 0 {
+            if3 contains(fpath, ".nova.vault") {
+                already_vaulted = already_vaulted + 1
+            }
+            if3 contains(fpath, ".nova.vault") == false {
+                let fpl = lower(fpath)
+                let skip = false
+                if3 contains(fpl, ".exe") { skip = true }
+                if3 contains(fpl, ".dll") { skip = true }
+                if3 contains(fpl, ".sys") { skip = true }
+                if3 contains(fpl, ".bat") { skip = true }
+                if3 contains(fpl, ".cmd") { skip = true }
+                if3 contains(fpl, ".msi") { skip = true }
+                if3 contains(fpl, ".drv") { skip = true }
+                if3 contains(fpath, "\\node_modules\\") { skip = true }
+                if3 contains(fpath, "\\__pycache__\\")  { skip = true }
+                if3 contains(fpath, "\\ai_env\\")       { skip = true }
+                if3 contains(fpath, "\\venv\\")         { skip = true }
+                if3 contains(fpath, "\\Windows\\")      { skip = true }
+
+                if3 skip == false {
+                    // Get file size via a quick dir query on the single file
+                    let size_cmd = "cmd /c for %F in (\"" + fpath + "\") do @echo %~zF"
+                    let size_out = nova_run(size_cmd)
+                    let size_str = replace(replace(size_out, "\r", ""), "\n", "")
+                    let fsize = 0
+                    if3 len(size_str) > 0 {
+                        let fsize = int(size_str)
+                    }
+                    if3 fsize > 0 {
+                        eligible = append(eligible, {"path": fpath, "size": fsize})
+                        total_size = total_size + fsize
+                    }
+                }
+                if3 skip == true {
+                    skipped_count = skipped_count + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // Cap eligible list at MAX_SCAN_FILES
+    let elig_count = len(eligible)
+    let show_count = elig_count
+    if3 show_count > MAX_SCAN_FILES {
+        let show_count = MAX_SCAN_FILES
+    }
+    let sample = slice(eligible, 0, 30)
+
+    // Estimate savings: TZip ~50% compression minus ~2% encryption overhead = ~48%
+    let est_saved = int(total_size * 45 / 100)
+    let total_mb  = round(total_size / 1048576, 2)
+    let saved_mb  = round(est_saved  / 1048576, 2)
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "trit_char": "1",
+        "directory": dir_path,
+        "eligible_files": elig_count,
+        "total_size_bytes": total_size,
+        "total_size_mb": total_mb,
+        "estimated_savings_mb": saved_mb,
+        "already_vaulted": already_vaulted,
+        "skipped": skipped_count,
+        "sample_files": sample
+    }
+}
+
+fn handle_scan_dir(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let dir_path = dict_get(body, "path") ?? ""
+    if3 len(dir_path) == 0 {
+        let dir_path = dict_get(body, "directory") ?? DEFAULT_SCAN_DIR
+    }
+    if3 len(dir_path) == 0 {
+        let dir_path = DEFAULT_SCAN_DIR
+    }
+    let res = do_scan_dir(dir_path)
+    record_trit(dict_get(res, "trit") ?? T_MAYBE)
+    return res
+}
+
+// ============================================================
+// POST /vault/shred
+// Body: {"path": "/some/file.txt"}
+// Overwrites the file content with zeros 3 times then deletes it.
+// Uses nova_run() to call fsutil + del for secure overwrite.
+// ============================================================
+fn handle_shred(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let file_path = dict_get(body, "path") ?? ""
+    if3 len(file_path) == 0 {
+        record_trit(T_FALSE)
+        return {"ok": false, "trit": T_FALSE, "trit_char": "T", "error": "missing 'path'"}
+    }
+
+    // H3 = 3 overwrite passes
+    let shred_cmd = "cmd /c \"(for /L %i in (1,1,3) do @fsutil file setzerodata offset=0 length=999999999 \"" + file_path + "\") & del /f /q \"" + file_path + "\"\""
+    let out = nova_run(shred_cmd)
+
+    _shredded = _shredded + 1
+    hist_append("shred", file_path)
+    record_trit(T_TRUE)
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "trit_char": "1",
+        "shredded": file_path,
+        "passes": 3
+    }
+}
+
+// ============================================================
+// GET /vault/list
+// Lists all .nova.vault files under DEFAULT_SCAN_DIR.
+// ============================================================
+fn handle_list() {
+    let list_cmd = "cmd /c dir /s /b /a-d \"" + DEFAULT_SCAN_DIR + "\\*.nova.vault\""
+    let dir_out  = nova_run(list_cmd)
+    let lines    = split(dir_out, "\n")
+    let vaults   = []
+    let total_sz = 0
+
+    let i = 0
+    while3 i < len(lines) {
+        let fpath = replace(lines[i], "\r", "")
+        if3 len(fpath) > 0 {
+            if3 contains(fpath, ".nova.vault") {
+                let size_cmd = "cmd /c for %F in (\"" + fpath + "\") do @echo %~zF"
+                let sz_out   = nova_run(size_cmd)
+                let sz_str   = replace(replace(sz_out, "\r", ""), "\n", "")
+                let fsize = 0
+                if3 len(sz_str) > 0 {
+                    let fsize = int(sz_str)
+                }
+                vaults = append(vaults, {"path": fpath, "size": fsize})
+                total_sz = total_sz + fsize
+            }
+        }
+        i = i + 1
+    }
+
+    record_trit(T_TRUE)
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "trit_char": "1",
+        "count": len(vaults),
+        "total_size": total_sz,
+        "vaults": vaults
+    }
+}
+
+// ============================================================
+// GET /vault/status
+// Returns session stats, lock state, and lifetime counters.
+// ============================================================
+fn handle_vault_status() {
+    let uptime_sec = round(time() - _t0, 1)
+    let trit_val = T_MAYBE
+    if3 _vault_locked == T_FALSE {
+        let trit_val = T_TRUE
+    }
+
+    let overall_ratio = "0%"
+    let saved_mb = 0
+    if3 _bytes_original > 0 {
+        let ratio_pct = round(_bytes_vaulted * 100 / _bytes_original, 1)
+        let overall_ratio = str(ratio_pct) + "%"
+        let saved_mb = round(_bytes_saved / 1048576, 2)
+    }
+
+    // Last 10 history entries
+    let hist_len = len(_history)
+    let hist_start = hist_len - 10
+    if3 hist_start < 0 {
+        let hist_start = 0
+    }
+    let recent = slice(_history, hist_start, hist_len)
+
+    return {
+        "ok": true,
+        "trit": trit_val,
+        "trit_char": trit_char(trit_val),
+        "service": SERVICE,
+        "port": PORT,
+        "version": VERSION,
+        "password_set": _vault_setup == T_TRUE,
+        "locked": _vault_locked == T_TRUE,
+        "uptime_seconds": uptime_sec,
+        "files_locked": _files_locked,
+        "files_unlocked": _files_unlocked,
+        "bytes_original": _bytes_original,
+        "bytes_vaulted": _bytes_vaulted,
+        "bytes_saved": _bytes_saved,
+        "saved_mb": saved_mb,
+        "overall_ratio": overall_ratio,
+        "shredded": _shredded,
+        "errors": _errors,
+        "ops_total": _ops_total,
+        "ops_success": _ops_success,
+        "ops_maybe": _ops_maybe,
+        "ops_fail": _ops_fail,
+        "recent": recent,
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================
+// GET /health
+// ============================================================
+fn handle_health() {
+    let counters = {}
+    counters = dict_set(counters, "success", _ops_success)
+    counters = dict_set(counters, "partial", _ops_maybe)
+    counters = dict_set(counters, "failed", _ops_fail)
+    let resp = ns_health_dict(SERVICE, VERSION, PORT, counters)
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "password_set", _vault_setup == T_TRUE)
+    resp = dict_set(resp, "locked", _vault_locked == T_TRUE)
+    return resp
+}
+
+// ============================================================
+// Register Routes
+// ============================================================
+troute(server, "GET",  "/health",              "handle_health")
+troute(server, "GET",  "/vault/status",        "handle_vault_status")
+troute(server, "GET",  "/vault/scan",          "handle_scan_get")
+troute(server, "GET",  "/vault/list",          "handle_list_get")
+troute(server, "POST", "/vault/set-password",  "handle_set_password")
+troute(server, "POST", "/vault/unlock-session","handle_unlock_session")
+troute(server, "POST", "/vault/lock-session",  "handle_lock_session")
+troute(server, "POST", "/vault/lock",          "handle_lock")
+troute(server, "POST", "/vault/unlock",        "handle_unlock")
+troute(server, "POST", "/vault/lock-dir",      "handle_lock_dir")
+troute(server, "POST", "/vault/scan-dir",      "handle_scan_dir")
+troute(server, "POST", "/vault/shred",         "handle_shred")
+
+// -- GET-only wrappers (no body) for scan and list --
+fn handle_scan_get(body) {
+    return do_scan_dir(DEFAULT_SCAN_DIR)
+}
+
+fn handle_list_get(body) {
+    return handle_list()
+}
+
+// ============================================================
+// Startup: load saved password state if present
+// ============================================================
+let _init_raw = read_file(KEY_FILE)
+if3 len(_init_raw) > 0 {
+    let _init_saved = json_decode(_init_raw)
+    _vault_pw_hash = dict_get(_init_saved, "pw_hash") ?? ""
+    _vault_salt    = dict_get(_init_saved, "salt") ?? ""
+    if3 len(_vault_pw_hash) > 0 {
+        _vault_setup  = T_TRUE
+        _vault_locked = T_TRUE
+    }
+}
+
+// ============================================================
+// Startup Banner
+// ============================================================
+print("[Vault] NovaX Vault v" + VERSION + " starting on port " + str(PORT))
+print("[Vault] Runtime: NovaLang | Ternary: TRUE | ASCII-clean")
+print("[Vault] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[Vault] Block=" + str(BLOCK) + " | Re=" + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT))
+print("[Vault] Encryption: XOR-sha256 key derivation (" + str(KEY_ITERATIONS) + " rounds)")
+print("[Vault] Key file: " + KEY_FILE)
+print("[Vault] Password configured: " + str(_vault_setup == T_TRUE))
+print("[Vault] Session state: " + str(_vault_locked == T_TRUE) + " (locked on startup)")
+print("[Vault] Routes: GET /health /vault/status /vault/scan /vault/list")
+print("[Vault] Routes: POST /vault/set-password /vault/unlock-session /vault/lock-session")
+print("[Vault] Routes: POST /vault/lock /vault/unlock /vault/lock-dir /vault/scan-dir /vault/shred")
+print("[Vault] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

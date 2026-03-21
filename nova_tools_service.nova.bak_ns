@@ -1,0 +1,2706 @@
+// nova_tools_service.nova -- NovaX Native Tools v3.0 (NovaLang Port)
+// Port 9891 | Pure NovaLang port of nova_tools.py
+//
+// 7 Core Tools for AI models and agents:
+//   1. read  -- Read file(s), with TZip compression delegate
+//   2. write -- Write content to file
+//   3. grep  -- Search files by pattern (basic + regex delegate)
+//   4. glob  -- Find files by glob pattern
+//   5. run   -- Execute command through exec_server
+//   6. edit  -- Find-and-replace in files
+//   7. pipe  -- Chain tool calls sequentially
+//
+// TMulti Composition System (20 modes across 7 tools):
+//   read:  stats, diff, extract, classify
+//   write: template, append, atomic
+//   grep:  analyze, replace, todo
+//   glob:  tree, size, recent
+//   run:   safe, timed, retry
+//   edit:  regex, multi
+//   pipe:  parallel, conditional
+//
+// Ternary States:
+//   +1 (T_TRUE)  = success with data
+//    0 (T_MAYBE) = success but empty/partial
+//   -1 (T_FALSE) = failure/error
+//
+// N-S Flow Routing:
+//   Re < 27  (3^3)  = laminar  (clean)
+//   Re < 125 (5^3)  = transitional
+//   Re < 343 (7^3)  = turbulent
+//   Re >= 343       = chaotic
+//
+// Endpoints:
+//   GET  /health          -- Health check with ternary stats
+//   GET  /tools/status    -- Service status + metrics
+//   GET  /tools/predict   -- Markov prediction of next tool
+//   GET  /multi/modes     -- Available composition modes per tool
+//   POST /tools/read      -- Read file(s)
+//   POST /tools/write     -- Write content to file
+//   POST /tools/grep      -- Search files by pattern
+//   POST /tools/glob      -- Find files by glob pattern
+//   POST /tools/run       -- Execute command
+//   POST /tools/edit      -- Find-and-replace in files
+//   POST /tools/pipe      -- Chain tool calls
+//   POST /multi           -- TMulti composition (tool + mode + args)
+
+// ============================================================================
+// SERVER INIT
+// ============================================================================
+
+let PORT = 9891
+let server = tserve(PORT, "Nova Tools v3.0")
+
+// ============================================================================
+// 3-5-7-13 HARMONIC CONSTANTS
+// ============================================================================
+
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+let BLOCK_SIZE = 2187          // 3^7 = ternary-native block size
+
+// -- N-S Reynolds Boundaries (harmonic cubes) --
+let RE_LAMINAR     = 27        // 3^3
+let RE_TRANSITION  = 125       // 5^3
+let RE_TURBULENT   = 343       // 7^3
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Service Constants --
+let VERSION       = "3.0"
+let SERVICE       = "nova-tools"
+let NOVAX_ROOT    = "C:\\NovaX"
+let EXEC_SERVER   = "http://127.0.0.1:9877"
+let HIVEMIND      = "http://127.0.0.1:9881"
+
+// -- Path safety: restrict file operations to these roots --
+let ALLOWED_ROOTS = ["C:\\NovaX", "C:\\NovaX\\data", "C:\\NovaX\\memory", "C:\\NovaX\\web"]
+
+// ============================================================================
+// STATE DICTS
+// ============================================================================
+
+let _t0 = time()
+
+// -- Tool stats --
+let _ops_total   = 0
+let _ops_success = 0
+let _ops_maybe   = 0
+let _ops_fail    = 0
+let _op_times    = []
+
+// -- Metrics --
+let _calls_by_tool  = {}
+let _bytes_read     = 0
+let _bytes_written  = 0
+let _bytes_compressed = 0
+let _bytes_saved    = 0
+let _total_time_ms  = 0
+let _errors         = 0
+let _pipe_chains    = 0
+let _channel_hits   = {}
+let _recent_ops     = []
+
+// -- Tool history for Markov prediction --
+let _tool_history     = []
+let _tool_transitions = {}
+
+// -- Channel keywords for classification --
+let CHANNEL_KEYWORDS = {
+    "CODE": "def ,class ,import ,function,const ,let ,var ,return ,async ,await ,.py,.js,.ts,.cpp,.java,.rs,.go",
+    "MATH": "equation,integral,derivative,matrix,vector,theorem,calculate,solve,probability,statistical",
+    "REASON": "because,therefore,implies,conclude,analyze,evaluate,compare,contrast,argument,logic",
+    "FACT": "who is,what is,when did,where is,history,define,meaning of,fact,wikipedia",
+    "INSTRUCT": "how to,step by step,tutorial,guide,instructions,recipe,procedure,workflow",
+    "LONG": "essay,article,report,document,story,narrative,chapter,summary,abstract",
+    "DOMAIN": "medical,legal,financial,engineering,scientific,clinical,regulatory,compliance",
+    "AGENT": "execute,run ,launch,deploy,automate,schedule,trigger,pipeline,workflow",
+    "LANGUAGE": "translate,grammar,syntax,vocabulary,idiom,conjugate,declension",
+    "VISION": "image,picture,photo,screenshot,visual,diagram,chart,graph"
+}
+
+// -- Dangerous command patterns for run/safe --
+let DANGEROUS_CMDS = "rm -rf,del /s,del /q,format ,mkfs ,dd if=,:(){ ,taskkill /f,shutdown ,git push --force,git reset --hard,drop database,drop table,truncate ,chmod 777,chown -R,reg delete,netsh "
+
+// -- Uncertain command patterns for run/safe --
+let UNCERTAIN_CMDS = "git push,git rebase,pip install,npm install,docker rm,docker stop,mkdir -p,mv ,rename ,copy "
+
+// -- TODO urgency scores --
+let TODO_SCORES = {"FIXME": 7, "HACK": 5, "XXX": 5, "WARN": 3, "TODO": 1, "NOTE": 0}
+
+// -- TMulti mode descriptions --
+let MULTI_MODES = {
+    "read": {
+        "default": "read file contents",
+        "stats": "read + compute file statistics (lines, words, chars, entropy)",
+        "diff": "read + compare with another file (mini diff)",
+        "extract": "read + extract patterns (emails, URLs, numbers, IPs)",
+        "classify": "read + Reynolds classify the content complexity"
+    },
+    "write": {
+        "default": "write file contents",
+        "template": "write from template with variable substitution",
+        "append": "append to file instead of overwrite",
+        "atomic": "write atomically (tmp + rename, survives crashes)"
+    },
+    "grep": {
+        "default": "search for pattern",
+        "analyze": "grep + analyze: frequency, context, hotspots",
+        "replace": "grep + replace: find and replace across files",
+        "todo": "grep for TODO/FIXME/HACK/XXX patterns, scored by urgency"
+    },
+    "glob": {
+        "default": "find files by pattern",
+        "tree": "glob + build directory tree structure",
+        "size": "glob + sort by file size, show totals",
+        "recent": "glob + sort by modification time, show age"
+    },
+    "run": {
+        "default": "execute command",
+        "safe": "run with ternary safety gate (+1=safe, 0=uncertain, -1=blocked)",
+        "timed": "run + measure execution time",
+        "retry": "run with automatic retry on failure (up to H3=3 times)"
+    },
+    "edit": {
+        "default": "replace text in file",
+        "regex": "edit with regex pattern matching",
+        "multi": "edit across multiple files simultaneously"
+    },
+    "pipe": {
+        "default": "chain operations",
+        "parallel": "pipe with sequential execution of all steps",
+        "conditional": "pipe with ternary branching (+1 path / 0 path / -1 path)"
+    }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// -- Record op trit --
+fn record_trit(trit) {
+    let _ops_total = _ops_total + 1
+    if3 trit == T_TRUE {
+        let _ops_success = _ops_success + 1
+    } else trit == T_MAYBE {
+        let _ops_maybe = _ops_maybe + 1
+    } else {
+        let _ops_fail = _ops_fail + 1
+    }
+}
+
+// -- Trit character: +1->"1", 0->"0", -1->"T" --
+fn trit_char(trit) {
+    if trit == T_TRUE {
+        return "1"
+    }
+    if trit == T_MAYBE {
+        return "0"
+    }
+    return "T"
+}
+
+// -- Record metric for a tool call --
+fn record_metric(tool_name, elapsed_ms, data_sz, compressed_sz, channel, success) {
+    let prev = dict_get(_calls_by_tool, tool_name, 0)
+    dict_set(_calls_by_tool, tool_name, prev + 1)
+    let _total_time_ms = _total_time_ms + elapsed_ms
+    if data_sz > 0 {
+        let _bytes_read = _bytes_read + data_sz
+    }
+    if compressed_sz > 0 {
+        let _bytes_compressed = _bytes_compressed + compressed_sz
+        let saved = data_sz - compressed_sz
+        if saved > 0 {
+            let _bytes_saved = _bytes_saved + saved
+        }
+    }
+    if len(str(channel)) > 0 {
+        let ch_prev = dict_get(_channel_hits, channel, 0)
+        dict_set(_channel_hits, channel, ch_prev + 1)
+    }
+    if success == false {
+        let _errors = _errors + 1
+    }
+    // Append to recent ops (bounded list)
+    let entry = {"tool": tool_name, "ms": round(elapsed_ms, 2),
+                 "bytes": data_sz, "channel": channel, "ok": success, "t": time()}
+    append(_recent_ops, entry)
+    if len(_recent_ops) > 200 {
+        let _recent_ops = slice(_recent_ops, len(_recent_ops) - 200, len(_recent_ops))
+    }
+}
+
+// -- Record tool call for Markov prediction --
+fn record_tool_call(tool_name) {
+    if len(_tool_history) > 0 {
+        let prev = _tool_history[len(_tool_history) - 1]
+        let trans_key = prev
+        let existing = dict_get(_tool_transitions, trans_key, {})
+        let cnt = dict_get(existing, tool_name, 0)
+        dict_set(existing, tool_name, cnt + 1)
+        dict_set(_tool_transitions, trans_key, existing)
+    }
+    append(_tool_history, tool_name)
+    if len(_tool_history) > 50 {
+        let _tool_history = slice(_tool_history, len(_tool_history) - 50, len(_tool_history))
+    }
+}
+
+// -- Predict next tool via Markov chain --
+fn predict_next_tool() {
+    if len(_tool_history) == 0 {
+        return {}
+    }
+    let current = _tool_history[len(_tool_history) - 1]
+    let trans = dict_get(_tool_transitions, current, {})
+    let tk = keys(trans)
+    if len(tk) == 0 {
+        return {}
+    }
+    let total = 0
+    let i = 0
+    while3 i < len(tk) {
+        let total = total + dict_get(trans, tk[i], 0)
+        let i = i + 1
+    }
+    let predictions = {}
+    let j = 0
+    while3 j < len(tk) {
+        let prob = round(dict_get(trans, tk[j], 0) / total, 3)
+        dict_set(predictions, tk[j], prob)
+        let j = j + 1
+    }
+    return predictions
+}
+
+// -- Path safety: validate path is within allowed roots --
+// Uses nova_run to call realpath and compare
+fn safe_path(path_val) {
+    // Normalize with nova_run
+    let cmd = "python -c \"import os,json; p=os.path.realpath(r'" + path_val + "'); roots=[r'C:\\\\NovaX',r'C:\\\\NovaX\\\\data',r'C:\\\\NovaX\\\\memory',r'C:\\\\NovaX\\\\web']; ok=any(p.lower().startswith(os.path.realpath(r).lower()+'\\\\') or p.lower()==os.path.realpath(r).lower() for r in roots); print(json.dumps({'path':p,'ok':ok}))\""
+    let result = nova_run(cmd)
+    let parsed = json_decode(trim(result))
+    let is_ok = dict_get(parsed, "ok", false)
+    if is_ok == false {
+        return {"error": "Path outside allowed roots: " + path_val, "path": ""}
+    }
+    return {"error": "", "path": dict_get(parsed, "path", path_val)}
+}
+
+// -- Classify text into a flow channel via keyword matching --
+fn classify_channel(text_val) {
+    let text_lower = lower(text_val)
+    let best_ch = "INSTRUCT"
+    let best_score = 0
+    let ch_keys = keys(CHANNEL_KEYWORDS)
+    let ci = 0
+    while3 ci < len(ch_keys) {
+        let ch = ch_keys[ci]
+        let kw_str = dict_get(CHANNEL_KEYWORDS, ch, "")
+        let kw_list = split(kw_str, ",")
+        let score = 0
+        let ki = 0
+        while3 ki < len(kw_list) {
+            let kw = lower(kw_list[ki])
+            if contains(text_lower, kw) {
+                let score = score + 1
+            }
+            let ki = ki + 1
+        }
+        if score > best_score {
+            let best_score = score
+            let best_ch = ch
+        }
+        let ci = ci + 1
+    }
+    return best_ch
+}
+
+// -- Map file extension to flow channel --
+fn ext_to_channel(ext_val) {
+    let e = lower(ext_val)
+    let code_exts = ".py,.js,.ts,.jsx,.tsx,.cpp,.c,.h,.java,.rs,.go,.rb,.php,.cs,.swift,.kt"
+    let doc_exts = ".md,.txt,.rst,.doc,.docx,.pdf"
+    let data_exts = ".json,.yaml,.yml,.toml,.xml,.csv"
+    let web_exts = ".html,.css,.scss,.less"
+    let img_exts = ".png,.jpg,.jpeg,.gif,.svg,.bmp,.webp"
+
+    if contains(code_exts, e) {
+        return "CODE"
+    }
+    if contains(doc_exts, e) {
+        return "LONG"
+    }
+    if contains(data_exts, e) {
+        return "FACT"
+    }
+    if contains(web_exts, e) {
+        return "CODE"
+    }
+    if contains(img_exts, e) {
+        return "VISION"
+    }
+    if e == ".nova" {
+        return "AGENT"
+    }
+    return "INSTRUCT"
+}
+
+// -- Get file extension from path --
+fn get_ext(fpath) {
+    let parts = split(fpath, ".")
+    if len(parts) < 2 {
+        return ""
+    }
+    return "." + parts[len(parts) - 1]
+}
+
+// -- Reynolds number from op rate (ops in last 60s) --
+fn tools_reynolds() {
+    let now = time()
+    let count = 0
+    let oi = 0
+    while3 oi < len(_op_times) {
+        if now - _op_times[oi] < 60 {
+            let count = count + 1
+        }
+        let oi = oi + 1
+    }
+    return count
+}
+
+// -- Flow regime from Reynolds number --
+fn flow_regime(re_num) {
+    if re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// -- Compute tool trit from result dict --
+fn tool_trit(result) {
+    let ok_val = dict_get(result, "ok", false)
+    let err_val = dict_get(result, "error", "")
+    if ok_val == false {
+        return T_FALSE
+    }
+    if len(str(err_val)) > 0 {
+        return T_FALSE
+    }
+    let content = dict_get(result, "content", "")
+    let data_val = dict_get(result, "data", "")
+    let matches_val = dict_get(result, "matches", [])
+    let output_val = dict_get(result, "output", "")
+    if len(str(content)) > 0 {
+        return T_TRUE
+    }
+    if len(str(data_val)) > 0 {
+        return T_TRUE
+    }
+    if len(matches_val) > 0 {
+        return T_TRUE
+    }
+    if len(str(output_val)) > 0 {
+        return T_TRUE
+    }
+    return T_MAYBE
+}
+
+// -- Human-readable file size --
+fn human_size(sz) {
+    if sz < 1024 {
+        return str(sz) + "B"
+    }
+    let kb = round(sz / 1024, 1)
+    if kb < 1024 {
+        return str(kb) + "KB"
+    }
+    let mb = round(kb / 1024, 1)
+    if mb < 1024 {
+        return str(mb) + "MB"
+    }
+    let gb = round(mb / 1024, 1)
+    return str(gb) + "GB"
+}
+
+// -- Human-readable age --
+fn human_age(seconds_val) {
+    if seconds_val < 60 {
+        return str(int(seconds_val)) + "s ago"
+    }
+    if seconds_val < 3600 {
+        return str(int(seconds_val / 60)) + "m ago"
+    }
+    if seconds_val < 86400 {
+        return str(int(seconds_val / 3600)) + "h ago"
+    }
+    return str(int(seconds_val / 86400)) + "d ago"
+}
+
+// -- TZip compression ratio string --
+fn tzip_ratio_str(raw_sz, cmp_sz) {
+    if raw_sz == 0 {
+        return "0%"
+    }
+    let saved = round((1 - cmp_sz / raw_sz) * 100, 1)
+    return str(saved) + "%"
+}
+
+// ============================================================================
+// TZIP INTEGRATION LAYER -- Stage 2 Quantization
+// Transparent TZip compression via DeepStorage (port 9893)
+// After every write: shadow-quantize the file to DeepStorage
+// On read: report quantized status + compression ratio
+// ============================================================================
+
+let _tzip_enabled = true
+let _tzip_quantized = 0
+let _tzip_bytes_saved = 0
+let _tzip_bytes_original = 0
+let DEEPSTORAGE_URL = "http://127.0.0.1:9893"
+
+// Shadow-quantize a file to DeepStorage after write
+fn tzip_shadow_quantize(path) {
+    if _tzip_enabled == false {
+        return {"ok": false, "reason": "tzip disabled"}
+    }
+    // Fire quantize request to DeepStorage
+    let cmd = "python -c \"import urllib.request,json; "
+    let cmd = cmd + "req=urllib.request.Request('" + DEEPSTORAGE_URL + "/deep/quantize',"
+    let cmd = cmd + "data=json.dumps({'path':r'" + path + "'}).encode(),"
+    let cmd = cmd + "headers={'Content-Type':'application/json'},method='POST'); "
+    let cmd = cmd + "r=urllib.request.urlopen(req,timeout=10); "
+    let cmd = cmd + "print(r.read().decode())\""
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+    let ok = dict_get(result, "ok", false)
+    if ok == true {
+        let orig = dict_get(result, "original_size", 0)
+        let stored = dict_get(result, "stored_size", 0)
+        let saved = orig - stored
+        let _tzip_quantized = _tzip_quantized + 1
+        let _tzip_bytes_saved = _tzip_bytes_saved + saved
+        let _tzip_bytes_original = _tzip_bytes_original + orig
+    }
+    return result
+}
+
+// Check if a file has a TZip shadow in DeepStorage
+fn tzip_check_status(path) {
+    let cmd = "python -c \"import os,json; "
+    let cmd = cmd + "store=r'C:\\\\NovaX\\\\data\\\\deepstorage'; "
+    let cmd = cmd + "name=r'" + path + "'.replace('\\\\\\\\','/').replace(':','_').replace('/','_'); "
+    let cmd = cmd + "zpath=os.path.join(store, name+'.tzip'); "
+    let cmd = cmd + "exists=os.path.isfile(zpath); "
+    let cmd = cmd + "sz=os.path.getsize(zpath) if exists else 0; "
+    let cmd = cmd + "orig=os.path.getsize(r'" + path + "') if os.path.isfile(r'" + path + "') else 0; "
+    let cmd = cmd + "print(json.dumps({'quantized':exists,'stored_size':sz,'original_size':orig}))\""
+    let raw = nova_run(cmd)
+    return json_decode(trim(raw))
+}
+
+// Get TZip stats
+fn tzip_stats() {
+    let ratio = "0%"
+    if _tzip_bytes_original > 0 {
+        let saved_pct = round((1 - (_tzip_bytes_original - _tzip_bytes_saved) / _tzip_bytes_original) * 100, 1)
+        let ratio = str(saved_pct) + "%"
+    }
+    return {
+        "enabled": _tzip_enabled,
+        "files_quantized": _tzip_quantized,
+        "bytes_original": _tzip_bytes_original,
+        "bytes_saved": _tzip_bytes_saved,
+        "compression_ratio": ratio,
+        "deepstorage": DEEPSTORAGE_URL
+    }
+}
+
+// -- Record op time for Reynolds tracking --
+fn record_op_time() {
+    append(_op_times, time())
+    if len(_op_times) > 200 {
+        let _op_times = slice(_op_times, len(_op_times) - 200, len(_op_times))
+    }
+}
+
+// -- Record op stats (trit tracking) --
+fn record_op_trit(trit) {
+    let _ops_total = _ops_total + 1
+    record_op_time()
+    if3 trit == T_TRUE {
+        let _ops_success = _ops_success + 1
+    } else trit == T_MAYBE {
+        let _ops_maybe = _ops_maybe + 1
+    } else {
+        let _ops_fail = _ops_fail + 1
+    }
+}
+
+// ============================================================================
+// CORE TOOL: READ
+// ============================================================================
+
+fn do_tool_read(params) {
+    let t0 = time()
+    let path_val = dict_get(params, "path", "")
+    let offset_val = dict_get(params, "offset", 0)
+    let limit_val = dict_get(params, "limit", 0)
+    let pattern = dict_get(params, "pattern", "")
+
+    record_tool_call("read")
+
+    // Multi-file read via glob pattern
+    if len(str(pattern)) > 0 {
+        let cmd = "python -c \"import glob,json,os; files=glob.glob(r'" + pattern + "',recursive=True)[:50]; results=[]; "
+        let cmd = cmd + "[results.append({'path':f,'size':os.path.getsize(f),'lines':open(f,encoding='utf-8',errors='replace').read().count(chr(10))+1}) for f in files if os.path.isfile(f)]; "
+        let cmd = cmd + "print(json.dumps(results))\""
+        let raw = nova_run(cmd)
+        let files_data = json_decode(trim(raw))
+        let elapsed = round((time() - t0) * 1000, 2)
+        record_metric("read", elapsed, 0, 0, "CODE", true)
+        return {
+            "ok": true, "files": files_data, "count": len(files_data),
+            "ms": elapsed
+        }
+    }
+
+    // Single file read
+    if len(path_val) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+
+    let sp = safe_path(path_val)
+    let sp_err = dict_get(sp, "error", "")
+    if len(sp_err) > 0 {
+        return {"ok": false, "error": sp_err, "trit": T_FALSE}
+    }
+    let path_val = dict_get(sp, "path", path_val)
+
+    // Read via nova_read
+    let content = nova_read(path_val)
+    if len(content) == 0 {
+        // Check if file exists
+        let check = nova_run("python -c \"import os; print('1' if os.path.isfile(r'" + path_val + "') else '0')\"")
+        if trim(check) == "0" {
+            let elapsed = round((time() - t0) * 1000, 2)
+            record_metric("read", elapsed, 0, 0, "", false)
+            return {"ok": false, "error": "file not found: " + path_val, "trit": T_FALSE}
+        }
+    }
+
+    let lines = split(content, "\n")
+    let total_lines = len(lines)
+    let data_size = len(content)
+
+    // Apply line offset/limit
+    if offset_val > 0 {
+        if limit_val > 0 {
+            let lines = slice(lines, offset_val, offset_val + limit_val)
+        } else {
+            let lines = slice(lines, offset_val, total_lines)
+        }
+        let content = join(lines, "\n")
+    } else {
+        if limit_val > 0 {
+            let lines = slice(lines, 0, limit_val)
+            let content = join(lines, "\n")
+        }
+    }
+
+    let channel = classify_channel(slice(content, 0, min(500, len(content))))
+    let elapsed = round((time() - t0) * 1000, 2)
+    record_metric("read", elapsed, data_size, 0, channel, true)
+
+    // Stage 2: TZip shadow status -- report if compressed shadow exists
+    let tzip_info = {"quantized": false, "stored_size": 0}
+    if _tzip_enabled == true {
+        if data_size > 64 {
+            let tzip_info = tzip_check_status(path_val)
+        }
+    }
+    let tz_quantized = dict_get(tzip_info, "quantized", false)
+    let tz_stored = dict_get(tzip_info, "stored_size", 0)
+    let tz_ratio = "0%"
+    if tz_quantized == true {
+        if data_size > 0 {
+            let tz_ratio = tzip_ratio_str(tz_stored, data_size)
+        }
+    }
+
+    return {
+        "ok": true, "path": path_val, "size": data_size,
+        "total_lines": total_lines, "channel": channel,
+        "content": content, "ms": elapsed,
+        "tzip": {"quantized": tz_quantized, "stored_size": tz_stored, "ratio": tz_ratio}
+    }
+}
+
+// ============================================================================
+// CORE TOOL: WRITE
+// ============================================================================
+
+fn do_tool_write(params) {
+    let t0 = time()
+    let path_val = dict_get(params, "path", "")
+    let content = dict_get(params, "content", "")
+    let append_mode = dict_get(params, "append", false)
+
+    record_tool_call("write")
+
+    if len(path_val) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+
+    let sp = safe_path(path_val)
+    let sp_err = dict_get(sp, "error", "")
+    if len(sp_err) > 0 {
+        return {"ok": false, "error": sp_err, "trit": T_FALSE}
+    }
+    let path_val = dict_get(sp, "path", path_val)
+
+    // Check if file existed
+    let existed_check = nova_run("python -c \"import os; print('1' if os.path.isfile(r'" + path_val + "') else '0')\"")
+    let existed = trim(existed_check) == "1"
+
+    // Ensure directory exists
+    let dir_cmd = "python -c \"import os; d=os.path.dirname(r'" + path_val + "'); "
+    let dir_cmd = dir_cmd + "os.makedirs(d,exist_ok=True) if d else None; print('ok')\""
+    nova_run(dir_cmd)
+
+    // Write using nova_write (or append mode via nova_run)
+    if append_mode == true {
+        let esc_content = replace(replace(replace(content, "\\", "\\\\"), "'", "\\'"), "\n", "\\n")
+        let wcmd = "python -c \"f=open(r'" + path_val + "','a',encoding='utf-8'); f.write('" + esc_content + "'); f.close(); print('ok')\""
+        nova_run(wcmd)
+    } else {
+        nova_write(path_val, content)
+    }
+
+    let data_size = len(content)
+    let channel = classify_channel(slice(content, 0, min(500, len(content))))
+    let elapsed = round((time() - t0) * 1000, 2)
+    let _bytes_written = _bytes_written + data_size
+    record_metric("write", elapsed, data_size, 0, channel, true)
+
+    // Stage 2: TZip shadow quantize -- compress to DeepStorage after write
+    let tzip_result = {"ok": false, "reason": "skipped"}
+    let do_tzip = dict_get(params, "tzip", _tzip_enabled)
+    if do_tzip == true {
+        if data_size > 64 {
+            let tzip_result = tzip_shadow_quantize(path_val)
+        }
+    }
+
+    let tzip_ok = dict_get(tzip_result, "ok", false)
+    let tzip_saved = 0
+    let tzip_ratio = "n/a"
+    if tzip_ok == true {
+        let tzip_stored = dict_get(tzip_result, "stored_size", data_size)
+        let tzip_saved = data_size - tzip_stored
+        let tzip_ratio = tzip_ratio_str(data_size, tzip_stored)
+    }
+
+    return {
+        "ok": true, "path": path_val, "bytes_written": data_size,
+        "created": existed == false, "appended": append_mode,
+        "channel": channel, "ms": elapsed,
+        "tzip": {"quantized": tzip_ok, "bytes_saved": tzip_saved, "ratio": tzip_ratio}
+    }
+}
+
+// ============================================================================
+// CORE TOOL: GREP
+// ============================================================================
+
+fn do_tool_grep(params) {
+    let t0 = time()
+    let pattern_str = dict_get(params, "pattern", "")
+    let path_val = dict_get(params, "path", NOVAX_ROOT)
+    let glob_filter = dict_get(params, "glob", "*")
+    let max_results = dict_get(params, "max_results", 100)
+    let context_lines = dict_get(params, "context", 0)
+    let case_insensitive = dict_get(params, "case_insensitive", false)
+
+    record_tool_call("grep")
+
+    if len(pattern_str) == 0 {
+        return {"ok": false, "error": "missing 'pattern'", "trit": T_FALSE}
+    }
+
+    let sp = safe_path(path_val)
+    let sp_err = dict_get(sp, "error", "")
+    if len(sp_err) > 0 {
+        return {"ok": false, "error": sp_err, "trit": T_FALSE}
+    }
+    let path_val = dict_get(sp, "path", path_val)
+
+    // Delegate grep to python for regex support
+    let ci_flag = "re.IGNORECASE"
+    if case_insensitive == false {
+        let ci_flag = "0"
+    }
+    let esc_pat = replace(replace(pattern_str, "\\", "\\\\"), "'", "\\'")
+    // Use forward slashes for paths -- Python handles them on Windows
+    // Avoids NovaLang string parser crash with nested backslash escapes
+    let esc_path = replace(path_val, "\\", "/")
+    let esc_glob = replace(glob_filter, "\\", "/")
+
+    let cmd = "python -c \""
+    let cmd = cmd + "import os,re,json,fnmatch; "
+    let cmd = cmd + "pat=re.compile(r'" + esc_pat + "'," + ci_flag + "); "
+    let cmd = cmd + "path=r'" + esc_path + "'; "
+    let cmd = cmd + "gf='" + esc_glob + "'; "
+    let cmd = cmd + "matches=[]; fs=0; fm=0; tb=0; "
+    let cmd = cmd + "skip={'.git','__pycache__','node_modules','venv','ai_env'}; "
+    let cmd = cmd + "def sf(fp):\n"
+    let cmd = cmd + "  global fs,fm,tb\n"
+    let cmd = cmd + "  try:\n"
+    let cmd = cmd + "    c=open(fp,'r',encoding='utf-8',errors='replace').read(); fs+=1; tb+=len(c)\n"
+    let cmd = cmd + "    ls=c.split('\\n'); hits=[]\n"
+    let cmd = cmd + "    for i,l in enumerate(ls):\n"
+    let cmd = cmd + "      if pat.search(l): hits.append({'line_num':i+1,'line':l.rstrip()[:200]})\n"
+    let cmd = cmd + "    if hits: fm+=1; matches.append({'path':fp,'hits':len(hits),'matches':hits[:20]})\n"
+    let cmd = cmd + "  except: pass\n"
+    let cmd = cmd + "if os.path.isfile(path): sf(path)\n"
+    let cmd = cmd + "elif os.path.isdir(path):\n"
+    let cmd = cmd + "  for r,ds,fls in os.walk(path):\n"
+    let cmd = cmd + "    ds[:]=[d for d in ds if d not in skip and not d.startswith('.')]\n"
+    let cmd = cmd + "    for fn in fls:\n"
+    let cmd = cmd + "      if len(matches)>=" + str(max_results) + ": break\n"
+    let cmd = cmd + "      if fnmatch.fnmatch(fn,gf): sf(os.path.join(r,fn))\n"
+    let cmd = cmd + "    if len(matches)>=" + str(max_results) + ": break\n"
+    let cmd = cmd + "print(json.dumps({'matches':matches[:"+str(max_results)+"],'files_searched':fs,'files_matched':fm,'total_bytes':tb}))\""
+
+    let raw = nova_run(cmd)
+    let trimmed = trim(raw)
+    // Guard: if nova_run returns empty, return error instead of crashing json_decode
+    if3 len(trimmed) == 0 {
+        let elapsed = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "grep subprocess returned empty output", "pattern": pattern_str, "path": path_val, "ms": elapsed, "trit": T_FALSE}
+    }
+    let result = json_decode(trimmed)
+    let matches_list = dict_get(result, "matches", [])
+    let files_searched = dict_get(result, "files_searched", 0)
+    let files_matched = dict_get(result, "files_matched", 0)
+    let total_bytes = dict_get(result, "total_bytes", 0)
+
+    // Count total matches
+    let total_matches = 0
+    let mi = 0
+    while3 mi < len(matches_list) {
+        let total_matches = total_matches + dict_get(matches_list[mi], "hits", 0)
+        let mi = mi + 1
+    }
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    record_metric("grep", elapsed, total_bytes, 0, "CODE", true)
+
+    return {
+        "ok": true, "pattern": pattern_str, "matches": matches_list,
+        "files_searched": files_searched, "files_matched": files_matched,
+        "total_matches": total_matches, "ms": elapsed
+    }
+}
+
+// ============================================================================
+// CORE TOOL: GLOB
+// ============================================================================
+
+fn do_tool_glob(params) {
+    let t0 = time()
+    let pattern = dict_get(params, "pattern", "")
+    let path_val = dict_get(params, "path", NOVAX_ROOT)
+    let max_results = dict_get(params, "max_results", 200)
+    let include_size = dict_get(params, "include_size", true)
+
+    record_tool_call("glob")
+
+    if len(pattern) == 0 {
+        return {"ok": false, "error": "missing 'pattern'", "trit": T_FALSE}
+    }
+
+    let sp = safe_path(path_val)
+    let sp_err = dict_get(sp, "error", "")
+    if len(sp_err) > 0 {
+        return {"ok": false, "error": sp_err, "trit": T_FALSE}
+    }
+    let path_val = dict_get(sp, "path", path_val)
+
+    // Delegate glob to python
+    let esc_pat = replace(pattern, "\\", "\\\\")
+    let esc_path = replace(path_val, "\\", "/")
+
+    let cmd = "python -c \""
+    let cmd = cmd + "import glob,os,json; "
+    let cmd = cmd + "pat=r'" + esc_pat + "'; path=r'" + esc_path + "'; "
+    let cmd = cmd + "fp=os.path.join(path,pat) if not os.path.isabs(pat) else pat; "
+    let cmd = cmd + "files=glob.glob(fp,recursive=True); "
+    let cmd = cmd + "files.sort(key=lambda f:os.path.getmtime(f) if os.path.exists(f) else 0,reverse=True); "
+    let cmd = cmd + "results=[]; "
+    let cmd = cmd + "for f in files[:" + str(max_results) + "]:\n"
+    let cmd = cmd + "  e={'path':f}\n"
+    let cmd = cmd + "  if os.path.isfile(f): e['size']=os.path.getsize(f); e['modified']=os.path.getmtime(f)\n"
+    let cmd = cmd + "  ext=os.path.splitext(f)[1].lower()\n"
+    let cmd = cmd + "  e['ext']=ext\n"
+    let cmd = cmd + "  results.append(e)\n"
+    let cmd = cmd + "print(json.dumps({'files':results,'pattern':fp,'count':len(results)}))\""
+
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+    let files_list = dict_get(result, "files", [])
+    let full_pattern = dict_get(result, "pattern", pattern)
+
+    // Add channel classification
+    let fi = 0
+    while3 fi < len(files_list) {
+        let ext = dict_get(files_list[fi], "ext", "")
+        let ch = ext_to_channel(ext)
+        dict_set(files_list[fi], "channel", ch)
+        let fi = fi + 1
+    }
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    record_metric("glob", elapsed, 0, 0, "CODE", true)
+
+    return {
+        "ok": true, "pattern": full_pattern, "count": len(files_list),
+        "files": files_list, "ms": elapsed
+    }
+}
+
+// ============================================================================
+// CORE TOOL: RUN
+// ============================================================================
+
+fn do_tool_run(params) {
+    let t0 = time()
+    let command = dict_get(params, "command", "")
+    let timeout = dict_get(params, "timeout", 30)
+
+    record_tool_call("run")
+
+    if len(command) == 0 {
+        return {"ok": false, "error": "missing 'command'", "trit": T_FALSE}
+    }
+
+    // Execute through exec_server
+    let exec_body = json_encode({"command": command, "timeout": timeout})
+    let resp_raw = ""
+    try3 {
+        let resp_raw = http_post(EXEC_SERVER + "/exec", exec_body, "application/json")
+    } else {
+        let elapsed = round((time() - t0) * 1000, 2)
+        record_metric("run", elapsed, 0, 0, "", false)
+        return {"ok": false, "error": "exec_server unreachable", "trit": T_FALSE}
+    }
+
+    let result = json_decode(resp_raw)
+    let stdout_val = dict_get(result, "stdout", "")
+    let stderr_val = dict_get(result, "stderr", "")
+    let code_val = dict_get(result, "code", -1)
+    let ok_val = dict_get(result, "ok", false)
+
+    let channel = classify_channel(command)
+    let elapsed = round((time() - t0) * 1000, 2)
+    let raw_len = len(stdout_val) + len(stderr_val)
+    record_metric("run", elapsed, raw_len, 0, channel, ok_val)
+
+    return {
+        "ok": ok_val, "code": code_val,
+        "stdout": stdout_val, "stderr": stderr_val,
+        "channel": channel, "ms": elapsed
+    }
+}
+
+// ============================================================================
+// CORE TOOL: EDIT
+// ============================================================================
+
+fn do_tool_edit(params) {
+    let t0 = time()
+    let path_val = dict_get(params, "path", "")
+    let old_string = dict_get(params, "old_string", "")
+    let new_string = dict_get(params, "new_string", "")
+    let regex_mode = dict_get(params, "regex", false)
+    let replace_all_mode = dict_get(params, "replace_all", false)
+
+    record_tool_call("edit")
+
+    if len(path_val) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+
+    let sp = safe_path(path_val)
+    let sp_err = dict_get(sp, "error", "")
+    if len(sp_err) > 0 {
+        return {"ok": false, "error": sp_err, "trit": T_FALSE}
+    }
+    let path_val = dict_get(sp, "path", path_val)
+
+    if len(old_string) == 0 {
+        return {"ok": false, "error": "missing 'old_string'", "trit": T_FALSE}
+    }
+
+    // Read original content
+    let original = nova_read(path_val)
+    if len(original) == 0 {
+        let check = nova_run("python -c \"import os; print('1' if os.path.isfile(r'" + path_val + "') else '0')\"")
+        if trim(check) == "0" {
+            let elapsed = round((time() - t0) * 1000, 2)
+            record_metric("edit", elapsed, 0, 0, "", false)
+            return {"ok": false, "error": "file not found: " + path_val, "trit": T_FALSE}
+        }
+    }
+
+    // For regex mode, delegate to python
+    if regex_mode == true {
+        let esc_old = replace(replace(old_string, "\\", "\\\\"), "'", "\\'")
+        let esc_new = replace(replace(new_string, "\\", "\\\\"), "'", "\\'")
+        let esc_p = replace(path_val, "\\", "/")
+        let count_flag = "0"
+        if replace_all_mode == true {
+            let count_flag = "0"
+        } else {
+            let count_flag = "1"
+        }
+        let cmd = "python -c \""
+        let cmd = cmd + "import re,json; "
+        let cmd = cmd + "c=open(r'" + esc_p + "','r',encoding='utf-8',errors='replace').read(); "
+        if replace_all_mode == true {
+            let cmd = cmd + "n,cnt=re.subn(r'" + esc_old + "',r'" + esc_new + "',c); "
+        } else {
+            let cmd = cmd + "n,cnt=re.subn(r'" + esc_old + "',r'" + esc_new + "',c,count=1); "
+        }
+        let cmd = cmd + "open(r'" + esc_p + "','w',encoding='utf-8').write(n) if cnt>0 else None; "
+        let cmd = cmd + "print(json.dumps({'count':cnt,'new_size':len(n)}))\""
+        let raw = nova_run(cmd)
+        let rr = json_decode(trim(raw))
+        let count = dict_get(rr, "count", 0)
+        if count == 0 {
+            let elapsed = round((time() - t0) * 1000, 2)
+            record_metric("edit", elapsed, 0, 0, "", false)
+            return {"ok": false, "error": "old_string not found in file", "path": path_val, "trit": T_FALSE}
+        }
+        let elapsed = round((time() - t0) * 1000, 2)
+        record_metric("edit", elapsed, len(original), 0, "", true)
+        return {
+            "ok": true, "path": path_val, "replacements": count,
+            "regex": true, "ms": elapsed
+        }
+    }
+
+    // Plain string replacement
+    if contains(original, old_string) == false {
+        let elapsed = round((time() - t0) * 1000, 2)
+        record_metric("edit", elapsed, 0, 0, "", false)
+        return {"ok": false, "error": "old_string not found in file", "path": path_val, "trit": T_FALSE}
+    }
+
+    let new_content = ""
+    let count = 0
+    if replace_all_mode == true {
+        let new_content = replace(original, old_string, new_string)
+        // Count occurrences
+        let tmp = original
+        while3 contains(tmp, old_string) {
+            let count = count + 1
+            let idx_parts = split(tmp, old_string)
+            if len(idx_parts) > 1 {
+                let tmp = join(slice(idx_parts, 1, len(idx_parts)), old_string)
+            } else {
+                let tmp = ""
+    } else {
+        let new_content = replace(original, old_string, new_string)
+        // replace() in NovaLang replaces all -- we need manual first-only
+        // Find first occurrence position via split
+        let parts = split(original, old_string)
+        if len(parts) >= 2 {
+            let new_content = parts[0] + new_string + join(slice(parts, 1, len(parts)), old_string)
+            let count = 1
+        }
+    }
+
+    // Write the modified content
+    nova_write(path_val, new_content)
+
+    let channel = classify_channel(slice(new_content, 0, min(500, len(new_content))))
+    let elapsed = round((time() - t0) * 1000, 2)
+    record_metric("edit", elapsed, len(new_content), 0, channel, true)
+
+    return {
+        "ok": true, "path": path_val, "replacements": count,
+        "original_size": len(original), "new_size": len(new_content),
+        "channel": channel, "ms": elapsed
+    }
+}
+
+// ============================================================================
+// CORE TOOL: PIPE
+// ============================================================================
+}
+}
+
+fn do_tool_pipe(params) {
+    let t0 = time()
+    let pipeline = dict_get(params, "pipeline", [])
+
+    record_tool_call("pipe")
+    let _pipe_chains = _pipe_chains + 1
+
+    if len(pipeline) == 0 {
+        return {"ok": false, "error": "missing 'pipeline' (list of tool calls)", "trit": T_FALSE}
+    }
+
+    let results = []
+    let carry = {}
+    let all_ok = true
+    let pi = 0
+
+    while3 pi < len(pipeline) {
+        let step = pipeline[pi]
+        let tool_name = dict_get(step, "tool", "")
+        let step_params = dict_get(step, "params", {})
+
+        // Inject carry data from previous step
+        if len(keys(carry)) > 0 {
+            dict_set(step_params, "_carry", carry)
+        }
+
+        // Dispatch tool
+        let step_result = {}
+        if3 tool_name == "read" {
+            let step_result = do_tool_read(step_params)
+        } else tool_name == "write" {
+            let step_result = do_tool_write(step_params)
+        } else tool_name == "grep" {
+            let step_result = do_tool_grep(step_params)
+        } else tool_name == "glob" {
+            let step_result = do_tool_glob(step_params)
+        } else tool_name == "run" {
+            let step_result = do_tool_run(step_params)
+        } else tool_name == "edit" {
+            let step_result = do_tool_edit(step_params)
+        } else {
+            let step_result = {"ok": false, "error": "unknown tool: " + tool_name}
+        }
+
+        dict_set(step_result, "step", pi)
+        dict_set(step_result, "tool", tool_name)
+        append(results, step_result)
+
+        let step_ok = dict_get(step_result, "ok", false)
+        if step_ok == false {
+            let all_ok = false
+            let pi = len(pipeline)
+        }
+
+        // Extract carry for next step
+        let carry = {}
+        if dict_has(step_result, "content") {
+            dict_set(carry, "content", dict_get(step_result, "content", ""))
+        }
+        if dict_has(step_result, "files") {
+            dict_set(carry, "files", dict_get(step_result, "files", []))
+        }
+        if dict_has(step_result, "matches") {
+            dict_set(carry, "matches", dict_get(step_result, "matches", []))
+        }
+        if dict_has(step_result, "stdout") {
+            dict_set(carry, "content", dict_get(step_result, "stdout", ""))
+        }
+
+        let pi = pi + 1
+    }
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    record_metric("pipe", elapsed, 0, 0, "", all_ok)
+
+    return {
+        "ok": all_ok, "steps": len(results), "results": results,
+        "prediction": predict_next_tool(), "ms": elapsed
+    }
+}
+
+// ============================================================================
+// TMULTI: READ MODES
+// ============================================================================
+
+// read/stats: Read file + compute statistics
+fn multi_read_stats(args) {
+    let path_val = dict_get(args, "path", "")
+    if len(path_val) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+    let sp = safe_path(path_val)
+    let sp_err = dict_get(sp, "error", "")
+    if len(sp_err) > 0 {
+        return {"ok": false, "error": sp_err, "trit": T_FALSE}
+    }
+    let path_val = dict_get(sp, "path", path_val)
+
+    // Delegate stats computation to python (entropy, word count, etc.)
+    let esc_p = replace(path_val, "\\", "/")
+    let cmd = "python -c \""
+    let cmd = cmd + "import os,json,math; "
+    let cmd = cmd + "from collections import Counter; "
+    let cmd = cmd + "raw=open(r'" + esc_p + "','rb').read(); "
+    let cmd = cmd + "text=raw.decode('utf-8',errors='replace'); "
+    let cmd = cmd + "lines=text.split('\\n'); words=text.split(); "
+    let cmd = cmd + "freq=Counter(raw); L=len(raw); "
+    let cmd = cmd + "ent=round(-sum(c/L*math.log2(c/L) for c in freq.values() if c>0),4) if L>0 else 0; "
+    let cmd = cmd + "blank=sum(1 for l in lines if not l.strip()); "
+    let cmd = cmd + "avg_ll=round(sum(len(l) for l in lines)/max(len(lines),1),1); "
+    let cmd = cmd + "max_ll=max((len(l) for l in lines),default=0); "
+    let cmd = cmd + "print(json.dumps({'bytes':len(raw),'lines':len(lines),'words':len(words),"
+    let cmd = cmd + "'chars':len(text),'entropy':ent,'blank_lines':blank,"
+    let cmd = cmd + "'avg_line_length':avg_ll,'max_line_length':max_ll}))\""
+
+    let raw_result = nova_run(cmd)
+    let stats = json_decode(trim(raw_result))
+    let entropy = dict_get(stats, "entropy", 0)
+
+    // Entropy trit: >4.0 = good code, 2-4 = repetitive, <2 = binary/empty
+    let etrit = T_MAYBE
+    if entropy > 4.0 {
+        let etrit = T_TRUE
+    }
+    if entropy < 2.0 {
+        let etrit = T_FALSE
+    }
+
+    let etrit_desc = "repetitive"
+    if etrit == T_TRUE {
+        let etrit_desc = "good code/text"
+    }
+    if etrit == T_FALSE {
+        let etrit_desc = "binary/empty"
+    }
+
+    dict_set(stats, "entropy_trit", etrit)
+    dict_set(stats, "entropy_char", trit_char(etrit))
+    dict_set(stats, "entropy_desc", etrit_desc)
+
+    return {"ok": true, "path": path_val, "stats": stats, "trit": etrit}
+}
+
+// read/diff: Compare two files
+fn multi_read_diff(args) {
+    let path_a = dict_get(args, "path", dict_get(args, "path_a", ""))
+    let path_b = dict_get(args, "path_b", "")
+
+    if len(path_a) == 0 {
+        return {"ok": false, "error": "need 'path' (or 'path_a') and 'path_b'", "trit": T_FALSE}
+    }
+    if len(path_b) == 0 {
+        return {"ok": false, "error": "need 'path' (or 'path_a') and 'path_b'", "trit": T_FALSE}
+    }
+
+    let sp_a = safe_path(path_a)
+    if len(dict_get(sp_a, "error", "")) > 0 {
+        return {"ok": false, "error": dict_get(sp_a, "error", ""), "trit": T_FALSE}
+    }
+    let path_a = dict_get(sp_a, "path", path_a)
+
+    let sp_b = safe_path(path_b)
+    if len(dict_get(sp_b, "error", "")) > 0 {
+        return {"ok": false, "error": dict_get(sp_b, "error", ""), "trit": T_FALSE}
+    }
+    let path_b = dict_get(sp_b, "path", path_b)
+
+    // Delegate diff to python
+    let esc_a = replace(path_a, "\\", "/")
+    let esc_b = replace(path_b, "\\", "/")
+    let cmd = "python -c \""
+    let cmd = cmd + "import json; "
+    let cmd = cmd + "la=open(r'" + esc_a + "','r',encoding='utf-8',errors='replace').readlines(); "
+    let cmd = cmd + "lb=open(r'" + esc_b + "','r',encoding='utf-8',errors='replace').readlines(); "
+    let cmd = cmd + "diffs=[]; add=0; rem=0; chg=0; "
+    let cmd = cmd + "ml=max(len(la),len(lb)); "
+    let cmd = cmd + "for i in range(ml):\n"
+    let cmd = cmd + "  a=la[i].rstrip() if i<len(la) else None\n"
+    let cmd = cmd + "  b=lb[i].rstrip() if i<len(lb) else None\n"
+    let cmd = cmd + "  if a==b: continue\n"
+    let cmd = cmd + "  if a is None: diffs.append({'line':i+1,'type':'added','content':b}); add+=1\n"
+    let cmd = cmd + "  elif b is None: diffs.append({'line':i+1,'type':'removed','content':a}); rem+=1\n"
+    let cmd = cmd + "  else: diffs.append({'line':i+1,'type':'changed','old':a,'new':b}); chg+=1\n"
+    let cmd = cmd + "print(json.dumps({'added':add,'removed':rem,'changed':chg,'total':add+rem+chg,'diffs':diffs[:100],'lines_a':len(la),'lines_b':len(lb)}))\""
+
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+    let total_diffs = dict_get(result, "total", 0)
+
+    // Trit: +1=identical, 0=minor (<H13), -1=major
+    let dtrit = T_FALSE
+    if total_diffs == 0 {
+        let dtrit = T_TRUE
+    }
+    if total_diffs > 0 {
+        if total_diffs < H13 {
+            let dtrit = T_MAYBE
+        }
+    }
+
+    return {
+        "ok": true, "path_a": path_a, "path_b": path_b,
+        "summary": {"added": dict_get(result, "added", 0),
+                     "removed": dict_get(result, "removed", 0),
+                     "changed": dict_get(result, "changed", 0),
+                     "total": total_diffs},
+        "diffs": dict_get(result, "diffs", []),
+        "lines_a": dict_get(result, "lines_a", 0),
+        "lines_b": dict_get(result, "lines_b", 0),
+        "trit": dtrit
+    }
+}
+
+// read/extract: Extract patterns (emails, URLs, IPs, numbers)
+fn multi_read_extract(args) {
+    let path_val = dict_get(args, "path", "")
+    if len(path_val) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+    let sp = safe_path(path_val)
+    if len(dict_get(sp, "error", "")) > 0 {
+        return {"ok": false, "error": dict_get(sp, "error", ""), "trit": T_FALSE}
+    }
+    let path_val = dict_get(sp, "path", path_val)
+
+    let esc_p = replace(path_val, "\\", "/")
+    let cmd = "python -c \""
+    let cmd = cmd + "import re,json; "
+    let cmd = cmd + "text=open(r'" + esc_p + "','r',encoding='utf-8',errors='replace').read(); "
+    let cmd = cmd + "emails=list(set(re.findall(r'[\\w.+-]+@[\\w.-]+\\.\\w+',text))); "
+    let cmd = cmd + "urls=list(set(re.findall(r'https?://\\S+',text))); "
+    let cmd = cmd + "ips=list(set(re.findall(r'\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\b',text))); "
+    let cmd = cmd + "nums=re.findall(r'\\b\\d+\\b',text)[:100]; "
+    let cmd = cmd + "print(json.dumps({'emails':emails,'urls':urls,'ips':ips,'numbers':nums}))\""
+
+    let raw = nova_run(cmd)
+    let extractions = json_decode(trim(raw))
+    let email_cnt = len(dict_get(extractions, "emails", []))
+    let url_cnt = len(dict_get(extractions, "urls", []))
+    let ip_cnt = len(dict_get(extractions, "ips", []))
+    let num_cnt = len(dict_get(extractions, "numbers", []))
+    let total = email_cnt + url_cnt + ip_cnt + num_cnt
+
+    let etrit = T_MAYBE
+    if total > 0 {
+        let etrit = T_TRUE
+    }
+
+    return {
+        "ok": true, "path": path_val, "extractions": extractions,
+        "counts": {"emails": email_cnt, "urls": url_cnt, "ips": ip_cnt, "numbers": num_cnt},
+        "total_extracted": total, "trit": etrit
+    }
+}
+
+// read/classify: Reynolds classify content complexity
+fn multi_read_classify(args) {
+    let path_val = dict_get(args, "path", "")
+    if len(path_val) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+    let sp = safe_path(path_val)
+    if len(dict_get(sp, "error", "")) > 0 {
+        return {"ok": false, "error": dict_get(sp, "error", ""), "trit": T_FALSE}
+    }
+    let path_val = dict_get(sp, "path", path_val)
+
+    let text = nova_read(path_val)
+    let lines = split(text, "\n")
+    let num_lines = len(lines)
+
+    if num_lines == 0 {
+        return {"ok": true, "path": path_val, "reynolds": 0,
+                "regime": "laminar", "trit": T_FALSE, "lines": 0, "avg_line_length": 0}
+    }
+
+    let total_len = 0
+    let li = 0
+    while3 li < num_lines {
+        let total_len = total_len + len(lines[li])
+        let li = li + 1
+    }
+    let avg_len = round(total_len / num_lines, 1)
+    let re_num = round(num_lines * avg_len / 100.0, 2)
+    let regime = flow_regime(int(re_num))
+
+    // Trit: laminar=+1, transitional=0, turbulent/chaotic=-1
+    let rtrit = T_FALSE
+    if re_num < RE_LAMINAR {
+        let rtrit = T_TRUE
+    }
+    if re_num >= RE_LAMINAR {
+        if re_num < RE_TRANSITION {
+            let rtrit = T_MAYBE
+        }
+    }
+
+    let channel = classify_channel(slice(text, 0, min(500, len(text))))
+
+    return {
+        "ok": true, "path": path_val, "reynolds": re_num,
+        "regime": regime, "trit": rtrit,
+        "lines": num_lines, "avg_line_length": avg_len,
+        "channel": channel
+    }
+}
+
+// ============================================================================
+// TMULTI: WRITE MODES
+// ============================================================================
+
+// write/template: Write from template with {{variable}} substitution
+fn multi_write_template(args) {
+    let path_val = dict_get(args, "path", "")
+    let template = dict_get(args, "template", dict_get(args, "content", ""))
+    let variables = dict_get(args, "variables", {})
+
+    if len(path_val) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+    if len(template) == 0 {
+        return {"ok": false, "error": "missing 'template' or 'content'", "trit": T_FALSE}
+    }
+
+    let sp = safe_path(path_val)
+    if len(dict_get(sp, "error", "")) > 0 {
+        return {"ok": false, "error": dict_get(sp, "error", ""), "trit": T_FALSE}
+    }
+    let path_val = dict_get(sp, "path", path_val)
+
+    // Substitute {{var}} patterns
+    let content = template
+    let substitutions = 0
+    let var_keys = keys(variables)
+    let vi = 0
+    while3 vi < len(var_keys) {
+        let vk = var_keys[vi]
+        let vv = str(dict_get(variables, vk, ""))
+        let placeholder = "{{" + vk + "}}"
+        if contains(content, placeholder) {
+            let content = replace(content, placeholder, vv)
+            let substitutions = substitutions + 1
+        }
+        let vi = vi + 1
+    }
+
+    // Write the file
+    // Ensure directory exists
+    let dir_cmd = "python -c \"import os; d=os.path.dirname(r'" + replace(path_val, "\\", "/") + "'); os.makedirs(d,exist_ok=True) if d else None; print('ok')\""
+    nova_run(dir_cmd)
+    nova_write(path_val, content)
+
+    // Check for unresolved placeholders
+    let has_unresolved = contains(content, "{{")
+    let wtrit = T_TRUE
+    if has_unresolved {
+        let wtrit = T_MAYBE
+    }
+
+    return {
+        "ok": true, "path": path_val, "bytes_written": len(content),
+        "substitutions": substitutions, "trit": wtrit
+    }
+}
+
+// write/append: Append to file instead of overwrite
+fn multi_write_append(args) {
+    dict_set(args, "append", true)
+    return do_tool_write(args)
+}
+
+// write/atomic: Atomic write via tmp file + rename
+fn multi_write_atomic(args) {
+    let path_val = dict_get(args, "path", "")
+    let content = dict_get(args, "content", "")
+
+    if len(path_val) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+    let sp = safe_path(path_val)
+    if len(dict_get(sp, "error", "")) > 0 {
+        return {"ok": false, "error": dict_get(sp, "error", ""), "trit": T_FALSE}
+    }
+    let path_val = dict_get(sp, "path", path_val)
+
+    // Delegate atomic write to python (tmpfile + rename)
+    let esc_p = replace(path_val, "\\", "/")
+    let esc_c = replace(replace(replace(content, "\\", "\\\\"), "'", "\\'"), "\n", "\\n")
+    let cmd = "python -c \""
+    let cmd = cmd + "import os,tempfile,json; "
+    let cmd = cmd + "p=r'" + esc_p + "'; "
+    let cmd = cmd + "d=os.path.dirname(p) or '.'; "
+    let cmd = cmd + "os.makedirs(d,exist_ok=True) if not os.path.isdir(d) else None; "
+    let cmd = cmd + "fd,tp=tempfile.mkstemp(dir=d,prefix='.nova_atomic_'); "
+    let cmd = cmd + "os.write(fd,'" + esc_c + "'.encode('utf-8')); os.close(fd); "
+    let cmd = cmd + "os.replace(tp,p) if os.path.exists(p) else os.rename(tp,p); "
+    let cmd = cmd + "print(json.dumps({'ok':True,'bytes':len('" + esc_c + "')}))\""
+
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+
+    return {
+        "ok": true, "path": path_val, "bytes_written": len(content),
+        "atomic": true, "trit": T_TRUE
+    }
+}
+
+// ============================================================================
+// TMULTI: GREP MODES
+// ============================================================================
+
+// grep/analyze: Grep + frequency analysis, hotspot detection
+fn multi_grep_analyze(args) {
+    let t0 = time()
+    let pattern_str = dict_get(args, "pattern", "")
+    let path_val = dict_get(args, "path", NOVAX_ROOT)
+    let glob_filter = dict_get(args, "glob", "*.py")
+    let top_n = dict_get(args, "top_n", H7)
+
+    if len(pattern_str) == 0 {
+        return {"ok": false, "error": "missing 'pattern'", "trit": T_FALSE}
+    }
+
+    // Delegate analysis to python
+    let esc_pat = replace(replace(pattern_str, "\\", "\\\\"), "'", "\\'")
+    // Use forward slashes for paths -- Python handles them on Windows
+    // Avoids NovaLang string parser crash with nested backslash escapes
+    let esc_path = replace(path_val, "\\", "/")
+    let esc_glob = replace(glob_filter, "\\", "/")
+
+    let cmd = "python -c \""
+    let cmd = cmd + "import os,re,json,fnmatch; "
+    let cmd = cmd + "from collections import defaultdict; "
+    let cmd = cmd + "pat=re.compile(r'" + esc_pat + "',re.IGNORECASE); "
+    let cmd = cmd + "path=r'" + esc_path + "'; gf='" + esc_glob + "'; "
+    let cmd = cmd + "fh={}; tm=0; fs=0; skip={'.git','__pycache__','node_modules','venv','ai_env'}; "
+    let cmd = cmd + "def af(fp):\n"
+    let cmd = cmd + "  global tm,fs\n"
+    let cmd = cmd + "  try:\n"
+    let cmd = cmd + "    c=open(fp,'r',encoding='utf-8',errors='replace').read(); fs+=1\n"
+    let cmd = cmd + "    ls=c.split('\\n'); hits=[]\n"
+    let cmd = cmd + "    for i,l in enumerate(ls):\n"
+    let cmd = cmd + "      for m in pat.finditer(l): hits.append({'line':i+1,'col':m.start()+1,'match':m.group()[:80]})\n"
+    let cmd = cmd + "    if hits:\n"
+    let cmd = cmd + "      d=len(hits)/max(len(ls),1)\n"
+    let cmd = cmd + "      fh[fp]={'count':len(hits),'density':round(d,4),'lines':len(ls),'first':hits[0]['line'],'last':hits[-1]['line'],'samples':hits[:5]}\n"
+    let cmd = cmd + "      tm+=len(hits)\n"
+    let cmd = cmd + "  except: pass\n"
+    let cmd = cmd + "if os.path.isfile(path): af(path)\n"
+    let cmd = cmd + "elif os.path.isdir(path):\n"
+    let cmd = cmd + "  for r,ds,fls in os.walk(path):\n"
+    let cmd = cmd + "    ds[:]=[d for d in ds if d not in skip and not d.startswith('.')]\n"
+    let cmd = cmd + "    for fn in fls:\n"
+    let cmd = cmd + "      if fnmatch.fnmatch(fn,gf): af(os.path.join(r,fn))\n"
+    let cmd = cmd + "sf=sorted(fh.items(),key=lambda x:-x[1]['count'])[:"+str(top_n)+"]; "
+    let cmd = cmd + "hs=[{'path':p,**i} for p,i in sf]; "
+    let cmd = cmd + "mf=defaultdict(int); "
+    let cmd = cmd + "[mf.__setitem__(s['match'],mf[s['match']]+1) for v in fh.values() for s in v.get('samples',[])]; "
+    let cmd = cmd + "tp=sorted(mf.items(),key=lambda x:-x[1])[:7]; "
+    let cmd = cmd + "ad=round(sum(v['density'] for v in fh.values())/max(len(fh),1),4); "
+    let cmd = cmd + "print(json.dumps({'total':tm,'files_with':len(fh),'files_searched':fs,'hotspots':hs,'top_patterns':[{'pattern':p,'frequency':c} for p,c in tp],'avg_density':ad}))\""
+
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+    let total_matches = dict_get(result, "total", 0)
+    let elapsed = round((time() - t0) * 1000, 2)
+
+    let atrit = T_MAYBE
+    if total_matches > 0 {
+        let atrit = T_TRUE
+    }
+
+    return {
+        "ok": true, "pattern": pattern_str,
+        "analysis": result,
+        "ms": elapsed, "trit": atrit
+    }
+}
+
+// grep/replace: Find and replace across files
+fn multi_grep_replace(args) {
+    let pattern_str = dict_get(args, "pattern", "")
+    let replacement = dict_get(args, "replacement", dict_get(args, "new_string", ""))
+    let path_val = dict_get(args, "path", NOVAX_ROOT)
+    let glob_filter = dict_get(args, "glob", "*.py")
+    let dry_run = dict_get(args, "dry_run", true)
+
+    if len(pattern_str) == 0 {
+        return {"ok": false, "error": "missing 'pattern'", "trit": T_FALSE}
+    }
+
+    let esc_pat = replace(replace(pattern_str, "\\", "\\\\"), "'", "\\'")
+    let esc_rep = replace(replace(str(replacement), "\\", "\\\\"), "'", "\\'")
+    let esc_path = replace(path_val, "\\", "/")
+    let esc_glob = replace(glob_filter, "\\", "\\\\")
+    let dr_str = "True"
+    if dry_run == false {
+        let dr_str = "False"
+    }
+
+    let cmd = "python -c \""
+    let cmd = cmd + "import os,re,json,fnmatch; "
+    let cmd = cmd + "pat=re.compile(r'" + esc_pat + "'); "
+    let cmd = cmd + "rep=r'" + esc_rep + "'; path=r'" + esc_path + "'; gf='" + esc_glob + "'; "
+    let cmd = cmd + "dr=" + dr_str + "; af=[]; tr=0; skip={'.git','__pycache__','node_modules','venv','ai_env'}; "
+    let cmd = cmd + "tfs=[]; "
+    let cmd = cmd + "if os.path.isfile(path): tfs=[path]\n"
+    let cmd = cmd + "elif os.path.isdir(path):\n"
+    let cmd = cmd + "  for r,ds,fls in os.walk(path):\n"
+    let cmd = cmd + "    ds[:]=[d for d in ds if d not in skip and not d.startswith('.')]\n"
+    let cmd = cmd + "    for fn in fls:\n"
+    let cmd = cmd + "      if fnmatch.fnmatch(fn,gf): tfs.append(os.path.join(r,fn))\n"
+    let cmd = cmd + "for fp in tfs:\n"
+    let cmd = cmd + "  try:\n"
+    let cmd = cmd + "    c=open(fp,'r',encoding='utf-8',errors='replace').read()\n"
+    let cmd = cmd + "    n,cnt=pat.subn(rep,c)\n"
+    let cmd = cmd + "    if cnt>0:\n"
+    let cmd = cmd + "      if not dr: open(fp,'w',encoding='utf-8').write(n)\n"
+    let cmd = cmd + "      af.append({'path':fp,'replacements':cnt}); tr+=cnt\n"
+    let cmd = cmd + "  except: pass\n"
+    let cmd = cmd + "print(json.dumps({'affected':af,'total':tr,'files':len(af),'dry_run':dr}))\""
+
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+    let total_rep = dict_get(result, "total", 0)
+
+    let rtrit = T_MAYBE
+    if total_rep > 0 {
+        let rtrit = T_TRUE
+    }
+
+    return {
+        "ok": true, "pattern": pattern_str, "replacement": str(replacement),
+        "dry_run": dry_run,
+        "affected_files": dict_get(result, "affected", []),
+        "total_replacements": total_rep,
+        "files_affected": dict_get(result, "files", 0),
+        "trit": rtrit
+    }
+}
+
+// grep/todo: Search for TODO/FIXME/HACK/XXX patterns, scored by urgency
+fn multi_grep_todo(args) {
+    let t0 = time()
+    let path_val = dict_get(args, "path", NOVAX_ROOT)
+    let glob_filter = dict_get(args, "glob", "*.py")
+
+    let esc_path = replace(path_val, "\\", "/")
+    let esc_glob = replace(glob_filter, "\\", "\\\\")
+
+    let cmd = "python -c \""
+    let cmd = cmd + "import os,re,json,fnmatch; "
+    let cmd = cmd + "from collections import defaultdict; "
+    let cmd = cmd + "pat=re.compile(r'\\b(FIXME|HACK|XXX|WARN|TODO|NOTE)\\b[:\\s]*(.*)',re.IGNORECASE); "
+    let cmd = cmd + "path=r'" + esc_path + "'; gf='" + esc_glob + "'; "
+    let cmd = cmd + "scores={'FIXME':7,'HACK':5,'XXX':5,'WARN':3,'TODO':1,'NOTE':0}; "
+    let cmd = cmd + "todos=[]; fs=0; ut=defaultdict(int); skip={'.git','__pycache__','node_modules','venv','ai_env'}; "
+    let cmd = cmd + "tfs=[]; "
+    let cmd = cmd + "if os.path.isfile(path): tfs=[path]\n"
+    let cmd = cmd + "elif os.path.isdir(path):\n"
+    let cmd = cmd + "  for r,ds,fls in os.walk(path):\n"
+    let cmd = cmd + "    ds[:]=[d for d in ds if d not in skip and not d.startswith('.')]\n"
+    let cmd = cmd + "    for fn in fls:\n"
+    let cmd = cmd + "      if fnmatch.fnmatch(fn,gf): tfs.append(os.path.join(r,fn))\n"
+    let cmd = cmd + "for fp in tfs:\n"
+    let cmd = cmd + "  try:\n"
+    let cmd = cmd + "    ls=open(fp,'r',encoding='utf-8',errors='replace').readlines(); fs+=1\n"
+    let cmd = cmd + "    for i,l in enumerate(ls):\n"
+    let cmd = cmd + "      m=pat.search(l)\n"
+    let cmd = cmd + "      if m:\n"
+    let cmd = cmd + "        tag=m.group(1).upper(); msg=m.group(2).strip()[:120]\n"
+    let cmd = cmd + "        sc=scores.get(tag,1); ut[tag]+=1\n"
+    let cmd = cmd + "        todos.append({'path':fp,'line':i+1,'tag':tag,'message':msg,'urgency':sc})\n"
+    let cmd = cmd + "  except: pass\n"
+    let cmd = cmd + "todos.sort(key=lambda t:(-t['urgency'],t['path'],t['line'])); "
+    let cmd = cmd + "tu=sum(t['urgency'] for t in todos); "
+    let cmd = cmd + "print(json.dumps({'todos':todos[:100],'total':len(todos),'by_tag':dict(ut),'urgency':tu,'files_scanned':fs}))\""
+
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+    let total_urgency = dict_get(result, "urgency", 0)
+    let elapsed = round((time() - t0) * 1000, 2)
+
+    // Trit: +1=clean, 0=some debt, -1=heavy debt (urgency > H13*H7=91)
+    let ttrit = T_TRUE
+    if total_urgency > 0 {
+        let ttrit = T_MAYBE
+    }
+    if total_urgency >= 91 {
+        let ttrit = T_FALSE
+    }
+
+    return {
+        "ok": true, "path": path_val,
+        "todos": dict_get(result, "todos", []),
+        "summary": {
+            "total": dict_get(result, "total", 0),
+            "by_tag": dict_get(result, "by_tag", {}),
+            "total_urgency_score": total_urgency,
+            "files_scanned": dict_get(result, "files_scanned", 0),
+            "debt_trit": ttrit,
+            "debt_char": trit_char(ttrit)
+        },
+        "ms": elapsed, "trit": ttrit
+    }
+}
+
+// ============================================================================
+// TMULTI: GLOB MODES
+// ============================================================================
+
+// glob/tree: Build directory tree structure
+fn multi_glob_tree(args) {
+    let path_val = dict_get(args, "path", NOVAX_ROOT)
+    let max_depth = dict_get(args, "max_depth", H7)
+    let show_files = dict_get(args, "show_files", true)
+
+    let esc_path = replace(path_val, "\\", "/")
+    let sf_str = "True"
+    if show_files == false {
+        let sf_str = "False"
+    }
+
+    let cmd = "python -c \""
+    let cmd = cmd + "import os,json; "
+    let cmd = cmd + "path=r'" + esc_path + "'; md=" + str(max_depth) + "; sf=" + sf_str + "; "
+    let cmd = cmd + "tree=[]; dc=0; fc=0; "
+    let cmd = cmd + "skip={'.git','__pycache__','node_modules','venv','ai_env'}; "
+    let cmd = cmd + "def bt(cp,pfx,d):\n"
+    let cmd = cmd + "  global dc,fc\n"
+    let cmd = cmd + "  if d>md: return\n"
+    let cmd = cmd + "  try: entries=sorted(os.listdir(cp))\n"
+    let cmd = cmd + "  except: return\n"
+    let cmd = cmd + "  entries=[e for e in entries if not e.startswith('.') and e not in skip]\n"
+    let cmd = cmd + "  dirs=[e for e in entries if os.path.isdir(os.path.join(cp,e))]\n"
+    let cmd = cmd + "  files=[e for e in entries if os.path.isfile(os.path.join(cp,e))] if sf else []\n"
+    let cmd = cmd + "  items=[(dn,True) for dn in dirs]+[(fn,False) for fn in files]\n"
+    let cmd = cmd + "  for i,(nm,isd) in enumerate(items):\n"
+    let cmd = cmd + "    last=i==len(items)-1\n"
+    let cmd = cmd + "    cn='L-- ' if last else '|-- '\n"
+    let cmd = cmd + "    if isd:\n"
+    let cmd = cmd + "      tree.append(pfx+cn+nm+'/'); dc+=1\n"
+    let cmd = cmd + "      np=pfx+('    ' if last else '|   ')\n"
+    let cmd = cmd + "      bt(os.path.join(cp,nm),np,d+1)\n"
+    let cmd = cmd + "    else:\n"
+    let cmd = cmd + "      sz=os.path.getsize(os.path.join(cp,nm))\n"
+    let cmd = cmd + "      tree.append(pfx+cn+nm+' ('+str(sz)+'B)'); fc+=1\n"
+    let cmd = cmd + "tree.append(os.path.basename(path)+'/'); bt(path,'',1); "
+    let cmd = cmd + "print(json.dumps({'tree':'\\n'.join(tree),'dirs':dc,'files':fc}))\""
+
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+
+    return {
+        "ok": true, "path": path_val,
+        "tree": dict_get(result, "tree", ""),
+        "summary": {
+            "directories": dict_get(result, "dirs", 0),
+            "files": dict_get(result, "files", 0),
+            "depth": max_depth
+        },
+        "trit": T_TRUE
+    }
+}
+
+// glob/size: Find files by pattern, sort by size
+fn multi_glob_size(args) {
+    let pattern = dict_get(args, "pattern", "**/*")
+    let path_val = dict_get(args, "path", NOVAX_ROOT)
+    let top_n = dict_get(args, "top_n", H13)
+
+    let esc_pat = replace(pattern, "\\", "\\\\")
+    let esc_path = replace(path_val, "\\", "/")
+
+    let cmd = "python -c \""
+    let cmd = cmd + "import glob,os,json; "
+    let cmd = cmd + "pat=r'" + esc_pat + "'; path=r'" + esc_path + "'; "
+    let cmd = cmd + "fp=os.path.join(path,pat) if not os.path.isabs(pat) else pat; "
+    let cmd = cmd + "files=glob.glob(fp,recursive=True); fz=[]; ts=0; "
+    let cmd = cmd + "for f in files:\n"
+    let cmd = cmd + "  if os.path.isfile(f):\n"
+    let cmd = cmd + "    try: sz=os.path.getsize(f); fz.append({'path':f,'size':sz}); ts+=sz\n"
+    let cmd = cmd + "    except: pass\n"
+    let cmd = cmd + "fz.sort(key=lambda x:-x['size']); "
+    let cmd = cmd + "print(json.dumps({'files':fz[:"+str(top_n)+"],'total_files':len(fz),'total_size':ts}))\""
+
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+    let total_size = dict_get(result, "total_size", 0)
+    let total_files = dict_get(result, "total_files", 0)
+    let files_list = dict_get(result, "files", [])
+
+    // Add human-readable sizes
+    let si = 0
+    while3 si < len(files_list) {
+        let sz = dict_get(files_list[si], "size", 0)
+        dict_set(files_list[si], "human", human_size(sz))
+        let si = si + 1
+    }
+
+    let strit = T_MAYBE
+    if len(files_list) > 0 {
+        let strit = T_TRUE
+    }
+
+    return {
+        "ok": true, "pattern": pattern,
+        "files": files_list,
+        "total_files": total_files,
+        "total_size": total_size,
+        "total_human": human_size(total_size),
+        "avg_size": round(total_size / max(total_files, 1), 0),
+        "trit": strit
+    }
+}
+
+// glob/recent: Find files sorted by modification time
+fn multi_glob_recent(args) {
+    let pattern = dict_get(args, "pattern", "**/*.py")
+    let path_val = dict_get(args, "path", NOVAX_ROOT)
+    let top_n = dict_get(args, "top_n", H13)
+
+    let esc_pat = replace(pattern, "\\", "\\\\")
+    let esc_path = replace(path_val, "\\", "/")
+
+    let cmd = "python -c \""
+    let cmd = cmd + "import glob,os,json,time; "
+    let cmd = cmd + "pat=r'" + esc_pat + "'; path=r'" + esc_path + "'; "
+    let cmd = cmd + "fp=os.path.join(path,pat) if not os.path.isabs(pat) else pat; "
+    let cmd = cmd + "files=glob.glob(fp,recursive=True); now=time.time(); ft=[]; "
+    let cmd = cmd + "for f in files:\n"
+    let cmd = cmd + "  if os.path.isfile(f):\n"
+    let cmd = cmd + "    try:\n"
+    let cmd = cmd + "      mt=os.path.getmtime(f); age=now-mt\n"
+    let cmd = cmd + "      ft.append({'path':f,'modified':mt,'age_seconds':round(age),'size':os.path.getsize(f)})\n"
+    let cmd = cmd + "    except: pass\n"
+    let cmd = cmd + "ft.sort(key=lambda x:-x['modified']); "
+    let cmd = cmd + "print(json.dumps({'files':ft[:"+str(top_n)+"],'total_files':len(ft)}))\""
+
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+    let files_list = dict_get(result, "files", [])
+    let total_files = dict_get(result, "total_files", 0)
+
+    // Add human age strings
+    let ri = 0
+    while3 ri < len(files_list) {
+        let age_s = dict_get(files_list[ri], "age_seconds", 0)
+        dict_set(files_list[ri], "age", human_age(age_s))
+        let ri = ri + 1
+    }
+
+    let newest = "none"
+    if len(files_list) > 0 {
+        let newest = dict_get(files_list[0], "age", "none")
+    }
+
+    let rtrit = T_MAYBE
+    if len(files_list) > 0 {
+        let rtrit = T_TRUE
+    }
+
+    return {
+        "ok": true, "pattern": pattern,
+        "files": files_list,
+        "total_files": total_files,
+        "newest": newest,
+        "trit": rtrit
+    }
+}
+
+// ============================================================================
+// TMULTI: RUN MODES
+// ============================================================================
+
+// run/safe: Ternary safety gate for commands
+fn multi_run_safe(args) {
+    let command = dict_get(args, "command", "")
+    if len(command) == 0 {
+        return {"ok": false, "error": "missing 'command'", "trit": T_FALSE}
+    }
+    let cmd_lower = lower(command)
+
+    // Check dangerous patterns
+    let danger_list = split(DANGEROUS_CMDS, ",")
+    let di = 0
+    while3 di < len(danger_list) {
+        if contains(cmd_lower, danger_list[di]) {
+            return {
+                "ok": true, "command": command,
+                "safety": {"trit": T_FALSE, "char": "T", "verdict": "BLOCKED",
+                           "reason": "matches dangerous pattern: " + danger_list[di]},
+                "executed": false, "trit": T_FALSE
+            }
+        }
+        let di = di + 1
+    }
+
+    // Check uncertain patterns
+    let uncertain_list = split(UNCERTAIN_CMDS, ",")
+    let ui = 0
+    while3 ui < len(uncertain_list) {
+        if contains(cmd_lower, uncertain_list[ui]) {
+            return {
+                "ok": true, "command": command,
+                "safety": {"trit": T_MAYBE, "char": "0", "verdict": "UNCERTAIN",
+                           "reason": "matches uncertain pattern: " + uncertain_list[ui]},
+                "executed": false, "trit": T_MAYBE
+            }
+        }
+        let ui = ui + 1
+    }
+
+    // Safe: execute the command
+    let result = do_tool_run({"command": command, "timeout": dict_get(args, "timeout", 30)})
+    dict_set(result, "safety", {"trit": T_TRUE, "char": "1", "verdict": "SAFE"})
+    return result
+}
+
+// run/timed: Execute with precise timing
+fn multi_run_timed(args) {
+    let command = dict_get(args, "command", "")
+    if len(command) == 0 {
+        return {"ok": false, "error": "missing 'command'", "trit": T_FALSE}
+    }
+    let t0 = time()
+    let result = do_tool_run({"command": command, "timeout": dict_get(args, "timeout", 30)})
+    let elapsed = time() - t0
+    let wall_human = str(round(elapsed, 3)) + "s"
+    if elapsed < 1 {
+        let wall_human = str(round(elapsed * 1000, 1)) + "ms"
+    }
+    dict_set(result, "timing", {
+        "wall_seconds": round(elapsed, 4),
+        "wall_ms": round(elapsed * 1000, 2),
+        "wall_human": wall_human
+    })
+    return result
+}
+
+// run/retry: Execute with automatic retry on failure (up to H3=3 attempts)
+fn multi_run_retry(args) {
+    let command = dict_get(args, "command", "")
+    let max_retries = dict_get(args, "retries", H3)
+    let delay = dict_get(args, "delay", 1.0)
+
+    if len(command) == 0 {
+        return {"ok": false, "error": "missing 'command'", "trit": T_FALSE}
+    }
+
+    let attempts = []
+    let attempt = 1
+    let last_result = {}
+
+    while3 attempt <= max_retries {
+        let result = do_tool_run({"command": command, "timeout": dict_get(args, "timeout", 30)})
+        let last_result = result
+        let step_ok = dict_get(result, "ok", false)
+        append(attempts, {"attempt": attempt, "ok": step_ok, "code": dict_get(result, "code", -1)})
+
+        if step_ok == true {
+            dict_set(result, "retry", {"attempts": attempts, "succeeded_on": attempt, "total_tries": attempt})
+            let rtrit = T_TRUE
+            if attempt > 1 {
+                let rtrit = T_MAYBE
+            }
+            dict_set(result, "trit", rtrit)
+            return result
+        }
+
+        // Wait before retry (delegate to nova_run to avoid blocking)
+        if attempt < max_retries {
+            nova_run("python -c \"import time; time.sleep(" + str(delay) + ")\"")
+        }
+
+        let attempt = attempt + 1
+    }
+
+    dict_set(last_result, "retry", {"attempts": attempts, "succeeded_on": -1, "total_tries": max_retries})
+    dict_set(last_result, "trit", T_FALSE)
+    return last_result
+}
+
+// ============================================================================
+// TMULTI: EDIT MODES
+// ============================================================================
+
+// edit/regex: Edit with regex pattern matching
+fn multi_edit_regex(args) {
+    dict_set(args, "regex", true)
+    return do_tool_edit(args)
+}
+
+// edit/multi: Edit across multiple files simultaneously
+fn multi_edit_multi(args) {
+    let old_string = dict_get(args, "old_string", "")
+    let new_string = dict_get(args, "new_string", "")
+    let path_val = dict_get(args, "path", NOVAX_ROOT)
+    let glob_filter = dict_get(args, "glob", "*.py")
+    let regex_mode = dict_get(args, "regex", false)
+
+    if len(old_string) == 0 {
+        return {"ok": false, "error": "missing 'old_string'", "trit": T_FALSE}
+    }
+
+    // Get list of target files
+    let esc_path = replace(path_val, "\\", "/")
+    let esc_glob = replace(glob_filter, "\\", "\\\\")
+    let cmd = "python -c \""
+    let cmd = cmd + "import os,json,fnmatch; "
+    let cmd = cmd + "path=r'" + esc_path + "'; gf='" + esc_glob + "'; "
+    let cmd = cmd + "skip={'.git','__pycache__','node_modules','venv','ai_env'}; tfs=[]; "
+    let cmd = cmd + "if os.path.isfile(path): tfs=[path]\n"
+    let cmd = cmd + "elif os.path.isdir(path):\n"
+    let cmd = cmd + "  for r,ds,fls in os.walk(path):\n"
+    let cmd = cmd + "    ds[:]=[d for d in ds if d not in skip and not d.startswith('.')]\n"
+    let cmd = cmd + "    for fn in fls:\n"
+    let cmd = cmd + "      if fnmatch.fnmatch(fn,gf): tfs.append(os.path.join(r,fn))\n"
+    let cmd = cmd + "print(json.dumps(tfs))\""
+
+    let raw = nova_run(cmd)
+    let target_files = json_decode(trim(raw))
+
+    let edit_results = []
+    let total_replacements = 0
+    let fi = 0
+
+    while3 fi < len(target_files) {
+        let fpath = target_files[fi]
+        let r = do_tool_edit({
+            "path": fpath, "old_string": old_string,
+            "new_string": new_string, "replace_all": true, "regex": regex_mode
+        })
+        let r_ok = dict_get(r, "ok", false)
+        if r_ok == true {
+            let rep_count = dict_get(r, "replacements", 0)
+            append(edit_results, {"path": fpath, "replacements": rep_count})
+            let total_replacements = total_replacements + rep_count
+        }
+        let fi = fi + 1
+    }
+
+    let mtrit = T_MAYBE
+    if total_replacements > 0 {
+        let mtrit = T_TRUE
+    }
+
+    return {
+        "ok": true, "old_string": old_string, "new_string": new_string,
+        "files_edited": edit_results,
+        "total_files": len(edit_results),
+        "total_replacements": total_replacements,
+        "trit": mtrit
+    }
+}
+
+// ============================================================================
+// TMULTI: PIPE MODES
+// ============================================================================
+
+// pipe/parallel: Execute all pipeline steps sequentially (no threading in NovaLang)
+fn multi_pipe_parallel(args) {
+    let pipeline = dict_get(args, "pipeline", [])
+    if len(pipeline) == 0 {
+        return {"ok": false, "error": "missing 'pipeline'", "trit": T_FALSE}
+    }
+
+    let t0 = time()
+    let results = []
+    let all_ok = true
+    let pi = 0
+
+    while3 pi < len(pipeline) {
+        let step = pipeline[pi]
+        let tool_name = dict_get(step, "tool", "")
+        let step_params = dict_get(step, "params", {})
+
+        let step_result = {}
+        if3 tool_name == "read" {
+            let step_result = do_tool_read(step_params)
+        } else tool_name == "write" {
+            let step_result = do_tool_write(step_params)
+        } else tool_name == "grep" {
+            let step_result = do_tool_grep(step_params)
+        } else tool_name == "glob" {
+            let step_result = do_tool_glob(step_params)
+        } else tool_name == "run" {
+            let step_result = do_tool_run(step_params)
+        } else tool_name == "edit" {
+            let step_result = do_tool_edit(step_params)
+        } else {
+            let step_result = {"ok": false, "error": "unknown tool: " + tool_name}
+        }
+
+        dict_set(step_result, "step", pi)
+        dict_set(step_result, "tool", tool_name)
+        append(results, step_result)
+
+        if dict_get(step_result, "ok", false) == false {
+            let all_ok = false
+        }
+
+        let pi = pi + 1
+    }
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    let ptrit = T_TRUE
+    if all_ok == false {
+        let ptrit = T_FALSE
+    }
+
+    return {
+        "ok": all_ok, "parallel": true, "steps": len(results),
+        "results": results, "ms": elapsed, "trit": ptrit
+    }
+}
+
+// pipe/conditional: Pipeline with ternary branching
+fn multi_pipe_conditional(args) {
+    let pipeline = dict_get(args, "pipeline", [])
+    if len(pipeline) == 0 {
+        return {"ok": false, "error": "missing 'pipeline'", "trit": T_FALSE}
+    }
+
+    let t0 = time()
+    let results = []
+    let step_idx = 0
+    let all_ok = true
+    let max_steps = len(pipeline)
+
+    while3 step_idx < max_steps {
+        let step = pipeline[step_idx]
+        let tool_name = dict_get(step, "tool", "")
+        let step_params = dict_get(step, "params", {})
+
+        let step_result = {}
+        if3 tool_name == "read" {
+            let step_result = do_tool_read(step_params)
+        } else tool_name == "write" {
+            let step_result = do_tool_write(step_params)
+        } else tool_name == "grep" {
+            let step_result = do_tool_grep(step_params)
+        } else tool_name == "glob" {
+            let step_result = do_tool_glob(step_params)
+        } else tool_name == "run" {
+            let step_result = do_tool_run(step_params)
+        } else tool_name == "edit" {
+            let step_result = do_tool_edit(step_params)
+        } else {
+            let step_result = {"ok": false, "error": "unknown tool: " + tool_name}
+        }
+
+        let trit = tool_trit(step_result)
+        dict_set(step_result, "step", step_idx)
+        dict_set(step_result, "tool", tool_name)
+        dict_set(step_result, "branch_trit", trit)
+        append(results, step_result)
+
+        // Ternary branching
+        let next_step = step_idx + 1
+        if3 trit == T_TRUE {
+            let next_step = dict_get(step, "on_true", step_idx + 1)
+        } else trit == T_MAYBE {
+            let next_step = dict_get(step, "on_maybe", step_idx + 1)
+        } else {
+            let next_step = dict_get(step, "on_false", -1)
+            if next_step == -1 {
+                dict_set(step_result, "aborted", true)
+                let all_ok = false
+                let step_idx = max_steps
+            }
+        }
+
+        // Prevent infinite loops
+        if next_step <= step_idx {
+            dict_set(step_result, "error", "loop detected, aborting")
+            let step_idx = max_steps
+        } else {
+            let step_idx = next_step
+        }
+    }
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    let ctrit = T_TRUE
+    if all_ok == false {
+        let ctrit = T_FALSE
+    }
+
+    return {
+        "ok": all_ok, "conditional": true, "steps": len(results),
+        "results": results, "ms": elapsed, "trit": ctrit
+    }
+}
+
+// ============================================================================
+// TMULTI DISPATCHER
+// ============================================================================
+
+fn execute_multi(tool, mode, args) {
+    let t0 = time()
+    record_tool_call("multi:" + tool + "/" + mode)
+
+    // Default mode: delegate to original tool
+    if mode == "default" {
+        if3 tool == "read" {
+            return do_tool_read(args)
+        } else tool == "write" {
+            return do_tool_write(args)
+        } else tool == "grep" {
+            return do_tool_grep(args)
+        } else tool == "glob" {
+            return do_tool_glob(args)
+        } else tool == "run" {
+            return do_tool_run(args)
+        } else tool == "edit" {
+            return do_tool_edit(args)
+        } else tool == "pipe" {
+            return do_tool_pipe(args)
+        } else {
+            return {"ok": false, "error": "unknown tool: " + tool, "trit": T_FALSE}
+        }
+    }
+
+    // Dispatch to composed handler
+    let result = {}
+    let handled = false
+
+    // read modes
+    if tool == "read" {
+        let handled = true
+        if3 mode == "stats" {
+            let result = multi_read_stats(args)
+        } else mode == "diff" {
+            let result = multi_read_diff(args)
+        } else mode == "extract" {
+            let result = multi_read_extract(args)
+        } else mode == "classify" {
+            let result = multi_read_classify(args)
+        } else {
+            let handled = false
+        }
+    }
+
+    // write modes
+    if tool == "write" {
+        let handled = true
+        if3 mode == "template" {
+            let result = multi_write_template(args)
+        } else mode == "append" {
+            let result = multi_write_append(args)
+        } else mode == "atomic" {
+            let result = multi_write_atomic(args)
+        } else {
+            let handled = false
+        }
+    }
+
+    // grep modes
+    if tool == "grep" {
+        let handled = true
+        if3 mode == "analyze" {
+            let result = multi_grep_analyze(args)
+        } else mode == "replace" {
+            let result = multi_grep_replace(args)
+        } else mode == "todo" {
+            let result = multi_grep_todo(args)
+        } else {
+            let handled = false
+        }
+    }
+
+    // glob modes
+    if tool == "glob" {
+        let handled = true
+        if3 mode == "tree" {
+            let result = multi_glob_tree(args)
+        } else mode == "size" {
+            let result = multi_glob_size(args)
+        } else mode == "recent" {
+            let result = multi_glob_recent(args)
+        } else {
+            let handled = false
+        }
+    }
+
+    // run modes
+    if tool == "run" {
+        let handled = true
+        if3 mode == "safe" {
+            let result = multi_run_safe(args)
+        } else mode == "timed" {
+            let result = multi_run_timed(args)
+        } else mode == "retry" {
+            let result = multi_run_retry(args)
+        } else {
+            let handled = false
+        }
+    }
+
+    // edit modes
+    if tool == "edit" {
+        let handled = true
+        if3 mode == "regex" {
+            let result = multi_edit_regex(args)
+        } else mode == "multi" {
+            let result = multi_edit_multi(args)
+        } else {
+            let handled = false
+        }
+    }
+
+    // pipe modes
+    if tool == "pipe" {
+        let handled = true
+        if3 mode == "parallel" {
+            let result = multi_pipe_parallel(args)
+        } else mode == "conditional" {
+            let result = multi_pipe_conditional(args)
+        } else {
+            let handled = false
+        }
+    }
+
+    if handled == false {
+        return {
+            "ok": false,
+            "error": "unknown mode '" + mode + "' for tool '" + tool + "'",
+            "trit": T_FALSE
+        }
+    }
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    if dict_has(result, "ms") == false {
+        dict_set(result, "ms", elapsed)
+    }
+    dict_set(result, "multi", {"tool": tool, "mode": mode})
+
+    let trit = dict_get(result, "trit", T_MAYBE)
+    record_op_trit(trit)
+    record_metric("multi:" + tool + "/" + mode, elapsed, 0, 0, "", dict_get(result, "ok", false))
+
+    if dict_has(result, "char") == false {
+        dict_set(result, "char", trit_char(trit))
+    }
+
+    return result
+}
+
+// ============================================================================
+// ROUTE HANDLERS
+// ============================================================================
+
+// GET /health
+fn handle_health() {
+    let re_num = tools_reynolds()
+    let regime = flow_regime(re_num)
+    let uptime = round(time() - _t0, 0)
+    let self_trit = T_MAYBE
+    if uptime > 10 {
+        let self_trit = T_TRUE
+    }
+
+    return {
+        "ok": true, "service": SERVICE, "port": PORT,
+        "version": VERSION, "ternary": true,
+        "runtime": "novalang",
+        "tools": ["read", "write", "grep", "glob", "run", "edit", "pipe"],
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "self_trit": self_trit, "char": trit_char(self_trit),
+        "reynolds": re_num, "flow_regime": regime,
+        "uptime": int(uptime),
+        "total_ops": _ops_total,
+        "quality": {
+            "strong": _ops_success,
+            "partial": _ops_maybe,
+            "failed": _ops_fail
+        },
+        "tzip": {"enabled": _tzip_enabled, "files_quantized": _tzip_quantized, "bytes_saved": _tzip_bytes_saved}
+    }
+}
+
+// GET /tools/status
+fn handle_tools_status() {
+    let uptime = round(time() - _t0, 0)
+    let avg_lat = 0
+    if _ops_total > 0 {
+        let avg_lat = round(_total_time_ms / _ops_total, 2)
+    }
+    let recent = _recent_ops
+    if len(recent) > 10 {
+        let recent = slice(recent, len(recent) - 10, len(recent))
+    }
+
+    return {
+        "uptime_s": int(uptime),
+        "total_ops": _ops_total,
+        "calls_by_tool": _calls_by_tool,
+        "bytes_read": _bytes_read,
+        "bytes_written": _bytes_written,
+        "bytes_compressed": _bytes_compressed,
+        "bytes_saved": _bytes_saved,
+        "avg_latency_ms": avg_lat,
+        "errors": _errors,
+        "pipe_chains": _pipe_chains,
+        "channel_distribution": _channel_hits,
+        "recent": recent,
+        "prediction": predict_next_tool(),
+        "tool_chain_depth": len(_tool_history)
+    }
+}
+
+// GET /tools/predict
+fn handle_tools_predict() {
+    let recent = _tool_history
+    if len(recent) > 10 {
+        let recent = slice(recent, len(recent) - 10, len(recent))
+    }
+    return {
+        "ok": true,
+        "prediction": predict_next_tool(),
+        "history": recent
+    }
+}
+
+// GET /multi/modes
+fn handle_multi_modes() {
+    // Count total modes (exclude 'default' from each tool)
+    let tool_keys = keys(MULTI_MODES)
+    let mode_count = 0
+    let ti = 0
+    while3 ti < len(tool_keys) {
+        let tk = tool_keys[ti]
+        let modes = dict_get(MULTI_MODES, tk, {})
+        let mk = keys(modes)
+        let mode_count = mode_count + len(mk) - 1
+        let ti = ti + 1
+    }
+
+    return {
+        "ok": true, "modes": MULTI_MODES,
+        "tools": tool_keys,
+        "total_modes": mode_count,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// POST /tools/read
+fn handle_read(body) {
+    let result = do_tool_read(body)
+    let trit = tool_trit(result)
+    record_op_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// POST /tools/write
+fn handle_write(body) {
+    let result = do_tool_write(body)
+    let trit = tool_trit(result)
+    record_op_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// POST /tools/grep
+fn handle_grep(body) {
+    let result = do_tool_grep(body)
+    let trit = tool_trit(result)
+    record_op_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// POST /tools/glob
+fn handle_glob(body) {
+    let result = do_tool_glob(body)
+    let trit = tool_trit(result)
+    record_op_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// POST /tools/run
+fn handle_run(body) {
+    let result = do_tool_run(body)
+    let trit = tool_trit(result)
+    record_op_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// POST /tools/edit
+fn handle_edit(body) {
+    let result = do_tool_edit(body)
+    let trit = tool_trit(result)
+    record_op_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// POST /tools/pipe
+fn handle_pipe(body) {
+    let result = do_tool_pipe(body)
+    let trit = tool_trit(result)
+    record_op_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// POST /multi
+fn handle_multi(body) {
+    let tool = dict_get(body, "tool", "")
+    let mode = dict_get(body, "mode", "default")
+    let args = dict_get(body, "args", {})
+
+    if len(tool) == 0 {
+        return {"ok": false, "error": "missing 'tool'", "trit": T_FALSE}
+    }
+
+    return execute_multi(tool, mode, args)
+}
+
+// ============================================================================
+// TIER 1: FILE SYSTEM PRIMITIVES
+// ============================================================================
+
+// POST /tools/mkdir — create directory
+fn handle_mkdir(body) {
+    let path = dict_get(body, "path", "")
+    if len(path) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+    let cmd = "mkdir -p \"" + path + "\" 2>&1 && echo OK"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC_SERVER + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout", "")
+    let trit = T_TRUE
+    if contains(out, "ERROR") {
+        trit = T_FALSE
+    }
+    record_op_trit(trit)
+    return {"ok": trit > 0, "path": path, "output": out, "trit": trit, "char": trit_char(trit)}
+}
+
+// POST /tools/ls — list directory contents
+fn handle_ls(body) {
+    let path = dict_get(body, "path", ".")
+    let flags = dict_get(body, "flags", "-la")
+    let cmd = "ls " + flags + " \"" + path + "\" 2>&1"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC_SERVER + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout", "")
+    let lines = split(out, "\n")
+    let count = len(lines)
+    let trit = T_TRUE
+    if count == 0 {
+        trit = T_MAYBE
+    }
+    record_op_trit(trit)
+    return {"ok": true, "path": path, "entries": count, "output": out, "trit": trit, "char": trit_char(trit)}
+}
+
+// POST /tools/du — disk usage
+fn handle_du(body) {
+    let path = dict_get(body, "path", ".")
+    let cmd = "du -sh \"" + path + "\" 2>&1"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC_SERVER + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout", "")
+    let trit = T_TRUE
+    if contains(out, "cannot") {
+        trit = T_FALSE
+    }
+    record_op_trit(trit)
+    return {"ok": trit >= 0, "path": path, "usage": strip(out), "trit": trit, "char": trit_char(trit)}
+}
+
+// POST /tools/df — disk free space
+fn handle_df(body) {
+    let cmd = "df -h 2>&1"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC_SERVER + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout", "")
+    let lines = split(out, "\n")
+    let trit = T_TRUE
+    record_op_trit(trit)
+    return {"ok": true, "output": out, "volumes": len(lines), "trit": trit, "char": trit_char(trit)}
+}
+
+// POST /tools/chmod — change file permissions
+fn handle_chmod(body) {
+    let path = dict_get(body, "path", "")
+    let mode = dict_get(body, "mode", "")
+    if len(path) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+    if len(str(mode)) == 0 {
+        return {"ok": false, "error": "missing 'mode' (e.g. '755')", "trit": T_FALSE}
+    }
+    let cmd = "chmod " + str(mode) + " \"" + path + "\" 2>&1 && echo OK"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC_SERVER + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout", "")
+    let trit = T_TRUE
+    if contains(out, "ERROR") {
+        trit = T_FALSE
+    }
+    record_op_trit(trit)
+    return {"ok": trit > 0, "path": path, "mode": str(mode), "output": out, "trit": trit, "char": trit_char(trit)}
+}
+
+// POST /tools/chown — change file ownership
+fn handle_chown(body) {
+    let path = dict_get(body, "path", "")
+    let owner = dict_get(body, "owner", "")
+    if len(path) == 0 {
+        return {"ok": false, "error": "missing 'path'", "trit": T_FALSE}
+    }
+    if len(owner) == 0 {
+        return {"ok": false, "error": "missing 'owner' (e.g. 'user:group')", "trit": T_FALSE}
+    }
+    let cmd = "chown " + owner + " \"" + path + "\" 2>&1 && echo OK"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC_SERVER + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout", "")
+    let trit = T_TRUE
+    if contains(out, "ERROR") {
+        trit = T_FALSE
+    }
+    record_op_trit(trit)
+    return {"ok": trit > 0, "path": path, "owner": owner, "output": out, "trit": trit, "char": trit_char(trit)}
+}
+
+// POST /tools/tree — directory tree visualization
+fn handle_tree(body) {
+    let path = dict_get(body, "path", ".")
+    let depth = dict_get(body, "depth", 3)
+    let cmd = "find \"" + path + "\" -maxdepth " + str(depth) + " -print 2>&1 | head -200"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC_SERVER + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout", "")
+    let lines = split(out, "\n")
+    let count = len(lines)
+    let trit = T_TRUE
+    if count == 0 {
+        trit = T_MAYBE
+    }
+    record_op_trit(trit)
+    return {"ok": true, "path": path, "depth": depth, "entries": count, "tree": out, "trit": trit, "char": trit_char(trit)}
+}
+
+// ============================================================================
+// TZIP ENDPOINTS
+// ============================================================================
+
+// GET /tzip/stats -- compression metrics
+fn handle_tzip_stats() {
+    return tzip_stats()
+}
+
+// POST /tzip/toggle -- enable/disable TZip, or set per-path
+fn handle_tzip_toggle(body) {
+    let enabled = dict_get(body, "enabled", "toggle")
+    if enabled == "toggle" {
+        // Toggle current state
+        if _tzip_enabled == true {
+            let _tzip_enabled = false
+        } else {
+            let _tzip_enabled = true
+    } else {
+        if enabled == true {
+            let _tzip_enabled = true
+        } else {
+            let _tzip_enabled = false
+        }
+    }
+    return {"ok": true, "tzip_enabled": _tzip_enabled}
+}
+
+// POST /tzip/status -- check shadow status for a specific path
+}
+fn handle_tzip_path_status(body) {
+    let path = dict_get(body, "path", "")
+    if len(path) == 0 {
+        return {"ok": false, "error": "missing 'path'"}
+    }
+    let info = tzip_check_status(path)
+    return {"ok": true, "path": path, "tzip": info}
+}
+
+// ============================================================================
+// ROUTE REGISTRATION
+// ============================================================================
+
+// GET routes
+troute(server, "GET",  "/health",          "handle_health")
+troute(server, "GET",  "/tools/status",    "handle_tools_status")
+troute(server, "GET",  "/tools/predict",   "handle_tools_predict")
+troute(server, "GET",  "/multi/modes",     "handle_multi_modes")
+troute(server, "GET",  "/tzip/stats",      "handle_tzip_stats")
+
+// POST routes
+troute(server, "POST", "/tools/read",      "handle_read")
+troute(server, "POST", "/tools/write",     "handle_write")
+troute(server, "POST", "/tools/grep",      "handle_grep")
+troute(server, "POST", "/tools/glob",      "handle_glob")
+troute(server, "POST", "/tools/run",       "handle_run")
+troute(server, "POST", "/tools/edit",      "handle_edit")
+troute(server, "POST", "/tools/pipe",      "handle_pipe")
+troute(server, "POST", "/multi",           "handle_multi")
+troute(server, "POST", "/tools/mkdir",     "handle_mkdir")
+troute(server, "POST", "/tools/ls",        "handle_ls")
+troute(server, "POST", "/tools/du",        "handle_du")
+troute(server, "POST", "/tools/df",        "handle_df")
+troute(server, "POST", "/tools/chmod",     "handle_chmod")
+troute(server, "POST", "/tools/chown",     "handle_chown")
+troute(server, "POST", "/tools/tree",      "handle_tree")
+troute(server, "POST", "/tzip/toggle",     "handle_tzip_toggle")
+troute(server, "POST", "/tzip/status",     "handle_tzip_path_status")
+
+// ============================================================================
+// STARTUP BANNER
+// ============================================================================
+
+print("[NovaTools] NovaX Native Tools v" + VERSION + " starting on port " + str(PORT))
+print("[NovaTools] Runtime: NovaLang | Ternary: TRUE | ASCII-clean")
+print("[NovaTools] 7 tools: read, write, grep, glob, run, edit, pipe")
+print("[NovaTools] TMulti: 20 composition modes across 7 tools")
+print("[NovaTools] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[NovaTools] Block=" + str(BLOCK_SIZE) + " | Re=" + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT))
+print("[NovaTools] Channel classifier: 10 channels (CODE,MATH,REASON,FACT,...)")
+print("[NovaTools] Markov prediction: active")
+print("[NovaTools] Exec server: " + EXEC_SERVER)
+print("[NovaTools] GET  /health /tools/status /tools/predict /multi/modes")
+print("[NovaTools] POST /tools/read /tools/write /tools/grep /tools/glob")
+print("[NovaTools] POST /tools/run /tools/edit /tools/pipe /multi")
+print("[NovaTools] TZip: enabled=" + str(_tzip_enabled) + " | GET /tzip/stats | POST /tzip/toggle /tzip/status")
+print("[NovaTools] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+// ============================================================================
+// START SERVER
+// ============================================================================
+
+tstart(server)

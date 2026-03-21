@@ -1,0 +1,2635 @@
+// nova_ternary_tools_service.nova -- NovaX Ternary Toolkit v1.0 (port 9894)
+// Pure NovaLang port of nova_ternary_tools.py
+//
+// 7 Core Tools + TFilter + TFlow built on 3-5-7-13 Harmonics:
+//   1. TDiff   -- Ternary 3-state diff (added/unchanged/removed = +1/0/-1)
+//   2. TCache  -- In-memory cache with 3-tier eviction (hot/warm/cold)
+//   3. TSync   -- Delta sync via ternary diffs
+//   4. TIndex  -- Three-state search index (match/partial/miss)
+//   5. TMesh   -- Compressed inter-service relay
+//   6. TStream -- Real-time ternary streams
+//   7. TForge  -- Reynolds code analyzer (N-S on source code)
+//   8. TFilter -- N-S Reynolds text classifier (+1/0/-1)
+//   9. TFlow   -- N-S pipe flow router for sessions + downloads
+//
+// Endpoints:
+//   POST /ttools/diff           -- Compute ternary diff
+//   POST /ttools/diff/apply     -- Apply ternary diff
+//   POST /ttools/cache/set      -- Store in TCache
+//   POST /ttools/cache/get      -- Retrieve from TCache
+//   GET  /ttools/cache/status   -- Cache stats
+//   POST /ttools/sync           -- Delta sync directories
+//   POST /ttools/index          -- Index files by ternary fingerprint
+//   POST /ttools/search         -- Three-state search
+//   POST /ttools/mesh           -- Compressed service relay
+//   POST /ttools/stream/start   -- Start compressed stream
+//   POST /ttools/stream/write   -- Write to stream
+//   GET  /ttools/stream/read    -- Read from stream
+//   POST /ttools/forge          -- Reynolds code analysis
+//   POST /ttools/filter         -- TFilter: N-S text classifier
+//   POST /ttools/flow/message   -- TFlow: route message through pipe
+//   POST /ttools/flow/recall    -- TFlow: recall session
+//   POST /ttools/flow/download  -- TFlow: download routing strategy
+//   GET  /ttools/flow/status    -- TFlow: pipe flow status
+//   GET  /ttools/status         -- Full toolkit status
+//   GET  /health                -- Health check
+//
+// N-S Mapping:
+//   Re < 27  (3^3)  = laminar      (clean, signal)
+//   Re < 125 (5^3)  = transitional (uncertain)
+//   Re < 343 (7^3)  = turbulent    (noisy)
+//   Re >= 343       = chaotic      (extreme)
+
+// ============================================================================
+// SERVER INIT
+// ============================================================================
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9894
+let server = tserve(PORT, "Nova Ternary Toolkit v1.0")
+
+// ============================================================================
+// 3-5-7-13 HARMONIC CONSTANTS
+// ============================================================================
+
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let BLOCK = 2187             // 3^7 = ternary-native block size
+
+// -- N-S Reynolds Boundaries (harmonic cubes) --
+let RE_LAMINAR      = 27     // 3^3
+let RE_TRANSITIONAL = 125    // 5^3
+let RE_TURBULENT    = 343    // 7^3
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Service Constants --
+let VERSION      = "1.0"
+let TOOLS_COUNT  = 7
+let MAX_PIPE     = 7         // H7 = max pipeline depth
+let TIERS        = 3         // H3 = cache tiers
+let HEARTBEAT    = 5         // H5 = check interval seconds
+let HEADER_SIZE  = 13        // H13 = frame header bytes
+let PACK_TRITS   = 5         // H5 = trits per packed byte
+
+// -- Cache Constants --
+let MAX_CACHE    = 1183      // H13 * H13 * H7 = 13*13*7
+let TIER_HOT     = 1
+let TIER_WARM    = 0
+let TIER_COLD    = -1
+
+// -- Safe Roots for path validation --
+let SAFE_ROOTS = ["C:\\NovaX", "C:\\NovaX\\data", "C:\\NovaX\\memory", "C:\\NovaX\\web"]
+
+// -- TFlow directories --
+let TFLOW_DIR          = "C:\\NovaX\\memory\\tflow"
+let TFLOW_SESSIONS_DIR = "C:\\NovaX\\memory\\tflow\\sessions"
+let TFLOW_DOWNLOADS_DIR = "C:\\NovaX\\memory\\tflow\\downloads"
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+// -- Start time --
+let _start_time = time()
+
+// -- TCache state --
+let _cache = {}
+let _cache_order = []
+let _cache_hits = 0
+let _cache_misses = 0
+let _cache_sets = 0
+let _cache_evictions = 0
+let _cache_bytes_saved = 0
+
+// -- TIndex state --
+let _index = {}
+
+// -- TMesh stats --
+let _mesh_calls = 0
+let _mesh_bytes_sent = 0
+let _mesh_bytes_raw = 0
+let _mesh_errors = 0
+
+// -- TStream state --
+let _streams = {}
+
+// -- TWeave state (Layer 2: Nervous System) --
+let _weave_channels = {}
+
+// -- TShield state (Layer 6: HTTP traffic Reynolds) --
+let _shield_traffic = {}
+
+// -- TFlow state (Layer 9: N-S Pipe Router) --
+let _flow_sessions = {}
+
+// -- TFilter noise words (known UI chrome) --
+let _tf_noise_list = [
+    "minimize", "restore", "close", "menu", "back", "forward",
+    "sidebar", "pretty-print", "copy message", "preview options",
+    "settings", "new chat", "model", "send", "stop generating",
+    "regenerate", "edit", "copy", "share", "like", "dislike",
+    "scroll to bottom", "attach", "search", "history", "close sidebar",
+    "open profile menu", "open conversation options", "close panel",
+    "go back", "go forward", "refresh", "toggle device toolbar",
+    "select element", "toggle logs panel", "update todos", "plan",
+    "more options", "more actions", "add files and more", "dictate button",
+    "good response", "bad response", "edit message", "skip to content",
+    "switch to light mode", "switch to dark mode", "black cat, settings",
+    "explore gpts", "your chats", "chat history", "search chats",
+    "images", "apps", "projects", "gpts", "deep research", "codex",
+    "home", "ask anything", "+ new chat"
+]
+
+// -- TFilter element type weights (rho = density) --
+let _tf_rho = {}
+_tf_rho = dict_set(_tf_rho, "50000", 2.5)   // Button
+_tf_rho = dict_set(_tf_rho, "50004", 2.0)   // Edit
+_tf_rho = dict_set(_tf_rho, "50005", 1.5)   // Hyperlink
+_tf_rho = dict_set(_tf_rho, "50007", 1.2)   // ListItem
+_tf_rho = dict_set(_tf_rho, "50020", 0.5)   // Text
+_tf_rho = dict_set(_tf_rho, "50026", 4.0)   // Landmark
+_tf_rho = dict_set(_tf_rho, "50032", 5.0)   // Window
+let TF_RHO_DEFAULT = 1.5
+
+// ============================================================================
+// HELPER: Safe path check
+// ============================================================================
+
+fn safe_path(p) {
+    // Check if path starts with any allowed root
+    let pl = lower(str(p))
+    let i = 0
+    while3 i < len(SAFE_ROOTS) {
+        let root = lower(SAFE_ROOTS[i])
+        if3 starts_with(pl, root) {
+            return T_TRUE
+        } else3 {
+            // continue
+        }
+        i = i + 1
+    }
+    return T_FALSE
+}
+
+// ============================================================================
+// HELPER: N-S Reynolds Calculator
+// ============================================================================
+
+fn classify_flow(re) {
+    if3 re < RE_LAMINAR {
+        return "laminar"
+    } else3 re < RE_TRANSITIONAL {
+        return "transitional"
+    } else3 re < RE_TURBULENT {
+        return "turbulent"
+    } else3 {
+        return "chaotic"
+    }
+}
+
+fn classify_trit(re) {
+    if3 re < RE_LAMINAR {
+        return T_TRUE
+    } else3 re < RE_TRANSITIONAL {
+        return T_MAYBE
+    } else3 {
+        return T_FALSE
+    }
+}
+
+// Compute a simple Reynolds number from text content
+// Uses character frequency + diversity as proxy for entropy
+fn text_reynolds(text) {
+    let t = str(text)
+    if3 len(t) < 2 {
+        return 0.0
+    } else3 {
+        // Count unique chars as entropy proxy
+        let chars = {}
+        let i = 0
+        let total = len(t)
+        while3 i < total {
+            let c = slice(t, i, i + 1)
+            let prev = dict_get(chars, c) ?? 0
+            chars = dict_set(chars, c, prev + 1)
+            i = i + 1
+        }
+        let unique = len(keys(chars))
+        // Entropy approximation: unique/total ratio
+        let entropy = unique / total
+        // Diversity: words
+        let words = split(t, " ")
+        let word_count = len(words)
+        let unique_words = {}
+        let wi = 0
+        while3 wi < word_count {
+            let w = lower(words[wi])
+            unique_words = dict_set(unique_words, w, 1)
+            wi = wi + 1
+        }
+        let diversity = len(keys(unique_words)) / max(word_count, 1)
+        // Re approximation
+        let velocity = 1.0 / max(entropy, 0.05)
+        let length = min(total, 500) / 100.0
+        let viscosity = max(diversity, 0.05)
+        let re = velocity * length / viscosity
+        return round(re * 100) / 100
+    }
+}
+
+// ============================================================================
+// HELPER: Text entropy (Shannon-like, normalized 0-1)
+// ============================================================================
+
+fn text_entropy(text) {
+    if3 len(str(text)) == 0 {
+        return 0.0
+    } else3 { t = lower(str(text))
+        let chars = {}
+        let i = 0
+        let n = len(t)
+        while3 i < n {
+            let c = slice(t, i, i + 1)
+            let prev = dict_get(chars, c) ?? 0
+            chars = dict_set(chars, c, prev + 1)
+            i = i + 1
+        }
+        // Approximate entropy without log2
+        // Use unique/total ratio scaled to 0-1
+        let unique = len(keys(chars))
+        let ent = unique / max(n, 1)
+        return min(ent, 1.0)
+    }
+}
+
+// ============================================================================
+// HELPER: Word diversity = unique words / total words
+// ============================================================================
+
+fn word_diversity(text) {
+    let words = split(str(text), " ")
+    if3 len(words) == 0 {
+        return 0.0
+    } else3 { seen = {}
+        let i = 0
+        while3 i < len(words) {
+            let w = lower(words[i])
+            if3 len(w) > 0 { _s = dict_set(seen, w, 1)
+            } else3 {
+                // skip empty
+            }
+            i = i + 1
+        }
+        return len(keys(seen)) / max(len(words), 1)
+    }
+}
+
+// ============================================================================
+// HELPER: Average word length
+// ============================================================================
+
+fn avg_word_length(text) {
+    let words = split(str(text), " ")
+    if3 len(words) == 0 {
+        return 1.0
+    } else3 { total = 0
+        let count = 0
+        let i = 0
+        while3 i < len(words) {
+            let w = words[i]
+            if3 len(w) > 0 { total = total + len(w)
+                count = count + 1
+            } else3 {
+                // skip
+            }
+            i = i + 1
+        }
+        if3 count == 0 {
+            return 1.0
+        } else3 {
+            return total / count
+        }
+    }
+}
+
+// ============================================================================
+// HELPER: Check if text is in noise list
+// ============================================================================
+
+fn is_noise_word(text) {
+    let t = lower(trim(str(text)))
+    let i = 0
+    while3 i < len(_tf_noise_list) {
+        if3 (dict_get(_tf_noise_list, i) ?? "") == t {
+            return T_TRUE
+        } else3 {
+            // continue
+        }
+        i = i + 1
+    }
+    return T_FALSE
+}
+
+// ============================================================================
+// HELPER: Check for server log patterns
+// ============================================================================
+
+fn is_server_log(text) {
+    let t = str(text)
+    if3 contains(t, "::ffff:") {
+        return T_TRUE
+    } else3 contains(t, "HTTP/") {
+        return T_TRUE
+    } else3 contains(t, "\"GET /") {
+        return T_TRUE
+    } else3 contains(t, "\"POST /") {
+        return T_TRUE
+    } else3 contains(t, "\"PUT /") {
+        return T_TRUE
+    } else3 contains(t, "\"DELETE /") {
+        return T_TRUE
+    } else3 {
+        return T_FALSE
+    }
+}
+
+// ============================================================================
+// HELPER: Check for model label patterns
+// ============================================================================
+
+fn is_model_label(text) {
+    let t = lower(trim(str(text)))
+    if3 t == "claude" {
+        return T_TRUE
+    } else3 t == "claude opus" {
+        return T_TRUE
+    } else3 t == "claude sonnet" {
+        return T_TRUE
+    } else3 t == "claude haiku" {
+        return T_TRUE
+    } else3 t == "chatgpt" {
+        return T_TRUE
+    } else3 t == "model" {
+        return T_TRUE
+    } else3 starts_with(t, "gpt-4") {
+        return T_TRUE
+    } else3 starts_with(t, "gpt-3") {
+        return T_TRUE
+    } else3 starts_with(t, "o1") {
+        return T_TRUE
+    } else3 starts_with(t, "o3") {
+        return T_TRUE
+    } else3 {
+        return T_FALSE
+    }
+}
+
+// ============================================================================
+// HELPER: Check for badge contamination
+// ============================================================================
+
+fn has_badge(text) {
+    let t = str(text)
+    if3 contains(t, "LAM Re=") {
+        return T_TRUE
+    } else3 contains(t, "TRN Re=") {
+        return T_TRUE
+    } else3 contains(t, "TRB Re=") {
+        return T_TRUE
+    } else3 contains(t, "CHO Re=") {
+        return T_TRUE
+    } else3 {
+        return T_FALSE
+    }
+}
+
+// ============================================================================
+// HELPER: Has punctuation
+// ============================================================================
+
+fn has_punctuation(text) {
+    let t = str(text)
+    if3 contains(t, ".") {
+        return T_TRUE
+    } else3 contains(t, "!") {
+        return T_TRUE
+    } else3 contains(t, "?") {
+        return T_TRUE
+    } else3 contains(t, ",") {
+        return T_TRUE
+    } else3 contains(t, ";") {
+        return T_TRUE
+    } else3 contains(t, ":") {
+        return T_TRUE
+    } else3 {
+        return T_FALSE
+    }
+}
+
+// ============================================================================
+// HELPER: LRU order management for cache
+// ============================================================================
+
+fn cache_order_remove(key) {
+    let new_order = []
+    let i = 0
+    while3 i < len(_cache_order) {
+        let k = _cache_order[i]
+        if3 k == key {
+            // skip -- remove
+        } else3 {
+            new_order = append(new_order, k)
+        }
+        i = i + 1
+    }
+    _cache_order = new_order
+}
+
+fn cache_order_touch(key) {
+    cache_order_remove(key)
+    _cache_order = append(_cache_order, key)
+}
+
+fn cache_evict_cold() {
+    // Evict first cold entry, fallback to LRU (oldest)
+    let evicted = T_FALSE
+    let i = 0
+    while3 i < len(_cache_order) {
+        let k = _cache_order[i]
+        let entry = dict_get(_cache, k) ?? {}
+        let tier = dict_get(entry, "tier") ?? 0
+        if3 tier == TIER_COLD { _d = dict_del(_cache, k)
+            cache_order_remove(k)
+            _cache_evictions = _cache_evictions + 1
+            let evicted = T_TRUE
+            return T_TRUE
+        } else3 { i = i + 1
+        }
+    }
+    // No cold entries -- evict oldest (front of order list)
+    if3 len(_cache_order) > 0 { oldest = _cache_order[0]
+        let _d = dict_del(_cache, oldest)
+        _cache_order = slice(_cache_order, 1, len(_cache_order))
+        _cache_evictions = _cache_evictions + 1
+    } else3 {
+        // nothing to evict
+    }
+    return T_TRUE
+}
+
+// ============================================================================
+// TOOL 1: TDIFF -- Ternary 3-State Diff (line-by-line)
+// ============================================================================
+// +1 = added, 0 = unchanged, -1 = removed
+// Operates on text strings via line comparison
+
+fn tdiff_compute(old_text, new_text) {
+    let t0 = time()
+    let old_lines = split(str(old_text), "\n")
+    let new_lines = split(str(new_text), "\n")
+    let old_len = len(old_lines)
+    let new_len = len(new_lines)
+    let max_len = max(old_len, new_len)
+
+    let diff_entries = []
+    let added = 0
+    let removed = 0
+    let unchanged = 0
+    let i = 0
+
+    while3 i < max_len {
+        let old_line = ""
+        let new_line = ""
+        if3 i < old_len { old_line = old_lines[i]
+        } else3 {
+            // beyond old
+        }
+        if3 i < new_len { new_line = new_lines[i]
+        } else3 {
+            // beyond new
+        }
+
+        if3 i >= old_len {
+            // Added line
+            let entry = {}
+            entry = dict_set(entry, "line", i + 1)
+            entry = dict_set(entry, "trit", T_TRUE)
+            entry = dict_set(entry, "type", "added")
+            entry = dict_set(entry, "text", new_line)
+            diff_entries = append(diff_entries, entry)
+            added = added + 1
+        } else3 i >= new_len {
+            // Removed line
+            let entry = {}
+            entry = dict_set(entry, "line", i + 1)
+            entry = dict_set(entry, "trit", T_FALSE)
+            entry = dict_set(entry, "type", "removed")
+            entry = dict_set(entry, "text", old_line)
+            diff_entries = append(diff_entries, entry)
+            removed = removed + 1
+        } else3 old_line == new_line {
+            // Unchanged
+            unchanged = unchanged + 1
+        } else3 {
+            // Changed -- count as remove + add
+            let entry_r = {}
+            entry_r = dict_set(entry_r, "line", i + 1)
+            entry_r = dict_set(entry_r, "trit", T_FALSE)
+            entry_r = dict_set(entry_r, "type", "removed")
+            entry_r = dict_set(entry_r, "text", old_line)
+            diff_entries = append(diff_entries, entry_r)
+            let entry_a = {}
+            entry_a = dict_set(entry_a, "line", i + 1)
+            entry_a = dict_set(entry_a, "trit", T_TRUE)
+            entry_a = dict_set(entry_a, "type", "added")
+            entry_a = dict_set(entry_a, "text", new_line)
+            diff_entries = append(diff_entries, entry_a)
+            added = added + 1
+            removed = removed + 1
+        }
+        i = i + 1
+    }
+
+    let changed_pct = 0
+    if3 max_len > 0 { changed_pct = round((added + removed) * 10000 / max_len) / 100
+    } else3 {
+        // 0
+    }
+
+    let ms = round((time() - t0) * 1000 * 100) / 100
+
+    return {
+        "ok": true,
+        "diff": diff_entries,
+        "old_lines": old_len,
+        "new_lines": new_len,
+        "added": added,
+        "removed": removed,
+        "unchanged": unchanged,
+        "changed_pct": changed_pct,
+        "ms": ms
+    }
+}
+
+fn tdiff_compute_files(old_path, new_path) {
+    // Read files and compute line diff
+    let old_text = ""
+    let new_text = ""
+    try3 {
+        let old_text = nova_read(old_path)
+    } else3 {
+        return {"ok": false, "error": "Cannot read old file: " + str(old_path)}
+    }
+    try3 {
+        let new_text = nova_read(new_path)
+    } else3 {
+        return {"ok": false, "error": "Cannot read new file: " + str(new_path)}
+    }
+    return tdiff_compute(old_text, new_text)
+}
+
+// ============================================================================
+// TOOL 2: TCACHE -- Ternary In-Memory Cache
+// ============================================================================
+// 3 tiers: +1=hot, 0=warm, -1=cold
+// LRU eviction with cold-first priority
+
+fn tcache_set(key, value) {
+    // Evict if full
+    while3 len(_cache_order) >= MAX_CACHE {
+        cache_evict_cold()
+    }
+
+    let now = time()
+    let encoded = json_encode(value)
+    let original_size = len(encoded)
+
+    // Delegate compression to TZip service if available
+    let compressed_size = original_size
+    let saved = 0
+    try3 {
+        let resp = http_post("http://127.0.0.1:9885/tzip/compress",
+            {"data": encoded})
+        let cs = dict_get(resp, "compressed_size") ?? original_size
+        let compressed_size = cs
+        let saved = original_size - cs
+    } else3 {
+        // TZip not available -- store raw
+    }
+
+    let entry = {}
+    entry = dict_set(entry, "key", key)
+    entry = dict_set(entry, "value", value)
+    entry = dict_set(entry, "original_size", original_size)
+    entry = dict_set(entry, "compressed_size", compressed_size)
+    entry = dict_set(entry, "tier", TIER_HOT)
+    entry = dict_set(entry, "created", now)
+    entry = dict_set(entry, "last_access", now)
+    entry = dict_set(entry, "hits", 0)
+
+    // Remove old entry if exists
+    if3 dict_has(_cache, key) {
+        cache_order_remove(key)
+    } else3 {
+        // new entry
+    }
+
+    _cache = dict_set(_cache, key, entry)
+    _cache_order = append(_cache_order, key)
+    _cache_sets = _cache_sets + 1
+    if3 saved > 0 { _cache_bytes_saved = _cache_bytes_saved + saved
+    } else3 {
+        // no savings
+    }
+
+    return {
+        "ok": true,
+        "key": key,
+        "original": original_size,
+        "compressed": compressed_size,
+        "saved": saved
+    }
+}
+
+fn tcache_get(key) {
+    let entry = dict_get(_cache, key) ?? {}
+    if3 len(keys(entry)) == 0 { _cache_misses = _cache_misses + 1
+        return {"ok": false, "error": "miss"}
+    } else3 { _cache_hits = _cache_hits + 1
+        let hits = (dict_get(entry, "hits") ?? 0) + 1
+        entry = dict_set(entry, "hits", hits)
+        entry = dict_set(entry, "last_access", time())
+        entry = dict_set(entry, "tier", TIER_HOT)
+        _cache = dict_set(_cache, key, entry)
+        cache_order_touch(key)
+        return {
+            "ok": true,
+            "key": key,
+            "value": dict_get(entry, "value") ?? null,
+            "tier": TIER_HOT,
+            "hits": hits,
+            "compressed_size": dict_get(entry, "compressed_size") ?? 0
+        }
+    }
+}
+
+fn tcache_status() {
+    let hot = 0
+    let warm = 0
+    let cold = 0
+    let total_compressed = 0
+    let total_original = 0
+
+    let ks = keys(_cache)
+    let i = 0
+    while3 i < len(ks) {
+        let k = ks[i]
+        let entry = dict_get(_cache, k) ?? {}
+        let tier = dict_get(entry, "tier") ?? 0
+        if3 tier == TIER_HOT { hot = hot + 1
+        } else3 tier == TIER_WARM { warm = warm + 1
+        } else3 { cold = cold + 1
+        }
+        total_compressed = total_compressed + dict_get(entry, "compressed_size") ?? 0
+        total_original = total_original + dict_get(entry, "original_size") ?? 0
+        i = i + 1
+    }
+
+    let total_gets = _cache_hits + _cache_misses
+    let hit_rate = 0
+    if3 total_gets > 0 { hit_rate = round(_cache_hits * 10000 / total_gets) / 100
+    } else3 {
+        // 0
+    }
+
+    let ram_saved_pct = 0
+    if3 total_original > 0 { ram_saved_pct = round((1 - total_compressed / total_original) * 10000) / 100
+    } else3 {
+        // 0
+    }
+
+    return {
+        "sets": _cache_sets,
+        "gets": total_gets,
+        "hits": _cache_hits,
+        "misses": _cache_misses,
+        "evictions": _cache_evictions,
+        "bytes_saved": _cache_bytes_saved,
+        "entries": len(_cache_order),
+        "hot": hot,
+        "warm": warm,
+        "cold": cold,
+        "ram_compressed": total_compressed,
+        "ram_original": total_original,
+        "ram_saved_pct": str(ram_saved_pct) + "%",
+        "hit_rate": str(hit_rate) + "%"
+    }
+}
+
+// ============================================================================
+// TOOL 3: TSYNC -- Ternary Delta Sync
+// ============================================================================
+// Syncs directories by computing diffs on changed files
+// Delegates file listing to nova_run for dir walking
+
+fn tsync_hash_file(path) {
+    // Hash file via sha256 (first BLOCK bytes)
+    try3 {
+        let content = nova_read(path)
+        let hash = sha256(content)
+        return slice(hash, 0, 16)
+    } else3 {
+        return ""
+    }
+}
+
+fn tsync_build_manifest(dir_path) {
+    // Use nova_run to list files in directory
+    let manifest = {}
+    try3 {
+        let cmd = "cmd /c dir /s /b \"" + str(dir_path) + "\""
+        let output = nova_run(cmd)
+        let files = split(str(output), "\n")
+        let i = 0
+        while3 i < len(files) {
+            let fpath = trim(files[i])
+            if3 len(fpath) > 0 {
+                // Skip excluded dirs
+                let skip = T_FALSE
+                if3 contains(fpath, "\\.git\\") { skip = T_TRUE
+                } else3 contains(fpath, "\\__pycache__\\") { skip = T_TRUE
+                } else3 contains(fpath, "\\node_modules\\") { skip = T_TRUE
+                } else3 contains(fpath, "\\ai_env\\") { skip = T_TRUE
+                } else3 contains(fpath, "\\venv\\") { skip = T_TRUE
+                } else3 {
+                    // not excluded
+                }
+                if3 skip == T_FALSE { hash = tsync_hash_file(fpath)
+                    if3 len(hash) > 0 {
+                        // Use relative path as key
+                        let rel = replace(fpath, dir_path + "\\", "")
+                        manifest = dict_set(manifest, rel, hash)
+                    } else3 {
+                        // hash failed
+                } else3 {
+                    // excluded
+            } else3 {
+                // empty line
+            }
+            i = i + 1
+    } else3 {
+        // dir listing failed
+    }
+    return manifest
+}
+}
+}
+}
+
+fn tsync_sync(source, target) {
+    if3 safe_path(source) == T_FALSE {
+        return {"ok": false, "error": "Source path outside allowed roots"}
+    } else3 safe_path(target) == T_FALSE {
+        return {"ok": false, "error": "Target path outside allowed roots"}
+    } else3 { t0 = time()
+        let src_manifest = tsync_build_manifest(source)
+        let tgt_manifest = tsync_build_manifest(target)
+
+        let synced = 0
+        let skipped = 0
+        let errors = 0
+        let delta_bytes = 0
+        let full_bytes = 0
+
+        let src_keys = keys(src_manifest)
+        let ki = 0
+        while3 ki < len(src_keys) {
+            let rel = src_keys[ki]
+            let src_hash = dict_get(src_manifest, rel) ?? ""
+            let tgt_hash = dict_get(tgt_manifest, rel) ?? ""
+            let src_path = source + "\\" + rel
+            let tgt_path = target + "\\" + rel
+
+            try3 {
+                let src_content = nova_read(src_path)
+                full_bytes = full_bytes + len(src_content)
+
+                if3 src_hash == tgt_hash { skipped = skipped + 1
+                } else3 {
+                    // File changed or new -- copy via nova_write
+                    try3 {
+                        nova_write(tgt_path, src_content)
+                        synced = synced + 1
+                        delta_bytes = delta_bytes + len(src_content)
+                    } else3 { errors = errors + 1
+            } else3 { errors = errors + 1
+            }
+            ki = ki + 1
+        }
+
+        let ms = round((time() - t0) * 1000 * 100) / 100
+        let savings = 0
+        if3 full_bytes > 0 { savings = round((1 - delta_bytes / full_bytes) * 10000) / 100
+        } else3 {
+            // 0
+        }
+
+        return {
+            "ok": true,
+            "synced": synced,
+            "skipped": skipped,
+            "errors": errors,
+            "delta_bytes": delta_bytes,
+            "full_bytes": full_bytes,
+            "savings": str(savings) + "%",
+            "ms": ms
+        }
+    }
+}
+
+// ============================================================================
+// TOOL 4: TINDEX -- Ternary Search Index
+// ============================================================================
+// Three-state search: +1=match, 0=partial, -1=miss
+// Indexes files by sha256 fingerprint and text content
+}
+}
+
+fn tindex_index_file(path) {
+    if3 safe_path(path) == T_FALSE {
+        return {"ok": false, "error": "Path outside allowed roots"}
+    } else3 {
+        try3 {
+            let content = nova_read(path)
+            let fp_hash = slice(sha256(content), 0, 12)
+            let re = text_reynolds(content)
+            let flow = classify_flow(re)
+
+            let entry = {}
+            entry = dict_set(entry, "fingerprint_hash", fp_hash)
+            entry = dict_set(entry, "size", len(content))
+            entry = dict_set(entry, "reynolds", re)
+            entry = dict_set(entry, "flow", flow)
+            entry = dict_set(entry, "indexed_at", time())
+            entry = dict_set(entry, "content_preview", slice(lower(content), 0, BLOCK))
+            _index = dict_set(_index, path, entry)
+
+            return {
+                "ok": true,
+                "path": path,
+                "fingerprint": fp_hash,
+                "reynolds": re,
+                "flow": flow
+        } else3 {
+            return {"ok": false, "error": "Cannot read file: " + str(path)}
+        }
+    }
+}
+}
+
+fn tindex_index_directory(dir_path) {
+    if3 safe_path(dir_path) == T_FALSE {
+        return {"ok": false, "error": "Path outside allowed roots"}
+    } else3 { count = 0
+        let errs = 0
+        try3 {
+            let cmd = "cmd /c dir /s /b \"" + str(dir_path) + "\""
+            let output = nova_run(cmd)
+            let files = split(str(output), "\n")
+            let i = 0
+            while3 i < len(files) {
+                let fpath = trim(files[i])
+                if3 len(fpath) > 0 {
+                    // Skip excluded extensions
+                    let skip = T_FALSE
+                    if3 ends_with(fpath, ".exe") { skip = T_TRUE
+                    } else3 ends_with(fpath, ".dll") { skip = T_TRUE
+                    } else3 ends_with(fpath, ".sys") { skip = T_TRUE
+                    } else3 ends_with(fpath, ".msi") { skip = T_TRUE
+                    } else3 contains(fpath, "\\.git\\") { skip = T_TRUE
+                    } else3 contains(fpath, "\\__pycache__\\") { skip = T_TRUE
+                    } else3 contains(fpath, "\\node_modules\\") { skip = T_TRUE
+                    } else3 {
+                        // not excluded
+                    }
+                    if3 skip == T_FALSE { r = tindex_index_file(fpath)
+                        if3 (dict_get(r, "ok") ?? false) == true { count = count + 1
+                        } else3 { errs = errs + 1
+                    } else3 {
+                        // excluded
+                } else3 {
+                    // empty
+                }
+                i = i + 1
+        } else3 {
+            // dir listing failed
+        }
+        return {
+            "ok": true,
+            "indexed": count,
+            "errors": errs,
+            "total": len(keys(_index))
+        }
+    }
+}
+}
+}
+}
+
+fn tindex_search(query, search_type) {
+    let t0 = time()
+    let q = lower(str(query))
+    let results = []
+    let matches = 0
+    let partials = 0
+
+    let idx_keys = keys(_index)
+    let i = 0
+    while3 i < len(idx_keys) {
+        let path = idx_keys[i]
+        let entry = dict_get(_index, path) ?? {}
+
+        // Fingerprint comparison by hash prefix
+        let q_hash = slice(sha256(q), 0, 12)
+        let e_hash = dict_get(entry, "fingerprint_hash") ?? ""
+        let sim = 0.0
+
+        // Check hash prefix overlap
+        let match_chars = 0
+        let mi = 0
+        let hash_len = min(len(q_hash), len(e_hash))
+        while3 mi < hash_len {
+            if3 slice(q_hash, mi, mi + 1) == slice(e_hash, mi, mi + 1) { match_chars = match_chars + 1
+            } else3 {
+                // no match
+            }
+            mi = mi + 1
+        }
+        if3 hash_len > 0 { sim = match_chars / hash_len
+        } else3 {
+            // 0
+        }
+
+        // Also check text content match
+        let text_match = T_FALSE
+        if3 search_type == "content" { preview = dict_get(entry, "content_preview") ?? ""
+            if3 contains(preview, q) { text_match = T_TRUE
+                let sim = max(sim, 0.85)
+            } else3 {
+                // no content match
+        } else3 {
+            // fingerprint only
+        }
+
+        // Classify by ternary thresholds
+        let state = T_FALSE
+        let state_name = "miss"
+        if3 sim > 0.667 { state = T_TRUE
+            let state_name = "match"
+            matches = matches + 1
+        } else3 sim > 0.333 { state = T_MAYBE
+            let state_name = "partial"
+            partials = partials + 1
+        } else3 {
+            // miss -- skip from results
+        }
+
+        if3 state >= T_MAYBE { result = {}
+            result = dict_set(result, "path", path)
+            result = dict_set(result, "similarity", round(sim * 10000) / 10000)
+            result = dict_set(result, "state", state)
+            result = dict_set(result, "state_name", state_name)
+            result = dict_set(result, "reynolds", dict_get(entry, "reynolds") ?? 0)
+            result = dict_set(result, "flow", dict_get(entry, "flow") ?? "unknown")
+            result = dict_set(result, "size", dict_get(entry, "size") ?? 0)
+            if3 text_match == T_TRUE { _e = dict_set(result, "text_match", true)
+            } else3 {
+                // no text_match field
+            }
+            results = append(results, result)
+        } else3 {
+            // skip misses
+        }
+
+        i = i + 1
+    }
+
+    // Sort results by similarity (descending) -- simple bubble sort
+    let sorted = T_FALSE
+    while3 sorted == T_FALSE {
+        let sorted = T_TRUE
+        let si = 0
+        while3 si < len(results) - 1 {
+            let a = dict_get(results, si) ?? {}
+            let b = dict_get(results, si + 1) ?? {}
+            let sa = dict_get(a, "similarity") ?? 0
+            let sb = dict_get(b, "similarity") ?? 0
+            if3 sa < sb {
+                // Swap
+                results = dict_set(results, si, b)
+                results = dict_set(results, si + 1, a)
+                let sorted = T_FALSE
+            } else3 {
+                // in order
+            }
+            si = si + 1
+        }
+    }
+
+    // Cap results at H13 * H3 = 39
+    let max_results = H13 * H3
+    if3 len(results) > max_results { results = slice(results, 0, max_results)
+    } else3 {
+        // all fit
+    }
+
+    let ms = round((time() - t0) * 1000 * 100) / 100
+
+    return {
+        "ok": true,
+        "query": query,
+        "type": search_type,
+        "matches": matches,
+        "partials": partials,
+        "results": results,
+        "ms": ms
+    }
+}
+}
+
+fn tindex_status() {
+    let flow_breakdown = {}
+    let idx_keys = keys(_index)
+    let i = 0
+    while3 i < len(idx_keys) {
+        let k = idx_keys[i]
+        let entry = dict_get(_index, k) ?? {}
+        let flow = dict_get(entry, "flow") ?? "unknown"
+        let prev = dict_get(flow_breakdown, flow) ?? 0
+        flow_breakdown = dict_set(flow_breakdown, flow, prev + 1)
+        i = i + 1
+    }
+    return {
+        "indexed_files": len(idx_keys),
+        "flow_breakdown": flow_breakdown
+    }
+}
+
+// ============================================================================
+// TOOL 5: TMESH -- Ternary Service Mesh Relay
+// ============================================================================
+// Compressed inter-service relay via http_post
+
+fn tmesh_relay(port, path, req_body, method) {
+    let t0 = time()
+    let url = "http://127.0.0.1:" + str(port) + str(path)
+
+    try3 {
+        let response = null
+        let raw_size = 0
+
+        if3 method == "GET" { resp = http_get(url)
+            let response = resp
+            let raw_size = len(json_encode(resp))
+        } else3 { payload = {}
+            if3 type_of(req_body) == "dict" { payload = req_body
+            } else3 type_of(req_body) == "string" { payload = json_decode(req_body)
+            } else3 { payload = {}
+            }
+            let resp = http_post(url, payload)
+            let response = resp
+            let raw_size = len(json_encode(resp))
+        }
+
+        _mesh_calls = _mesh_calls + 1
+        let sent = len(json_encode(req_body))
+        _mesh_bytes_sent = _mesh_bytes_sent + sent
+        _mesh_bytes_raw = _mesh_bytes_raw + raw_size
+
+        let ms = round((time() - t0) * 1000 * 100) / 100
+
+        return {
+            "ok": true,
+            "response": response,
+            "request_bytes": sent,
+            "response_bytes": raw_size,
+            "ms": ms
+    } else3 { _mesh_errors = _mesh_errors + 1
+        return {"ok": false, "error": "Relay failed to " + url}
+    }
+}
+}
+
+fn tmesh_status() {
+    let total = _mesh_bytes_sent + _mesh_bytes_raw
+    return {
+        "calls": _mesh_calls,
+        "bytes_sent": _mesh_bytes_sent,
+        "bytes_raw": _mesh_bytes_raw,
+        "errors": _mesh_errors,
+        "total_bytes": total,
+        "total_mb": round(total * 100 / 1048576) / 100
+    }
+}
+
+// ============================================================================
+// TOOL 6: TSTREAM -- Ternary Streaming
+// ============================================================================
+// List-based ring buffers for real-time data streams
+
+fn tstream_start(name, buffer_size) {
+    if3 dict_has(_streams, name) {
+        return {"ok": true, "stream": name, "status": "already_exists"}
+    } else3 { stream = {}
+        stream = dict_set(stream, "name", name)
+        stream = dict_set(stream, "buffer", [])
+        stream = dict_set(stream, "max_size", buffer_size)
+        stream = dict_set(stream, "created", time())
+        stream = dict_set(stream, "total_writes", 0)
+        stream = dict_set(stream, "total_bytes", 0)
+        stream = dict_set(stream, "total_compressed", 0)
+        _streams = dict_set(_streams, name, stream)
+        return {"ok": true, "stream": name, "buffer_size": buffer_size}
+    }
+}
+
+fn tstream_write(name, data) {
+    let stream = dict_get(_streams, name) ?? {}
+    if3 len(keys(stream)) == 0 {
+        return {"ok": false, "error": "Stream not found: " + str(name)}
+    } else3 { raw_size = len(str(data))
+        let buffer = dict_get(stream, "buffer") ?? []
+        let max_size = dict_get(stream, "max_size") ?? 455
+
+        // Delegate compression to TZip service
+        let compressed_size = raw_size
+        try3 {
+            let resp = http_post("http://127.0.0.1:9885/tzip/compress",
+                {"data": str(data)})
+            let compressed_size = dict_get(resp, "compressed_size") ?? raw_size
+        } else3 {
+            // TZip not available
+        }
+
+        let entry = {}
+        entry = dict_set(entry, "data", str(data))
+        entry = dict_set(entry, "original_size", raw_size)
+        entry = dict_set(entry, "compressed_size", compressed_size)
+        entry = dict_set(entry, "timestamp", time())
+        buffer = append(buffer, entry)
+
+        // Trim buffer if exceeds max
+        while3 len(buffer) > max_size {
+            let buffer = slice(buffer, 1, len(buffer))
+        }
+
+        let tw = (dict_get(stream, "total_writes") ?? 0) + 1
+        let tb = (dict_get(stream, "total_bytes") ?? 0) + raw_size
+        let tc = (dict_get(stream, "total_compressed") ?? 0) + compressed_size
+
+        stream = dict_set(stream, "buffer", buffer)
+        stream = dict_set(stream, "total_writes", tw)
+        stream = dict_set(stream, "total_bytes", tb)
+        stream = dict_set(stream, "total_compressed", tc)
+        _streams = dict_set(_streams, name, stream)
+
+        return {
+            "ok": true,
+            "stream": name,
+            "original": raw_size,
+            "compressed": compressed_size
+        }
+    }
+}
+
+fn tstream_read(name, count) {
+    let stream = dict_get(_streams, name) ?? {}
+    if3 len(keys(stream)) == 0 {
+        return {"ok": false, "error": "Stream not found: " + str(name)}
+    } else3 { buffer = dict_get(stream, "buffer") ?? []
+        let read_count = min(count, len(buffer))
+        let entries = []
+        let remaining_buf = []
+
+        // Read from front of buffer (oldest first)
+        let i = 0
+        while3 i < len(buffer) {
+            if3 i < read_count { entry = buffer[i]
+                let out_entry = {}
+                out_entry = dict_set(out_entry, "data", dict_get(entry, "data") ?? "")
+                out_entry = dict_set(out_entry, "timestamp", dict_get(entry, "timestamp") ?? 0)
+                entries = append(entries, out_entry)
+            } else3 {
+                remaining_buf = append(remaining_buf, buffer[i])
+            }
+            i = i + 1
+        }
+
+        stream = dict_set(stream, "buffer", remaining_buf)
+        _streams = dict_set(_streams, name, stream)
+
+        return {
+            "ok": true,
+            "stream": name,
+            "entries": entries,
+            "remaining": len(remaining_buf)
+        }
+    }
+}
+
+fn tstream_status() {
+    let stream_info = {}
+    let skeys = keys(_streams)
+    let i = 0
+    while3 i < len(skeys) {
+        let name = skeys[i]
+        let s = dict_get(_streams, name) ?? {}
+        let tb = dict_get(s, "total_bytes") ?? 0
+        let tc = dict_get(s, "total_compressed") ?? 0
+        let ratio = 0
+        if3 tb > 0 { ratio = round(tc * 10000 / tb) / 100
+        } else3 {
+            // 0
+        }
+        let info = {}
+        info = dict_set(info, "writes", dict_get(s, "total_writes") ?? 0)
+        info = dict_set(info, "buffered", len(dict_get(s, "buffer") ?? []))
+        info = dict_set(info, "bytes", tb)
+        info = dict_set(info, "compressed", tc)
+        info = dict_set(info, "saved", tb - tc)
+        info = dict_set(info, "ratio", str(ratio) + "%")
+        stream_info = dict_set(stream_info, name, info)
+        i = i + 1
+    }
+    return {
+        "streams": stream_info,
+        "count": len(skeys)
+    }
+}
+
+// ============================================================================
+// TOOL 7: TFORGE -- Reynolds Code Analyzer
+// ============================================================================
+// Applies N-S fluid dynamics to source code
+// Treats functions as flow channels, calculates per-function Reynolds
+
+fn tforge_analyze(path) {
+    let t0 = time()
+    if3 safe_path(path) == T_FALSE {
+        return {"ok": false, "error": "Path outside allowed roots"}
+    } else3 {
+        try3 {
+            let content = nova_read(path)
+            let lines = split(content, "\n")
+            let total_lines = len(lines)
+            let file_re = text_reynolds(content)
+            let file_flow = classify_flow(file_re)
+
+            // Find function definitions by scanning lines
+            // Look for: def, class, function, fn, func
+            let hotspots = []
+            let func_starts = []
+            let func_names = []
+            let li = 0
+            while3 li < total_lines {
+                let line = lines[li]
+                let stripped = trim(line)
+                let found_func = T_FALSE
+
+                // Check for function keywords
+                if3 starts_with(stripped, "def ") { fname = split(stripped, " ")
+                    let name = fname[1]
+                    // Remove ( and : from name
+                    let name = split(name, "(")
+                    let name = name[0]
+                    func_starts = append(func_starts, li)
+                    func_names = append(func_names, name)
+                    let found_func = T_TRUE
+                } else3 starts_with(stripped, "class ") { fname = split(stripped, " ")
+                    let name = fname[1]
+                    let name = split(name, "(")
+                    let name = name[0]
+                    let name = split(name, ":")
+                    let name = name[0]
+                    func_starts = append(func_starts, li)
+                    func_names = append(func_names, name)
+                    let found_func = T_TRUE
+                } else3 starts_with(stripped, "function ") { fname = split(stripped, " ")
+                    let name = fname[1]
+                    let name = split(name, "(")
+                    let name = name[0]
+                    func_starts = append(func_starts, li)
+                    func_names = append(func_names, name)
+                    let found_func = T_TRUE
+                } else3 starts_with(stripped, "fn ") { fname = split(stripped, " ")
+                    let name = fname[1]
+                    let name = split(name, "(")
+                    let name = name[0]
+                    func_starts = append(func_starts, li)
+                    func_names = append(func_names, name)
+                    let found_func = T_TRUE
+                } else3 starts_with(stripped, "async def ") { fname = split(stripped, " ")
+                    let name = fname[2]
+                    let name = split(name, "(")
+                    let name = name[0]
+                    func_starts = append(func_starts, li)
+                    func_names = append(func_names, name)
+                    let found_func = T_TRUE
+                } else3 {
+                    // not a function definition
+                }
+                li = li + 1
+            }
+
+            // Analyze each function body
+            let fi = 0
+            while3 fi < len(func_starts) {
+                let start_line = func_starts[fi]
+                let func_name = func_names[fi]
+
+                // Determine end of function
+                let end_line = total_lines
+                if3 fi + 1 < len(func_starts) { end_line = func_starts[fi + 1]
+                } else3 {
+                    // last function -- goes to end
+                }
+
+                // Build function body text
+                let body_parts = []
+                let bi = start_line
+                while3 bi < end_line {
+                    body_parts = append(body_parts, lines[bi])
+                    bi = bi + 1
+                }
+                let func_body = join(body_parts, "\n")
+                let func_lines = end_line - start_line
+
+                // Compute Reynolds for function body
+                let func_re = text_reynolds(func_body)
+                let func_flow = classify_flow(func_re)
+
+                // Detect issues
+                let issues = []
+                let hints = []
+
+                // Check nesting depth
+                let max_indent = 0
+                let base_indent = len(lines[start_line]) - len(trim(lines[start_line]))
+                let ni = start_line
+                while3 ni < end_line {
+                    let line = lines[ni]
+                    let stripped = trim(line)
+                    if3 len(stripped) > 0 { indent = len(line) - len(stripped)
+                        let relative = indent - base_indent
+                        if3 relative > max_indent { max_indent = relative
+                        } else3 {
+                            // not deeper
+                    } else3 {
+                        // empty line
+                    }
+                    ni = ni + 1
+                }
+
+                let nesting_depth = max_indent / 4
+                if3 nesting_depth > H3 {
+                    issues = append(issues, "deep nesting (" + str(nesting_depth) + " levels)")
+                } else3 {
+                    // ok nesting
+                }
+
+                // Check for complex patterns in body
+                if3 func_lines > 100 {
+                    issues = append(issues, "long function (" + str(func_lines) + " lines)")
+                } else3 {
+                    // ok length
+                }
+
+                // Optimization hints by regime
+                if3 func_re > RE_TRANSITIONAL {
+                    hints = append(hints, "extract inner logic to reduce Reynolds number")
+                } else3 {
+                    // laminar ok
+                }
+                if3 func_re > RE_TURBULENT {
+                    hints = append(hints, "break into smaller laminar functions")
+                } else3 {
+                    // not turbulent
+                }
+                if3 nesting_depth > H3 {
+                    hints = append(hints, "flatten nested structures")
+                } else3 {
+                    // ok
+                }
+
+                let hotspot = {}
+                hotspot = dict_set(hotspot, "name", func_name)
+                hotspot = dict_set(hotspot, "line", start_line + 1)
+                hotspot = dict_set(hotspot, "reynolds", func_re)
+                hotspot = dict_set(hotspot, "flow", func_flow)
+                hotspot = dict_set(hotspot, "lines", func_lines)
+                hotspot = dict_set(hotspot, "issues", issues)
+                hotspot = dict_set(hotspot, "hints", hints)
+                hotspots = append(hotspots, hotspot)
+
+                fi = fi + 1
+            }
+
+            // Sort hotspots by Reynolds (descending) -- bubble sort
+            let sorted = T_FALSE
+            while3 sorted == T_FALSE {
+                let sorted = T_TRUE
+                let si = 0
+                while3 si < len(hotspots) - 1 {
+                    let a = hotspots[si]
+                    let b = hotspots[si + 1]
+                    if3 (dict_get(a, "reynolds") ?? 0) < (dict_get(b, "reynolds") ?? 0) { _s = dict_set(hotspots, si, b)
+                        hotspots = dict_set(hotspots, si + 1, a)
+                        let sorted = T_FALSE
+                    } else3 {
+                        // in order
+                    }
+                    si = si + 1
+                }
+            }
+
+            // Cap hotspots at H13
+            if3 len(hotspots) > H13 { hotspots = slice(hotspots, 0, H13)
+            } else3 {
+                // all fit
+            }
+
+            let turbulent_count = 0
+            let ti = 0
+            while3 ti < len(hotspots) {
+                let h = hotspots[ti]
+                if3 (dict_get(h, "reynolds") ?? 0) > RE_TRANSITIONAL { turbulent_count = turbulent_count + 1
+                } else3 {
+                    // not turbulent
+                }
+                ti = ti + 1
+            }
+
+            let ms = round((time() - t0) * 1000 * 100) / 100
+
+            return {
+                "ok": true,
+                "path": path,
+                "file_reynolds": file_re,
+                "file_flow": file_flow,
+                "total_lines": total_lines,
+                "total_functions": len(func_starts),
+                "turbulent_functions": turbulent_count,
+                "hotspots": hotspots,
+                "harmonic_boundaries": {
+                    "laminar": "Re < " + str(RE_LAMINAR),
+                    "transitional": str(RE_LAMINAR) + " < Re < " + str(RE_TRANSITIONAL),
+                    "turbulent": str(RE_TRANSITIONAL) + " < Re < " + str(RE_TURBULENT),
+                    "chaotic": "Re > " + str(RE_TURBULENT)
+                },
+                "ms": ms
+        } else3 {
+            return {"ok": false, "error": "Cannot read file: " + str(path)}
+        }
+    }
+}
+
+// ============================================================================
+// TFILTER v2 -- N-S Reynolds Text Classifier
+// ============================================================================
+// Classifies text elements using N-S fluid dynamics:
+//   Re < 27  (3^3)  -> laminar      -> +1 SIGNAL
+//   Re < 125 (5^3)  -> transitional -> 0 UNCERTAIN
+//   Re >= 125       -> turbulent    -> -1 NOISE
+//
+// N-S variables:
+//   rho = element type weight (buttons heavy, text light)
+//   v   = 1/entropy (repetitive text = fast = turbulent)
+//   L   = normalized text length
+//   mu  = semantic richness (diverse vocab dampens Re)
+}
+}
+
+fn tfilter_reynolds(text, el_type, bounds, depth) {
+    let t = trim(str(text))
+    if3 len(t) == 0 {
+        return {"re": 999.0, "regime": "chaotic", "trit": T_FALSE}
+    } else3 { tl = lower(t)
+
+        // -- Instant classification: known patterns --
+        if3 is_server_log(t) == T_TRUE {
+            return {"re": 500.0, "regime": "chaotic", "trit": T_FALSE}
+        } else3 is_noise_word(tl) == T_TRUE {
+            return {"re": 200.0, "regime": "turbulent", "trit": T_FALSE}
+        } else3 is_model_label(t) == T_TRUE {
+            return {"re": 180.0, "regime": "turbulent", "trit": T_FALSE}
+        } else3 {
+            // proceed with N-S computation
+        }
+
+        // -- N-S Variable Computation --
+
+        // rho (density) from element type
+        let rho = TF_RHO_DEFAULT
+        if3 type_of(el_type) == "number" { type_key = str(int(el_type))
+            let rho = dict_get(_tf_rho, type_key) ?? TF_RHO_DEFAULT
+        } else3 {
+            // use default
+        }
+
+        // v (velocity) = 1/entropy -- low entropy = fast = turbulent
+        let entropy = text_entropy(t)
+        let v = 1.0 / max(entropy, 0.05)
+
+        // L (characteristic length)
+        let tlen = min(len(t), 500)
+        let big_l = tlen / 100.0
+
+        // mu (viscosity) = semantic richness
+        let diversity = word_diversity(t)
+        let awl = avg_word_length(t)
+        let punct_boost = 1.0
+        if3 has_punctuation(t) == T_TRUE { punct_boost = 1.5
+        } else3 {
+            // no punct
+        }
+        let mu = max(diversity * (awl / H5) * punct_boost, 0.05)
+
+        // -- Core Reynolds: Re = rho * v * L / mu --
+        let re = (rho * v * big_l) / mu
+
+        // -- External Forces --
+
+        // Spatial force: bounds x > 1300 -> preview panel -> noise boost
+        if3 type_of(bounds) == "list" {
+            if3 len(bounds) >= 1 { bx = dict_get(bounds, 0) ?? 0
+                if3 bx > 1300 { re = re * H3
+                } else3 {
+                    // not in preview panel
+            } else3 {
+                // no bounds data
+        } else3 {
+            // no bounds
+        }
+
+        // Depth force: shallow -> noise boost
+        if3 type_of(depth) == "number" {
+            if3 depth < H5 { boost = 1.0 + (H5 - depth) * 0.3
+                re = re * boost
+            } else3 {
+                // deep enough
+        } else3 {
+            // no depth
+        }
+
+        // Badge contamination
+        if3 has_badge(t) == T_TRUE { re = re + 50
+        } else3 {
+            // no badge
+        }
+
+        // Short text penalty (under 15 chars)
+        if3 len(t) < 15 { re = re + 30
+        } else3 {
+            // long enough
+        }
+
+        // -- Classify by harmonic boundaries --
+        let re = round(re * 100) / 100
+        if3 re < RE_LAMINAR {
+            return {"re": re, "regime": "laminar", "trit": T_TRUE}
+        } else3 re < RE_TRANSITIONAL {
+            return {"re": re, "regime": "transitional", "trit": T_MAYBE}
+        } else3 re < RE_TURBULENT {
+            return {"re": re, "regime": "turbulent", "trit": T_FALSE}
+        } else3 {
+            return {"re": re, "regime": "chaotic", "trit": T_FALSE}
+        }
+    }
+}
+}
+}
+}
+
+fn tfilter_classify(text, texts, elements) {
+    // Elements mode: classify UIA elements
+    if3 type_of(elements) == "list" {
+        if3 len(elements) > 0 { results = []
+            let count_signal = 0
+            let count_uncertain = 0
+            let count_noise = 0
+
+            let ei = 0
+            while3 ei < len(elements) {
+                let el = dict_get(elements, ei) ?? {}
+                let name = dict_get(el, "name") ?? ""
+                if3 len(name) == 0 { name = dict_get(el, "text") ?? ""
+                } else3 {
+                    // has name
+                }
+                let el_type = dict_get(el, "type") ?? null
+                let bounds = dict_get(el, "bounds") ?? null
+                let el_depth = dict_get(el, "depth") ?? null
+
+                let r = tfilter_reynolds(name, el_type, bounds, el_depth)
+                let trit = dict_get(r, "trit") ?? 0
+                let label = "uncertain"
+                if3 trit == T_TRUE { label = "signal"
+                    count_signal = count_signal + 1
+                } else3 trit == T_FALSE { label = "noise"
+                    count_noise = count_noise + 1
+                } else3 { count_uncertain = count_uncertain + 1
+                }
+
+                let entry = {}
+                entry = dict_set(entry, "text", slice(name, 0, 200))
+                entry = dict_set(entry, "trit", trit)
+                entry = dict_set(entry, "reynolds", dict_get(r, "re") ?? 0)
+                entry = dict_set(entry, "regime", dict_get(r, "regime") ?? "unknown")
+                entry = dict_set(entry, "label", label)
+                results = append(results, entry)
+
+                ei = ei + 1
+            }
+
+            return {
+                "ok": true,
+                "tool": "tfilter",
+                "version": "2.0",
+                "model": "navier-stokes",
+                "results": results,
+                "summary": {
+                    "signal": count_signal,
+                    "uncertain": count_uncertain,
+                    "noise": count_noise,
+                    "total": len(elements)
+                },
+                "boundaries": {
+                    "laminar": RE_LAMINAR,
+                    "transitional": RE_TRANSITIONAL,
+                    "turbulent": RE_TURBULENT
+        } else3 {
+            // empty elements -- fall through to text mode
+    } else3 {
+        // not elements mode
+    }
+
+    // Texts mode: batch classify strings
+    if3 type_of(texts) == "list" {
+        if3 len(texts) > 0 { results = []
+            let count_signal = 0
+            let count_uncertain = 0
+            let count_noise = 0
+
+            let ti = 0
+            while3 ti < len(texts) {
+                let t = dict_get(texts, ti) ?? ""
+                let r = tfilter_reynolds(t, null, null, null)
+                let trit = dict_get(r, "trit") ?? 0
+                let label = "uncertain"
+                if3 trit == T_TRUE { label = "signal"
+                    count_signal = count_signal + 1
+                } else3 trit == T_FALSE { label = "noise"
+                    count_noise = count_noise + 1
+                } else3 { count_uncertain = count_uncertain + 1
+                }
+
+                let entry = {}
+                entry = dict_set(entry, "text", slice(str(t), 0, 200))
+                entry = dict_set(entry, "trit", trit)
+                entry = dict_set(entry, "reynolds", dict_get(r, "re") ?? 0)
+                entry = dict_set(entry, "regime", dict_get(r, "regime") ?? "unknown")
+                entry = dict_set(entry, "label", label)
+                results = append(results, entry)
+
+                ti = ti + 1
+            }
+
+            return {
+                "ok": true,
+                "tool": "tfilter",
+                "version": "2.0",
+                "model": "navier-stokes",
+                "results": results,
+                "summary": {
+                    "signal": count_signal,
+                    "uncertain": count_uncertain,
+                    "noise": count_noise,
+                    "total": len(texts)
+        } else3 {
+            // empty texts -- fall through to single
+    } else3 {
+        // not texts mode
+    }
+
+    // Single text mode
+    let r = tfilter_reynolds(str(text), null, null, null)
+    let trit = dict_get(r, "trit") ?? 0
+    let label = "uncertain"
+    if3 trit == T_TRUE { label = "signal"
+    } else3 trit == T_FALSE { label = "noise"
+    } else3 {
+        // uncertain
+    }
+
+    return {
+        "ok": true,
+        "tool": "tfilter",
+        "version": "2.0",
+        "model": "navier-stokes",
+        "trit": trit,
+        "reynolds": dict_get(r, "re") ?? 0,
+        "regime": dict_get(r, "regime") ?? "unknown",
+        "label": label,
+        "text": slice(str(text), 0, 200)
+    }
+}
+
+// ============================================================================
+// TFLOW -- N-S Pipe Flow Router for Sessions + Downloads
+// ============================================================================
+// Hagen-Poiseuille: Q = (delta_P * pi * r^4) / (8 * mu * L)
+// Messages are fluid particles flowing through ternary pipes
+// Downloads use mass flow: mdot = rho * v * A
+}
+}
+}
+}
+}
+}
+
+fn tflow_route_message(target, session, role, text) {
+    let key = str(target) + "/" + str(session)
+
+    // Reynolds for message content
+    let r = tfilter_reynolds(str(text), null, null, null)
+    let re_val = dict_get(r, "re") ?? 0
+    let regime = dict_get(r, "regime") ?? "unknown"
+    let trit = dict_get(r, "trit") ?? 0
+
+    // Hagen-Poiseuille throughput
+    let words = split(str(text), " ")
+    let delta_p = len(words) * word_diversity(str(text))
+    let pipe_r = H7
+    let mu_flow = max(text_entropy(str(text)), 0.1)
+    let l_msg = max(len(str(text)) / 1000.0, 0.1)
+    let q_val = (delta_p * 3.14159 * pipe_r * pipe_r * pipe_r * pipe_r) / (8 * mu_flow * l_msg)
+    let q_val = round(q_val * 100) / 100
+
+    // Encoding strategy by regime
+    let encoding = "raw"
+    let priority = "cold"
+    if3 regime == "laminar" { encoding = "tzip"
+        let priority = "hot"
+    } else3 regime == "transitional" { encoding = "tzip+tspeak"
+        let priority = "warm"
+    } else3 {
+        // turbulent/chaotic = raw, cold
+    }
+
+    // Compression ratio estimate via TZip delegation
+    let compression_ratio = 1.0
+    try3 {
+        let resp = http_post("http://127.0.0.1:9885/tzip/compress",
+            {"data": str(text)})
+        let csize = dict_get(resp, "compressed_size") ?? len(str(text))
+        let compression_ratio = round(csize * 1000 / max(len(str(text)), 1)) / 1000
+    } else3 {
+        // TZip not available
+    }
+
+    // Store message in session
+    let sess = dict_get(_flow_sessions, key) ?? {}
+    if3 len(keys(sess)) == 0 { sess = {}
+        sess = dict_set(sess, "target", target)
+        sess = dict_set(sess, "session", session)
+        sess = dict_set(sess, "messages", [])
+        sess = dict_set(sess, "created", time())
+        sess = dict_set(sess, "total_bytes_raw", 0)
+        sess = dict_set(sess, "total_bytes_compressed", 0)
+    } else3 {
+        // existing session
+    }
+
+    let msg = {}
+    msg = dict_set(msg, "role", role)
+    msg = dict_set(msg, "text", slice(str(text), 0, 5000))
+    msg = dict_set(msg, "reynolds", re_val)
+    msg = dict_set(msg, "regime", regime)
+    msg = dict_set(msg, "trit", trit)
+    msg = dict_set(msg, "throughput_Q", q_val)
+    msg = dict_set(msg, "encoding", encoding)
+    msg = dict_set(msg, "priority", priority)
+    msg = dict_set(msg, "compression_ratio", compression_ratio)
+    msg = dict_set(msg, "ts", time())
+
+    let msgs = dict_get(sess, "messages") ?? []
+    msgs = append(msgs, msg)
+
+    // Trim to 1000 messages
+    if3 len(msgs) > 1000 { msgs = slice(msgs, len(msgs) - 1000, len(msgs))
+    } else3 {
+        // fits
+    }
+
+    let raw_total = (dict_get(sess, "total_bytes_raw") ?? 0) + len(str(text))
+    let comp_total = (dict_get(sess, "total_bytes_compressed") ?? 0) + round(len(str(text)) * compression_ratio)
+
+    sess = dict_set(sess, "messages", msgs)
+    sess = dict_set(sess, "total_bytes_raw", raw_total)
+    sess = dict_set(sess, "total_bytes_compressed", comp_total)
+    _flow_sessions = dict_set(_flow_sessions, key, sess)
+
+    return {
+        "ok": true,
+        "tool": "tflow",
+        "action": "route_message",
+        "target": target,
+        "session": session,
+        "reynolds": re_val,
+        "regime": regime,
+        "throughput_Q": q_val,
+        "encoding": encoding,
+        "priority": priority,
+        "compression_ratio": compression_ratio,
+        "messages_stored": len(msgs)
+    }
+}
+
+fn tflow_recall_session(target, session, limit) {
+    let key = str(target) + "/" + str(session)
+    let sess = dict_get(_flow_sessions, key) ?? {}
+
+    if3 len(keys(sess)) == 0 {
+        return {"ok": false, "error": "Session not found: " + key}
+    } else3 { msgs = dict_get(sess, "messages") ?? []
+        let start = max(len(msgs) - limit, 0)
+        let result = []
+
+        let i = start
+        while3 i < len(msgs) {
+            let m = msgs[i]
+            let entry = {}
+            entry = dict_set(entry, "role", dict_get(m, "role") ?? "unknown")
+            entry = dict_set(entry, "text", dict_get(m, "text") ?? "")
+            entry = dict_set(entry, "reynolds", dict_get(m, "reynolds") ?? 0)
+            entry = dict_set(entry, "regime", dict_get(m, "regime") ?? "unknown")
+            entry = dict_set(entry, "ts", dict_get(m, "ts") ?? 0)
+            result = append(result, entry)
+            i = i + 1
+        }
+
+        let total_raw = dict_get(sess, "total_bytes_raw") ?? 0
+        let total_comp = dict_get(sess, "total_bytes_compressed") ?? 0
+        let savings = 0
+        if3 total_raw > 0 { savings = round((1 - total_comp / total_raw) * 10000) / 100
+        } else3 {
+            // 0
+        }
+
+        return {
+            "ok": true,
+            "tool": "tflow",
+            "action": "recall",
+            "target": target,
+            "session": session,
+            "messages": result,
+            "count": len(result),
+            "total_stored": len(msgs),
+            "memory_savings": str(savings) + "%",
+            "total_bytes_raw": total_raw,
+            "total_bytes_compressed": total_comp
+        }
+    }
+}
+
+fn tflow_route_download(url, filename, size_bytes) {
+    // Determine density by extension
+    let rho = 1.0
+    if3 ends_with(filename, ".zip") { rho = 3.0
+    } else3 ends_with(filename, ".gz") { rho = 3.0
+    } else3 ends_with(filename, ".7z") { rho = 3.0
+    } else3 ends_with(filename, ".rar") { rho = 3.0
+    } else3 ends_with(filename, ".mp4") { rho = 3.0
+    } else3 ends_with(filename, ".mp3") { rho = 3.0
+    } else3 ends_with(filename, ".jpg") { rho = 3.0
+    } else3 ends_with(filename, ".png") { rho = 3.0
+    } else3 ends_with(filename, ".exe") { rho = 3.0
+    } else3 ends_with(filename, ".dll") { rho = 3.0
+    } else3 {
+        // sparse content
+    }
+
+    let v = max(size_bytes / 1048576, 0.1)
+    let big_l = len(str(url)) / 100.0
+    let mu = 0.5
+    if3 contains(str(url), "localhost") {
+        // local -- low viscosity
+    } else3 { mu = 2.0
+    }
+
+    let re = (rho * v * big_l) / max(mu, 0.1)
+    let re = round(re * 100) / 100
+
+    // Strategy by Reynolds
+    let strategy = "direct"
+    let chunks = 1
+    let do_compress = true
+
+    if3 re < RE_LAMINAR { strategy = "direct"
+        let chunks = 1
+        let do_compress = true
+    } else3 re < RE_TRANSITIONAL { strategy = "dual"
+        let chunks = H3
+        let do_compress = true
+    } else3 re < RE_TURBULENT { strategy = "parallel"
+        let chunks = H7
+        let do_compress = true
+    } else3 { strategy = "scatter"
+        let chunks = H13
+        let do_compress = false
+    }
+
+    let regime = classify_flow(re)
+    let tier = "hot"
+    if3 size_bytes > 104857600 { tier = "cold"
+    } else3 size_bytes > 1048576 { tier = "warm"
+    } else3 {
+        // hot
+    }
+
+    let estimated_savings = "5%"
+    if3 do_compress == true {
+        if3 rho < 3.0 { estimated_savings = "60%"
+        } else3 {
+            // dense files don't compress well
+    } else3 {
+        // no compression
+    }
+
+    return {
+        "ok": true,
+        "tool": "tflow",
+        "action": "download_route",
+        "url": url,
+        "filename": filename,
+        "reynolds": re,
+        "regime": regime,
+        "strategy": strategy,
+        "chunks": chunks,
+        "compress": do_compress,
+        "storage_tier": tier,
+        "estimated_savings": estimated_savings
+    }
+}
+}
+
+fn tflow_list_sessions() {
+    let result = {}
+    let skeys = keys(_flow_sessions)
+    let i = 0
+    while3 i < len(skeys) {
+        let key = skeys[i]
+        let data = dict_get(_flow_sessions, key) ?? {}
+        let n = len(dict_get(data, "messages") ?? [])
+        let raw = dict_get(data, "total_bytes_raw") ?? 0
+        let comp = dict_get(data, "total_bytes_compressed") ?? 0
+        let savings = 0
+        if3 raw > 0 { savings = round((1 - comp / raw) * 10000) / 100
+        } else3 {
+            // 0
+        }
+        let info = {}
+        info = dict_set(info, "messages", n)
+        info = dict_set(info, "bytes_raw", raw)
+        info = dict_set(info, "bytes_compressed", comp)
+        info = dict_set(info, "savings", str(savings) + "%")
+        result = dict_set(result, key, info)
+        i = i + 1
+    }
+    return result
+}
+
+fn tflow_status() {
+    let total_msgs = 0
+    let total_raw = 0
+    let total_comp = 0
+    let skeys = keys(_flow_sessions)
+    let i = 0
+    while3 i < len(skeys) {
+        let key = skeys[i]
+        let data = dict_get(_flow_sessions, key) ?? {}
+        total_msgs = total_msgs + len(dict_get(data, "messages") ?? [])
+        total_raw = total_raw + dict_get(data, "total_bytes_raw") ?? 0
+        total_comp = total_comp + dict_get(data, "total_bytes_compressed") ?? 0
+        i = i + 1
+    }
+
+    let savings = 0
+    if3 total_raw > 0 { savings = round((1 - total_comp / total_raw) * 10000) / 100
+    } else3 {
+        // 0
+    }
+
+    return {
+        "ok": true,
+        "tool": "tflow",
+        "model": "navier-stokes",
+        "pipe_model": "hagen-poiseuille",
+        "total_sessions": len(skeys),
+        "total_messages": total_msgs,
+        "total_bytes_raw": total_raw,
+        "total_bytes_compressed": total_comp,
+        "memory_savings": str(savings) + "%",
+        "sessions": tflow_list_sessions(),
+        "boundaries": {
+            "laminar": RE_LAMINAR,
+            "transitional": RE_TRANSITIONAL,
+            "turbulent": RE_TURBULENT
+        }
+    }
+}
+
+// ============================================================================
+// TWEAVE -- Persistent Compressed Channels (Layer 2: Nervous System)
+// ============================================================================
+
+fn tweave_create_channel(source_port, dest_port) {
+    let cid = str(source_port) + "->" + str(dest_port)
+    let ch = {}
+    ch = dict_set(ch, "source", source_port)
+    ch = dict_set(ch, "dest", dest_port)
+    ch = dict_set(ch, "created", time())
+    ch = dict_set(ch, "messages", 0)
+    ch = dict_set(ch, "bytes_raw", 0)
+    ch = dict_set(ch, "bytes_compressed", 0)
+    _weave_channels = dict_set(_weave_channels, cid, ch)
+    return cid
+}
+
+fn tweave_send(channel_id, data) {
+    let ch = dict_get(_weave_channels, channel_id) ?? {}
+    if3 len(keys(ch)) == 0 {
+        return {"ok": false, "error": "channel not found"}
+    } else3 { raw = json_encode(data)
+        let raw_size = len(raw)
+        let dest_port = dict_get(ch, "dest") ?? 0
+
+        // Update stats
+        let msgs = (dict_get(ch, "messages") ?? 0) + 1
+        let br = (dict_get(ch, "bytes_raw") ?? 0) + raw_size
+        ch = dict_set(ch, "messages", msgs)
+        ch = dict_set(ch, "bytes_raw", br)
+
+        // Attempt delivery
+        let delivered = false
+        try3 {
+            let url = "http://127.0.0.1:" + str(dest_port) + "/tweave/receive"
+            let resp = http_post(url, data)
+            let delivered = true
+        } else3 {
+            // delivery failed
+        }
+
+        // Estimate compression
+        let compressed_size = raw_size
+        try3 {
+            let resp = http_post("http://127.0.0.1:9885/tzip/compress",
+                {"data": raw})
+            let compressed_size = dict_get(resp, "compressed_size") ?? raw_size
+        } else3 {
+            // TZip not available
+        }
+
+        let bc = (dict_get(ch, "bytes_compressed") ?? 0) + compressed_size
+        ch = dict_set(ch, "bytes_compressed", bc)
+        _weave_channels = dict_set(_weave_channels, channel_id, ch)
+
+        let savings = 0
+        if3 raw_size > 0 { savings = round((1 - compressed_size / raw_size) * 10000) / 100
+        } else3 {
+            // 0
+        }
+
+        return {
+            "ok": true,
+            "delivered": delivered,
+            "raw": raw_size,
+            "compressed": compressed_size,
+            "savings": str(savings) + "%"
+        }
+    }
+}
+
+fn tweave_status() {
+    let total_raw = 0
+    let total_comp = 0
+    let total_msgs = 0
+    let channel_list = []
+    let ckeys = keys(_weave_channels)
+    let i = 0
+    while3 i < len(ckeys) {
+        let cid = ckeys[i]
+        let ch = dict_get(_weave_channels, cid) ?? {}
+        total_raw = total_raw + dict_get(ch, "bytes_raw") ?? 0
+        total_comp = total_comp + dict_get(ch, "bytes_compressed") ?? 0
+        total_msgs = total_msgs + dict_get(ch, "messages") ?? 0
+        channel_list = append(channel_list, cid)
+        i = i + 1
+    }
+    let savings = 0
+    if3 total_raw > 0 { savings = round((1 - total_comp / total_raw) * 10000) / 100
+    } else3 {
+        // 0
+    }
+    return {
+        "channels": len(ckeys),
+        "total_messages": total_msgs,
+        "bytes_raw": total_raw,
+        "bytes_compressed": total_comp,
+        "savings": str(savings) + "%",
+        "channel_list": channel_list
+    }
+}
+
+// ============================================================================
+// TSHIELD -- Reynolds on HTTP Traffic (Layer 6)
+// ============================================================================
+
+fn tshield_record(source, method, path, size) {
+    let entry = dict_get(_shield_traffic, source) ?? {}
+    if3 len(keys(entry)) == 0 { entry = {}
+        entry = dict_set(entry, "requests", [])
+        entry = dict_set(entry, "total_bytes", 0)
+    } else3 {
+        // existing source
+    }
+
+    let req = {}
+    req = dict_set(req, "time", time())
+    req = dict_set(req, "method", method)
+    req = dict_set(req, "path", path)
+    req = dict_set(req, "size", size)
+
+    let reqs = dict_get(entry, "requests") ?? []
+    reqs = append(reqs, req)
+    // Keep last 100 requests
+    if3 len(reqs) > 100 { reqs = slice(reqs, len(reqs) - 100, len(reqs))
+    } else3 {
+        // fits
+    }
+
+    entry = dict_set(entry, "requests", reqs)
+    let tb = (dict_get(entry, "total_bytes") ?? 0) + size
+    entry = dict_set(entry, "total_bytes", tb)
+    _shield_traffic = dict_set(_shield_traffic, source, entry)
+}
+
+fn tshield_analyze(source) {
+    let results = {}
+    let src_keys = keys(_shield_traffic)
+
+    // Filter to single source if provided
+    if3 type_of(source) == "string" {
+        if3 len(source) > 0 { src_keys = [source]
+        } else3 {
+            // all sources
+    } else3 {
+        // all sources
+    }
+
+    let si = 0
+    while3 si < len(src_keys) {
+        let src = src_keys[si]
+        let data = dict_get(_shield_traffic, src) ?? {}
+        if3 len(keys(data)) == 0 { si = si + 1
+        } else3 { reqs = dict_get(data, "requests") ?? []
+            if3 len(reqs) < 2 { _s = dict_set(results, src, {
+                    "reynolds": 0, "regime": "laminar", "risk": "none"
+                })
+            } else3 {
+                // Count recent requests (last 60 seconds)
+                let now = time()
+                let recent = []
+                let ri = 0
+                while3 ri < len(reqs) {
+                    let req = reqs[ri]
+                    let rt = dict_get(req, "time") ?? 0
+                    if3 now - rt < 60 {
+                        recent = append(recent, req)
+                    } else3 {
+                        // old request
+                    }
+                    ri = ri + 1
+                }
+
+                if3 len(recent) == 0 { _s = dict_set(results, src, {
+                        "reynolds": 0, "regime": "laminar", "risk": "none"
+                    })
+                } else3 { rate = len(recent) / 60.0
+
+                    // Path diversity
+                    let paths = {}
+                    let avg_size = 0
+                    let pi = 0
+                    while3 pi < len(recent) {
+                        let req = recent[pi]
+                        let p = dict_get(req, "path") ?? "/"
+                        paths = dict_set(paths, p, 1)
+                        avg_size = avg_size + dict_get(req, "size") ?? 0
+                        pi = pi + 1
+                    }
+                    avg_size = avg_size / max(len(recent), 1)
+                    let diversity = len(keys(paths)) / max(len(recent), 1)
+
+                    let re_val = rate * diversity * avg_size
+                    let re_val = round(re_val * 100) / 100
+
+                    let regime = "laminar"
+                    let risk = "none"
+                    if3 re_val >= RE_TURBULENT { regime = "chaotic"
+                        let risk = "high"
+                    } else3 re_val >= RE_TRANSITIONAL { regime = "turbulent"
+                        let risk = "medium"
+                    } else3 re_val >= RE_LAMINAR { regime = "transitional"
+                        let risk = "low"
+                    } else3 {
+                        // laminar/none
+                    }
+
+                    let info = {}
+                    info = dict_set(info, "reynolds", re_val)
+                    info = dict_set(info, "regime", regime)
+                    info = dict_set(info, "risk", risk)
+                    info = dict_set(info, "rate_per_sec", round(rate * 100) / 100)
+                    info = dict_set(info, "unique_routes", len(keys(paths)))
+                    info = dict_set(info, "avg_payload", round(avg_size * 10) / 10)
+                    info = dict_set(info, "recent_requests", len(recent))
+                    results = dict_set(results, src, info)
+                }
+            }
+            si = si + 1
+        }
+    }
+    return results
+}
+
+// ============================================================================
+// ROUTE HANDLERS
+// ============================================================================
+
+// -- GET /health --
+}
+fn handle_health() {
+    let resp = ns_health_dict("nova-ternary-tools", VERSION, PORT, {})
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "harmonics", "3-5-7-13")
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// -- GET /ttools/status --
+fn handle_status() {
+    let uptime = round(time() - _start_time)
+    return {
+        "service": "nova-ternary-tools",
+        "version": VERSION,
+        "port": PORT,
+        "runtime": "novalang",
+        "uptime_s": uptime,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "constants": {
+            "block_size": BLOCK,
+            "flow_boundaries": [RE_LAMINAR, RE_TRANSITIONAL, RE_TURBULENT],
+            "header_size": HEADER_SIZE,
+            "max_pipe": MAX_PIPE
+        },
+        "tools": {
+            "tdiff": "active",
+            "tcache": tcache_status(),
+            "tsync": "active",
+            "tindex": tindex_status(),
+            "tmesh": tmesh_status(),
+            "tstream": tstream_status(),
+            "tforge": "active"
+        }
+    }
+}
+
+// -- GET /ttools/cache/status --
+fn handle_cache_status() {
+    return tcache_status()
+}
+
+// -- GET /ttools/stream/read --
+fn handle_stream_read() {
+    // GET without body -- will use default stream name
+    // In practice this would need query params; return all stream status instead
+    return tstream_status()
+}
+
+// -- GET /ttools/weave/status --
+fn handle_weave_status() {
+    return tweave_status()
+}
+
+// -- GET /ttools/shield/status --
+fn handle_shield_status() {
+    return tshield_analyze(null)
+}
+
+// -- GET /ttools/flow/status --
+fn handle_flow_status() {
+    return tflow_status()
+}
+
+// -- POST /ttools/diff --
+fn handle_diff(body) {
+    let old_path = dict_get(body, "old") ?? ""
+    let new_path = dict_get(body, "new") ?? ""
+
+    // File-based diff
+    if3 len(str(old_path)) > 0 {
+        if3 len(str(new_path)) > 0 {
+            return tdiff_compute_files(old_path, new_path)
+        } else3 {
+            // fall through to data diff
+    } else3 {
+        // no file paths
+    }
+
+    // Data-based diff
+    let old_data = dict_get(body, "old_data") ?? ""
+    let new_data = dict_get(body, "new_data") ?? ""
+    return tdiff_compute(old_data, new_data)
+}
+
+// -- POST /ttools/diff/apply --
+}
+fn handle_diff_apply(body) {
+    // Apply a diff -- simplified in NovaLang (no binary diff blob)
+    // Return the new text from the stored diff
+    let diff = dict_get(body, "diff") ?? []
+    let target = dict_get(body, "target") ?? ""
+
+    let old_text = ""
+    if3 len(str(target)) > 0 {
+        if3 safe_path(target) == T_FALSE {
+            return {"ok": false, "error": "Path outside allowed roots"}
+        } else3 {
+            try3 {
+                let old_text = nova_read(target)
+            } else3 {
+                return {"ok": false, "error": "Cannot read target file"}
+    } else3 { old_text = dict_get(body, "target_data") ?? ""
+    }
+
+    // Apply additions/removals from diff entries
+    let old_lines = split(old_text, "\n")
+    let new_lines = []
+    let di = 0
+    let li = 0
+
+    // Simple: replay diff entries
+    while3 di < len(diff) {
+        let entry = dict_get(diff, di) ?? {}
+        let entry_type = dict_get(entry, "type") ?? "unchanged"
+        let entry_text = dict_get(entry, "text") ?? ""
+
+        if3 entry_type == "added" {
+            new_lines = append(new_lines, entry_text)
+        } else3 entry_type == "removed" {
+            // skip the old line
+            li = li + 1
+        } else3 {
+            // unchanged -- keep old line
+            if3 li < len(old_lines) {
+                new_lines = append(new_lines, old_lines[li])
+            } else3 {
+                // beyond old
+            }
+            li = li + 1
+        }
+        di = di + 1
+    }
+
+    // Append any remaining old lines
+    while3 li < len(old_lines) {
+        new_lines = append(new_lines, old_lines[li])
+        li = li + 1
+    }
+
+    let result = join(new_lines, "\n")
+    return {
+        "ok": true,
+        "data": result,
+        "size": len(result),
+        "lines": len(new_lines)
+    }
+}
+
+// -- POST /ttools/cache/set --
+}
+}
+fn handle_cache_set(body) {
+    let key = dict_get(body, "key") ?? ""
+    let value = dict_get(body, "value") ?? null
+    return tcache_set(key, value)
+}
+
+// -- POST /ttools/cache/get --
+fn handle_cache_get(body) {
+    let key = dict_get(body, "key") ?? ""
+    return tcache_get(key)
+}
+
+// -- POST /ttools/sync --
+fn handle_sync(body) {
+    let source = dict_get(body, "source") ?? ""
+    let target = dict_get(body, "target") ?? ""
+    return tsync_sync(source, target)
+}
+
+// -- POST /ttools/index --
+fn handle_index(body) {
+    let p = dict_get(body, "path") ?? ""
+    if3 safe_path(p) == T_FALSE {
+        return {"ok": false, "error": "Path outside allowed roots"}
+    } else3 {
+        // Try directory first, then file
+        // Check by attempting to list -- if nova_run dir works, it's a dir
+        try3 {
+            let cmd = "cmd /c dir /b \"" + str(p) + "\""
+            let output = nova_run(cmd)
+            // If we get output without error, treat as directory
+            return tindex_index_directory(p)
+        } else3 {
+            // Probably a file
+            return tindex_index_file(p)
+        }
+    }
+}
+
+// -- POST /ttools/search --
+fn handle_search(body) {
+    let query = dict_get(body, "query") ?? ""
+    let search_type = dict_get(body, "type") ?? "content"
+    return tindex_search(query, search_type)
+}
+
+// -- POST /ttools/mesh --
+fn handle_mesh(body) {
+    let port = dict_get(body, "port") ?? 9999
+    let path = dict_get(body, "path") ?? "/health"
+    let req_body = dict_get(body, "body") ?? null
+    let method = dict_get(body, "method") ?? "POST"
+    return tmesh_relay(port, path, req_body, method)
+}
+
+// -- POST /ttools/stream/start --
+fn handle_stream_start(body) {
+    let name = dict_get(body, "name") ?? ""
+    let buffer = dict_get(body, "buffer") ?? 455  // H13 * H7 * H5 = 455
+    return tstream_start(name, buffer)
+}
+
+// -- POST /ttools/stream/write --
+fn handle_stream_write(body) {
+    let stream = dict_get(body, "stream") ?? ""
+    let data = dict_get(body, "data") ?? ""
+    return tstream_write(stream, data)
+}
+
+// -- POST /ttools/forge --
+fn handle_forge(body) {
+    let path = dict_get(body, "path") ?? ""
+    return tforge_analyze(path)
+}
+
+// -- POST /ttools/filter --
+fn handle_filter(body) {
+    let text = dict_get(body, "text") ?? ""
+    let texts = dict_get(body, "texts") ?? []
+    let elements = dict_get(body, "elements") ?? []
+    return tfilter_classify(text, texts, elements)
+}
+
+// -- POST /ttools/flow/message --
+fn handle_flow_message(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let session = dict_get(body, "session") ?? "default"
+    let role = dict_get(body, "role") ?? "user"
+    let text = dict_get(body, "text") ?? ""
+    return tflow_route_message(target, session, role, text)
+}
+
+// -- POST /ttools/flow/recall --
+fn handle_flow_recall(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let session = dict_get(body, "session") ?? "default"
+    let limit = dict_get(body, "limit") ?? 50
+    return tflow_recall_session(target, session, limit)
+}
+
+// -- POST /ttools/flow/download --
+fn handle_flow_download(body) {
+    let url = dict_get(body, "url") ?? ""
+    let filename = dict_get(body, "filename") ?? ""
+    let size_bytes = dict_get(body, "size_bytes") ?? 0
+    return tflow_route_download(url, filename, size_bytes)
+}
+
+// -- POST /ttools/weave/channel --
+fn handle_weave_channel(body) {
+    let source = dict_get(body, "source") ?? 0
+    let dest = dict_get(body, "dest") ?? 0
+    let cid = tweave_create_channel(source, dest)
+    return {"ok": true, "channel_id": cid}
+}
+
+// -- POST /ttools/weave/send --
+fn handle_weave_send(body) {
+    let channel_id = dict_get(body, "channel_id") ?? ""
+    let data = dict_get(body, "data") ?? {}
+    return tweave_send(channel_id, data)
+}
+
+// -- POST /ttools/shield/record --
+fn handle_shield_record(body) {
+    let source = dict_get(body, "source") ?? ""
+    let method = dict_get(body, "method") ?? "GET"
+    let path = dict_get(body, "path") ?? "/"
+    let size = dict_get(body, "size") ?? 0
+    tshield_record(source, method, path, size)
+    return {"ok": true}
+}
+
+// -- POST /ttools/shield/analyze --
+fn handle_shield_analyze(body) {
+    let source = dict_get(body, "source") ?? null
+    return tshield_analyze(source)
+}
+
+// ============================================================================
+// REGISTER ROUTES
+// ============================================================================
+
+// GET routes
+troute(server, "GET",  "/health",                "handle_health")
+troute(server, "GET",  "/ttools/status",          "handle_status")
+troute(server, "GET",  "/ttools/cache/status",    "handle_cache_status")
+troute(server, "GET",  "/ttools/stream/read",     "handle_stream_read")
+troute(server, "GET",  "/ttools/weave/status",    "handle_weave_status")
+troute(server, "GET",  "/ttools/shield/status",   "handle_shield_status")
+troute(server, "GET",  "/ttools/flow/status",     "handle_flow_status")
+
+// POST routes -- Core Tools
+troute(server, "POST", "/ttools/diff",            "handle_diff")
+troute(server, "POST", "/ttools/diff/apply",      "handle_diff_apply")
+troute(server, "POST", "/ttools/cache/set",       "handle_cache_set")
+troute(server, "POST", "/ttools/cache/get",       "handle_cache_get")
+troute(server, "POST", "/ttools/sync",            "handle_sync")
+troute(server, "POST", "/ttools/index",           "handle_index")
+troute(server, "POST", "/ttools/search",          "handle_search")
+troute(server, "POST", "/ttools/mesh",            "handle_mesh")
+troute(server, "POST", "/ttools/stream/start",    "handle_stream_start")
+troute(server, "POST", "/ttools/stream/write",    "handle_stream_write")
+troute(server, "POST", "/ttools/forge",           "handle_forge")
+
+// POST routes -- TFilter + TFlow
+troute(server, "POST", "/ttools/filter",          "handle_filter")
+troute(server, "POST", "/ttools/flow/message",    "handle_flow_message")
+troute(server, "POST", "/ttools/flow/recall",     "handle_flow_recall")
+troute(server, "POST", "/ttools/flow/download",   "handle_flow_download")
+
+// POST routes -- TWeave + TShield
+troute(server, "POST", "/ttools/weave/channel",   "handle_weave_channel")
+troute(server, "POST", "/ttools/weave/send",      "handle_weave_send")
+troute(server, "POST", "/ttools/shield/record",   "handle_shield_record")
+troute(server, "POST", "/ttools/shield/analyze",  "handle_shield_analyze")
+
+// ============================================================================
+// STARTUP BANNER
+// ============================================================================
+
+print("[TTools] Nova Ternary Toolkit v" + VERSION + " starting in NovaLang...")
+print("[TTools] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TTools] Harmonics: 3-5-7-13 | Block: " + str(BLOCK) + " (3^7)")
+print("[TTools] Flow: Re<" + str(RE_LAMINAR) + "=laminar Re<" + str(RE_TRANSITIONAL) + "=transitional Re<" + str(RE_TURBULENT) + "=turbulent")
+print("[TTools] Tools: TDiff, TCache, TSync, TIndex, TMesh, TStream, TForge")
+print("[TTools] Extras: TFilter v2.0, TFlow (N-S pipe router), TWeave, TShield")
+print("[TTools] 7 GET + 18 POST routes = 25 endpoints total")
+print("[TTools] Ready at http://127.0.0.1:" + str(PORT) + "/health")
+
+// ============================================================================
+// START SERVER
+// ============================================================================
+
+tstart(server)

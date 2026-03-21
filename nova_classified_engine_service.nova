@@ -1,0 +1,785 @@
+// ============================================================================
+// nova_classified_engine_service.nova — Classified-Grade Ensemble Engine
+// ============================================================================
+// Maps classified MODEL CAPABILITIES to ENSEMBLES of accessible public models,
+// fires queries through N-S turbulent mixing to achieve classified-grade output.
+//
+// 8 capability clusters: intel_analysis, threat_assessment, code_exploit,
+// signals_analysis, geospatial, autonomous_planning, osint, multilingual_intel
+//
+// Endpoints:
+//   POST /classified/query      — query by capability cluster
+//   POST /classified/turbulent  — pure N-S turbulent mixing query
+//   GET  /classified/capabilities — list all 8 clusters
+//   POST /classified/learn      — update model performance per capability
+//   GET  /health                — standard N-S health
+//
+// Port: 9997 | v1.4 syntax | Pure NovaLang | 3-5-7-13 N-S constants
+// ============================================================================
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+let PORT = 9997
+let SERVICE = "nova-classified-engine"
+let VERSION = "1.0.0"
+let CLOUD_ROUTER_URL = "http://127.0.0.1:9878"
+let HIVEMIND_URL = "http://127.0.0.1:9881"
+
+// N-S 3-5-7-13 Constants
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let RE_LAMINAR = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT = 343
+let BLOCK = 2187
+
+// Ternary
+let T_POS = 1
+let T_ZERO = 0
+let T_NEG = -1
+
+// ── Server Init ──────────────────────────────────────────────────────────────
+
+let server = tserve(PORT, SERVICE)
+
+// ── State ────────────────────────────────────────────────────────────────────
+
+let _stats = {
+    "queries": 0,
+    "turbulent_queries": 0,
+    "learn_updates": 0,
+    "successes": 0,
+    "failures": 0,
+    "capability_hits": {},
+    "model_scores": {},
+    "t0": time()
+}
+
+// ── Capability Cluster Definitions ───────────────────────────────────────────
+// Each cluster maps a classified-equivalent capability to an ensemble of
+// public models accessible via OpenRouter / Cloud Router
+
+fn get_capability_clusters() {
+    return {
+        "intel_analysis": {
+            "mirrors": "Pentagon-Claude",
+            "focus": "intelligence analysis, strategic assessment, classified-grade reasoning",
+            "models": [
+                "anthropic/claude-opus-4-0",
+                "openai/gpt-4.1",
+                "deepseek/deepseek-r1",
+                "qwen/qwen3-235b-a22b"
+            ],
+            "min_consensus": 3,
+            "reynolds": 500
+        },
+        "threat_assessment": {
+            "mirrors": "Palantir AIP",
+            "focus": "risk scoring, threat chain analysis, adversary modeling",
+            "models": [
+                "openai/gpt-4.1",
+                "x-ai/grok-3-beta",
+                "anthropic/claude-sonnet-4",
+                "google/gemini-2.5-pro-preview-03-25"
+            ],
+            "min_consensus": 3,
+            "reynolds": 400
+        },
+        "code_exploit": {
+            "mirrors": "NSA SIGINT Tools",
+            "focus": "vulnerability analysis, security scanning, exploit detection",
+            "models": [
+                "qwen/qwen3-coder",
+                "mistralai/codestral-2501",
+                "openai/gpt-4.1",
+                "deepseek/deepseek-r1"
+            ],
+            "min_consensus": 3,
+            "reynolds": 450
+        },
+        "signals_analysis": {
+            "mirrors": "SIGINT-AI",
+            "focus": "pattern recognition, anomaly detection, signal processing",
+            "models": [
+                "google/gemini-2.5-pro-preview-03-25",
+                "anthropic/claude-opus-4-0",
+                "deepseek/deepseek-chat",
+                "meta-llama/llama-4-maverick"
+            ],
+            "min_consensus": 3,
+            "reynolds": 400
+        },
+        "geospatial": {
+            "mirrors": "NGA GEOINT",
+            "focus": "location analysis, mapping, spatial reasoning, terrain",
+            "models": [
+                "openai/gpt-4.1",
+                "google/gemini-2.5-pro-preview-03-25",
+                "anthropic/claude-opus-4-0"
+            ],
+            "min_consensus": 2,
+            "reynolds": 350
+        },
+        "autonomous_planning": {
+            "mirrors": "DARPA ACE/RACER",
+            "focus": "multi-step planning, decision trees, strategy, wargaming",
+            "models": [
+                "openai/o3",
+                "anthropic/claude-opus-4-0",
+                "openai/gpt-4.1"
+            ],
+            "min_consensus": 2,
+            "reynolds": 500
+        },
+        "osint": {
+            "mirrors": "CIA OSIRIS",
+            "focus": "open source intelligence, social analysis, web scraping analysis",
+            "models": [
+                "x-ai/grok-3-beta",
+                "google/gemini-2.5-pro-preview-03-25",
+                "openai/gpt-4.1",
+                "anthropic/claude-opus-4-0"
+            ],
+            "min_consensus": 3,
+            "reynolds": 400
+        },
+        "multilingual_intel": {
+            "mirrors": "Five-Eyes SIGINT",
+            "focus": "cross-language analysis, translation with context, cultural intel",
+            "models": [
+                "mistralai/mistral-large-2411",
+                "qwen/qwen3-235b-a22b",
+                "google/gemini-2.5-pro-preview-03-25",
+                "anthropic/claude-opus-4-0"
+            ],
+            "min_consensus": 3,
+            "reynolds": 400
+        }
+    }
+}
+
+// ── Model Query Engine ───────────────────────────────────────────────────────
+// Fire a single model query via Cloud Router (OpenRouter provider)
+
+fn fire_model(prompt, model_id, system_prompt = "") {
+    let full_prompt = prompt
+    if3 len(system_prompt) > 0 {
+        full_prompt = system_prompt + "\n\n" + prompt
+    }
+
+    let body = json_encode({
+        "prompt": full_prompt,
+        "provider": "openrouter",
+        "model": model_id
+    })
+    let headers = {"Content-Type": "application/json"}
+
+    let result = try3 {
+        http_request(CLOUD_ROUTER_URL + "/api/v1/query", body, headers, 30000)
+    } fail {
+        null
+    }
+
+    if3 result == null {
+        return {"ok": T_NEG, "model": model_id, "response": "", "error": "request_failed"}
+    }
+
+    let resp_body = dict_get(result, "body") ?? ""
+    if3 len(resp_body) < 5 {
+        return {"ok": T_NEG, "model": model_id, "response": "", "error": "empty_response"}
+    }
+
+    let parsed = try3 { json_decode(resp_body) } fail { {} }
+    let response = dict_get(parsed, "response") ?? ""
+    let provider = dict_get(parsed, "provider") ?? "openrouter"
+
+    if3 len(response) > 3 {
+        return {"ok": T_POS, "model": model_id, "provider": provider, "response": response, "length": len(response)}
+    }
+
+    return {"ok": T_ZERO, "model": model_id, "response": response, "error": "short_response"}
+}
+
+// ── Ensemble Fire: query all models in a cluster simultaneously ──────────────
+
+fn fire_ensemble(prompt, models, system_prompt = "") {
+    let results = []
+    let i = 0
+    while3 i < len(models) {
+        let model_id = models[i]
+        let r = fire_model(prompt, model_id, system_prompt)
+        results = append(results, r)
+        i = i + 1
+    }
+    return results
+}
+
+// ── Tripple Consensus Scoring ────────────────────────────────────────────────
+// Score responses by: length, keyword agreement, inter-model consensus
+// Tripple consensus: if 3+ models give similar answers, that wins
+
+fn score_response(response) {
+    let score = 0
+    let rlen = len(response)
+
+    // Length scoring (longer = more detailed = better, up to a point)
+    if3 rlen > 2000 {
+        score = score + 30
+    } else3 {
+        if3 rlen > 1000 {
+            score = score + 20
+        } else3 {
+            if3 rlen > 500 {
+                score = score + 10
+            } else3 {
+                if3 rlen > 100 {
+                    score = score + 5
+                }
+            }
+        }
+    }
+
+    // Structural scoring: presence of analysis indicators
+    if3 contains(response, "therefore") {
+        score = score + 5
+    }
+    if3 contains(response, "however") {
+        score = score + 5
+    }
+    if3 contains(response, "analysis") {
+        score = score + 5
+    }
+    if3 contains(response, "conclusion") {
+        score = score + 5
+    }
+    if3 contains(response, "recommend") {
+        score = score + 5
+    }
+    if3 contains(response, "evidence") {
+        score = score + 5
+    }
+    if3 contains(response, "assessment") {
+        score = score + 5
+    }
+    if3 contains(response, "risk") {
+        score = score + 3
+    }
+    if3 contains(response, "confidence") {
+        score = score + 3
+    }
+
+    return score
+}
+
+// Check agreement between two responses (simple keyword overlap)
+fn check_agreement(resp_a, resp_b) {
+    // Extract significant words (> 6 chars) and count overlap
+    let words_a = split(lower(resp_a), " ")
+    let words_b = split(lower(resp_b), " ")
+    let overlap = 0
+    let checked = 0
+    let ia = 0
+    while3 ia < len(words_a) {
+        let word = words_a[ia]
+        if3 len(word) > 6 {
+            checked = checked + 1
+            let ib = 0
+            while3 ib < len(words_b) {
+                if3 words_b[ib] == word {
+                    overlap = overlap + 1
+                    ib = len(words_b)
+                }
+                ib = ib + 1
+            }
+        }
+        ia = ia + 1
+    }
+
+    if3 checked == 0 {
+        return 0
+    }
+    // Return overlap ratio * 100 (as integer percentage)
+    return (overlap * 100) / checked
+}
+
+// ── Turbulent Mixer ──────────────────────────────────────────────────────────
+// The core N-S turbulent mixing algorithm:
+// 1. Fire all models
+// 2. Score each response individually
+// 3. Check inter-model agreement (Tripple consensus)
+// 4. Standing wave detection: when min_consensus+ models agree, lock as truth
+// 5. Return best response with full metadata
+
+fn turbulent_mix(prompt, models, min_consensus = 3, reynolds = 400, system_prompt = "") {
+    // Determine ensemble size from Reynolds number
+    let ensemble_size = len(models)
+    if3 reynolds < RE_LAMINAR {
+        // Laminar: use 1 model (fastest)
+        ensemble_size = 1
+    } else3 {
+        if3 reynolds < RE_TRANSITION {
+            // Transitional: use min(3, available)
+            if3 ensemble_size > H3 {
+                ensemble_size = H3
+            }
+        } else3 {
+            if3 reynolds < RE_TURBULENT {
+                // Turbulent: use min(5, available)
+                if3 ensemble_size > H5 {
+                    ensemble_size = H5
+                }
+            }
+            // Fully turbulent (>343): use all models (up to H7)
+        }
+    }
+
+    // Trim models to ensemble size
+    let active_models = []
+    let m = 0
+    while3 m < ensemble_size {
+        if3 m < len(models) {
+            active_models = append(active_models, models[m])
+        }
+        m = m + 1
+    }
+
+    // Fire ensemble
+    let results = fire_ensemble(prompt, active_models, system_prompt)
+
+    // Score each response
+    let scored = []
+    let valid_count = 0
+    let ri = 0
+    while3 ri < len(results) {
+        let r = results[ri]
+        let ok = dict_get(r, "ok") ?? T_NEG
+        if3 ok >= T_ZERO {
+            let response = dict_get(r, "response") ?? ""
+            let s = score_response(response)
+            let entry = {
+                "model": dict_get(r, "model") ?? "unknown",
+                "provider": dict_get(r, "provider") ?? "unknown",
+                "score": s,
+                "length": len(response),
+                "response": response,
+                "trit": T_POS
+            }
+            scored = append(scored, entry)
+            valid_count = valid_count + 1
+        }
+        ri = ri + 1
+    }
+
+    if3 valid_count == 0 {
+        return {"ok": T_NEG, "trit": T_NEG, "error": "all_models_failed", "models_fired": len(active_models)}
+    }
+
+    // Tripple consensus: check agreement between all valid responses
+    let agreement_matrix = []
+    let ai = 0
+    while3 ai < len(scored) {
+        let aj = ai + 1
+        let agrees_with = 0
+        while3 aj < len(scored) {
+            let resp_a = dict_get(scored[ai], "response") ?? ""
+            let resp_b = dict_get(scored[aj], "response") ?? ""
+            let agreement = check_agreement(resp_a, resp_b)
+            if3 agreement > 15 {
+                agrees_with = agrees_with + 1
+            }
+            aj = aj + 1
+        }
+        let updated = scored[ai]
+        let updated = dict_set(updated, "consensus_links", agrees_with)
+        scored = list_set(scored, ai, updated)
+        ai = ai + 1
+    }
+
+    // Find best response: highest (score + consensus_links * 20)
+    let best_idx = 0
+    let best_total = 0
+    let bi = 0
+    while3 bi < len(scored) {
+        let s = dict_get(scored[bi], "score") ?? 0
+        let c = dict_get(scored[bi], "consensus_links") ?? 0
+        let total = s + (c * 20)
+        if3 total > best_total {
+            best_total = total
+            best_idx = bi
+        }
+        bi = bi + 1
+    }
+
+    let best = scored[best_idx]
+    let best_response = dict_get(best, "response") ?? ""
+    let best_model = dict_get(best, "model") ?? "unknown"
+    let best_score = dict_get(best, "score") ?? 0
+    let consensus_count = dict_get(best, "consensus_links") ?? 0
+
+    // Standing wave detection: consensus_count + 1 >= min_consensus
+    let standing_wave = (consensus_count + 1) >= min_consensus
+
+    // Confidence calculation
+    let confidence = 0
+    if3 valid_count > 0 {
+        confidence = ((consensus_count + 1) * 100) / valid_count
+    }
+    if3 confidence > 100 {
+        confidence = 100
+    }
+
+    // Build model summary
+    let model_summary = []
+    let si = 0
+    while3 si < len(scored) {
+        let sm = dict_get(scored[si], "model") ?? "unknown"
+        let ss = dict_get(scored[si], "score") ?? 0
+        let sl = dict_get(scored[si], "length") ?? 0
+        let sc = dict_get(scored[si], "consensus_links") ?? 0
+        model_summary = append(model_summary, {
+            "model": sm,
+            "score": ss,
+            "length": sl,
+            "consensus_links": sc
+        })
+        si = si + 1
+    }
+
+    // Fire-and-forget Tripple reporting
+    let tripple_body = json_encode({
+        "provider": best_model,
+        "trit": T_POS,
+        "latency": 0,
+        "source": "classified-engine",
+        "capability": "turbulent_mix"
+    })
+    let _rip = try3 {
+        http_request(HIVEMIND_URL + "/hive/tripple/ripple", tripple_body, {"Content-Type": "application/json"}, 3000)
+    } fail { {} }
+
+    return {
+        "ok": T_POS,
+        "trit": T_POS,
+        "response": best_response,
+        "best_model": best_model,
+        "best_score": best_score,
+        "confidence_pct": confidence,
+        "standing_wave": standing_wave,
+        "consensus_count": consensus_count + 1,
+        "models_fired": len(active_models),
+        "models_responded": valid_count,
+        "reynolds": reynolds,
+        "flow_regime": flow_regime_label(reynolds),
+        "model_details": model_summary
+    }
+}
+
+// ── Flow Regime Label ────────────────────────────────────────────────────────
+
+fn flow_regime_label(re) {
+    if3 re < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "fully_turbulent"
+}
+
+// ── Kolmogorov Cascade: break prompt into sub-questions ──────────────────────
+
+fn kolmogorov_cascade(prompt, models) {
+    // Break the prompt into sub-questions by splitting on question marks
+    // or generating analytical sub-tasks
+    let sub_prompts = [
+        "Analyze the core facts and data in this query: " + prompt,
+        "Identify risks, threats, or vulnerabilities related to: " + prompt,
+        "Provide strategic recommendations based on: " + prompt
+    ]
+
+    let cascade_results = []
+    let ci = 0
+    while3 ci < len(sub_prompts) {
+        // Assign each sub-prompt to a different model (round-robin)
+        let model_idx = ci
+        if3 model_idx >= len(models) {
+            model_idx = 0
+        }
+        let sub_model = models[model_idx]
+        let sub_result = fire_model(sub_prompts[ci], sub_model, "You are a classified-grade analyst. Be thorough and precise.")
+        let sub_ok = dict_get(sub_result, "ok") ?? T_NEG
+        if3 sub_ok >= T_ZERO {
+            cascade_results = append(cascade_results, {
+                "sub_task": sub_prompts[ci],
+                "model": sub_model,
+                "response": dict_get(sub_result, "response") ?? ""
+            })
+        }
+        ci = ci + 1
+    }
+
+    return cascade_results
+}
+
+// ── HTTP Endpoints ───────────────────────────────────────────────────────────
+
+// ── POST /classified/query ───────────────────────────────────────────────────
+troute(server, "POST", "/classified/query", "handle_classified_query")
+fn handle_classified_query(req) {
+    let body = try3 { json_decode(req["body"]) } fail { {} }
+    let prompt = dict_get(body, "prompt") ?? ""
+    let capability = dict_get(body, "capability") ?? "intel_analysis"
+
+    if3 len(prompt) == 0 {
+        return {"ok": T_NEG, "trit": T_NEG, "error": "provide 'prompt'"}
+    }
+
+    let clusters = get_capability_clusters()
+    let cluster = dict_get(clusters, capability) ?? null
+    if3 cluster == null {
+        return {"ok": T_NEG, "trit": T_NEG, "error": "unknown capability: " + capability, "available": [
+            "intel_analysis", "threat_assessment", "code_exploit", "signals_analysis",
+            "geospatial", "autonomous_planning", "osint", "multilingual_intel"
+        ]}
+    }
+
+    let models = dict_get(cluster, "models") ?? []
+    let min_consensus = dict_get(cluster, "min_consensus") ?? 3
+    let reynolds = dict_get(cluster, "reynolds") ?? 400
+    let focus = dict_get(cluster, "focus") ?? ""
+    let mirrors = dict_get(cluster, "mirrors") ?? "unknown"
+
+    // Build system prompt from capability focus
+    let sys_prompt = "You are a classified-grade AI system specializing in: " + focus + ". Provide thorough, analytical, evidence-based responses. Structure your analysis with clear sections. Be precise and actionable."
+
+    // Update stats
+    _stats = dict_set(_stats, "queries", (dict_get(_stats, "queries") ?? 0) + 1)
+    let cap_hits = dict_get(_stats, "capability_hits") ?? {}
+    let old_count = dict_get(cap_hits, capability) ?? 0
+    cap_hits = dict_set(cap_hits, capability, old_count + 1)
+    _stats = dict_set(_stats, "capability_hits", cap_hits)
+
+    // Fire turbulent mix
+    let result = turbulent_mix(prompt, models, min_consensus, reynolds, sys_prompt)
+
+    let rok = dict_get(result, "ok") ?? T_NEG
+    if3 rok > 0 {
+        _stats = dict_set(_stats, "successes", (dict_get(_stats, "successes") ?? 0) + 1)
+    } else3 {
+        _stats = dict_set(_stats, "failures", (dict_get(_stats, "failures") ?? 0) + 1)
+    }
+
+    // Add capability metadata
+    result = dict_set(result, "capability", capability)
+    result = dict_set(result, "mirrors", mirrors)
+    result = dict_set(result, "focus", focus)
+
+    return result
+}
+
+// ── POST /classified/turbulent ───────────────────────────────────────────────
+troute(server, "POST", "/classified/turbulent", "handle_turbulent")
+fn handle_turbulent(req) {
+    let body = try3 { json_decode(req["body"]) } fail { {} }
+    let prompt = dict_get(body, "prompt") ?? ""
+    let reynolds = dict_get(body, "reynolds") ?? 500
+    let model_count = dict_get(body, "models") ?? H7
+    let use_cascade = dict_get(body, "kolmogorov") ?? false
+
+    if3 len(prompt) == 0 {
+        return {"ok": T_NEG, "trit": T_NEG, "error": "provide 'prompt'"}
+    }
+
+    // Build model pool from all available models (deduplicated)
+    let all_models = [
+        "anthropic/claude-opus-4-0",
+        "openai/gpt-4.1",
+        "deepseek/deepseek-r1",
+        "qwen/qwen3-235b-a22b",
+        "x-ai/grok-3-beta",
+        "anthropic/claude-sonnet-4",
+        "google/gemini-2.5-pro-preview-03-25",
+        "mistralai/codestral-2501",
+        "deepseek/deepseek-chat",
+        "meta-llama/llama-4-maverick",
+        "openai/o3",
+        "mistralai/mistral-large-2411",
+        "qwen/qwen3-coder"
+    ]
+
+    // Cap at requested model count and H13
+    let use_count = model_count
+    if3 use_count > H13 {
+        use_count = H13
+    }
+    if3 use_count > len(all_models) {
+        use_count = len(all_models)
+    }
+
+    let selected_models = []
+    let sm = 0
+    while3 sm < use_count {
+        selected_models = append(selected_models, all_models[sm])
+        sm = sm + 1
+    }
+
+    _stats = dict_set(_stats, "turbulent_queries", (dict_get(_stats, "turbulent_queries") ?? 0) + 1)
+
+    let sys_prompt = "You are part of a classified-grade multi-model ensemble. Provide the most thorough, accurate, and analytically rigorous response possible. Structure clearly."
+
+    // Main turbulent mix
+    let result = turbulent_mix(prompt, selected_models, H3, reynolds, sys_prompt)
+
+    // Optional Kolmogorov cascade
+    if3 use_cascade == true {
+        let cascade = kolmogorov_cascade(prompt, selected_models)
+        result = dict_set(result, "kolmogorov_cascade", cascade)
+    }
+
+    return result
+}
+
+// ── GET /classified/capabilities ─────────────────────────────────────────────
+troute(server, "GET", "/classified/capabilities", "handle_capabilities")
+fn handle_capabilities(req) {
+    let clusters = get_capability_clusters()
+    let cap_names = [
+        "intel_analysis", "threat_assessment", "code_exploit", "signals_analysis",
+        "geospatial", "autonomous_planning", "osint", "multilingual_intel"
+    ]
+
+    let summary = []
+    let ci = 0
+    while3 ci < len(cap_names) {
+        let name = cap_names[ci]
+        let cluster = dict_get(clusters, name) ?? {}
+        summary = append(summary, {
+            "capability": name,
+            "mirrors": dict_get(cluster, "mirrors") ?? "unknown",
+            "focus": dict_get(cluster, "focus") ?? "",
+            "model_count": len(dict_get(cluster, "models") ?? []),
+            "models": dict_get(cluster, "models") ?? [],
+            "min_consensus": dict_get(cluster, "min_consensus") ?? 3,
+            "reynolds": dict_get(cluster, "reynolds") ?? 400
+        })
+        ci = ci + 1
+    }
+
+    return {
+        "ok": T_POS,
+        "trit": T_POS,
+        "service": SERVICE,
+        "total_capabilities": len(cap_names),
+        "ns_constants": {
+            "H3": H3, "H5": H5, "H7": H7, "H13": H13,
+            "RE_LAMINAR": RE_LAMINAR, "RE_TRANSITION": RE_TRANSITION,
+            "RE_TURBULENT": RE_TURBULENT, "BLOCK": BLOCK
+        },
+        "capabilities": summary
+    }
+}
+
+// ── POST /classified/learn ───────────────────────────────────────────────────
+troute(server, "POST", "/classified/learn", "handle_learn")
+fn handle_learn(req) {
+    let body = try3 { json_decode(req["body"]) } fail { {} }
+    let capability = dict_get(body, "capability") ?? ""
+    let model = dict_get(body, "model") ?? ""
+    let score_delta = dict_get(body, "score") ?? 0
+
+    if3 len(capability) == 0 {
+        return {"ok": T_NEG, "error": "provide 'capability'"}
+    }
+    if3 len(model) == 0 {
+        return {"ok": T_NEG, "error": "provide 'model'"}
+    }
+
+    // Update model scores in state
+    let model_scores = dict_get(_stats, "model_scores") ?? {}
+    let cap_scores = dict_get(model_scores, capability) ?? {}
+    let old_score = dict_get(cap_scores, model) ?? 0
+    let new_score = old_score + score_delta
+    cap_scores = dict_set(cap_scores, model, new_score)
+    model_scores = dict_set(model_scores, capability, cap_scores)
+    _stats = dict_set(_stats, "model_scores", model_scores)
+    _stats = dict_set(_stats, "learn_updates", (dict_get(_stats, "learn_updates") ?? 0) + 1)
+
+    // Fire-and-forget Tripple report
+    let tripple_body = json_encode({
+        "provider": model,
+        "trit": T_POS,
+        "latency": 0,
+        "source": "classified-learn",
+        "capability": capability,
+        "score_delta": score_delta
+    })
+    let _rip = try3 {
+        http_request(HIVEMIND_URL + "/hive/tripple/ripple", tripple_body, {"Content-Type": "application/json"}, 3000)
+    } fail { {} }
+
+    return {
+        "ok": T_POS,
+        "trit": T_POS,
+        "capability": capability,
+        "model": model,
+        "previous_score": old_score,
+        "new_score": new_score,
+        "delta": score_delta
+    }
+}
+
+// ── GET /health ──────────────────────────────────────────────────────────────
+troute(server, "GET", "/health", "handle_health")
+fn handle_health(req) {
+    let uptime = time() - (dict_get(_stats, "t0") ?? time())
+    let queries = dict_get(_stats, "queries") ?? 0
+    let turbulent = dict_get(_stats, "turbulent_queries") ?? 0
+    let successes = dict_get(_stats, "successes") ?? 0
+    let failures = dict_get(_stats, "failures") ?? 0
+
+    // N-S health: compute Reynolds from query pressure
+    let total = queries + turbulent
+    let health_re = 0
+    if3 total > 0 {
+        health_re = (successes * RE_TURBULENT) / total
+    }
+
+    return {
+        "ok": true,
+        "trit": T_POS,
+        "service": SERVICE,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "queries": queries,
+        "turbulent_queries": turbulent,
+        "successes": successes,
+        "failures": failures,
+        "learn_updates": dict_get(_stats, "learn_updates") ?? 0,
+        "health_reynolds": health_re,
+        "flow_regime": flow_regime_label(health_re),
+        "ns_constants": {
+            "H3": H3, "H5": H5, "H7": H7, "H13": H13,
+            "RE_LAMINAR": RE_LAMINAR, "RE_TRANSITION": RE_TRANSITION,
+            "RE_TURBULENT": RE_TURBULENT, "BLOCK": BLOCK
+        },
+        "capability_hits": dict_get(_stats, "capability_hits") ?? {}
+    }
+}
+
+// ── Startup ──────────────────────────────────────────────────────────────────
+print("=== NovaX Classified Engine v" + VERSION + " ===")
+print("[CLASSIFIED] Port: " + str(PORT))
+print("[CLASSIFIED] Cloud Router: " + CLOUD_ROUTER_URL)
+print("[CLASSIFIED] HiveMind: " + HIVEMIND_URL)
+print("[CLASSIFIED] Capabilities: 8 clusters")
+print("[CLASSIFIED] N-S Constants: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[CLASSIFIED] Reynolds: Laminar<" + str(RE_LAMINAR) + " Trans<" + str(RE_TRANSITION) + " Turb<" + str(RE_TURBULENT))
+print("[CLASSIFIED] Mirrors: Pentagon-Claude | Palantir AIP | NSA SIGINT | SIGINT-AI | NGA GEOINT | DARPA ACE | CIA OSIRIS | Five-Eyes")
+print("[CLASSIFIED] Status: OPERATIONAL")
+tstart(server)

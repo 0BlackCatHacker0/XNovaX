@@ -1,0 +1,536 @@
+// NovaX TFFmpeg Service v1.0 - Ternary Media Processing (NovaLang)
+// Port 9922: FFmpeg operations through ternary-native micro-tools
+//
+// 7 ternary-native ffmpeg tools on 3-5-7-13 harmonic constants:
+//   1. /tffmpeg/info       -- Probe media file metadata (path)
+//   2. /tffmpeg/convert    -- Convert between formats (input, output, opts?)
+//   3. /tffmpeg/audio      -- Extract audio from video (input, output?, format?)
+//   4. /tffmpeg/thumbnail  -- Extract frame as image (input, output?, time?)
+//   5. /tffmpeg/trim       -- Trim/cut media (input, output, start, end?)
+//   6. /tffmpeg/merge      -- Concatenate media files (inputs[], output)
+//   7. /tffmpeg/compress   -- Compress video (input, output?, quality?)
+//
+// N-S Mapping:
+//   media_flow        = velocity_field (media content being processed)
+//   codec_complexity  = turbulent_energy (encoding complexity)
+//   Reynolds(media)   = file_size_mb * H5
+//   RE_LAMINAR=27     = small file (<5MB)
+//   RE_TRANSITION=125 = medium file (5-25MB)
+//   RE_TURBULENT=343  = large file (>25MB)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9922
+let server = tserve(PORT, "TFFmpeg v1.0 - Ternary Media Processing")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE     = 2187
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+let TOOLS_COUNT    = 7
+let VERSION        = "1.0.0"
+let SERVICE_NAME   = "nova-tffmpeg"
+let FFMPEG_PATH    = "C:\\NovaX\\tools\\ffmpeg\\ffmpeg.exe"
+let FFPROBE_PATH   = "C:\\NovaX\\tools\\ffmpeg\\ffprobe.exe"
+let TMP_DIR        = "C:\\NovaX\\data"
+let TIMEOUT        = 120
+
+// -- Global Stats --
+let stat_ops         = 0
+let stat_trit_true   = 0
+let stat_trit_maybe  = 0
+let stat_trit_false  = 0
+let stat_t0          = time()
+
+// by_tool counters
+let by_tool_info     = 0
+let by_tool_convert  = 0
+let by_tool_audio    = 0
+let by_tool_thumb    = 0
+let by_tool_trim     = 0
+let by_tool_merge    = 0
+let by_tool_compress = 0
+
+// -- N-S flow tracking --
+let ns_total_bytes_in  = 0
+let ns_total_bytes_out = 0
+let ns_max_reynolds    = 0
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: 3-char balanced ternary from integer
+// ===========================================================================
+fn bt_three(n) {
+    let result = ""
+    let val = n
+    let i = 0
+    while3 i < 3 {
+        let rem = val % 3
+        if3 rem == 0 {
+            result = "0" + result
+        }
+        if3 rem == 1 {
+            result = "+" + result
+            val = val - 1
+        }
+        if3 rem == 2 {
+            result = "T" + result
+            val = val + 1
+        }
+        val = val / 3
+        i = i + 1
+    }
+    return result
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_op(tool_name, trit_val) {
+    stat_ops = stat_ops + 1
+    if3 trit_val == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit_val == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit_val == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "info" {
+        by_tool_info = by_tool_info + 1
+    }
+    if3 tool_name == "convert" {
+        by_tool_convert = by_tool_convert + 1
+    }
+    if3 tool_name == "audio" {
+        by_tool_audio = by_tool_audio + 1
+    }
+    if3 tool_name == "thumbnail" {
+        by_tool_thumb = by_tool_thumb + 1
+    }
+    if3 tool_name == "trim" {
+        by_tool_trim = by_tool_trim + 1
+    }
+    if3 tool_name == "merge" {
+        by_tool_merge = by_tool_merge + 1
+    }
+    if3 tool_name == "compress" {
+        by_tool_compress = by_tool_compress + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: check if nova_run result is an error
+// nova_run returns stdout on success (returncode 0), stderr on failure
+// ffmpeg errors contain "Error", "Invalid", "No such file" etc.
+// ffprobe success starts with "{" (JSON)
+// ===========================================================================
+fn run_failed(raw) {
+    if3 contains(raw, "No such file") {
+        return true
+    }
+    if3 contains(raw, "Invalid") {
+        return true
+    }
+    if3 contains(raw, "Error") {
+        return true
+    }
+    if3 contains(raw, "error") {
+        return true
+    }
+    if3 contains(raw, "not found") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: escape path for shell command
+// ===========================================================================
+fn esc_path(p) {
+    let escaped = replace(p, "\\", "\\\\")
+    return "\"" + escaped + "\""
+}
+
+// ===========================================================================
+// TOOL 1: /tffmpeg/info — Probe media metadata via ffprobe
+// ===========================================================================
+fn handle_info(body) {
+    let path = dict_get(body, "path") ?? ""
+    if3 path == "" {
+        record_op("info", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "missing path"}
+    }
+
+    let cmd = FFPROBE_PATH + " -v quiet -print_format json -show_format -show_streams \"" + path + "\""
+    let raw = nova_run(cmd, TIMEOUT)
+    let is_err = run_failed(raw)
+    if3 raw == "" {
+        is_err = true
+    }
+
+    if3 is_err == true {
+        record_op("info", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "ffprobe failed", "detail": raw}
+    }
+
+    let info = json_decode(raw)
+    let fmt = dict_get(info, "format") ?? {}
+    let size_bytes = dict_get(fmt, "size") ?? "0"
+    let duration = dict_get(fmt, "duration") ?? "0"
+    let size_mb = float(size_bytes) / 1048576
+    let re_num = size_mb * H5
+    if3 re_num > ns_max_reynolds {
+        ns_max_reynolds = re_num
+    }
+    ns_total_bytes_in = ns_total_bytes_in + float(size_bytes)
+
+    record_op("info", T_TRUE)
+    return {
+        "ok": true,
+        "trit": 1,
+        "char": "1",
+        "format": dict_get(fmt, "format_name") ?? "unknown",
+        "duration_s": float(duration),
+        "size_mb": size_mb,
+        "streams": dict_get(info, "streams") ?? [],
+        "reynolds": re_num,
+        "regime": flow_regime(re_num)
+    }
+}
+
+// ===========================================================================
+// TOOL 2: /tffmpeg/convert — Convert between formats
+// ===========================================================================
+fn handle_convert(body) {
+    let input_path = dict_get(body, "input") ?? ""
+    let output_path = dict_get(body, "output") ?? ""
+
+    if3 input_path == "" {
+        record_op("convert", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "missing input"}
+    }
+    if3 output_path == "" {
+        record_op("convert", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "missing output"}
+    }
+
+    let opts = dict_get(body, "opts") ?? ""
+    let cmd = FFMPEG_PATH + " -y -i \"" + input_path + "\" " + opts + " \"" + output_path + "\""
+    let raw = nova_run(cmd, TIMEOUT)
+    let is_err = run_failed(raw)
+
+    if3 is_err == true {
+        record_op("convert", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "convert failed", "detail": raw}
+    }
+
+    record_op("convert", T_TRUE)
+    return {"ok": true, "trit": 1, "char": "1", "output": output_path}
+}
+
+// ===========================================================================
+// TOOL 3: /tffmpeg/audio — Extract audio from video
+// ===========================================================================
+fn handle_audio(body) {
+    let input_path = dict_get(body, "input") ?? ""
+    if3 input_path == "" {
+        record_op("audio", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "missing input"}
+    }
+
+    let format = dict_get(body, "format") ?? "mp3"
+    let output_path = dict_get(body, "output") ?? ""
+    if3 output_path == "" {
+        output_path = TMP_DIR + "\\extracted_audio." + format
+    }
+
+    let cmd = FFMPEG_PATH + " -y -i \"" + input_path + "\" -vn -acodec "
+    if3 format == "mp3" {
+        cmd = cmd + "libmp3lame -q:a 2"
+    }
+    if3 format == "opus" {
+        cmd = cmd + "libopus -b:a 128k"
+    }
+    if3 format == "wav" {
+        cmd = cmd + "pcm_s16le"
+    }
+    if3 format == "aac" {
+        cmd = cmd + "aac -b:a 192k"
+    }
+    cmd = cmd + " \"" + output_path + "\""
+
+    let raw = nova_run(cmd, TIMEOUT)
+    let is_err = run_failed(raw)
+
+    if3 is_err == true {
+        record_op("audio", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "audio extract failed", "detail": raw}
+    }
+
+    record_op("audio", T_TRUE)
+    return {"ok": true, "trit": 1, "char": "1", "output": output_path, "format": format}
+}
+
+// ===========================================================================
+// TOOL 4: /tffmpeg/thumbnail — Extract a frame as image
+// ===========================================================================
+fn handle_thumbnail(body) {
+    let input_path = dict_get(body, "input") ?? ""
+    if3 input_path == "" {
+        record_op("thumbnail", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "missing input"}
+    }
+
+    let at_time = dict_get(body, "time") ?? "00:00:01"
+    let output_path = dict_get(body, "output") ?? ""
+    if3 output_path == "" {
+        output_path = TMP_DIR + "\\thumbnail.jpg"
+    }
+
+    let cmd = FFMPEG_PATH + " -y -ss " + at_time + " -i \"" + input_path + "\" -vframes 1 -q:v 2 \"" + output_path + "\""
+    let raw = nova_run(cmd, TIMEOUT)
+    let is_err = run_failed(raw)
+
+    if3 is_err == true {
+        record_op("thumbnail", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "thumbnail failed", "detail": raw}
+    }
+
+    record_op("thumbnail", T_TRUE)
+    return {"ok": true, "trit": 1, "char": "1", "output": output_path, "time": at_time}
+}
+
+// ===========================================================================
+// TOOL 5: /tffmpeg/trim — Trim/cut media file
+// ===========================================================================
+fn handle_trim(body) {
+    let input_path = dict_get(body, "input") ?? ""
+    let output_path = dict_get(body, "output") ?? ""
+    let start_time = dict_get(body, "start") ?? ""
+
+    if3 input_path == "" {
+        record_op("trim", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "missing input"}
+    }
+    if3 output_path == "" {
+        record_op("trim", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "missing output"}
+    }
+    if3 start_time == "" {
+        record_op("trim", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "missing start time"}
+    }
+
+    let end_time = dict_get(body, "end") ?? ""
+    let cmd = FFMPEG_PATH + " -y -ss " + start_time
+    if3 end_time != "" {
+        cmd = cmd + " -to " + end_time
+    }
+    cmd = cmd + " -i \"" + input_path + "\" -c copy \"" + output_path + "\""
+
+    let raw = nova_run(cmd, TIMEOUT)
+    let is_err = run_failed(raw)
+
+    if3 is_err == true {
+        record_op("trim", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "trim failed", "detail": raw}
+    }
+
+    record_op("trim", T_TRUE)
+    return {"ok": true, "trit": 1, "char": "1", "output": output_path, "start": start_time, "end": end_time}
+}
+
+// ===========================================================================
+// TOOL 6: /tffmpeg/merge — Concatenate media files
+// ===========================================================================
+fn handle_merge(body) {
+    let inputs = dict_get(body, "inputs") ?? []
+    let output_path = dict_get(body, "output") ?? ""
+
+    if3 len(inputs) < 2 {
+        record_op("merge", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "need at least 2 input files"}
+    }
+    if3 output_path == "" {
+        record_op("merge", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "missing output"}
+    }
+
+    // Write concat list to temp file
+    let list_path = TMP_DIR + "\\ffmpeg_concat.txt"
+    let list_content = ""
+    let idx = 0
+    while3 idx < len(inputs) {
+        let item = dict_get(inputs, idx) ?? ""
+        let escaped_item = replace(item, "\\", "/")
+        list_content = list_content + "file '" + escaped_item + "'\n"
+        idx = idx + 1
+    }
+    nova_write(list_path, list_content)
+
+    let cmd = FFMPEG_PATH + " -y -f concat -safe 0 -i \"" + list_path + "\" -c copy \"" + output_path + "\""
+    let raw = nova_run(cmd, TIMEOUT)
+    let is_err = run_failed(raw)
+
+    if3 is_err == true {
+        record_op("merge", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "merge failed", "detail": raw}
+    }
+
+    record_op("merge", T_TRUE)
+    return {"ok": true, "trit": 1, "char": "1", "output": output_path, "input_count": len(inputs)}
+}
+
+// ===========================================================================
+// TOOL 7: /tffmpeg/compress — Compress video with quality control
+// ===========================================================================
+fn handle_compress(body) {
+    let input_path = dict_get(body, "input") ?? ""
+    if3 input_path == "" {
+        record_op("compress", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "missing input"}
+    }
+
+    let output_path = dict_get(body, "output") ?? ""
+    if3 output_path == "" {
+        output_path = TMP_DIR + "\\compressed.mp4"
+    }
+
+    // quality: low=35, medium=28, high=23 (CRF scale, lower=better)
+    let quality = dict_get(body, "quality") ?? "medium"
+    let crf = "28"
+    if3 quality == "low" {
+        crf = "35"
+    }
+    if3 quality == "high" {
+        crf = "23"
+    }
+
+    let cmd = FFMPEG_PATH + " -y -i \"" + input_path + "\" -c:v libx264 -crf " + crf + " -preset medium -c:a aac -b:a 128k \"" + output_path + "\""
+    let raw = nova_run(cmd, TIMEOUT)
+    let is_err = run_failed(raw)
+
+    if3 is_err == true {
+        record_op("compress", T_FALSE)
+        return {"ok": false, "trit": -1, "char": "T", "error": "compress failed", "detail": raw}
+    }
+
+    record_op("compress", T_TRUE)
+    return {"ok": true, "trit": 1, "char": "1", "output": output_path, "crf": crf, "quality": quality}
+}
+
+// ===========================================================================
+// /health — Health check
+// ===========================================================================
+fn handle_health(body) {
+    let uptime = time() - stat_t0
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "char", "1")
+    resp = dict_set(resp, "reynolds", stat_ops * H5)
+    resp = dict_set(resp, "flow_regime", flow_regime(stat_ops * H5))
+    resp = dict_set(resp, "total_ops", stat_ops)
+    resp = dict_set(resp, "ffmpeg", FFMPEG_PATH)
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "harmonics", {"H3": H3, "H5": H5, "H7": H7, "H13": H13})
+    return resp
+}
+
+// ===========================================================================
+// /tffmpeg/service-status — Full service stats
+// ===========================================================================
+fn handle_status(body) {
+    let uptime = time() - stat_t0
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "tools_count": TOOLS_COUNT,
+        "stats": {
+            "total_ops": stat_ops,
+            "trit_true": stat_trit_true,
+            "trit_maybe": stat_trit_maybe,
+            "trit_false": stat_trit_false
+        },
+        "by_tool": {
+            "info": by_tool_info,
+            "convert": by_tool_convert,
+            "audio": by_tool_audio,
+            "thumbnail": by_tool_thumb,
+            "trim": by_tool_trim,
+            "merge": by_tool_merge,
+            "compress": by_tool_compress
+        },
+        "ns": {
+            "total_bytes_in": ns_total_bytes_in,
+            "total_bytes_out": ns_total_bytes_out,
+            "max_reynolds": ns_max_reynolds,
+            "regime": flow_regime(ns_max_reynolds)
+        },
+        "trit": 1,
+        "char": "1"
+    }
+}
+
+// ===========================================================================
+// ROUTE REGISTRATION
+// ===========================================================================
+troute(server, "GET",  "/health",                  "handle_health")
+troute(server, "GET",  "/tffmpeg/service-status",   "handle_status")
+troute(server, "POST", "/tffmpeg/info",             "handle_info")
+troute(server, "POST", "/tffmpeg/convert",          "handle_convert")
+troute(server, "POST", "/tffmpeg/audio",            "handle_audio")
+troute(server, "POST", "/tffmpeg/thumbnail",        "handle_thumbnail")
+troute(server, "POST", "/tffmpeg/trim",             "handle_trim")
+troute(server, "POST", "/tffmpeg/merge",            "handle_merge")
+troute(server, "POST", "/tffmpeg/compress",         "handle_compress")
+
+// ===========================================================================
+// START
+// ===========================================================================
+tstart(server)

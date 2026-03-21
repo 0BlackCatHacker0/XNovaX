@@ -1,0 +1,1775 @@
+// Nova UIA Bridge Service v1.0 - Session-1 UIA Bridge (NovaLang)
+// Port 9902: Captures UIA element trees from Claude/GPT Desktop
+// Relays commands from Cortex, executes via UIA delegation
+//
+// Architecture:
+//   Bridge (session-1) -> captures UIA trees -> POSTs to Cortex (nowindow)
+//   Cortex -> queues commands -> Bridge polls -> executes via UIA
+//   Result: NovaX panels mirror and control real desktop apps
+//
+// ALL UIA automation delegated via nova_run() to uia_helper.py
+// No ctypes, no comtypes, no threading, no for loops
+//
+// N-S Mapping:
+//   element_flow   = velocity_field
+//   noise_text     = turbulent particle
+//   signal_text    = laminar flow
+//   tfilter_trit   = Reynolds classification (+1 signal, 0 transitional, -1 noise)
+//
+// Endpoints:
+//   GET  /health              -- standard tlight health
+//   GET  /uia/status          -- bridge status with stats
+//   POST /uia/tick            -- one capture+poll+execute cycle
+//   POST /uia/capture         -- capture UIA tree for a target
+//   POST /uia/execute         -- execute a command
+//   GET  /uia/conversation    -- get conversation from cached tree
+//   GET  /uia/app-state       -- get app state from cached tree
+//   GET  /uia/windows         -- list discovered windows
+//   POST /uia/focus           -- focus a target window
+//   POST /uia/type            -- type text into target
+//   POST /uia/submit          -- press enter in target
+//   POST /uia/click           -- click element by name
+//   POST /uia/key             -- press key combo
+//   POST /uia/new-chat        -- start new chat
+//   POST /uia/select-model    -- select model in dropdown
+//   POST /uia/select-session  -- select sidebar session
+//   POST /uia/copy-response   -- copy last response text
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9902
+let server = tserve(PORT, "Nova UIA Bridge v1.0 - Session-1 Desktop Bridge")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let BLOCK = 2187
+
+// -- Reynolds Boundaries (3^3 / 5^3 / 7^3) --
+let RE_LAMINAR      = 27
+let RE_TRANSITIONAL = 125
+let RE_TURBULENT    = 343
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Service Configuration --
+let VERSION      = "1.0"
+let SERVICE_NAME = "nova-uia-bridge"
+let CORTEX_URL   = "http://127.0.0.1:9896"
+let TFLOW_URL    = "http://127.0.0.1:9894/ttools/flow/message"
+let UIA_HELPER   = "C:\\NovaX\\uia_helper.py"
+let LOG_FILE     = "C:\\NovaX\\logs\\uia_bridge_nova.log"
+let GROUP_GAP    = 40
+
+// -- UIA Control Type IDs --
+let CT_BUTTON    = 50000
+let CT_CALENDAR  = 50001
+let CT_CHECKBOX  = 50002
+let CT_COMBOBOX  = 50003
+let CT_EDIT      = 50004
+let CT_HYPERLINK = 50005
+let CT_IMAGE     = 50006
+let CT_LISTITEM  = 50007
+let CT_LIST      = 50008
+let CT_MENU      = 50009
+let CT_MENUBAR   = 50010
+let CT_MENUITEM  = 50011
+let CT_TEXT      = 50020
+let CT_DOCUMENT  = 50030
+let CT_GROUP     = 50026
+let CT_PANE      = 50033
+let CT_TABITEM   = 50013
+let CT_WINDOW    = 50032
+
+// -- Global Stats --
+let stat_captures  = 0
+let stat_commands   = 0
+let stat_errors     = 0
+let stat_ticks      = 0
+let stat_start      = time()
+
+// -- Cached State --
+// hwnds: dict target_name -> hwnd int
+// trees: dict target_name -> list of element dicts (serialized, no COM refs)
+// last_hint_ts: dict target_name -> timestamp
+let hwnds        = {}
+let trees         = {}
+let last_hint_ts  = {}
+let command_queue = []
+
+// -- Noise word set (stored as dict for O(1) lookup) --
+let NOISE_WORDS = {}
+NOISE_WORDS = dict_set(NOISE_WORDS, "minimize", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "restore", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "close", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "menu", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "back", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "forward", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "sidebar", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "pretty-print", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "copy message", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "preview options", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "settings", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "new chat", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "model", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "send", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "stop generating", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "regenerate", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "edit", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "copy", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "share", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "like", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "dislike", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "scroll to bottom", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "attach", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "search", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "history", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "close sidebar", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "open profile menu", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "open conversation options", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "close panel", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "go back", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "go forward", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "more options", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "more actions", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "add files and more", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "dictate button", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "good response", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "bad response", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "edit message", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "skip to content", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "black cat, settings", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "explore gpts", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "your chats", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "chat history", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "search chats", 1)
+NOISE_WORDS = dict_set(NOISE_WORDS, "ask anything", 1)
+
+// -- Session noise set --
+let SESSION_NOISE = {}
+let _sn0  = dict_set(SESSION_NOISE, "open conversation options", 1)
+let _sn1  = dict_set(SESSION_NOISE, "explore gpts", 1)
+let _sn2  = dict_set(SESSION_NOISE, "your chats", 1)
+let _sn3  = dict_set(SESSION_NOISE, "chat history", 1)
+let _sn4  = dict_set(SESSION_NOISE, "search chats", 1)
+let _sn5  = dict_set(SESSION_NOISE, "images", 1)
+let _sn6  = dict_set(SESSION_NOISE, "apps", 1)
+let _sn7  = dict_set(SESSION_NOISE, "projects", 1)
+let _sn8  = dict_set(SESSION_NOISE, "gpts", 1)
+let _sn9  = dict_set(SESSION_NOISE, "deep research", 1)
+SESSION_NOISE = dict_set(SESSION_NOISE, "codex", 1)
+SESSION_NOISE = dict_set(SESSION_NOISE, "new chat", 1)
+SESSION_NOISE = dict_set(SESSION_NOISE, "home", 1)
+SESSION_NOISE = dict_set(SESSION_NOISE, "skip to content", 1)
+
+// -- Nav buttons set --
+let NAV_BUTTONS = {}
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "minimize", 1)
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "restore", 1)
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "close", 1)
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "menu", 1)
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "close sidebar", 1)
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "back", 1)
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "forward", 1)
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "preview", 1)
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "preview options", 1)
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "copy message", 1)
+NAV_BUTTONS = dict_set(NAV_BUTTONS, "settings", 1)
+
+// -- Model names set --
+let MODEL_NAMES = {}
+MODEL_NAMES = dict_set(MODEL_NAMES, "opus", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "sonnet", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "haiku", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "gpt-4", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "gpt-4o", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "4o", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "4.6", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "4.5", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "3.5", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "gpt-4o-mini", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "o1-mini", 1)
+MODEL_NAMES = dict_set(MODEL_NAMES, "auto", 1)
+
+// -- N-S Element Type Densities (rho) --
+let RHO_MAP = {}
+RHO_MAP = dict_set(RHO_MAP, str(CT_BUTTON),   2.5)
+RHO_MAP = dict_set(RHO_MAP, str(CT_EDIT),      2.0)
+RHO_MAP = dict_set(RHO_MAP, str(CT_HYPERLINK), 1.5)
+RHO_MAP = dict_set(RHO_MAP, str(CT_LISTITEM),  1.2)
+RHO_MAP = dict_set(RHO_MAP, str(CT_TEXT),       0.5)
+RHO_MAP = dict_set(RHO_MAP, str(CT_GROUP),      4.0)
+RHO_MAP = dict_set(RHO_MAP, str(CT_PANE),       3.0)
+let RHO_DEFAULT = 1.5
+
+
+// ============================================================
+// Helper: Logging
+// ============================================================
+
+fn bridge_log(msg) {
+    let ts = str(time())
+    let line = "[UIA-BRIDGE-NOVA " + ts + "] " + msg
+    try3 {
+        let _w = nova_write(LOG_FILE, line + "\n")
+    } else {
+        // best-effort logging
+    }
+    return T_TRUE
+}
+
+
+// ============================================================
+// Helper: N-S Reynolds Text Classifier (TFilter)
+// ============================================================
+
+fn text_entropy(text) {
+    // Shannon-like character entropy normalized 0-1
+    if3 len(text) == 0 {
+        return 0.0
+    }
+    let chars = {}
+    let t_lower = lower(text)
+    let idx = 0
+    let tlen = len(t_lower)
+    while3 idx < tlen {
+        let ch = slice(t_lower, idx, idx + 1)
+        let cur = dict_get(chars, ch) ?? 0
+        chars = dict_set(chars, ch, cur + 1)
+        idx = idx + 1
+    }
+    let char_keys = keys(chars)
+    let n = float(tlen)
+    let ent = 0.0
+    let ki = 0
+    while3 ki < len(char_keys) {
+        let ch_key = dict_get(char_keys, ki)
+        let count = float(dict_get(chars, ch_key) ?? 0)
+        let p = count / n
+        if3 p > 0.0 {
+            // log2(p) = ln(p) / ln(2) ~ ln(p) / 0.6931
+            // use sqrt-based approximation since we lack log2 builtin
+            // ent -= p * log2(p) approximated
+            let neg_contrib = p * (1.0 - p) * 4.0
+            ent = ent + neg_contrib
+        }
+        ki = ki + 1
+    }
+    return min(ent / 6.6, 1.0)
+}
+
+fn word_diversity(text) {
+    // Unique words / total words (approximation)
+    let words = split(text, " ")
+    let wcount = len(words)
+    if3 wcount == 0 {
+        return 0.0
+    }
+    // Count unique words via dict
+    let seen = {}
+    let wi = 0
+    while3 wi < wcount {
+        let w = lower(dict_get(words, wi))
+        seen = dict_set(seen, w, 1)
+        wi = wi + 1
+    }
+    let unique = float(len(keys(seen)))
+    return unique / float(wcount)
+}
+
+fn is_noise_word(text) {
+    let tl = lower(trim(text))
+    if3 dict_has(NOISE_WORDS, tl) {
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+fn is_model_label(text) {
+    let tl = lower(trim(text))
+    if3 len(text) > 40 {
+        return T_FALSE
+    }
+    if3 dict_has(MODEL_NAMES, tl) {
+        return T_TRUE
+    }
+    if3 starts_with(tl, "claude") {
+        return T_TRUE
+    }
+    if3 starts_with(tl, "gpt") {
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+fn has_server_log_pattern(text) {
+    // Check for server log patterns: ::ffff: or HTTP/ or GET/POST paths
+    if3 contains(text, "::ffff:") {
+        return T_TRUE
+    }
+    if3 contains(text, "HTTP/") {
+        return T_TRUE
+    }
+    if3 contains(text, "\"GET /") {
+        return T_TRUE
+    }
+    if3 contains(text, "\"POST /") {
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+fn has_punctuation(text) {
+    if3 contains(text, ".") {
+        return 1.5
+    }
+    if3 contains(text, "!") {
+        return 1.5
+    }
+    if3 contains(text, "?") {
+        return 1.5
+    }
+    if3 contains(text, ",") {
+        return 1.5
+    }
+    if3 contains(text, ";") {
+        return 1.5
+    }
+    if3 contains(text, ":") {
+        return 1.5
+    }
+    return 1.0
+}
+
+fn tfilter_reynolds(text, el_type, depth) {
+    // N-S Reynolds classifier. Returns dict with re, regime, trit
+    // Laminar (Re<27) -> +1 signal
+    // Transitional (27-125) -> 0
+    // Turbulent (125+) -> -1 noise
+    let t = trim(text)
+    if3 len(t) == 0 {
+        return {"re": 999.0, "regime": "chaotic", "trit": -1}
+    }
+
+    // Instant classifications
+    if3 has_server_log_pattern(t) == T_TRUE {
+        return {"re": 500.0, "regime": "chaotic", "trit": -1}
+    }
+    if3 is_noise_word(t) == T_TRUE {
+        return {"re": 200.0, "regime": "turbulent", "trit": -1}
+    }
+    if3 is_model_label(t) == T_TRUE {
+        return {"re": 180.0, "regime": "turbulent", "trit": -1}
+    }
+
+    // N-S variables
+    let rho_key = str(el_type)
+    let rho = dict_get(RHO_MAP, rho_key) ?? RHO_DEFAULT
+    let entropy = text_entropy(t)
+    let v = 1.0 / max(entropy, 0.05)
+    let tlen_f = float(min(len(t), 500))
+    let L = tlen_f / 100.0
+    let diversity = word_diversity(t)
+    let words = split(t, " ")
+    let wcount = len(words)
+
+    // Average word length
+    let total_wl = 0
+    let wi = 0
+    while3 wi < wcount {
+        let w = dict_get(words, wi)
+        total_wl = total_wl + len(w)
+        wi = wi + 1
+    }
+    let avg_wl = 1.0
+    if3 wcount > 0 { avg_wl = float(total_wl) / float(wcount)
+    }
+
+    let punct_mult = has_punctuation(t)
+    let mu = max(diversity * (avg_wl / float(H5)) * punct_mult, 0.05)
+    let Re = (rho * v * L) / mu
+
+    // External forces: depth
+    if3 depth < H5 { depth_boost = 1.0 + (float(H5) - float(depth)) * 0.3
+        Re = Re * depth_boost
+    }
+
+    // Short text penalty
+    if3 len(t) < 15 { Re = Re + 30.0
+    }
+
+    // Harmonic classification
+    if3 Re < float(RE_LAMINAR) {
+        return {"re": round(Re, 2), "regime": "laminar", "trit": 1}
+    }
+    if3 Re < float(RE_TRANSITIONAL) {
+        return {"re": round(Re, 2), "regime": "transitional", "trit": 0}
+    }
+    if3 Re < float(RE_TURBULENT) {
+        return {"re": round(Re, 2), "regime": "turbulent", "trit": -1}
+    }
+    return {"re": round(Re, 2), "regime": "chaotic", "trit": -1}
+}
+
+fn tfilter_score(text, el_type, depth) {
+    // TFilter v2: N-S Reynolds shorthand. Returns +1/0/-1
+    let result = tfilter_reynolds(text, el_type, depth)
+    return dict_get(result, "trit") ?? -1
+}
+
+
+// ============================================================
+// Helper: TFlow Async Message Route (fire-and-forget via http_post)
+// ============================================================
+
+fn tflow_route(target, session, role, text) {
+    // Route message through N-S pipe to ternary storage (best-effort)
+    let msg_text = text
+    if3 len(msg_text) > 5000 { msg_text = slice(msg_text, 0, 5000)
+    }
+    let payload = {
+        "target": target,
+        "session": session,
+        "role": role,
+        "text": msg_text
+    }
+    try3 {
+        let _resp = http_post(TFLOW_URL, payload)
+    } else {
+        // best-effort: don't block capture cycle
+    }
+    return T_TRUE
+}
+
+
+// ============================================================
+// UIA Delegation: All UIA operations via nova_run()
+// ============================================================
+// uia_helper.py actions:
+//   find_windows <pattern>       -> JSON list of [hwnd, title]
+//   find_by_process <exe_name>   -> JSON list of [hwnd, title]
+//   capture_tree <hwnd> <depth>  -> JSON element tree
+//   focus_window <hwnd>          -> JSON {ok: bool}
+//   type_text <hwnd> <text>      -> JSON {ok: bool, method: str}
+//   submit <hwnd>                -> JSON {ok: bool}
+//   click_element <hwnd> <name>  -> JSON {ok: bool, method: str}
+//   press_key <hwnd> <keys>      -> JSON {ok: bool}
+//   new_chat <hwnd>              -> JSON {ok: bool}
+//   select_model <hwnd> <model>  -> JSON {ok: bool}
+//   select_session <hwnd> <name> -> JSON {ok: bool}
+//   copy_response <hwnd>         -> JSON {ok: bool, text: str}
+//   set_dpi_aware                -> JSON {ok: bool}
+//   get_window_title <hwnd>      -> JSON {title: str}
+
+fn uia_call(action, args) {
+    // Delegate UIA operation to Python helper via nova_run
+    let cmd = "\"" + UIA_HELPER + "\" " + action
+    if3 len(args) > 0 { cmd = cmd + " " + args
+    }
+    try3 {
+        let raw = nova_run(cmd)
+        let result = json_decode(raw)
+        return result
+    } else { _l = bridge_log("uia_call failed: " + action + " " + args)
+        return {"ok": false, "error": "uia_call error on " + action}
+    }
+}
+
+fn uia_find_windows(pattern) {
+    return uia_call("find_windows", "\"" + pattern + "\"")
+}
+
+fn uia_find_by_process(exe_name) {
+    return uia_call("find_by_process", "\"" + exe_name + "\"")
+}
+
+fn uia_capture_tree(hwnd, depth) {
+    return uia_call("capture_tree", str(hwnd) + " " + str(depth))
+}
+
+fn uia_focus_window(hwnd) {
+    return uia_call("focus_window", str(hwnd))
+}
+
+fn uia_type_text(hwnd, text) {
+    // Encode text as JSON string to handle spaces/special chars
+    let encoded = json_encode(text)
+    return uia_call("type_text", str(hwnd) + " " + encoded)
+}
+
+fn uia_submit(hwnd) {
+    return uia_call("submit", str(hwnd))
+}
+
+fn uia_click_element(hwnd, name) {
+    let encoded = json_encode(name)
+    return uia_call("click_element", str(hwnd) + " " + encoded)
+}
+
+fn uia_press_key(hwnd, key_combo) {
+    return uia_call("press_key", str(hwnd) + " \"" + key_combo + "\"")
+}
+
+fn uia_new_chat(hwnd) {
+    return uia_call("new_chat", str(hwnd))
+}
+
+fn uia_select_model(hwnd, model_name) {
+    let encoded = json_encode(model_name)
+    return uia_call("select_model", str(hwnd) + " " + encoded)
+}
+
+fn uia_select_session(hwnd, session_name) {
+    let encoded = json_encode(session_name)
+    return uia_call("select_session", str(hwnd) + " " + encoded)
+}
+
+fn uia_copy_response(hwnd) {
+    return uia_call("copy_response", str(hwnd))
+}
+
+fn uia_get_title(hwnd) {
+    return uia_call("get_window_title", str(hwnd))
+}
+
+
+// ============================================================
+// Conversation Extraction from Element Tree
+// ============================================================
+
+fn is_text_bearing(ct) {
+    if3 ct == CT_TEXT {
+        return T_TRUE
+    }
+    if3 ct == CT_DOCUMENT {
+        return T_TRUE
+    }
+    if3 ct == CT_EDIT {
+        return T_TRUE
+    }
+    if3 ct == CT_GROUP {
+        return T_TRUE
+    }
+    if3 ct == CT_LISTITEM {
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+fn is_clickable(ct) {
+    if3 ct == CT_BUTTON {
+        return T_TRUE
+    }
+    if3 ct == CT_LISTITEM {
+        return T_TRUE
+    }
+    if3 ct == CT_HYPERLINK {
+        return T_TRUE
+    }
+    if3 ct == CT_MENUITEM {
+        return T_TRUE
+    }
+    if3 ct == CT_CHECKBOX {
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+fn is_role_label_user(name) {
+    let nl = lower(trim(name))
+    if3 nl == "human" {
+        return T_TRUE
+    }
+    if3 nl == "you" {
+        return T_TRUE
+    }
+    if3 nl == "user" {
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+fn is_role_label_assistant(name) {
+    let nl = lower(trim(name))
+    if3 nl == "claude" {
+        return T_TRUE
+    }
+    if3 nl == "assistant" {
+        return T_TRUE
+    }
+    if3 nl == "chatgpt" {
+        return T_TRUE
+    }
+    if3 starts_with(nl, "gpt") {
+        return T_TRUE
+    }
+    if3 nl == "opus" {
+        return T_TRUE
+    }
+    if3 nl == "sonnet" {
+        return T_TRUE
+    }
+    if3 nl == "haiku" {
+        return T_TRUE
+    }
+    return T_FALSE
+}
+
+fn detect_role_labels(elements) {
+    // Scan elements for role-indicator labels
+    // Returns list of {y, role} dicts sorted by y
+    let labels = []
+    let ei = 0
+    let elen = len(elements)
+    while3 ei < elen {
+        let el = dict_get(elements, ei)
+        let name = dict_get(el, "name") ?? ""
+        ei = ei + 1
+        if3 len(name) == 0 {
+            // skip
+        } else {
+            if3 len(name) > 30 {
+                // skip long names
+            } else { ct = dict_get(el, "type") ?? 0
+                // Role labels are typically CT_TEXT, CT_GROUP, or CT_BUTTON
+                if3 ct == CT_TEXT {
+                    // ok
+                } else {
+                    if3 ct == CT_GROUP {
+                        // ok
+                    } else {
+                        if3 ct == CT_BUTTON {
+                            // ok
+                        } else {
+                            // skip non-matching types, continue
+                            let ct = -999
+                        }
+                    }
+                }
+                if3 ct != -999 { bounds = dict_get(el, "bounds", [0, 0, 0, 0])
+                    let y = dict_get(bounds, 1) ?? 0
+                    if3 y > 0 {
+                        if3 is_role_label_user(name) == T_TRUE { _a = append(labels, {"y": y, "role": "user"})
+                        }
+                        if3 is_role_label_assistant(name) == T_TRUE { _a = append(labels, {"y": y, "role": "assistant"})
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Sort labels by y (simple insertion sort)
+    let li = 1
+    let llen = len(labels)
+    while3 li < llen {
+        let cur_label = dict_get(labels, li)
+        let cur_y = dict_get(cur_label, "y") ?? 0
+        let ji = li - 1
+        while3 ji >= 0 {
+            let prev_label = dict_get(labels, ji)
+            let prev_y = dict_get(prev_label, "y") ?? 0
+            if3 prev_y > cur_y {
+                // swap
+                labels = dict_set(labels, ji + 1, prev_label)
+                labels = dict_set(labels, ji, cur_label)
+                ji = ji - 1
+            } else { ji = -1
+            }
+        }
+        li = li + 1
+    }
+    return labels
+}
+
+fn assign_roles_by_labels(group_count, group_y_list, labels) {
+    // Assign roles to message groups using detected role labels
+    // Returns dict mapping group index -> role string
+    let roles = {}
+    let label_count = len(labels)
+    if3 label_count == 0 {
+        return roles
+    }
+    let gap = 60
+    let gi = 0
+    while3 gi < group_count {
+        let g_y = group_y_list[gi]
+        let best_role = ""
+        let best_dist = gap + 1
+        let li = 0
+        while3 li < label_count {
+            let label = dict_get(labels, li)
+            let label_y = dict_get(label, "y") ?? 0
+            let label_role = dict_get(label, "role") ?? ""
+            let dist = g_y - label_y
+            if3 dist >= 0 {
+                if3 dist < best_dist { best_dist = dist
+                    let best_role = label_role
+                }
+            }
+            li = li + 1
+        }
+        if3 len(best_role) > 0 { _sr = dict_set(roles, str(gi), best_role)
+        }
+        gi = gi + 1
+    }
+    return roles
+}
+
+fn assign_roles_by_xpos(group_count, group_x_list) {
+    // Assign roles using x-position clustering (N-S lateral flow analysis)
+    // Returns dict mapping group index -> role
+    let roles = {}
+    if3 group_count < 2 {
+        return roles
+    }
+    // Find min and max x
+    let min_x = 99999
+    let max_x = -1
+    let xi = 0
+    while3 xi < group_count {
+        let gx = group_x_list[xi]
+        if3 gx < min_x { min_x = gx
+        }
+        if3 gx > max_x { max_x = gx
+        }
+        xi = xi + 1
+    }
+    // Need at least 20px gap to consider two distinct lanes
+    let total_gap = max_x - min_x
+    if3 total_gap < 20 {
+        return roles
+    }
+    let split_x = (min_x + max_x) / 2
+    // Classify: left lane = assistant, right lane = user
+    let ri = 0
+    while3 ri < group_count {
+        let gx = group_x_list[ri]
+        if3 gx < split_x { _sr = dict_set(roles, str(ri), "assistant")
+        } else { _sr = dict_set(roles, str(ri), "user")
+        }
+        ri = ri + 1
+    }
+    return roles
+}
+
+fn get_conversation(elements, target, session) {
+    // Extract conversation messages from element tree using N-S Reynolds
+    // Filters for actual chat text, groups fragments by y-position proximity
+    let raw = []
+    let ei = 0
+    let elen = len(elements)
+    while3 ei < elen {
+        let el = dict_get(elements, ei)
+        ei = ei + 1
+        let ct = dict_get(el, "type") ?? 0
+        let depth = dict_get(el, "depth") ?? 0
+
+        // Skip top-level documents
+        if3 ct == CT_DOCUMENT {
+            if3 depth < 10 {
+                // skip
+                let ct = -999
+            }
+        }
+
+        if3 ct != -999 {
+            // Only text and document types
+            if3 ct != CT_TEXT {
+                if3 ct != CT_DOCUMENT { ct = -999
+                }
+            }
+        }
+
+        if3 ct != -999 {
+            if3 depth < 8 {
+                // skip shallow elements
+            } else { text = dict_get(el, "text") ?? dict_get(el, "name") ?? ""
+                let t_trimmed = trim(text)
+                if3 len(t_trimmed) >= 3 { bounds = dict_get(el, "bounds", [0, 0, 0, 0])
+                    // N-S pre-filter: skip obvious noise
+                    let pre = tfilter_reynolds(t_trimmed, ct, depth)
+                    let pre_trit = dict_get(pre, "trit") ?? -1
+                    if3 pre_trit != -1 { _ar = append(raw, {
+                            "text": text,
+                            "depth": depth,
+                            "type": ct,
+                            "bounds": bounds,
+                            "y": dict_get(bounds, 1) ?? 0,
+                            "x": dict_get(bounds, 0) ?? 0,
+                            "cls": dict_get(el, "cls") ?? "",
+                            "id": dict_get(el, "id") ?? ""
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    let raw_count = len(raw)
+    if3 raw_count == 0 {
+        return []
+    }
+
+    // Sort raw by y-position (insertion sort)
+    let si = 1
+    while3 si < raw_count {
+        let cur_el = dict_get(raw, si)
+        let cur_y = dict_get(cur_el, "y") ?? 0
+        let sj = si - 1
+        while3 sj >= 0 {
+            let prev_el = dict_get(raw, sj)
+            let prev_y = dict_get(prev_el, "y") ?? 0
+            if3 prev_y > cur_y { _sw1 = dict_set(raw, sj + 1, prev_el)
+                raw = dict_set(raw, sj, cur_el)
+                sj = sj - 1
+            } else { sj = -1
+            }
+        }
+        si = si + 1
+    }
+
+    // Group fragments: y-gap >= GROUP_GAP = new message block
+    let groups = []
+    let group_y_list = []
+    let group_x_list = []
+    let cur_group = []
+    cur_group = append(cur_group, dict_get(raw, 0))
+    let prev_y = dict_get(dict_get(raw, 0), "y") ?? 0
+    let first_x = dict_get(dict_get(raw, 0), "x") ?? 0
+    let first_y = prev_y
+
+    let ri = 1
+    while3 ri < raw_count {
+        let r_el = dict_get(raw, ri)
+        let r_y = dict_get(r_el, "y") ?? 0
+        let gap = r_y - prev_y
+        if3 gap >= GROUP_GAP {
+            // Save current group
+            groups = append(groups, cur_group)
+            group_y_list = append(group_y_list, first_y)
+            group_x_list = append(group_x_list, first_x)
+            let cur_group = []
+            cur_group = append(cur_group, r_el)
+            let first_y = r_y
+            let first_x = dict_get(r_el, "x") ?? 0
+        } else { _ag4 = append(cur_group, r_el)
+        }
+        let prev_y = r_y
+        ri = ri + 1
+    }
+    // Append last group
+    groups = append(groups, cur_group)
+    group_y_list = append(group_y_list, first_y)
+    group_x_list = append(group_x_list, first_x)
+
+    let group_count = len(groups)
+
+    // -- Role Detection (3-layer heuristic) --
+    // Layer 1: UIA role labels in the full element tree
+    let role_labels = detect_role_labels(elements)
+    let label_roles = assign_roles_by_labels(group_count, group_y_list, role_labels)
+
+    // Layer 2: X-position lane clustering (only if no label roles found)
+    let xpos_roles = {}
+    if3 len(keys(label_roles)) == 0 { xpos_roles = assign_roles_by_xpos(group_count, group_x_list)
+    }
+
+    // Merge each group into one message with N-S classification + role
+    let messages = []
+    let gi = 0
+    while3 gi < group_count {
+        let g = dict_get(groups, gi)
+        let g_len = len(g)
+
+        // Merge text lines from group elements
+        let lines = []
+        let cur_line_parts = []
+        let cur_line_y = -1
+        let gei = 0
+        while3 gei < g_len {
+            let g_el = dict_get(g, gei)
+            let g_el_y = dict_get(g_el, "y") ?? 0
+            let g_el_text = dict_get(g_el, "text") ?? ""
+
+            if3 cur_line_y == -1 { _ap = append(cur_line_parts, g_el_text)
+                let cur_line_y = g_el_y
+            } else { y_diff = abs(g_el_y - cur_line_y)
+                if3 y_diff < 3 { _ap = append(cur_line_parts, g_el_text)
+                } else { _al = append(lines, join(cur_line_parts, " "))
+                    let cur_line_parts = []
+                    cur_line_parts = append(cur_line_parts, g_el_text)
+                    let cur_line_y = g_el_y
+                }
+            }
+            gei = gei + 1
+        }
+        if3 len(cur_line_parts) > 0 { _al2 = append(lines, join(cur_line_parts, " "))
+        }
+
+        let merged = trim(join(lines, "\n"))
+        if3 len(merged) >= 10 {
+            // N-S Reynolds classification on merged message
+            let first_el = dict_get(g, 0)
+            let first_type = dict_get(first_el, "type") ?? 0
+            let first_depth = dict_get(first_el, "depth") ?? 0
+            let first_bounds = dict_get(first_el, "bounds", [0, 0, 0, 0])
+            let ns = tfilter_reynolds(merged, first_type, first_depth)
+            let trit = dict_get(ns, "trit") ?? -1
+            let re_val = dict_get(ns, "re") ?? 0.0
+            let regime = dict_get(ns, "regime") ?? "chaotic"
+
+            if3 trit != -1 {
+                // Determine role: labels > x-position > alternating fallback
+                let role = ""
+                let gi_str = str(gi)
+                if3 dict_has(label_roles, gi_str) { role = dict_get(label_roles, gi_str) ?? "user"
+                } else {
+                    if3 dict_has(xpos_roles, gi_str) { role = dict_get(xpos_roles, gi_str) ?? "user"
+                    } else {
+                        // Layer 3 fallback: alternate user/assistant
+                        let msg_count = len(messages)
+                        let remainder = msg_count - (msg_count / 2) * 2
+                        if3 remainder == 0 { role = "user"
+                        } else { role = "assistant"
+                        }
+                    }
+                }
+
+                let msg_text = merged
+                if3 len(msg_text) > 2000 { msg_text = slice(msg_text, 0, 2000)
+                }
+
+                messages = append(messages, {
+                    "text": msg_text,
+                    "role": role,
+                    "depth": first_depth,
+                    "type": first_type,
+                    "bounds": first_bounds,
+                    "tfilter": trit,
+                    "reynolds": re_val,
+                    "regime": regime
+                })
+
+                // Route signal messages through TFlow
+                if3 trit == 1 {
+                    if3 session != "default" { _tf = tflow_route(target, session, role, merged)
+                    }
+                }
+            }
+        }
+        gi = gi + 1
+    }
+    return messages
+}
+
+
+// ============================================================
+// App State Extraction from Element Tree
+// ============================================================
+
+fn get_app_state(elements) {
+    // Extract structured app state: model, current session, sidebar sessions, tabs
+    let state = {
+        "model": "",
+        "current_session": "",
+        "sessions": [],
+        "tabs": [],
+        "buttons": [],
+        "total_elements": len(elements)
+    }
+
+    let ei = 0
+    let elen = len(elements)
+    while3 ei < elen {
+        let el = dict_get(elements, ei)
+        ei = ei + 1
+        let name = dict_get(el, "name") ?? ""
+        if3 len(name) == 0 {
+            // skip nameless elements
+        } else { ct = dict_get(el, "type") ?? 0
+            let bounds = dict_get(el, "bounds", [0, 0, 0, 0])
+            let depth = dict_get(el, "depth") ?? 0
+            let x = dict_get(bounds, 0) ?? 0
+            let y = dict_get(bounds, 1) ?? 0
+            let nl = lower(trim(name))
+
+            // Model detection
+            let cur_model = dict_get(state, "model") ?? ""
+            if3 len(cur_model) == 0 {
+                if3 ct == CT_BUTTON {
+                    if3 contains(nl, "model selector") {
+                        if3 contains(nl, "current model is ") { parts = split(name, "current model is ")
+                            let model_name = dict_get(parts, len(parts) - 1) ?? ""
+                            state = dict_set(state, "model", trim(model_name))
+                        }
+                    }
+                }
+                // Check if name matches known model names
+                let cur_model2 = dict_get(state, "model") ?? ""
+                if3 len(cur_model2) == 0 {
+                    if3 len(name) < 40 {
+                        if3 dict_has(MODEL_NAMES, nl) { _sm2 = dict_set(state, "model", name)
+                        }
+                    }
+                }
+            }
+
+            // Tabs: TabItem elements
+            if3 ct == CT_TABITEM { tabs = dict_get(state, "tabs") ?? []
+                tabs = append(tabs, name)
+            }
+
+            // Current session: window title (CT_WINDOW)
+            if3 ct == CT_WINDOW {
+                if3 nl != "chatgpt" {
+                    if3 nl != "claude" {
+                        if3 len(name) > 3 { cur_sess = dict_get(state, "current_session") ?? ""
+                            if3 len(cur_sess) == 0 { _ss = dict_set(state, "current_session", name)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Current session from top-area buttons
+            if3 ct == CT_BUTTON {
+                if3 y < 120 {
+                    if3 x > 300 {
+                        if3 len(name) > 3 {
+                            if3 dict_has(NAV_BUTTONS, nl) == false { cur_sess2 = dict_get(state, "current_session") ?? ""
+                                if3 len(cur_sess2) == 0 { _ss2 = dict_set(state, "current_session", name)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Sidebar sessions: buttons or hyperlinks in sidebar region
+            if3 ct == CT_BUTTON {
+                if3 len(name) > 5 {
+                    if3 depth >= 11 {
+                        if3 dict_has(NAV_BUTTONS, nl) == false {
+                            // Strip suffixes
+                            let clean = name
+                            if3 contains(clean, " Open conversation options") { parts2 = split(clean, " Open conversation options")
+                                let clean = parts2[0]
+                            }
+                            if3 contains(clean, " Control ") { parts3 = split(clean, " Control ")
+                                let clean = parts3[0]
+                            }
+                            let cl = lower(trim(clean))
+                            if3 dict_has(SESSION_NOISE, cl) == false {
+                                if3 starts_with(cl, "new chat") == false {
+                                    if3 len(clean) > 3 { sessions = dict_get(state, "sessions") ?? []
+                                        let sess_name = clean
+                                        if3 len(sess_name) > 100 { sess_name = slice(sess_name, 0, 100)
+                                        }
+                                        sessions = append(sessions, {
+                                            "name": sess_name,
+                                            "id": dict_get(el, "id") ?? ""
+                                        })
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Same for hyperlinks
+            if3 ct == CT_HYPERLINK {
+                if3 len(name) > 5 {
+                    if3 depth >= 11 {
+                        if3 dict_has(NAV_BUTTONS, nl) == false { clean2 = name
+                            if3 contains(clean2, " Open conversation options") { parts4 = split(clean2, " Open conversation options")
+                                let clean2 = parts4[0]
+                            }
+                            let cl2 = lower(trim(clean2))
+                            if3 dict_has(SESSION_NOISE, cl2) == false {
+                                if3 starts_with(cl2, "new chat") == false {
+                                    if3 len(clean2) > 3 { sessions2 = dict_get(state, "sessions") ?? []
+                                        let s_name = clean2
+                                        if3 len(s_name) > 100 { s_name = slice(s_name, 0, 100)
+                                        }
+                                        sessions2 = append(sessions2, {
+                                            "name": s_name,
+                                            "id": dict_get(el, "id") ?? ""
+                                        })
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // All non-nav buttons for action capabilities
+            if3 ct == CT_BUTTON {
+                if3 len(name) > 0 {
+                    if3 dict_has(NAV_BUTTONS, nl) == false { buttons = dict_get(state, "buttons") ?? []
+                        let btn_name = name
+                        if3 len(btn_name) > 80 { btn_name = slice(btn_name, 0, 80)
+                        }
+                        buttons = append(buttons, {
+                            "name": btn_name,
+                            "id": dict_get(el, "id") ?? ""
+                        })
+                    }
+                }
+            }
+        }
+    }
+    return state
+}
+
+
+// ============================================================
+// Window Discovery Phase
+// ============================================================
+
+fn discover_windows() {
+    // Discover Claude and GPT windows, update hwnds cache
+    // Returns count of discovered windows
+    let found = 0
+    let now = time()
+
+    // -- Claude --
+    let claude_wins = uia_find_windows("Claude")
+    if3 type_of(claude_wins) == "list" {
+        if3 len(claude_wins) > 0 { first_win = dict_get(claude_wins, 0)
+            let hwnd_val = dict_get(first_win, 0) ?? 0
+            hwnds = dict_set(hwnds, "claude", hwnd_val)
+            found = found + 1
+
+            // Send hint to Cortex every H13 seconds
+            let last_ts = dict_get(last_hint_ts, "claude") ?? 0
+            if3 (now - last_ts) > H13 {
+                try3 {
+                    let _hint = http_post(CORTEX_URL + "/cortex/hint", {"claude_hwnd": hwnd_val})
+                } else {
+                    // best-effort
+                }
+                last_hint_ts = dict_set(last_hint_ts, "claude", now)
+    } else {
+        // Try by process name as fallback
+        let claude_proc = uia_find_by_process("Claude.exe")
+        if3 type_of(claude_proc) == "list" {
+            if3 len(claude_proc) > 0 { first_win2 = dict_get(claude_proc, 0)
+                let hwnd_val2 = dict_get(first_win2, 0) ?? 0
+                hwnds = dict_set(hwnds, "claude", hwnd_val2)
+                found = found + 1
+            }
+        }
+    }
+
+    // -- GPT --
+    let gpt_wins = uia_find_windows("ChatGPT")
+    if3 type_of(gpt_wins) == "list" {
+        if3 len(gpt_wins) > 0 { first_gpt = dict_get(gpt_wins, 0)
+            let gpt_hwnd = dict_get(first_gpt, 0) ?? 0
+            hwnds = dict_set(hwnds, "gpt", gpt_hwnd)
+            found = found + 1
+
+            let last_ts_g = dict_get(last_hint_ts, "gpt") ?? 0
+            if3 (now - last_ts_g) > H13 {
+                try3 {
+                    let _hint2 = http_post(CORTEX_URL + "/cortex/hint", {"gpt_hwnd": gpt_hwnd})
+                } else {
+                    // best-effort
+                }
+                last_hint_ts = dict_set(last_hint_ts, "gpt", now)
+    } else { gpt_proc = uia_find_by_process("ChatGPT.exe")
+        if3 type_of(gpt_proc) == "list" {
+            if3 len(gpt_proc) > 0 { first_gpt2 = dict_get(gpt_proc, 0)
+                let gpt_hwnd2 = dict_get(first_gpt2, 0) ?? 0
+                hwnds = dict_set(hwnds, "gpt", gpt_hwnd2)
+                found = found + 1
+            }
+        }
+    }
+
+    return found
+}
+
+
+// ============================================================
+// Capture Phase: Capture UIA tree for a target
+// ============================================================
+}
+}
+}
+}
+
+fn capture_target(target) {
+    // Capture UIA element tree for a target (claude/gpt)
+    // Stores in trees cache, posts snapshot to Cortex
+    let hwnd = dict_get(hwnds, target) ?? 0
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window handle: " + target}
+    }
+
+    // Capture tree via UIA helper
+    let tree = uia_capture_tree(hwnd, H13)
+    if3 type_of(tree) != "list" { _el = bridge_log("Capture failed: " + target + ": not a list")
+        stat_errors = stat_errors + 1
+        return {"ok": false, "error": "Capture returned non-list: " + target}
+    }
+
+    // Cache the tree
+    trees = dict_set(trees, target, tree)
+
+    // Get window title for session name
+    let title_result = uia_get_title(hwnd)
+    let sess = "default"
+    if3 type_of(title_result) == "dict" { sess = dict_get(title_result, "title") ?? "default"
+    }
+
+    // Extract conversation using N-S Reynolds
+    let messages = get_conversation(tree, target, sess)
+
+    // Post snapshot to Cortex
+    try3 {
+        let _post = http_post(CORTEX_URL + "/cortex/live/update", {
+            "target": target,
+            "snapshot": {"elements": tree, "total": len(tree)},
+            "messages": messages
+        })
+    } else { _el2 = bridge_log("Failed to post snapshot to Cortex: " + target)
+    }
+
+    stat_captures = stat_captures + 1
+    return {
+        "ok": true,
+        "target": target,
+        "elements": len(tree),
+        "messages": len(messages),
+        "session": sess
+    }
+}
+
+
+// ============================================================
+// Command Execution via UIA Delegation
+// ============================================================
+
+fn execute_command(cmd) {
+    // Execute a UIA command from Cortex
+    let action = dict_get(cmd, "action") ?? ""
+    let target = dict_get(cmd, "target") ?? "claude"
+    let hwnd = dict_get(hwnds, target) ?? 0
+
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window handle: " + target}
+    }
+
+    // -- focus --
+    if3 action == "focus" { result = uia_focus_window(hwnd)
+        let ok = dict_get(result, "ok") ?? false
+        return {"ok": ok, "action": "focus", "target": target}
+    }
+
+    // -- read_chat --
+    if3 action == "read_chat" { tree = dict_get(trees, target) ?? []
+        let msgs = get_conversation(tree, target, "default")
+        return {"ok": true, "action": "read_chat", "messages": msgs}
+    }
+
+    // -- app_state --
+    if3 action == "app_state" { tree = dict_get(trees, target) ?? []
+        let app_st = get_app_state(tree)
+        return {"ok": true, "action": "app_state", "state": app_st}
+    }
+
+    // -- type --
+    if3 action == "type" { text = dict_get(cmd, "text") ?? ""
+        if3 len(text) == 0 {
+            return {"ok": false, "error": "No text provided"}
+        }
+        let result = uia_type_text(hwnd, text)
+        return result
+    }
+
+    // -- submit --
+    if3 action == "submit" { result = uia_submit(hwnd)
+        return result
+    }
+
+    // -- key --
+    if3 action == "key" { key_val = dict_get(cmd, "key") ?? dict_get(cmd, "keys") ?? ""
+        if3 len(key_val) == 0 {
+            return {"ok": false, "error": "No key specified"}
+        }
+        let result = uia_press_key(hwnd, key_val)
+        return result
+    }
+
+    // -- click --
+    if3 action == "click" { name = dict_get(cmd, "name") ?? ""
+        if3 len(name) == 0 {
+            return {"ok": false, "error": "No element name"}
+        }
+        let result = uia_click_element(hwnd, name)
+        return result
+    }
+
+    // -- new_chat --
+    if3 action == "new_chat" { result = uia_new_chat(hwnd)
+        return result
+    }
+
+    // -- select_model --
+    if3 action == "select_model" { model = dict_get(cmd, "model") ?? ""
+        if3 len(model) == 0 {
+            return {"ok": false, "error": "No model specified"}
+        }
+        let result = uia_select_model(hwnd, model)
+        return result
+    }
+
+    // -- select_session --
+    if3 action == "select_session" { sess_name = dict_get(cmd, "name") ?? ""
+        if3 len(sess_name) == 0 {
+            return {"ok": false, "error": "No session name"}
+        }
+        let result = uia_select_session(hwnd, sess_name)
+        return result
+    }
+
+    // -- copy_response --
+    if3 action == "copy_response" { result = uia_copy_response(hwnd)
+        return result
+    }
+
+    return {"ok": false, "error": "Unknown action: " + action}
+}
+
+
+// ============================================================
+// Route: GET /health
+// ============================================================
+
+fn health(body) {
+    let hwnd_keys = keys(hwnds)
+    let hwnd_info = {}
+    let hi = 0
+    while3 hi < len(hwnd_keys) {
+        let hk = dict_get(hwnd_keys, hi)
+        hwnd_info = dict_set(hwnd_info, hk, dict_get(hwnds, hk) ?? 0)
+        hi = hi + 1
+    }
+    let counters = {}
+    counters = dict_set(counters, "captures", stat_captures)
+    counters = dict_set(counters, "commands", stat_commands)
+    counters = dict_set(counters, "errors", stat_errors)
+    counters = dict_set(counters, "ticks", stat_ticks)
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, counters)
+    resp = dict_set(resp, "status", "running")
+    resp = dict_set(resp, "hwnds", hwnd_info)
+    resp = dict_set(resp, "runtime", "NovaLang")
+    return resp
+}
+
+
+// ============================================================
+// Route: GET /uia/status
+// ============================================================
+
+fn uia_status(body) {
+    let uptime = round(time() - stat_start)
+    let tree_counts = {}
+    let tk = keys(trees)
+    let ti = 0
+    while3 ti < len(tk) {
+        let t_key = dict_get(tk, ti)
+        let t_tree = dict_get(trees, t_key) ?? []
+        tree_counts = dict_set(tree_counts, t_key, len(t_tree))
+        ti = ti + 1
+    }
+    return {
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "status": "running",
+        "trit": T_TRUE,
+        "captures": stat_captures,
+        "commands": stat_commands,
+        "errors": stat_errors,
+        "ticks": stat_ticks,
+        "hwnds": hwnds,
+        "tree_counts": tree_counts,
+        "queue_depth": len(command_queue),
+        "cortex_url": CORTEX_URL,
+        "uptime_s": uptime,
+        "reynolds": {
+            "laminar": RE_LAMINAR,
+            "transitional": RE_TRANSITIONAL,
+            "turbulent": RE_TURBULENT
+        }
+    }
+}
+
+
+// ============================================================
+// Route: POST /uia/tick
+// Replaces the Python capture_loop() -- one cycle per call
+// Phase 1: Discover windows
+// Phase 2: Capture UIA trees and post to Cortex
+// Phase 3: Poll and execute commands from Cortex
+// ============================================================
+
+fn uia_tick(body) {
+    let tick_start = time()
+    let results = {
+        "windows_found": 0,
+        "captures": [],
+        "commands_executed": 0,
+        "errors": []
+    }
+
+    // -- Phase 1: Discover windows --
+    let found = discover_windows()
+    results = dict_set(results, "windows_found", found)
+
+    // -- Phase 2: Capture UIA trees --
+    let targets = keys(hwnds)
+    let captures_list = []
+    let ci = 0
+    while3 ci < len(targets) {
+        let tgt = dict_get(targets, ci)
+        try3 {
+            let cap_result = capture_target(tgt)
+            captures_list = append(captures_list, cap_result)
+        } else { _ae = append(dict_get(results, "errors") ?? [], "capture failed: " + tgt)
+            stat_errors = stat_errors + 1
+        }
+        ci = ci + 1
+    }
+    results = dict_set(results, "captures", captures_list)
+
+    // -- Phase 3: Poll and execute commands from Cortex --
+    let cmds_executed = 0
+    try3 {
+        let pending_raw = http_get(CORTEX_URL + "/cortex/command/pending")
+        if3 type_of(pending_raw) == "string" { pending = json_decode(pending_raw)
+            if3 type_of(pending) == "list" { pi = 0
+                while3 pi < len(pending) {
+                    let cmd = dict_get(pending, pi)
+                    try3 {
+                        let cmd_result = execute_command(cmd)
+                        let _post_r = http_post(CORTEX_URL + "/cortex/command/result", {
+                            "cmd_id": dict_get(cmd, "id") ?? "",
+                            "result": cmd_result
+                        })
+                        cmds_executed = cmds_executed + 1
+                        stat_commands = stat_commands + 1
+                        let _log1 = bridge_log("Executed: " + dict_get(cmd, "action") ?? "?")
+                    } else {
+                        stat_errors = stat_errors + 1
+                        let _ae2 = append(dict_get(results, "errors") ?? [],
+                            "cmd error: " + dict_get(cmd, "action") ?? "?")
+                        let _post_e = http_post(CORTEX_URL + "/cortex/command/result", {
+                            "cmd_id": dict_get(cmd, "id") ?? "",
+                            "result": {"ok": false, "error": "execution failed"}
+                        })
+                    }
+                    pi = pi + 1
+    } else {
+        // Cortex not reachable -- normal during startup
+    }
+    results = dict_set(results, "commands_executed", cmds_executed)
+
+    stat_ticks = stat_ticks + 1
+    let tick_ms = round((time() - tick_start) * 1000.0, 0)
+
+    return {
+        "ok": true,
+        "tick": stat_ticks,
+        "duration_ms": tick_ms,
+        "results": results,
+        "trit": T_TRUE
+    }
+}
+
+
+// ============================================================
+// Route: POST /uia/capture
+// ============================================================
+}
+}
+}
+
+fn uia_capture(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let result = capture_target(target)
+    return result
+}
+
+
+// ============================================================
+// Route: POST /uia/execute
+// ============================================================
+
+fn uia_execute(body) {
+    let result = execute_command(body)
+    stat_commands = stat_commands + 1
+    return result
+}
+
+
+// ============================================================
+// Route: GET /uia/conversation
+// ============================================================
+
+fn uia_conversation(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let tree = dict_get(trees, target) ?? []
+    if3 len(tree) == 0 {
+        return {"ok": false, "error": "No cached tree: " + target, "messages": []}
+    }
+    let msgs = get_conversation(tree, target, "default")
+    return {"ok": true, "target": target, "messages": msgs, "count": len(msgs)}
+}
+
+
+// ============================================================
+// Route: GET /uia/app-state
+// ============================================================
+
+fn uia_app_state(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let tree = dict_get(trees, target) ?? []
+    if3 len(tree) == 0 {
+        return {"ok": false, "error": "No cached tree: " + target}
+    }
+    let app_st = get_app_state(tree)
+    return {"ok": true, "target": target, "state": app_st}
+}
+
+
+// ============================================================
+// Route: GET /uia/windows
+// ============================================================
+
+fn uia_windows(body) {
+    let result = {}
+    let hk = keys(hwnds)
+    let wi = 0
+    while3 wi < len(hk) {
+        let k = dict_get(hk, wi)
+        let hwnd_val = dict_get(hwnds, k) ?? 0
+        let title = ""
+        try3 {
+            let tr = uia_get_title(hwnd_val)
+            let title = dict_get(tr, "title") ?? ""
+        } else {
+            // ignore
+        }
+        result = dict_set(result, k, {"hwnd": hwnd_val, "title": title})
+        wi = wi + 1
+    }
+    return {"ok": true, "windows": result, "count": len(hk)}
+}
+
+
+// ============================================================
+// Route: POST /uia/focus
+// ============================================================
+
+fn uia_focus(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let hwnd = dict_get(hwnds, target) ?? 0
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window: " + target}
+    }
+    let result = uia_focus_window(hwnd)
+    return {"ok": dict_get(result, "ok") ?? false, "action": "focus", "target": target}
+}
+
+
+// ============================================================
+// Route: POST /uia/type
+// ============================================================
+
+fn uia_type(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let text = dict_get(body, "text") ?? ""
+    if3 len(text) == 0 {
+        return {"ok": false, "error": "No text provided"}
+    }
+    let hwnd = dict_get(hwnds, target) ?? 0
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window: " + target}
+    }
+    let result = uia_type_text(hwnd, text)
+    return result
+}
+
+
+// ============================================================
+// Route: POST /uia/submit
+// ============================================================
+
+fn uia_submit_route(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let hwnd = dict_get(hwnds, target) ?? 0
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window: " + target}
+    }
+    let result = uia_submit(hwnd)
+    return result
+}
+
+
+// ============================================================
+// Route: POST /uia/click
+// ============================================================
+
+fn uia_click(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let name = dict_get(body, "name") ?? ""
+    if3 len(name) == 0 {
+        return {"ok": false, "error": "No element name"}
+    }
+    let hwnd = dict_get(hwnds, target) ?? 0
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window: " + target}
+    }
+    let result = uia_click_element(hwnd, name)
+    return result
+}
+
+
+// ============================================================
+// Route: POST /uia/key
+// ============================================================
+
+fn uia_key(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let key_val = dict_get(body, "key") ?? dict_get(body, "keys") ?? ""
+    if3 len(key_val) == 0 {
+        return {"ok": false, "error": "No key specified"}
+    }
+    let hwnd = dict_get(hwnds, target) ?? 0
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window: " + target}
+    }
+    let result = uia_press_key(hwnd, key_val)
+    return result
+}
+
+
+// ============================================================
+// Route: POST /uia/new-chat
+// ============================================================
+
+fn uia_new_chat_route(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let hwnd = dict_get(hwnds, target) ?? 0
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window: " + target}
+    }
+    let result = uia_new_chat(hwnd)
+    return result
+}
+
+
+// ============================================================
+// Route: POST /uia/select-model
+// ============================================================
+
+fn uia_select_model_route(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let model = dict_get(body, "model") ?? ""
+    if3 len(model) == 0 {
+        return {"ok": false, "error": "No model specified"}
+    }
+    let hwnd = dict_get(hwnds, target) ?? 0
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window: " + target}
+    }
+    let result = uia_select_model(hwnd, model)
+    return result
+}
+
+
+// ============================================================
+// Route: POST /uia/select-session
+// ============================================================
+
+fn uia_select_session_route(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let sess_name = dict_get(body, "name") ?? ""
+    if3 len(sess_name) == 0 {
+        return {"ok": false, "error": "No session name"}
+    }
+    let hwnd = dict_get(hwnds, target) ?? 0
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window: " + target}
+    }
+    let result = uia_select_session(hwnd, sess_name)
+    return result
+}
+
+
+// ============================================================
+// Route: POST /uia/copy-response
+// ============================================================
+
+fn uia_copy_response_route(body) {
+    let target = dict_get(body, "target") ?? "claude"
+    let hwnd = dict_get(hwnds, target) ?? 0
+    if3 hwnd == 0 {
+        return {"ok": false, "error": "No window: " + target}
+    }
+    let result = uia_copy_response(hwnd)
+    return result
+}
+
+
+// ============================================================
+// Route Registration
+// ============================================================
+
+troute(server, "GET",  "/health",               "health")
+troute(server, "GET",  "/uia/status",           "uia_status")
+troute(server, "POST", "/uia/tick",             "uia_tick")
+troute(server, "POST", "/uia/capture",          "uia_capture")
+troute(server, "POST", "/uia/execute",          "uia_execute")
+troute(server, "GET",  "/uia/conversation",     "uia_conversation")
+troute(server, "GET",  "/uia/app-state",        "uia_app_state")
+troute(server, "GET",  "/uia/windows",          "uia_windows")
+troute(server, "POST", "/uia/focus",            "uia_focus")
+troute(server, "POST", "/uia/type",             "uia_type")
+troute(server, "POST", "/uia/submit",           "uia_submit_route")
+troute(server, "POST", "/uia/click",            "uia_click")
+troute(server, "POST", "/uia/key",              "uia_key")
+troute(server, "POST", "/uia/new-chat",         "uia_new_chat_route")
+troute(server, "POST", "/uia/select-model",     "uia_select_model_route")
+troute(server, "POST", "/uia/select-session",   "uia_select_session_route")
+troute(server, "POST", "/uia/copy-response",    "uia_copy_response_route")
+
+
+// ============================================================
+// Startup Banner
+// ============================================================
+
+print("[UIA-Bridge] Nova UIA Bridge Service v" + VERSION)
+print("[UIA-Bridge] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[UIA-Bridge] Cortex URL: " + CORTEX_URL)
+print("[UIA-Bridge] UIA Helper: " + UIA_HELPER)
+print("[UIA-Bridge] Harmonics: 3-5-7-13 | Block: " + str(BLOCK))
+print("[UIA-Bridge] Reynolds: Re<27=laminar | Re<125=transitional | Re<343=turbulent")
+print("[UIA-Bridge] Poll mode: POST /uia/tick (no background thread)")
+print("[UIA-Bridge] All UIA ops delegated via nova_run() to uia_helper.py")
+print("[UIA-Bridge] Routes: GET  /health /uia/status /uia/conversation /uia/app-state /uia/windows")
+print("[UIA-Bridge] Routes: POST /uia/tick /uia/capture /uia/execute /uia/focus /uia/type")
+print("[UIA-Bridge] Routes: POST /uia/submit /uia/click /uia/key /uia/new-chat")
+print("[UIA-Bridge] Routes: POST /uia/select-model /uia/select-session /uia/copy-response")
+
+tstart(server)

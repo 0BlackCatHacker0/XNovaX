@@ -1,0 +1,1 @@
+Add-Type -AssemblyName presentationCore; $p = New-Object System.Windows.Media.MediaPlayer; $p.Open('C:/NovaX/tmp/tspeak_0.mp3'); Start-Sleep -Milliseconds 500; $p.Play(); while ($p.NaturalDuration.HasTimeSpan -eq $false) { Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds ([math]::Ceiling($p.NaturalDuration.TimeSpan.TotalSeconds)); $p.Close()

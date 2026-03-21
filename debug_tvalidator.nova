@@ -1,0 +1,285 @@
+// Nova TValidator Service v1.0 - Ternary Input Validation Micro-Tool
+// Port 9964: Centralized input validation for all NovaX services.
+// Send user input here to be sanitized before processing.
+// Prevents injection, XSS, path traversal, oversized payloads,
+// shell injection, SQL injection, and null byte attacks.
+//
+// Validation is ternary:
+//   TRUE  (+1) = input is clean, passed all rules
+//   MAYBE ( 0) = input was dirty but sanitized successfully (moderate mode)
+//   FALSE (-1) = input is rejected, failed validation in strict mode
+//
+// Sanitize modes:
+//   strict     = all rules applied, reject on any violation (trit FALSE)
+//   moderate   = strip dangerous chars, allow through (trit MAYBE if modified)
+//   permissive = only strip null bytes and limit length (trit TRUE if clean)
+//
+// N-S Mapping:
+//   input_flow  = velocity_field
+//   violations  = turbulent pressure
+//   sanitize    = viscous correction
+//   validation_trit = Reynolds classification (+1 clean, 0 modified, -1 rejected)
+//
+// Harmonics:
+//   Max input length default = 3^7 = 2187 (BLOCK boundary)
+//   Stats bounded to H13*H3 = 39 top violation types tracked
+//
+// Endpoints:
+//   GET  /health                  -- health check
+//   GET  /tvalidator/health       -- health check (alias)
+//   POST /tvalidator/validate     -- validate input against named rules
+//   POST /tvalidator/sanitize     -- sanitize input by mode
+//   POST /tvalidator/check_path   -- validate file path against safe roots
+//   POST /tvalidator/check_url    -- validate URL (no internal IPs, no file://)
+//   GET  /tvalidator/stats        -- validation counts, rejection rate, top violations
+
+let PORT = 9964
+let server = tserve(PORT, "Nova TValidator v1.0 - Ternary Input Validation")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+
+// -- Ternary Truth Values --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Size Limits (harmonic boundaries) --
+let MAX_INPUT_DEFAULT = 2187
+let MAX_VIOLATIONS_RETURN = 39
+let MAX_BODY = 10935
+
+// N-S Reynolds boundaries
+let RE_LAMINAR      = 27
+let RE_TRANSITIONAL = 125
+let RE_TURBULENT    = 343
+let BLOCK = 2187
+
+// -- Safe path roots for path validation --
+let SAFE_ROOT_0 = "C:\\NovaX"
+let SAFE_ROOT_1 = "C:\\NovaX\\data"
+let SAFE_ROOT_2 = "C:\\NovaX\\memory"
+let SAFE_ROOT_3 = "C:\\NovaX\\web"
+
+// -- Blocked URL schemes --
+let BLOCKED_SCHEME_0 = "file"
+let BLOCKED_SCHEME_1 = "ftp"
+let BLOCKED_SCHEME_2 = "gopher"
+let BLOCKED_SCHEME_3 = "data"
+let BLOCKED_SCHEME_4 = "javascript"
+let BLOCKED_SCHEME_5 = "vbscript"
+let BLOCKED_SCHEME_6 = "ldap"
+
+// -- Cloud metadata hosts --
+let CLOUD_META_0 = "169.254.169.254"
+let CLOUD_META_1 = "metadata.google.internal"
+let CLOUD_META_2 = "100.100.100.200"
+
+// -- Database/cache ports to block in URLs --
+let DB_PORT_0 = 6379
+let DB_PORT_1 = 27017
+let DB_PORT_2 = 3306
+let DB_PORT_3 = 5432
+let DB_PORT_4 = 11211
+let DB_PORT_5 = 9200
+let DB_PORT_6 = 2379
+
+// -- Global Stats --
+let stat_validations   = 0
+let stat_rejections    = 0
+let stat_sanitizations = 0
+let stat_path_checks   = 0
+let stat_url_checks    = 0
+let stat_start         = time()
+
+// -- Violation counts: list of {rule, count} dicts (bounded to 39) --
+let violation_log = []
+
+// ===========================================================================
+// HELPER: tchar -- return ternary char symbol for a trit value
+// ===========================================================================
+
+fn tchar(t) {
+    if3 t == T_TRUE {
+        return "+"
+    } else t == T_MAYBE {
+        return "0"
+    } else {
+        return "-"
+    }
+}
+
+// ===========================================================================
+// HELPER: record_violation -- increment count for a named rule in violation_log
+// ===========================================================================
+
+fn record_violation(rule_name) {
+    // Search existing entries
+    let found = FALSE
+    let vlen = len(violation_log)
+    let i = 0
+    while3 i < vlen {
+        let entry = violation_log[i]
+        let ename = dict_get(entry, "rule") ?? ""
+        if3 ename == rule_name {
+            let cnt = dict_get(entry, "count") ?? 0
+            entry = dict_set(entry, "count", cnt + 1)
+            found = TRUE
+        }
+        i = i + 1
+    }
+    // If not found and under cap, append new entry
+    if3 found == FALSE {
+        if3 vlen < MAX_VIOLATIONS_RETURN {
+            let new_entry = {"rule": rule_name, "count": 1}
+            violation_log = append(violation_log, new_entry)
+        }
+    }
+    return T_TRUE
+}
+
+// ===========================================================================
+// HELPER: contains_substr -- check if text contains pattern (case-sensitive)
+// ===========================================================================
+
+fn contains_substr(text, pattern) {
+    if3 contains(text, pattern) {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: strip_between -- remove content matching <...> style (HTML tags)
+// Works by splitting on "<" and re-assembling, stripping tag bodies.
+// Approximation: removes everything from first "<" to next ">".
+// ===========================================================================
+
+fn strip_html_tags(text) {
+    // Replace "<" and ">" with space as a conservative strip
+    let cleaned = replace(text, "<", " ")
+    cleaned = replace(cleaned, ">", " ")
+    return cleaned
+}
+
+// ===========================================================================
+// HELPER: has_html_tag -- detect "<" followed eventually by ">"
+// ===========================================================================
+
+fn has_html_tag(text) {
+    if3 contains(text, "<") {
+        if3 contains(text, ">") {
+            return TRUE
+        }
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: has_path_traversal -- detect ../ or ..\ patterns
+// ===========================================================================
+
+fn has_path_traversal(text) {
+    if3 contains(text, "../") {
+        return TRUE
+    }
+    if3 contains(text, "..\\") {
+        return TRUE
+    }
+    if3 contains(text, "..%2f") {
+        return TRUE
+    }
+    if3 contains(text, "..%2F") {
+        return TRUE
+    }
+    if3 contains(text, "..%5c") {
+        return TRUE
+    }
+    if3 contains(text, "..%5C") {
+        return TRUE
+    }
+    if3 contains(text, "..") {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: has_shell_chars -- detect ; | & ` $ ( ) { } < > \
+// ===========================================================================
+
+fn has_shell_chars(text) {
+    if3 contains(text, ";") {
+        return TRUE
+    }
+    if3 contains(text, "|") {
+        return TRUE
+    }
+    if3 contains(text, "&") {
+        return TRUE
+    }
+    if3 contains(text, "`") {
+        return TRUE
+    }
+    if3 contains(text, "$") {
+        return TRUE
+    }
+    if3 contains(text, "(") {
+        return TRUE
+    }
+    if3 contains(text, ")") {
+        return TRUE
+    }
+    if3 contains(text, "{") {
+        return TRUE
+    }
+    if3 contains(text, "}") {
+        return TRUE
+    }
+    if3 contains(text, "\\") {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: strip_shell_chars -- remove shell metacharacters from text
+// ===========================================================================
+
+fn strip_shell_chars(text) {
+    let cleaned = replace(text, ";", "")
+    cleaned = replace(cleaned, "|", "")
+    cleaned = replace(cleaned, "&", "")
+    cleaned = replace(cleaned, "`", "")
+    cleaned = replace(cleaned, "$", "")
+    cleaned = replace(cleaned, "(", "")
+    cleaned = replace(cleaned, ")", "")
+    cleaned = replace(cleaned, "{", "")
+    cleaned = replace(cleaned, "}", "")
+    cleaned = replace(cleaned, "\\", "")
+    return cleaned
+}
+
+// ===========================================================================
+// HELPER: has_null_byte -- detect null byte in text
+// ===========================================================================
+
+fn has_null_byte(text) {
+    // NovaLang string contains() checks byte presence
+    if3 contains(text, "\x00") {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: has_sql_injection -- detect common SQL injection patterns
+// Checks uppercase converted text for keywords.
+// ===========================================================================
+
+fn has_sql_injection(text) {
+print("REACHED 283")
+}

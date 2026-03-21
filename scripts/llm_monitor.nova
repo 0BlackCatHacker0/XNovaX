@@ -1,0 +1,186 @@
+// llm_monitor.nova - LLM Training Monitor + Auto-Export
+// NovaX Script | Watches training_log.json, exports at 10000 steps
+// Ternary: +1=exported, 0=monitoring, -1=stalled
+// 3-5-7-13: check_interval=30, target=10000, stall_threshold=5
+
+print("=== NovaX LLM Training Monitor ===")
+print("Target: 10000 steps | Check interval: 30s")
+print("Stall detection: 5 consecutive identical steps (2.5 min)")
+print("")
+
+let log_path = "C:/NovaX/nova_llm/training_log.json"
+let export_path = "C:/NovaX/nova_llm/novax_llm_v1.bin"
+let target_steps = 10000
+let close_enough = 9990
+let check_interval = 30
+let stall_threshold = 5
+
+let last_step = -1
+let stall_count = 0
+let check_num = 0
+let done = 0
+
+// Helper: extract last entry from training log
+fn get_last_entry(path) {
+    let raw = try3 { read_file(path) } { "" }
+    if3 len(raw) == 0 {
+        return {"step": -1, "loss": 0, "eta": "unknown", "ok": 0}
+    }
+    let data = try3 { json_decode(raw) } { {} }
+    // data could be a list of entries or a single dict
+    let entry = {}
+    if3 type(data) == "list" {
+        let n = len(data)
+        if3 n > 0 {
+            entry = data[n - 1]
+        }
+    } {
+        // single dict with step/loss fields
+        entry = data
+    }
+    let step = dict_get(entry, "step", 0)
+    let loss = dict_get(entry, "loss", 0)
+    let eta = dict_get(entry, "eta", "unknown")
+    return {"step": step, "loss": loss, "eta": eta, "ok": 1}
+}
+
+// Helper: compute ETA string when not provided
+fn calc_eta(current, target, elapsed_checks, interval) {
+    if3 current <= 0 {
+        return "calculating..."
+    }
+    let steps_remaining = target - current
+    if3 steps_remaining <= 0 {
+        return "done"
+    }
+    // rough: steps_per_check based on progress so far
+    let elapsed_sec = elapsed_checks * interval
+    let steps_per_sec = current / elapsed_sec
+    if3 steps_per_sec > 0 {
+        let eta_sec = steps_remaining / steps_per_sec
+        let eta_min = floor(eta_sec / 60)
+        return str(eta_min) + " min"
+    }
+    return "calculating..."
+}
+
+// Helper: get file size via shell
+fn get_file_size(path) {
+    let result = shell("powershell -Command \"(Get-Item '" + path + "').Length\"")
+    let stdout = dict_get(result, "stdout", "0")
+    return trim(stdout)
+}
+
+// Helper: report to Tripple
+fn report_to_tripple() {
+    let url = "http://127.0.0.1:9881/hive/tripple/ripple"
+    let body = json_encode({"provider": "novax-llm-v1", "trit": 1, "latency": 0, "domain": "LOCAL"})
+    let resp = try3 { http_post(url, body) } { {"ok": -1} }
+    let ok = dict_get(resp, "ok", -1)
+    if3 ok == 1 {
+        print("[Tripple] Reported model ready: trit=+1")
+    } {
+        print("[Tripple] Warning: could not report to Tripple (service may be down)")
+    }
+}
+
+// Helper: run export command
+fn run_export() {
+    print("")
+    print("========================================")
+    print("  TRAINING COMPLETE - EXPORTING MODEL")
+    print("========================================")
+    print("")
+    let cmd = "cd C:\\NovaX\\nova_llm && python train.py --export C:\\NovaX\\nova_llm\\novax_llm_v1.bin"
+    print("[EXPORT] Running: " + cmd)
+    let result = shell(cmd)
+    let code = dict_get(result, "code", -1)
+    let stdout = dict_get(result, "stdout", "")
+    let stderr = dict_get(result, "stderr", "")
+    if3 code == 0 {
+        print("[EXPORT] Success!")
+        if3 len(stdout) > 0 {
+            print("[EXPORT] Output: " + stdout)
+        }
+        // Get file size
+        let fsize = get_file_size("C:/NovaX/nova_llm/novax_llm_v1.bin")
+        print("[EXPORT] Model size: " + fsize + " bytes")
+        print("")
+        // Report to Tripple
+        report_to_tripple()
+        print("")
+        print("========================================")
+        print("  MODEL READY")
+        print("  Start inference with:")
+        print("    novalang.exe inference.nova")
+        print("========================================")
+        return 1
+    } {
+        print("[EXPORT] FAILED (exit code " + str(code) + ")")
+        if3 len(stderr) > 0 {
+            print("[EXPORT] Error: " + stderr)
+        }
+        return -1
+    }
+}
+
+// ============================================================
+// Main monitoring loop
+// ============================================================
+print("[MONITOR] Starting... watching " + log_path)
+print("")
+
+while3 done == 0 {
+    check_num = check_num + 1
+
+    let entry = get_last_entry(log_path)
+    let ok = dict_get(entry, "ok", 0)
+
+    if3 ok == 1 {
+        let step = dict_get(entry, "step", 0)
+        let loss = dict_get(entry, "loss", 0)
+        let eta = dict_get(entry, "eta", "")
+
+        // Calculate ETA if not provided
+        if3 len(str(eta)) == 0 {
+            eta = calc_eta(step, target_steps, check_num, check_interval)
+        }
+        if3 eta == "unknown" {
+            eta = calc_eta(step, target_steps, check_num, check_interval)
+        }
+
+        print("[Check #" + str(check_num) + "] Step " + str(step) + "/" + str(target_steps) + " | Loss: " + str(loss) + " | ETA: " + str(eta))
+
+        // Check stall detection
+        if3 step == last_step {
+            stall_count = stall_count + 1
+            if3 stall_count >= stall_threshold {
+                print("")
+                print("!!! WARNING: Training appears STALLED !!!")
+                print("!!! Step " + str(step) + " unchanged across " + str(stall_count) + " checks (" + str(stall_count * check_interval) + "s) !!!")
+                print("")
+            }
+        } {
+            // Reset stall counter on progress
+            stall_count = 0
+        }
+        last_step = step
+
+        // Check completion
+        if3 step >= close_enough {
+            let export_result = run_export()
+            done = 1
+        }
+    } {
+        print("[Check #" + str(check_num) + "] Waiting... training_log.json not found or empty")
+    }
+
+    // Sleep between checks (skip if done)
+    if3 done == 0 {
+        sleep(check_interval)
+    }
+}
+
+print("")
+print("[+1] LLM Monitor finished")
+return 1

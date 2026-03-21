@@ -1,0 +1,828 @@
+// Nova TSkipTrace v1.0 - Bible Code ELS Search (N-S Flow + 3-5-7-13 Harmonics)
+// Port 9903: Equidistant Letter Sequence search with harmonic skip distances
+//
+// N-S Mapping:
+//   text_flow     = velocity_field (characters flowing through grid)
+//   skip_distance = spatial_frequency (harmonic sampling interval)
+//   reynolds      = (text_len / 1000) * target_len * complexity
+//   Re < 27  (H3^3) = laminar      (H3 only, forward)
+//   Re < 125 (H5^3) = transitional (H3+H5, both dirs)
+//   Re < 343 (H7^3) = turbulent    (H3+H5+H7+H13, both dirs)
+//   Re >= 343        = chaotic      (ALL distances + offsets, both dirs)
+//
+// Skip distances: 3, 5, 7, 13, 15, 21, 35, 39, 65, 91, 105
+// Endpoints: GET /health, GET /skip/status
+//            POST /skip/search, POST /skip/matrix, POST /skip/harmonic
+//            POST /skip/correlate, POST /skip/japan/multiply, POST /skip/japan/divide
+
+let PORT = 9903
+let server = tserve(PORT, "TSkipTrace v1.0 - ELS Harmonic Search")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+
+// Reynolds flow boundaries (harmonic cubes: 3^3 / 5^3 / 7^3)
+let RE_LAMINAR     = 27    // H3^3
+let RE_TRANSITION  = 125   // H5^3
+let RE_TURBULENT   = 343   // H7^3
+
+// TRUE=+1, MAYBE=0, FALSE=-1 (ternary states)
+let TRUE  =  1
+let MAYBE =  0
+let FALSE = -1
+
+// -- Global stats --
+let stat_searches    = 0
+let stat_hits        = 0
+let stat_correlations = 0
+let stat_t0          = time()
+let stat_trit_pos    = 0
+let stat_trit_zero   = 0
+let stat_trit_neg    = 0
+
+// -- Skip distances (all harmonic products up to H3*H5*H7) --
+// [3, 5, 7, 13, 15, 21, 35, 39, 65, 91, 105]
+let SKIPS = [3, 5, 7, 13, 15, 21, 35, 39, 65, 91, 105]
+
+// Regime skip counts: how many SKIPS[] entries each regime uses
+let SKIP_LAMINAR      = 1   // SKIPS[0..0]   -> [3]
+let SKIP_TRANSITIONAL = 2   // SKIPS[0..1]   -> [3,5]
+let SKIP_TURBULENT    = 4   // SKIPS[0..3]   -> [3,5,7,13]
+let SKIP_CHAOTIC      = 11  // SKIPS[0..10]  -> all (+ offset variants added at runtime)
+
+// -- Helpers --
+
+fn trit_update(t) {
+    if3 t == TRUE {
+        stat_trit_pos = stat_trit_pos + 1
+    } else t == MAYBE {
+        stat_trit_zero = stat_trit_zero + 1
+    } else {
+        stat_trit_neg = stat_trit_neg + 1
+    }
+    return t
+}
+
+fn make_trit(ok, has_data) {
+    let t = FALSE
+    if3 ok == TRUE {
+        if has_data == TRUE {
+            let t = TRUE
+        } else {
+            let t = MAYBE
+    } else {
+        let t = FALSE
+    }
+    return trit_update(t)
+}
+
+// Convert ternary trit list to balanced-ternary string: 1->1, 0->0, -1->T
+}
+fn bt_char(t) {
+    let c = "T"
+    if3 t == 1 {
+        let c = "1"
+    } else t == 0 {
+        let c = "0"
+    } else {
+        let c = "T"
+    }
+    return c
+}
+
+// Reynolds number: Re = (text_len / 1000) * target_len * complexity
+fn calc_re(text_len, target_len, complexity) {
+    let rho = text_len
+    let v   = target_len
+    let L   = complexity
+    if rho < 1 { let rho = 1 }
+    if v   < 1 { let v   = 1 }
+    if L   < 1 { let L   = 1 }
+    // scale rho by /1000 via integer arithmetic: result * 1000 / 1000
+    let re_scaled = rho * v * L
+    let re = round(float(re_scaled) / 1000.0, 2)
+    return re
+}
+
+// Classify Reynolds number into flow regime
+fn regime_of(re) {
+    let r = "chaotic"
+    if3 re < RE_LAMINAR {
+        let r = "laminar"
+    } else re < RE_TRANSITION {
+        let r = "transitional"
+    } else re < RE_TURBULENT {
+        let r = "turbulent"
+    } else {
+        let r = "chaotic"
+    }
+    return r
+}
+
+// How many SKIPS[] entries to use given a regime name
+fn regime_skip_count(regime) {
+    let n = SKIP_CHAOTIC
+    if3 regime == "laminar" {
+        let n = SKIP_LAMINAR
+    } else regime == "transitional" {
+        let n = SKIP_TRANSITIONAL
+    } else regime == "turbulent" {
+        let n = SKIP_TURBULENT
+    } else {
+        let n = SKIP_CHAOTIC
+    }
+    return n
+}
+
+
+// ==============================================================
+// SKIP ENGINE - Core ELS (Equidistant Letter Sequence) Search
+// ==============================================================
+
+// Extract every Nth char from text starting at start, stepping by skip*dir
+// Returns the extracted string (may be empty)
+fn els_extract(text, start, skip, dir, want_len) {
+    let n    = len(text)
+    let chars = ""
+    let pos  = start
+    let count = 0
+    while3 count < want_len {
+        if3 pos >= 0 {
+            if pos < n {
+                let chars = chars + slice(text, pos, pos + 1)
+                let pos   = pos + skip * dir
+                let count = count + 1
+            } else {
+                let count = want_len   // exit: out of bounds high
+        } else {
+            let count = want_len       // exit: out of bounds low
+        }
+    }
+    return chars
+}
+
+// Core scanner: search text for target at given skip distance and direction
+// Returns list of hit dicts
+}
+fn scan_one_skip(text_lo, target_lo, n, skip, dir) {
+    let tgt_len = len(target_lo)
+    let hits    = []
+    let start   = 0
+    while3 start < n {
+        let extracted = els_extract(text_lo, start, skip, dir, tgt_len)
+        if3 extracted == target_lo {
+            let re_val  = calc_re(n, tgt_len, skip)
+            let reg     = regime_of(re_val)
+            let dir_str = "forward"
+            if dir == -1 { let dir_str = "backward" }
+            append(hits, {
+                "start":     start,
+                "skip":      skip,
+                "direction": dir_str,
+                "reynolds":  re_val,
+                "regime":    reg,
+                "trit":      TRUE
+            })
+        }
+        let start = start + 1
+    }
+    return hits
+}
+
+// Run scan across a slice of SKIPS[], both directions if do_both=1
+fn multi_scan(text, target, skip_count, do_both) {
+    let text_lo   = lower(text)
+    let target_lo = lower(target)
+    let n         = len(text_lo)
+    let hits      = []
+    let si        = 0
+    while3 si < skip_count {
+        let skip = dict_get(SKIPS, si)
+        if skip < n {
+            // forward
+            let fwd = scan_one_skip(text_lo, target_lo, n, skip, 1)
+            let fi  = 0
+            while3 fi < len(fwd) {
+                append(hits, dict_get(fwd, fi))
+                let fi = fi + 1
+            }
+            // backward (if regime allows)
+            if do_both == 1 {
+                let bwd = scan_one_skip(text_lo, target_lo, n, skip, -1)
+                let bi  = 0
+                while3 bi < len(bwd) {
+                    append(hits, dict_get(bwd, bi))
+                    let bi = bi + 1
+                }
+            }
+        }
+        let si = si + 1
+    }
+    return hits
+}
+
+// For chaotic regime: also scan skip-1 and skip+1 offsets
+fn chaotic_scan(text, target) {
+    let text_lo   = lower(text)
+    let target_lo = lower(target)
+    let n         = len(text_lo)
+    let hits      = []
+    // base distances
+    let si = 0
+    while3 si < SKIP_CHAOTIC {
+        let skip = dict_get(SKIPS, si)
+        // base skip fwd + bwd
+        if skip < n {
+            let fwd = scan_one_skip(text_lo, target_lo, n, skip, 1)
+            let fi  = 0
+            while3 fi < len(fwd) {
+                append(hits, dict_get(fwd, fi))
+                let fi = fi + 1
+            }
+            let bwd = scan_one_skip(text_lo, target_lo, n, skip, -1)
+            let bi  = 0
+            while3 bi < len(bwd) {
+                append(hits, dict_get(bwd, bi))
+                let bi = bi + 1
+            }
+        }
+        // skip - 1 (offset fwd)
+        let sm = skip - 1
+        if3 sm > 0 {
+            if sm < n {
+                let fm = scan_one_skip(text_lo, target_lo, n, sm, 1)
+                let mi = 0
+                while3 mi < len(fm) {
+                    append(hits, dict_get(fm, mi))
+                    let mi = mi + 1
+        } else {
+            // skip - 1 <= 0, do nothing
+        }
+        // skip + 1 (offset fwd)
+        let sp = skip + 1
+        if sp < n {
+            let fp = scan_one_skip(text_lo, target_lo, n, sp, 1)
+            let pi = 0
+            while3 pi < len(fp) {
+                append(hits, dict_get(fp, pi))
+                let pi = pi + 1
+            }
+        }
+        let si = si + 1
+    }
+    return hits
+}
+
+// N-S flow-routed search: Reynolds number determines search breadth
+}
+}
+fn flow_search(body) {
+    let text   = dict_get(body, "text")
+    let target = dict_get(body, "target")
+    if3 len(text) == 0 {
+        return {"ok": false, "error": "text and target required", "trit": FALSE}
+    } else len(target) == 0 {
+        return {"ok": false, "error": "text and target required", "trit": FALSE}
+    } else {
+        let t0     = time()
+        let n      = len(text)
+        let tgt_len = len(target)
+
+        // Reynolds: caller may pass re directly or regime name
+        let re_val = calc_re(n, tgt_len, SKIP_CHAOTIC)
+        let regime_in = dict_get(body, "regime")
+        if3 regime_in == "laminar" {
+            let re_val = 1
+        } else regime_in == "transitional" {
+            let re_val = RE_LAMINAR
+        } else regime_in == "turbulent" {
+            let re_val = RE_TRANSITION
+        } else regime_in == "chaotic" {
+            let re_val = RE_TURBULENT
+        } else {
+            // keep computed re_val
+        }
+
+        let regime     = regime_of(re_val)
+        let skip_count = regime_skip_count(regime)
+
+        // laminar = forward only; others = both directions
+        let do_both = 1
+        if regime == "laminar" { let do_both = 0 }
+
+        let hits = []
+        if3 regime == "chaotic" {
+            let hits = chaotic_scan(text, target)
+        } else {
+            let hits = multi_scan(text, target, skip_count, do_both)
+        }
+
+        let hit_count = len(hits)
+        let ms = round((time() - t0) * 1000.0, 2)
+        stat_searches = stat_searches + 1
+        let stat_hits     = stat_hits + hit_count
+
+        return {
+            "ok":             true,
+            "target":         target,
+            "hits":           hits,
+            "hit_count":      hit_count,
+            "reynolds":       re_val,
+            "regime":         regime,
+            "skips_searched": skip_count,
+            "ms":             ms,
+            "trit":           make_trit(TRUE, hit_count)
+        }
+    }
+}
+
+// Harmonic scan: search ALL 11 skip distances, both directions
+fn harmonic_scan(body) {
+    let text   = dict_get(body, "text")
+    let target = dict_get(body, "target")
+    if3 len(text) == 0 {
+        return {"ok": false, "error": "text and target required", "trit": FALSE}
+    } else len(target) == 0 {
+        return {"ok": false, "error": "text and target required", "trit": FALSE}
+    } else {
+        let t0   = time()
+        let hits = multi_scan(text, target, SKIP_CHAOTIC, 1)
+        let hit_count = len(hits)
+        let ms = round((time() - t0) * 1000.0, 2)
+        stat_searches = stat_searches + 1
+        let stat_hits     = stat_hits + hit_count
+        return {
+            "ok":                 true,
+            "target":             target,
+            "hits":               hits,
+            "hit_count":          hit_count,
+            "distances_searched": SKIP_CHAOTIC,
+            "ms":                 ms,
+            "trit":               make_trit(TRUE, hit_count)
+        }
+    }
+}
+
+// Bible Code matrix search: arrange text in grid, search columns + diagonals
+fn matrix_search(body) {
+    let text = dict_get(body, "text")
+    if len(text) == 0 {
+        return {"ok": false, "error": "text required", "trit": FALSE}
+    }
+    let width   = dict_get(body, "width")
+    let targets = dict_get(body, "targets")
+    if width < 1 { let width = H13 }
+    let n      = len(text)
+    let hits   = []
+
+    // Build rows: slice text into width-sized chunks
+    let rows   = []
+    let offset = 0
+    while3 offset < n {
+        let end = offset + width
+        if end > n { let end = n }
+        append(rows, lower(slice(text, offset, end)))
+        let offset = end
+    }
+    let height = len(rows)
+
+    // Column scan: column col -> join char col from each row
+    let col = 0
+    while3 col < width {
+        let col_text = ""
+        let r = 0
+        while3 r < height {
+            let row_str = dict_get(rows, r)
+            if col < len(row_str) {
+                let col_text = col_text + slice(row_str, col, col + 1)
+            }
+            let r = r + 1
+        }
+        // Check each target in column text
+        let ti = 0
+        while3 ti < len(targets) {
+            let tgt = lower(dict_get(targets, ti))
+            if contains(col_text, tgt) {
+                append(hits, {
+                    "target": dict_get(targets, ti),
+                    "type":   "column",
+                    "col":    col,
+                    "skip":   width,
+                    "trit":   TRUE
+                })
+            }
+            let ti = ti + 1
+        }
+        let col = col + 1
+    }
+
+    // Diagonal scan: down-right from each start column
+    let sc = 0
+    while3 sc < width {
+        let diag = ""
+        let r    = 0
+        while3 r < height {
+            let dc = sc + r
+            let row_str = dict_get(rows, r)
+            if dc < len(row_str) {
+                let diag = diag + slice(row_str, dc, dc + 1)
+            }
+            let r = r + 1
+        }
+        let ti = 0
+        while3 ti < len(targets) {
+            let tgt = lower(dict_get(targets, ti))
+            if contains(diag, tgt) {
+                append(hits, {
+                    "target":    dict_get(targets, ti),
+                    "type":      "diagonal",
+                    "start_col": sc,
+                    "skip":      width + 1,
+                    "trit":      TRUE
+                })
+            }
+            let ti = ti + 1
+        }
+        let sc = sc + 1
+    }
+
+    let hit_count = len(hits)
+    let has_hits = 0
+    if hit_count > 0 { let has_hits = 1 }
+    return {
+        "ok":           true,
+        "hits":         hits,
+        "hit_count":    hit_count,
+        "matrix_rows":  height,
+        "matrix_width": width,
+        "trit":         make_trit(TRUE, has_hits)
+    }
+}
+
+
+// ==============================================================
+// JAPANESE MULTIPLICATION - Line Crossing Pattern Correlation
+// ==============================================================
+
+// Compute digit array from absolute integer (returns list of ints)
+// Encodes digits as a string like "3,1,2" for later splitting
+fn digits_of(n_abs) {
+    let s = str(n_abs)
+    let result = []
+    let i = 0
+    while3 i < len(s) {
+        let ch = slice(s, i, i + 1)
+        append(result, int(ch))
+        let i = i + 1
+    }
+    return result
+}
+
+// Japanese line multiplication: count crossings per column
+fn japan_multiply(body) {
+    let a = dict_get(body, "a")
+    let b = dict_get(body, "b")
+    if3 a == 0 {
+        return {"product": 0, "crossings": [0], "trit": make_trit(TRUE, TRUE)}
+    } else b == 0 {
+        return {"product": 0, "crossings": [0], "trit": make_trit(TRUE, TRUE)}
+    } else {
+        // Determine sign
+        let sign = 1
+        let a_neg = 0
+        let b_neg = 0
+        if a < 0 { let a_neg = 1 }
+        if b < 0 { let b_neg = 1 }
+        if a_neg != b_neg { let sign = -1 }
+
+        // Work with absolute values
+        let a_abs = a
+        let b_abs = b
+        if a < 0 { let a_abs = 0 - a }
+        if b < 0 { let b_abs = 0 - b }
+
+        let da = digits_of(a_abs)
+        let db = digits_of(b_abs)
+        let la = len(da)
+        let lb = len(db)
+        let cross_len = la + lb - 1
+
+        // Build crossings array (sum of products per column position)
+        let crossings = []
+        let ci = 0
+        while3 ci < cross_len {
+            append(crossings, 0)
+            let ci = ci + 1
+        }
+
+        let i = 0
+        while3 i < la {
+            let x = dict_get(da, i)
+            let j = 0
+            while3 j < lb {
+                let y   = dict_get(db, j)
+                let pos = i + j
+                let old = dict_get(crossings, pos)
+                // crossings[pos] += x * y
+                let crossings = dict_set(crossings, pos, old + x * y)
+                let j = j + 1
+            }
+            let i = i + 1
+        }
+
+        // Carry propagation (right to left)
+        let digits = []
+        let carry  = 0
+        let ci2 = cross_len - 1
+        while3 ci2 >= 0 {
+            let total = dict_get(crossings, ci2) + carry
+            append(digits, total - (total / 10) * 10)   // total % 10
+            let carry = total / 10
+            let ci2   = ci2 - 1
+        }
+        while3 carry > 0 {
+            append(digits, carry - (carry / 10) * 10)
+            let carry = carry / 10
+        }
+
+        // digits is reversed; reverse it to get correct order
+        let dlen    = len(digits)
+        let ordered = []
+        let di      = dlen - 1
+        while3 di >= 0 {
+            append(ordered, dict_get(digits, di))
+            let di = di - 1
+        }
+
+        // Build product integer from ordered digits
+        let product_abs = 0
+        let oi = 0
+        while3 oi < len(ordered) {
+            let product_abs = product_abs * 10 + dict_get(ordered, oi)
+            let oi = oi + 1
+        }
+        let product = product_abs * sign
+
+        return {
+            "product":   product,
+            "crossings": crossings,
+            "digits_a":  da,
+            "digits_b":  db,
+            "sign":      sign,
+            "trit":      make_trit(TRUE, TRUE)
+        }
+    }
+}
+
+// Japanese division: inverse skip ratio
+fn japan_divide(body) {
+    let a = dict_get(body, "a")
+    let b = dict_get(body, "b")
+    if3 b == 0 {
+        return {"ok": false, "error": "Division by zero", "trit": FALSE}
+    } else {
+        let quotient  = a / b
+        let remainder = a - quotient * b
+        let ratio     = round(float(a) / float(b), H5)
+        // Check if ratio matches a harmonic constant
+        let harmonic  = 0
+        if3 ratio == float(H3)  { let harmonic = 1 }
+        else ratio == float(H5)  { let harmonic = 1 }
+        else ratio == float(H7)  { let harmonic = 1 }
+        else ratio == float(H13) { let harmonic = 1 }
+        else { let harmonic = 0 }
+        return {
+            "ok":        true,
+            "quotient":  quotient,
+            "remainder": remainder,
+            "ratio":     ratio,
+            "harmonic":  harmonic,
+            "trit":      make_trit(TRUE, TRUE)
+        }
+    }
+}
+
+// Pattern correlation via Japanese multiplication of positions
+fn correlate(body) {
+    let patterns = dict_get(body, "patterns")
+    let n = len(patterns)
+    if3 n < 2 {
+        return {"ok": false, "error": "At least 2 patterns required", "trit": FALSE}
+    } else {
+        let pairs = []
+        let i = 0
+        while3 i < n {
+            let j = i + 1
+            while3 j < n {
+                let pa = dict_get(dict_get(patterns, i), "start")
+                let pb = dict_get(dict_get(patterns, j), "start")
+                let sa = dict_get(dict_get(patterns, i), "skip")
+                let sb = dict_get(dict_get(patterns, j), "skip")
+                if pa < 0 { let pa = 0 }
+                if pb < 0 { let pb = 0 }
+                if sa < 1 { let sa = 1 }
+                if sb < 1 { let sb = 1 }
+
+                // Cross sum via Japanese multiply of positions (+1 offset to avoid 0)
+                let mul_body = {"a": pa + 1, "b": pb + 1}
+                let mul_res  = japan_multiply(mul_body)
+                let crossings = dict_get(mul_res, "crossings")
+
+                // Sum all crossing values
+                let cross_sum = 0
+                let ci = 0
+                while3 ci < len(crossings) {
+                    let cross_sum = cross_sum + dict_get(crossings, ci)
+                    let ci = ci + 1
+                }
+
+                // Skip ratio (max/min)
+                let s_max = sa
+                let s_min = sb
+                if sb > sa { let s_max = sb }
+                if sb > sa { let s_min = sa }
+                let ratio = float(s_max) / float(s_min)
+
+                // Harmonic bonus: +13 if ratio is a harmonic constant
+                let bonus = 0
+                if3 ratio == float(H3)  { let bonus = H13 }
+                else ratio == float(H5)  { let bonus = H13 }
+                else ratio == float(H7)  { let bonus = H13 }
+                else ratio == float(H13) { let bonus = H13 }
+                else { let bonus = 0 }
+
+                let score = cross_sum + bonus
+
+                // Ternary: +1 if score>13, 0 if score>0, -1 if 0
+                let pair_trit = FALSE
+                if3 score > H13 { let pair_trit = TRUE  }
+                else score > 0  { let pair_trit = MAYBE }
+                else            { let pair_trit = FALSE }
+
+                append(pairs, {
+                    "i":             i,
+                    "j":             j,
+                    "score":         score,
+                    "crossings":     cross_sum,
+                    "harmonic_bonus": bonus,
+                    "skip_ratio":    round(ratio, H3),
+                    "trit":          pair_trit
+                })
+                let j = j + 1
+            }
+            let i = i + 1
+        }
+
+        stat_correlations = stat_correlations + 1
+        let has_pairs = 0
+        if len(pairs) > 0 { let has_pairs = 1 }
+        return {
+            "ok":            true,
+            "pairs":         pairs,
+            "pattern_count": n,
+            "trit":          make_trit(TRUE, has_pairs)
+        }
+    }
+}
+
+
+// ==============================================================
+// TRIT MATRIX - Ternary Grid for Skip Pattern Storage
+// ==============================================================
+
+// Generate an empty trit matrix (rows x cols) as flat list representation
+// Returns {"width": w, "height": h, "grid": [[0,...], ...], "bt": [...]}
+fn trit_matrix_new(w, h) {
+    let grid = []
+    let r = 0
+    while3 r < h {
+        let row = []
+        let c   = 0
+        while3 c < w {
+            append(row, 0)
+            let c = c + 1
+        }
+        append(grid, row)
+        let r = r + 1
+    }
+    // BT string per row
+    let bt = []
+    let r2 = 0
+    while3 r2 < h {
+        let row     = dict_get(grid, r2)
+        let bt_row  = ""
+        let c2      = 0
+        while3 c2 < w {
+            let bt_row = bt_row + bt_char(dict_get(row, c2))
+            let c2     = c2 + 1
+        }
+        append(bt, bt_row)
+        let r2 = r2 + 1
+    }
+    return {"width": w, "height": h, "grid": grid, "bt": bt}
+}
+
+
+// ==============================================================
+// ROUTE HANDLERS
+// ==============================================================
+
+fn health() {
+    let up = round(time() - stat_t0, 1)
+    return {
+        "ok":             true,
+        "service":        "nova-skiptrace",
+        "version":        "1.0",
+        "port":           PORT,
+        "harmonics":      "3-5-7-13",
+        "skip_distances": SKIPS,
+        "uptime_s":       up,
+        "ternary":        true,
+        "runtime":        "novalang",
+        "trit":           TRUE
+    }
+}
+
+fn skip_status() {
+    let up = round(time() - stat_t0, 1)
+
+    // Health trit: +1=searches>0, +1=hits>0, +1=uptime>0
+    let ht_search = MAYBE
+    if stat_searches > 0 { let ht_search = TRUE }
+    let ht_hits = FALSE
+    if stat_hits > 0 { let ht_hits = TRUE }
+    let ht_up = MAYBE
+    if up > 0 { let ht_up = TRUE }
+    let health_bt = bt_char(ht_search) + bt_char(ht_hits) + bt_char(ht_up)
+
+    return {
+        "ok":              true,
+        "service":         "nova-skiptrace",
+        "version":         "1.0",
+        "port":            PORT,
+        "uptime_s":        up,
+        "searches":        stat_searches,
+        "total_hits":      stat_hits,
+        "correlations":    stat_correlations,
+        "trits":           {"pos": stat_trit_pos, "zero": stat_trit_zero, "neg": stat_trit_neg},
+        "health_bt":       health_bt,
+        "skip_distances":  SKIPS,
+        "ternary":         true,
+        "runtime":         "novalang",
+        "regimes": {
+            "laminar":      "Re<27",
+            "transitional": "27<=Re<125",
+            "turbulent":    "125<=Re<343",
+            "chaotic":      "Re>=343"
+        },
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+fn route_search(body) {
+    return flow_search(body)
+}
+
+fn route_matrix(body) {
+    return matrix_search(body)
+}
+
+fn route_harmonic(body) {
+    return harmonic_scan(body)
+}
+
+fn route_correlate(body) {
+    return correlate(body)
+}
+
+fn route_japan_multiply(body) {
+    return japan_multiply(body)
+}
+
+fn route_japan_divide(body) {
+    return japan_divide(body)
+}
+
+
+// -- Register routes --
+troute(server, "GET",  "/health",              "health")
+troute(server, "GET",  "/skip/status",         "skip_status")
+troute(server, "POST", "/skip/search",         "route_search")
+troute(server, "POST", "/skip/matrix",         "route_matrix")
+troute(server, "POST", "/skip/harmonic",       "route_harmonic")
+troute(server, "POST", "/skip/correlate",      "route_correlate")
+troute(server, "POST", "/skip/japan/multiply", "route_japan_multiply")
+troute(server, "POST", "/skip/japan/divide",   "route_japan_divide")
+
+print("[TSkipTrace] Nova TSkipTrace v1.0 - Bible Code ELS Search")
+print("[TSkipTrace] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TSkipTrace] Harmonics: 3-5-7-13 | Distances: [3,5,7,13,15,21,35,39,65,91,105]")
+print("[TSkipTrace] N-S Flow: Re<27=laminar, Re<125=transitional, Re<343=turbulent, Re>=343=chaotic")
+print("[TSkipTrace] Engines: SkipEngine (ELS), JapanMul (correlation), TritMatrix (storage)")
+print("[TSkipTrace] Routes: /health, /skip/status, /skip/search, /skip/matrix")
+print("[TSkipTrace] Routes: /skip/harmonic, /skip/correlate, /skip/japan/multiply, /skip/japan/divide")
+
+tstart(server)

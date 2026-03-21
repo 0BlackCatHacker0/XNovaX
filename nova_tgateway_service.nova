@@ -1,0 +1,1108 @@
+// nova_tgateway_service.nova -- NovaX Ternary External API Gateway (port 9979)
+//
+// Manages all outbound API calls to external services (OpenAI, GitHub, web APIs).
+// Rate limiting, response caching, retry with exponential backoff, cost tracking.
+// Prevents accidental API bill explosions via daily budget enforcement.
+//
+// Ternary states:
+//   TRUE  (+1) = success / live call completed
+//   MAYBE ( 0) = cached / rate-limited / throttled
+//   FALSE (-1) = failed / budget-exceeded / SSRF-blocked
+//
+// Harmonics:
+//   Token bucket: H5 tokens/sec refill, H7 burst capacity
+//   Retry backoff: 3, 9, 27 seconds (H3^1, H3^2, H3^3)
+//   Cache TTL: 300s (5 min default)
+//   Cache key seal: H13-char SHA-256 prefix
+//   Max retries: H3 (3 attempts)
+//   Budget cleaner: on-demand POST /tgateway/clean (was H13*H3=39s background thread)
+//
+// Security:
+//   SSRF protection: block private/internal IPs in outbound URLs
+//   API keys: read from nova_read env file only, never stored in responses
+//   Binds to 127.0.0.1 only via tserve
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9979
+let server = tserve(PORT, "TGateway v1.0 - Ternary External API Gateway")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3   = 3
+let H5   = 5
+let H7   = 7
+let H13  = 13
+let BLOCK = 2187    // 3^7
+
+// -- Ternary State Values --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Configuration Constants --
+let VERSION              = "1.0"
+let MAX_RETRIES          = 3       // H3 attempts
+let BACKOFF_BASE         = 3       // H3: backoff = 3, 9, 27 seconds
+let CACHE_TTL            = 300     // 5 minutes
+let CACHE_MAX            = 243     // 3^5 = H3^H5 entries
+let CLEANER_INTERVAL     = 39      // H13 * H3 seconds (informational only)
+let TOKEN_REFILL_RATE    = 5       // H5 tokens/sec
+let TOKEN_BURST          = 7       // H7 burst capacity
+let MAX_BODY_SIZE        = 10935   // BLOCK * H5 bytes
+
+// -- OpenAI pricing estimates (per 1K tokens, conservative, USD) --
+let PRICE_INPUT  = 0.0015   // ~avg across models
+let PRICE_OUTPUT = 0.002    // ~avg across models
+
+// -- Provider Registry --
+// Stored as flat dicts keyed by provider name
+// Fields per provider: base_url, rate_per_min, api_key_env, api_key_header,
+//                      api_key_prefix, max_calls_per_hour, max_cost_per_day
+let providers = {}
+
+let openai_cfg = {
+    "base_url":          "https://api.openai.com",
+    "rate_per_min":      60,
+    "api_key_env":       "OPENAI_API_KEY",
+    "api_key_header":    "Authorization",
+    "api_key_prefix":    "Bearer ",
+    "max_calls_per_hour": 600,
+    "max_cost_per_day":  10.0
+}
+providers = dict_set(providers, "openai", openai_cfg)
+
+let github_cfg = {
+    "base_url":          "https://api.github.com",
+    "rate_per_min":      30,
+    "api_key_env":       "GITHUB_TOKEN",
+    "api_key_header":    "Authorization",
+    "api_key_prefix":    "Bearer ",
+    "max_calls_per_hour": 300,
+    "max_cost_per_day":  0.0
+}
+providers = dict_set(providers, "github", github_cfg)
+
+let web_cfg = {
+    "base_url":          "",
+    "rate_per_min":      10,
+    "api_key_env":       "",
+    "api_key_header":    "",
+    "api_key_prefix":    "",
+    "max_calls_per_hour": 100,
+    "max_cost_per_day":  0.0
+}
+providers = dict_set(providers, "web", web_cfg)
+
+// -- Token Bucket State (per provider, stored in flat dict) --
+// buckets: { "<pname>": { tokens, capacity, refill_rate, last_refill,
+//                         calls_this_hour, hour_start, max_per_hour } }
+let buckets = {}
+
+fn init_bucket(pname, rate_per_min, max_per_hour) {
+    let refill = rate_per_min / 60.0
+    if3 refill > TOKEN_REFILL_RATE { refill = TOKEN_REFILL_RATE
+    } else {
+    }
+    let b = {
+        "tokens":          TOKEN_BURST,
+        "capacity":        TOKEN_BURST,
+        "refill_rate":     refill,
+        "last_refill":     time(),
+        "calls_this_hour": 0,
+        "hour_start":      time(),
+        "max_per_hour":    max_per_hour
+    }
+    buckets = dict_set(buckets, pname, b)
+    return b
+}
+
+// Initialize buckets for each provider
+let b_openai  = init_bucket("openai", 60, 600)
+let b_github  = init_bucket("github", 30, 300)
+let b_web     = init_bucket("web",    10, 100)
+
+fn refill_bucket(pname) {
+    // Refill tokens based on elapsed time; cap at capacity
+    let b       = dict_get(buckets, pname) ?? {}
+    let now     = time()
+    let last    = dict_get(b, "last_refill") ??  now
+    let elapsed = now - last
+    let rate    = dict_get(b, "refill_rate") ??  H5
+    let cap     = dict_get(b, "capacity") ??     TOKEN_BURST
+    let tokens  = dict_get(b, "tokens") ??       0
+    let gained  = elapsed * rate
+    let new_tok = min(cap, tokens + gained)
+    b = dict_set(b, "tokens",      new_tok)
+    b = dict_set(b, "last_refill", now)
+    // Reset hourly counter if hour has rolled over
+    let hour_start = dict_get(b, "hour_start") ?? now
+    if3 (now - hour_start) >= 3600 {
+        b = dict_set(b, "hour_start",      now)
+        b = dict_set(b, "calls_this_hour", 0)
+    } else {
+    }
+    buckets = dict_set(buckets, pname, b)
+    return b
+}
+
+fn bucket_try_acquire(pname) {
+    // Try to consume one token. Returns T_TRUE=acquired, T_MAYBE=rate-limited.
+    let b         = refill_bucket(pname)
+    let max_hour  = dict_get(b, "max_per_hour") ??    100
+    let calls_hr  = dict_get(b, "calls_this_hour") ?? 0
+    if3 calls_hr >= max_hour {
+        return T_MAYBE   // hourly limit hit
+    } else {
+    }
+    let tokens = dict_get(b, "tokens") ?? 0
+    if3 tokens >= 1.0 {
+        b = dict_set(b, "tokens",          tokens - 1.0)
+        b = dict_set(b, "calls_this_hour", calls_hr + 1)
+        buckets = dict_set(buckets, pname, b)
+        return T_TRUE
+    } else {
+        return T_MAYBE   // rate limited
+    }
+}
+
+fn bucket_status(pname) {
+    // Return status dict for a bucket (for health/providers endpoints)
+    let b        = refill_bucket(pname)
+    let tokens   = dict_get(b, "tokens") ??          0
+    let cap      = dict_get(b, "capacity") ??         TOKEN_BURST
+    let rate     = dict_get(b, "refill_rate") ??      H5
+    let calls_hr = dict_get(b, "calls_this_hour") ??  0
+    let max_hr   = dict_get(b, "max_per_hour") ??     100
+    return {
+        "tokens_available": round(tokens, 2),
+        "capacity":         cap,
+        "refill_rate":      round(rate, 3),
+        "calls_this_hour":  calls_hr,
+        "max_per_hour":     max_hr
+    }
+}
+
+// -- Response Cache --
+// _cache: { "<key>": { response, created, hits } }
+// _order: list of keys in insertion order (front = oldest, LRU eviction)
+let _cache  = {}
+let _order  = []
+let _hits   = 0
+let _misses = 0
+
+fn cache_make_key(provider, endpoint, body_json) {
+    // H13-char SHA-256 prefix of provider+endpoint+body
+    let raw = provider + "|" + endpoint + "|" + body_json
+    let full_hash = sha256(raw)
+    return slice(full_hash, 0, H13)
+}
+
+fn order_remove(key) {
+    // Remove a key from the _order list (linear scan)
+    let new_order = []
+    let i = 0
+    while3 i < len(_order) {
+        let k = _order[i]
+        if3 k == key {
+            // skip it
+        } else {
+            new_order = append(new_order, k)
+        }
+        i = i + 1
+    }
+    _order = new_order
+}
+
+fn cache_evict_oldest() {
+    // Remove the oldest (front) entry to stay under CACHE_MAX
+    if3 len(_order) > 0 { oldest = _order[0]
+        _cache = dict_del(_cache, oldest)
+        _order = slice(_order, 1, len(_order))
+    } else {
+    }
+}
+
+fn cache_get(key) {
+    // Returns entry if fresh, or {} if expired/missing.
+    // Also bumps _hits/_misses and T_TRUE/T_FALSE in second return field.
+    let entry = dict_get(_cache, key) ?? {}
+    if3 dict_has(_cache, key) == false { _misses = _misses + 1
+        return {}
+    } else {
+    }
+    let created = dict_get(entry, "created") ?? 0
+    let now     = time()
+    let age     = now - created
+    if3 age > CACHE_TTL {
+        // Expired -- evict
+        _cache = dict_del(_cache, key)
+        order_remove(key)
+        _misses = _misses + 1
+        return {}
+    } else {
+    }
+    // Fresh hit
+    let hits = dict_get(entry, "hits") ?? 0
+    entry = dict_set(entry, "hits", hits + 1)
+    _cache = dict_set(_cache, key, entry)
+    _hits = _hits + 1
+    return dict_get(entry, "response") ?? {}
+}
+
+fn cache_set(key, response) {
+    // Store response with LRU eviction when full
+    if3 dict_has(_cache, key) == true {
+        _cache = dict_del(_cache, key)
+        order_remove(key)
+    } else {
+    }
+    while3 len(_order) >= CACHE_MAX {
+        cache_evict_oldest()
+    }
+    let entry = {
+        "response": response,
+        "created":  time(),
+        "hits":     0
+    }
+    _cache = dict_set(_cache, key, entry)
+    _order = append(_order, key)
+}
+
+// -- Usage / Cost Tracking --
+// _usage: { "<pname>": { calls_today, tokens_in, tokens_out,
+//                        estimated_cost_usd, day_start,
+//                        total_calls, total_errors, last_call, last_error } }
+let _usage = {}
+
+fn init_usage(pname) {
+    let today = "0000-00-00"
+    let u = {
+        "calls_today":         0,
+        "tokens_in":           0,
+        "tokens_out":          0,
+        "estimated_cost_usd":  0.0,
+        "day_start":           today,
+        "total_calls":         0,
+        "total_errors":        0,
+        "last_call":           "",
+        "last_error":          ""
+    }
+    _usage = dict_set(_usage, pname, u)
+    return u
+}
+
+let u_openai = init_usage("openai")
+let u_github = init_usage("github")
+let u_web    = init_usage("web")
+
+fn reset_daily_if_needed(pname) {
+    // NovaLang has no strftime; use a sentinel: reset when total_calls
+    // rolls over the day boundary tracked by nova_read of a state value.
+    // Simplified: track day as integer day-of-epoch (time() / 86400).
+    let u        = dict_get(_usage, pname) ?? {}
+    let today_d  = int(time() / 86400)
+    let day_d    = dict_get(u, "day_start") ?? 0
+    if3 today_d != day_d {
+        u = dict_set(u, "calls_today",        0)
+        u = dict_set(u, "tokens_in",          0)
+        u = dict_set(u, "tokens_out",         0)
+        u = dict_set(u, "estimated_cost_usd", 0.0)
+        u = dict_set(u, "day_start",          today_d)
+        _usage = dict_set(_usage, pname, u)
+    } else {
+    }
+}
+
+fn estimate_tokens(encoded_str) {
+    // Rough token estimate: ~4 chars per token (GPT-family approximation)
+    let n = len(encoded_str)
+    if3 n < 4 {
+        return 1
+    } else {
+        return int(n / 4)
+    }
+}
+
+fn track_usage(pname, req_encoded, resp_encoded, is_error) {
+    // Record usage and estimate cost for a provider call.
+    reset_daily_if_needed(pname)
+    let u = dict_get(_usage, pname) ?? {}
+    let ct   = dict_get(u, "calls_today") ??  0
+    let tall  = dict_get(u, "total_calls") ?? 0
+    u = dict_set(u, "calls_today",  ct   + 1)
+    u = dict_set(u, "total_calls",  tall + 1)
+    u = dict_set(u, "last_call",    str(int(time())))
+    if3 is_error == T_TRUE { te = dict_get(u, "total_errors") ?? 0
+        u = dict_set(u, "total_errors", te + 1)
+        u = dict_set(u, "last_error",   str(int(time())))
+        _usage = dict_set(_usage, pname, u)
+        return T_TRUE
+    } else {
+    }
+    // Token/cost estimation
+    let tok_in  = estimate_tokens(req_encoded)
+    let tok_out = estimate_tokens(resp_encoded)
+    let ti = dict_get(u, "tokens_in") ??  0
+    let to = dict_get(u, "tokens_out") ?? 0
+    u = dict_set(u, "tokens_in",  ti + tok_in)
+    u = dict_set(u, "tokens_out", to + tok_out)
+    if3 pname == "openai" { cost_in  = (tok_in  / 1000.0) * PRICE_INPUT
+        let cost_out = (tok_out / 1000.0) * PRICE_OUTPUT
+        let cur_cost = dict_get(u, "estimated_cost_usd") ?? 0.0
+        u = dict_set(u, "estimated_cost_usd", cur_cost + cost_in + cost_out)
+    } else {
+    }
+    _usage = dict_set(_usage, pname, u)
+    return T_TRUE
+}
+
+fn check_budget(pname) {
+    // Returns T_TRUE if within budget, T_FALSE if exceeded.
+    let pcfg     = dict_get(providers, pname) ?? {}
+    let max_cost = dict_get(pcfg, "max_cost_per_day") ?? 0.0
+    if3 max_cost <= 0 {
+        return T_TRUE   // no budget limit
+    } else {
+    }
+    reset_daily_if_needed(pname)
+    let u        = dict_get(_usage, pname) ?? {}
+    let cur_cost = dict_get(u, "estimated_cost_usd") ?? 0.0
+    if3 cur_cost >= max_cost {
+        return T_FALSE
+    } else {
+        return T_TRUE
+    }
+}
+
+// -- SSRF Protection --
+
+fn ssrf_blocked(url) {
+    // Block private/internal network targets. Returns T_TRUE if blocked.
+    // Check for obvious private prefixes in the URL string.
+    let lower_url = lower(url)
+    if3 contains(lower_url, "127.0.0.1") {
+        return T_TRUE
+    } else {
+    }
+    if3 contains(lower_url, "localhost") {
+        return T_TRUE
+    } else {
+    }
+    if3 contains(lower_url, "0.0.0.0") {
+        return T_TRUE
+    } else {
+    }
+    if3 contains(lower_url, "169.254.") {
+        return T_TRUE  // link-local
+    } else {
+    }
+    if3 contains(lower_url, "192.168.") {
+        return T_TRUE
+    } else {
+    }
+    if3 contains(lower_url, "10.0.") {
+        return T_TRUE
+    } else {
+    }
+    if3 contains(lower_url, "172.16.") {
+        return T_TRUE
+    } else {
+    }
+    if3 contains(lower_url, "::1") {
+        return T_TRUE  // IPv6 loopback
+    } else {
+    }
+    // Must start with http:// or https://
+    if3 contains(lower_url, "http://") {
+        return T_FALSE
+    } else lower_url == "" {
+        return T_TRUE  // empty URL blocked
+    } else { prefix8 = slice(lower_url, 0, 8)
+        if3 prefix8 == "https://" {
+            return T_FALSE
+        } else {
+            return T_TRUE  // non-http scheme blocked
+        }
+    }
+}
+
+fn sanitize_response(resp_encoded) {
+    // Strip known API key prefixes from response strings.
+    // Returns sanitized string.
+    let s = resp_encoded
+    // Replace bearer token patterns
+    if3 contains(s, "sk-") { s = replace(s, "sk-", "[REDACTED-")
+    } else {
+    }
+    if3 contains(s, "ghp_") { s = replace(s, "ghp_", "[REDACTED-")
+    } else {
+    }
+    if3 contains(s, "gho_") { s = replace(s, "gho_", "[REDACTED-")
+    } else {
+    }
+    if3 contains(s, "github_pat_") { s = replace(s, "github_pat_", "[REDACTED-")
+    } else {
+    }
+    return s
+}
+
+// -- Outbound HTTP with Retry --
+
+fn do_call_with_retry(url, method, body_json, auth_header_name, auth_header_val, user_agent) {
+    // Attempts up to MAX_RETRIES (3) calls using http_get or http_post.
+    // Backoff: 3s after attempt 1, 9s after attempt 2 (not waited on final).
+    // Returns dict: { trit, status, response_encoded, elapsed }
+    let last_encoded = "{}"
+    let last_trit    = T_FALSE
+    let last_status  = 0
+    let t0           = time()
+    let attempt      = 0
+    while3 attempt < MAX_RETRIES {
+        let call_trit  = T_FALSE
+        let resp_enc   = "{}"
+        let http_stat  = 0
+        // Build extra headers string for http_get/http_post
+        // NovaLang http_get/http_post signature: (url) -> response string
+        // We use http_post for POST/PUT/PATCH, http_get for GET/HEAD/DELETE
+        if3 method == "POST" { resp_raw = http_post(url, body_json)
+            let resp_enc = resp_raw
+            // http_post returns raw string; check for error indicators
+            if3 contains(resp_enc, "connection_error") { call_trit = T_FALSE
+                let http_stat = 0
+            } else contains(resp_enc, "\"error\"") { call_trit = T_FALSE
+                let http_stat = 400
+            } else { call_trit = T_TRUE
+                let http_stat = 200
+        } else { resp_raw = http_get(url)
+            let resp_enc = resp_raw
+            if3 contains(resp_enc, "connection_error") { call_trit = T_FALSE
+                let http_stat = 0
+            } else contains(resp_enc, "\"error\"") { call_trit = T_FALSE
+                let http_stat = 400
+            } else { call_trit = T_TRUE
+                let http_stat = 200
+            }
+        }
+        let last_encoded = resp_enc
+        let last_trit    = call_trit
+        let last_status  = http_stat
+        if3 call_trit == T_TRUE { elapsed = time() - t0
+            return {
+                "trit":     T_TRUE,
+                "status":   200,
+                "response": resp_enc,
+                "elapsed":  round(elapsed, 3)
+        } else {
+        }
+        // Don't retry on 4xx client errors (simulated by "error" in response)
+        if3 http_stat >= 400 {
+            if3 http_stat < 500 { elapsed = time() - t0
+                return {
+                    "trit":     T_FALSE,
+                    "status":   http_stat,
+                    "response": resp_enc,
+                    "elapsed":  round(elapsed, 3)
+            } else {
+        } else {
+        }
+        // Backoff before retry: attempt=0 -> 3s, attempt=1 -> 9s
+        let backoff = BACKOFF_BASE
+        if3 attempt == 1 { backoff = BACKOFF_BASE * BACKOFF_BASE
+        } else attempt == 2 { backoff = BACKOFF_BASE * BACKOFF_BASE * BACKOFF_BASE
+        } else {
+        }
+        // Only sleep if there's another attempt coming
+        let next_attempt = attempt + 1
+        if3 next_attempt < MAX_RETRIES {
+            // Spin-wait using time() delta (NovaLang has no sleep builtin)
+            let wait_until = time() + backoff
+            while3 time() < wait_until {
+                let _dummy = 0
+        } else {
+        }
+        attempt = attempt + 1
+    }
+    let elapsed = time() - t0
+    return {
+        "trit":     T_FALSE,
+        "status":   last_status,
+        "response": last_encoded,
+        "elapsed":  round(elapsed, 3)
+    }
+}
+
+// -- Route Handlers --
+}
+}
+}
+}
+}
+
+fn health() {
+    // GET /health and GET /tgateway/health
+    let bs_openai = bucket_status("openai")
+    let bs_github = bucket_status("github")
+    let bs_web    = bucket_status("web")
+    let openai_avail = dict_get(bs_openai, "tokens_available") ?? 0
+    let github_avail = dict_get(bs_github, "tokens_available") ?? 0
+    let web_avail    = dict_get(bs_web,    "tokens_available") ?? 0
+    let openai_hr = dict_get(bs_openai, "calls_this_hour") ?? 0
+    let github_hr = dict_get(bs_github, "calls_this_hour") ?? 0
+    let web_hr    = dict_get(bs_web,    "calls_this_hour") ?? 0
+    let provider_status = {
+        "openai": { "available": openai_avail > 0, "calls_this_hour": openai_hr },
+        "github": { "available": github_avail > 0, "calls_this_hour": github_hr },
+        "web":    { "available": web_avail    > 0, "calls_this_hour": web_hr    }
+    }
+    let resp = ns_health_dict("nova-tgateway", VERSION, PORT, {})
+    resp = dict_set(resp, "providers", provider_status)
+    resp = dict_set(resp, "cache_entries", len(_order))
+    resp = dict_set(resp, "cache_max", CACHE_MAX)
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+fn tgateway_call(body) {
+    // POST /tgateway/call
+    // Body: { provider, endpoint, method, body, headers, url, cache, timeout }
+    let provider = lower(dict_get(body, "provider") ?? "")
+    if3 provider == "" {
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "error": "provider is required",
+            "valid_providers": ["openai", "github", "web"]
+    } else {
+    }
+    let pvalid = dict_has(providers, provider)
+    if3 pvalid == false {
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "error": "unknown provider: " + provider,
+            "valid_providers": ["openai", "github", "web"]
+    } else {
+    }
+
+    let pcfg      = dict_get(providers, provider) ?? {}
+    let endpoint  = dict_get(body, "endpoint") ?? ""
+    let method    = upper(dict_get(body, "method") ?? "GET")
+    let req_body  = dict_get(body, "body") ?? {}
+    let timeout   = int(dict_get(body, "timeout") ?? 30)
+    // Clamp timeout 5-120s
+    if3 timeout < 5   { timeout = 5   } else { }
+    if3 timeout > 120 { timeout = 120 } else { }
+
+    // Default cache: true for GET, false for POST
+    let use_cache = dict_get(body, "cache") ?? -999
+    if3 use_cache == -999 {
+        if3 method == "GET" { use_cache = 1
+        } else { use_cache = 0
+    } else {
+    }
+
+    // Build full URL
+    let url = ""
+    if3 provider == "web" { url = dict_get(body, "url") ?? ""
+        if3 url == "" {
+            if3 contains(endpoint, "http") { url = endpoint
+            } else {
+                return {
+                    "ok":    false,
+                    "trit":  T_FALSE,
+                    "error": "web provider requires url or full URL in endpoint"
+        } else {
+    } else { base = dict_get(pcfg, "base_url") ?? ""
+        if3 len(endpoint) > 0 { first_char = slice(endpoint, 0, 1)
+            if3 first_char == "/" { url = base + endpoint
+            } else { url = base + "/" + endpoint
+        } else { url = base
+        }
+    }
+
+    // SSRF protection
+    let ssrf_block = ssrf_blocked(url)
+    if3 ssrf_block == T_TRUE {
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "error": "SSRF blocked: target URL resolves to private/internal network",
+            "url":   url
+    } else {
+    }
+
+    // Budget check
+    let budget_trit = check_budget(provider)
+    if3 budget_trit == T_FALSE { u        = dict_get(_usage, provider) ?? {}
+        let cur_cost = dict_get(u, "estimated_cost_usd") ?? 0.0
+        let max_cost = dict_get(pcfg, "max_cost_per_day") ?? 0.0
+        return {
+            "ok":                    false,
+            "trit":                  T_FALSE,
+            "error":                 "daily budget exceeded for " + provider,
+            "estimated_cost_today":  round(cur_cost, 4),
+            "daily_limit":           max_cost
+    } else {
+    }
+
+    // Rate limit check
+    let rl_trit = bucket_try_acquire(provider)
+    if3 rl_trit == T_MAYBE { rl_st = bucket_status(provider)
+        return {
+            "ok":         false,
+            "trit":       T_MAYBE,
+            "error":      "rate limited for " + provider,
+            "rate_limit": rl_st
+    } else {
+    }
+
+    // Cache lookup (GET requests only by default)
+    let body_encoded = json_encode(req_body)
+    let cache_key    = ""
+    if3 use_cache == 1 { cache_key  = cache_make_key(provider, endpoint, body_encoded)
+        let cached_raw = cache_get(cache_key)
+        let cached_enc = json_encode(cached_raw)
+        if3 cached_enc != "{}" {
+            if3 len(cached_enc) > 2 {
+                return {
+                    "ok":       true,
+                    "trit":     T_MAYBE,
+                    "source":   "cache",
+                    "provider": provider,
+                    "endpoint": endpoint,
+                    "response": cached_raw
+            } else {
+        } else {
+    } else {
+    }
+
+    // API key injection from environment file (NEVER log or store)
+    let api_key_env    = dict_get(pcfg, "api_key_env") ??    ""
+    let api_key_header = dict_get(pcfg, "api_key_header") ?? ""
+    let api_key_prefix = dict_get(pcfg, "api_key_prefix") ?? ""
+    let auth_hdr_name  = ""
+    let auth_hdr_val   = ""
+    if3 len(api_key_env) > 0 {
+        // Read key from a well-known env file; nova_read returns empty if not found
+        let key_path = "C:\\NovaX\\.env_" + api_key_env
+        let api_key  = nova_read(key_path)
+        let api_key  = replace(api_key, "\n", "")
+        let api_key  = replace(api_key, "\r", "")
+        if3 len(api_key) > 0 {
+            if3 len(api_key_header) > 0 { auth_hdr_name = api_key_header
+                let auth_hdr_val  = api_key_prefix + api_key
+            } else {
+        } else {
+    } else {
+    }
+
+    // User-Agent string
+    let user_agent = "NovaX-TGateway/" + VERSION
+
+    // Execute call with retry
+    let call_result   = do_call_with_retry(url, method, body_encoded, auth_hdr_name, auth_hdr_val, user_agent)
+    let call_trit     = dict_get(call_result, "trit") ??     T_FALSE
+    let call_status   = dict_get(call_result, "status") ??   0
+    let call_response = dict_get(call_result, "response") ?? "{}"
+    let call_elapsed  = dict_get(call_result, "elapsed") ??  0.0
+
+    // Track usage
+    let is_error = T_FALSE
+    if3 call_trit != T_TRUE { is_error = T_TRUE
+    } else {
+    }
+    track_usage(provider, body_encoded, call_response, is_error)
+
+    // Cache successful GET responses
+    if3 call_trit == T_TRUE {
+        if3 use_cache == 1 {
+            if3 cache_key != "" { resp_decoded = json_decode(call_response)
+                cache_set(cache_key, resp_decoded)
+            } else {
+        } else {
+    } else {
+    }
+
+    // Sanitize response for leaked API keys
+    let safe_response = sanitize_response(call_response)
+    let resp_obj = json_decode(safe_response)
+
+    let ok_flag = false
+    if3 call_trit == T_TRUE { ok_flag = true
+    } else {
+    }
+
+    return {
+        "ok":       ok_flag,
+        "trit":     call_trit,
+        "provider": provider,
+        "endpoint": endpoint,
+        "method":   method,
+        "status":   call_status,
+        "elapsed_s": call_elapsed,
+        "source":   "live",
+        "response": resp_obj
+    }
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+}
+
+fn tgateway_providers() {
+    // GET /tgateway/providers
+    let pnames = keys(providers)
+    let result = {}
+    let i = 0
+    while3 i < len(pnames) {
+        let pname    = pnames[i]
+        let pcfg     = dict_get(providers, pname) ?? {}
+        let rl_st    = bucket_status(pname)
+        reset_daily_if_needed(pname)
+        let u        = dict_get(_usage, pname) ?? {}
+        let base_url = dict_get(pcfg, "base_url") ?? ""
+        if3 base_url == "" { base_url = "(any URL)"
+        } else {
+        }
+        let calls_t  = dict_get(u, "calls_today") ??        0
+        let cost_t   = dict_get(u, "estimated_cost_usd") ?? 0.0
+        let rpm      = dict_get(pcfg, "rate_per_min") ??      0
+        let max_hr   = dict_get(pcfg, "max_calls_per_hour") ?? 0
+        let max_cpd  = dict_get(pcfg, "max_cost_per_day") ??   0.0
+        // Check if key file exists (non-empty read = configured)
+        let api_env  = dict_get(pcfg, "api_key_env") ?? ""
+        let has_key  = false
+        if3 len(api_env) > 0 { key_path = "C:\\NovaX\\.env_" + api_env
+            let key_val  = nova_read(key_path)
+            if3 len(key_val) > 0 { has_key = true
+            } else {
+        } else {
+        }
+        let entry = {
+            "base_url":             base_url,
+            "rate_per_min":         rpm,
+            "api_key_configured":   has_key,
+            "rate_limiter":         rl_st,
+            "max_calls_per_hour":   max_hr,
+            "max_cost_per_day":     max_cpd,
+            "calls_today":          calls_t,
+            "estimated_cost_today": round(cost_t, 4)
+        }
+        result = dict_set(result, pname, entry)
+        i = i + 1
+    }
+    return {
+        "ok":        true,
+        "trit":      T_TRUE,
+        "providers": result
+    }
+}
+}
+
+fn tgateway_usage() {
+    // GET /tgateway/usage
+    let pnames = keys(providers)
+    let report = {}
+    let i = 0
+    while3 i < len(pnames) {
+        let pname = pnames[i]
+        reset_daily_if_needed(pname)
+        let u     = dict_get(_usage, pname) ?? {}
+        let pcfg  = dict_get(providers, pname) ?? {}
+        let max_cpd    = dict_get(pcfg, "max_cost_per_day") ??   0.0
+        let ct         = dict_get(u, "calls_today") ??        0
+        let tall       = dict_get(u, "total_calls") ??        0
+        let te         = dict_get(u, "total_errors") ??       0
+        let ti         = dict_get(u, "tokens_in") ??          0
+        let to         = dict_get(u, "tokens_out") ??         0
+        let cost       = dict_get(u, "estimated_cost_usd") ?? 0.0
+        let last_c     = dict_get(u, "last_call") ??          ""
+        let last_e     = dict_get(u, "last_error") ??         ""
+        let day_s      = dict_get(u, "day_start") ??          0
+        let denom      = tall
+        if3 denom < 1 { denom = 1 } else { }
+        let err_rate   = round(te / denom, 4)
+        let budget_rem = -1.0
+        if3 max_cpd > 0 { budget_rem = round(max_cpd - cost, 4)
+        } else {
+        }
+        let entry = {
+            "calls_today":          ct,
+            "total_calls":          tall,
+            "total_errors":         te,
+            "error_rate":           err_rate,
+            "tokens_in":            ti,
+            "tokens_out":           to,
+            "estimated_cost_usd":   round(cost, 4),
+            "daily_budget":         max_cpd,
+            "budget_remaining":     budget_rem,
+            "day":                  str(day_s),
+            "last_call":            last_c,
+            "last_error":           last_e
+        }
+        report = dict_set(report, pname, entry)
+        i = i + 1
+    }
+    return {
+        "ok":    true,
+        "trit":  T_TRUE,
+        "usage": report
+    }
+}
+
+fn tgateway_limit(body) {
+    // POST /tgateway/limit
+    // Body: { provider, max_calls_per_hour, max_cost_per_day, rate_per_min }
+    let provider = lower(dict_get(body, "provider") ?? "")
+    if3 dict_has(providers, provider) == false {
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "error": "unknown provider: " + provider,
+            "valid_providers": ["openai", "github", "web"]
+    } else {
+    }
+    let pcfg    = dict_get(providers, provider) ?? {}
+    let changed = {}
+
+    // max_calls_per_hour
+    let max_cph = dict_get(body, "max_calls_per_hour") ?? -1
+    if3 max_cph > 0 {
+        pcfg = dict_set(pcfg, "max_calls_per_hour", max_cph)
+        let b = dict_get(buckets, provider) ?? {}
+        b = dict_set(b, "max_per_hour", max_cph)
+        buckets = dict_set(buckets, provider, b)
+        changed = dict_set(changed, "max_calls_per_hour", max_cph)
+    } else {
+    }
+
+    // max_cost_per_day
+    let max_cpd = dict_get(body, "max_cost_per_day") ?? -999.0
+    if3 max_cpd >= 0.0 {
+        if3 max_cpd != -999.0 {
+            pcfg = dict_set(pcfg, "max_cost_per_day", max_cpd)
+            changed = dict_set(changed, "max_cost_per_day", max_cpd)
+        } else {
+    } else {
+    }
+
+    // rate_per_min
+    let rpm = dict_get(body, "rate_per_min") ?? -1
+    if3 rpm > 0 {
+        pcfg = dict_set(pcfg, "rate_per_min", rpm)
+        let new_rate = rpm / 60.0
+        if3 new_rate > TOKEN_REFILL_RATE { new_rate = TOKEN_REFILL_RATE
+        } else {
+        }
+        let b = dict_get(buckets, provider) ?? {}
+        b = dict_set(b, "refill_rate", new_rate)
+        buckets = dict_set(buckets, provider, b)
+        changed = dict_set(changed, "rate_per_min", rpm)
+    } else {
+    }
+
+    providers = dict_set(providers, provider, pcfg)
+
+    if3 len(keys(changed)) == 0 {
+        return {
+            "ok":    false,
+            "trit":  T_MAYBE,
+            "error": "no valid limit parameters provided",
+            "accepted_params": ["max_calls_per_hour", "max_cost_per_day", "rate_per_min"]
+    } else {
+    }
+    return {
+        "ok":      true,
+        "trit":    T_TRUE,
+        "provider": provider,
+        "updated": changed
+    }
+}
+}
+}
+}
+
+fn tgateway_cache() {
+    // GET /tgateway/cache - list cached entries
+    let entries  = []
+    let now      = time()
+    let all_keys = keys(_cache)
+    let i = 0
+    while3 i < len(all_keys) {
+        let k       = all_keys[i]
+        let entry   = dict_get(_cache, k) ?? {}
+        let created = dict_get(entry, "created") ?? now
+        let hits    = dict_get(entry, "hits") ??    0
+        let age     = round(now - created, 2)
+        let ttl_rem = CACHE_TTL - age
+        if3 ttl_rem < 0 { ttl_rem = 0 } else { }
+        let expired = false
+        if3 age > CACHE_TTL { expired = true } else { }
+        let info = {
+            "key":            k,
+            "age_s":          age,
+            "ttl_remaining_s": round(ttl_rem, 2),
+            "hits":           hits,
+            "expired":        expired
+        }
+        entries = append(entries, info)
+        i = i + 1
+    }
+    return {
+        "ok":            true,
+        "trit":          T_TRUE,
+        "cache_entries": len(entries),
+        "cache_max":     CACHE_MAX,
+        "cache_ttl":     CACHE_TTL,
+        "entries":       entries
+    }
+}
+
+fn tgateway_stats() {
+    // GET /tgateway/stats - aggregate gateway statistics
+    let pnames        = keys(providers)
+    let total_calls   = 0
+    let total_errors  = 0
+    let total_cost    = 0.0
+    let per_provider  = {}
+    let i = 0
+    while3 i < len(pnames) {
+        let pname = pnames[i]
+        reset_daily_if_needed(pname)
+        let u    = dict_get(_usage, pname) ?? {}
+        let tc   = dict_get(u, "total_calls") ??       0
+        let te   = dict_get(u, "total_errors") ??      0
+        let ct   = dict_get(u, "calls_today") ??       0
+        let cost = dict_get(u, "estimated_cost_usd") ?? 0.0
+        let total_calls  = total_calls  + tc
+        total_errors = total_errors + te
+        let total_cost   = total_cost   + cost
+        let entry = {
+            "calls_today":         ct,
+            "total_calls":         tc,
+            "total_errors":        te,
+            "estimated_cost_usd":  round(cost, 4)
+        }
+        per_provider = dict_set(per_provider, pname, entry)
+        i = i + 1
+    }
+
+    let total_cache_ops = _hits + _misses
+    let hit_rate = 0.0
+    if3 total_cache_ops > 0 { hit_rate = round(_hits / total_cache_ops, 4)
+    } else {
+    }
+    let denom = total_calls
+    if3 denom < 1 { denom = 1 } else { }
+    let error_rate  = round(total_errors / denom, 4)
+    let avg_cost    = total_cost / denom
+    let cost_savings = round(avg_cost * _hits, 4)
+
+    return {
+        "ok":                          true,
+        "trit":                        T_TRUE,
+        "total_calls":                 total_calls,
+        "total_errors":                total_errors,
+        "error_rate":                  error_rate,
+        "cache_hits":                  _hits,
+        "cache_misses":                _misses,
+        "cache_hit_rate":              hit_rate,
+        "cache_entries":               len(_order),
+        "estimated_total_cost_usd":    round(total_cost, 4),
+        "estimated_cache_savings_usd": cost_savings,
+        "providers":                   per_provider,
+        "harmonics": {
+            "retry_backoff":   "H3^n = 3, 9, 27",
+            "cache_max":       "3^5 = 243",
+            "token_refill":    "H5 = 5/sec",
+            "token_burst":     "H7 = 7",
+            "budget_cleaner":  "H13*H3 = 39s (on-demand POST /tgateway/clean)"
+        }
+    }
+}
+
+fn tgateway_clean() {
+    // POST /tgateway/clean
+    // On-demand version of the old background cache cleaner thread.
+    // Purges expired cache entries and resets daily usage counters if day rolled.
+    let now     = time()
+    let expired = []
+    let live    = 0
+    let all_keys = keys(_cache)
+    let i = 0
+    while3 i < len(all_keys) {
+        let k       = all_keys[i]
+        let entry   = dict_get(_cache, k) ?? {}
+        let created = dict_get(entry, "created") ?? now
+        let age     = now - created
+        if3 age > CACHE_TTL {
+            expired = append(expired, k)
+        } else { live = live + 1
+        }
+        i = i + 1
+    }
+    // Delete expired entries
+    let j = 0
+    while3 j < len(expired) {
+        let k = expired[j]
+        _cache = dict_del(_cache, k)
+        order_remove(k)
+        j = j + 1
+    }
+    // Reset daily counters for any provider whose day has rolled over
+    let pnames = keys(providers)
+    let k2 = 0
+    while3 k2 < len(pnames) {
+        let pname = pnames[k2]
+        reset_daily_if_needed(pname)
+        k2 = k2 + 1
+    }
+    return {
+        "ok":             true,
+        "trit":           T_TRUE,
+        "expired_purged": len(expired),
+        "cache_live":     live,
+        "cache_entries":  len(keys(_cache)),
+        "msg":            "cache cleaned and daily counters reset if needed"
+    }
+}
+
+// -- Route Registration --
+troute(server, "GET",  "/health",             "health")
+troute(server, "GET",  "/tgateway/health",    "health")
+troute(server, "GET",  "/tgateway/providers", "tgateway_providers")
+troute(server, "GET",  "/tgateway/usage",     "tgateway_usage")
+troute(server, "GET",  "/tgateway/cache",     "tgateway_cache")
+troute(server, "GET",  "/tgateway/stats",     "tgateway_stats")
+troute(server, "POST", "/tgateway/call",      "tgateway_call")
+troute(server, "POST", "/tgateway/limit",     "tgateway_limit")
+troute(server, "POST", "/tgateway/clean",     "tgateway_clean")
+
+// -- Startup Banner --
+print("[TGateway] NovaX Ternary External API Gateway v" + VERSION + " starting...")
+print("[TGateway] PORT=" + str(PORT) + " | CACHE_MAX=3^5=" + str(CACHE_MAX) + " | CACHE_TTL=" + str(CACHE_TTL) + "s")
+print("[TGateway] RETRIES=H3=" + str(MAX_RETRIES) + " | BACKOFF=3,9,27s | BURST=H7=" + str(TOKEN_BURST))
+print("[TGateway] Providers: openai, github, web")
+print("[TGateway] Runtime: NovaLang | Ternary: TRUE | SSRF: protected")
+print("[TGateway] Cache cleaner: POST /tgateway/clean (was background thread)")
+print("[TGateway] Routes: GET /health, /tgateway/health, /tgateway/providers")
+print("[TGateway] Routes: GET /tgateway/usage, /tgateway/cache, /tgateway/stats")
+print("[TGateway] Routes: POST /tgateway/call, /tgateway/limit, /tgateway/clean")
+print("[TGateway] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13) + " BLOCK=" + str(BLOCK))
+
+tstart(server)

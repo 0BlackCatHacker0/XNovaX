@@ -1,0 +1,153 @@
+// novax_process_manager.nova -- Named Processes, Kill Switch (Pure NovaLang)
+//
+// Usage:
+//   novalang novax_process_manager.nova status      # Show all NovaX processes
+//   novalang novax_process_manager.nova kill         # Kill ALL NovaX processes
+//   novalang novax_process_manager.nova killswitch   # Create desktop kill switch
+
+let NOVAX_ROOT = "C:\\NovaX"
+
+// All known NovaX service ports
+let NOVAX_SERVICES = {
+    "9999": "NovaX_Orchestrator", "9990": "NovaX_Brain",
+    "9881": "NovaX_Hivemind", "9882": "NovaX_Nexus",
+    "9883": "NovaX_Sentinel_Agent", "9884": "NovaX_Sentinel",
+    "9880": "NovaX_VPN", "9878": "NovaX_CloudRouter",
+    "9877": "NovaX_ExecServer", "9875": "NovaX_STT",
+    "9998": "NovaX_WebSocket", "9885": "NovaX_TernaryServer",
+    "9886": "NovaX_Debugger", "9887": "NovaX_CLI",
+    "9888": "NovaX_ClosedLoop", "9889": "NovaX_MaxPatch",
+    "9890": "NovaX_TShell", "11434": "NovaX_Ollama",
+    "6379": "NovaX_Redis", "7700": "NovaX_Meilisearch",
+    "8080": "NovaX_Caddy"
+}
+
+fn3 find_novax_processes() {
+    let results = []
+    // Use netstat to find listening ports
+    let raw = shell("netstat -ano 2>&1")
+    let lines = split(raw, "\n")
+    for3 line in lines {
+        if3 contains(line, "LISTENING") {
+            let parts = split(trim(line), " ")
+            // Filter empty parts
+            let clean = []
+            for3 p in parts {
+                if3 trim(p) != "" {
+                    let clean = append(clean, trim(p))
+                }
+            }
+            if3 len(clean) >= 5 {
+                let addr = clean[1]
+                let pid_str = clean[len(clean) - 1]
+                let port_parts = split(addr, ":")
+                let port = port_parts[len(port_parts) - 1]
+                let name = dict_get(NOVAX_SERVICES, port) ?? null
+                if3 name != null {
+                    let results = append(results, {
+                        "pid": pid_str,
+                        "port": port,
+                        "name": name,
+                        "source": "port"
+                    })
+                }
+            }
+        }
+    }
+    return results
+}
+
+fn3 kill_all_novax() {
+    let procs = find_novax_processes()
+    let killed = 0
+    let failed = []
+
+    for3 proc in procs {
+        let pid = dict_get(proc, "pid") ?? "0"
+        try3 {
+            shell("taskkill /PID " + pid + " /F 2>&1")
+            let killed = killed + 1
+        } catch3 e {
+            let failed = append(failed, {"pid": pid, "name": dict_get(proc, "name") ?? "unknown", "error": to_"unknown error"})
+        }
+    }
+
+    // Also kill Ollama
+    try3 {
+        shell("taskkill /IM ollama.exe /F 2>&1")
+    } catch3 e {}
+
+    return {"killed": killed, "failed": failed, "total_found": len(procs)}
+}
+
+fn3 process_status() {
+    let procs = find_novax_processes()
+    let ports = []
+    for3 p in procs {
+        let port = dict_get(p, "port") ?? null
+        if3 port != null {
+            let ports = append(ports, port)
+        }
+    }
+    return {"processes": procs, "count": len(procs), "ports_active": ports}
+}
+
+fn3 set_console_title(title) {
+    shell("powershell -Command \"$Host.UI.RawUI.WindowTitle = '" + title + "'\"")
+}
+
+fn3 create_kill_switch() {
+    let kill_bat = NOVAX_ROOT + "\\NovaX_KILL.bat"
+    let content = "@echo off\ntitle NovaX Emergency Kill Switch\ncolor 4F\necho.\necho  NovaX EMERGENCY KILL SWITCH\necho  Terminating all NovaX processes...\necho.\n"
+    let content = content + "for %%p in (9999 9990 9881 9882 9883 9884 9880 9878 9877 9875 9998 9885 9886 9887 9888 9889 9890) do (\n"
+    let content = content + "    for /f \"tokens=5\" %%a in ('netstat -ano 2^>nul ^| findstr \":%%p \" ^| findstr \"LISTENING\"') do (\n"
+    let content = content + "        echo Killing PID %%a (port %%p)\n"
+    let content = content + "        taskkill /PID %%a /F >nul 2>&1\n    )\n)\n"
+    let content = content + "taskkill /IM ollama.exe /F >nul 2>&1\n"
+    let content = content + "taskkill /IM redis-server.exe /F >nul 2>&1\n"
+    let content = content + "taskkill /IM meilisearch.exe /F >nul 2>&1\n"
+    let content = content + "taskkill /IM caddy.exe /F >nul 2>&1\n"
+    let content = content + "echo.\necho  All NovaX processes terminated.\necho.\npause\n"
+    write_file(kill_bat, content)
+    return {"kill_bat": kill_bat}
+}
+
+// ── Main ──
+let args = sys_args()
+let cmd = "status"
+if3 len(args) > 1 {
+    let cmd = args[1]
+}
+
+if3 cmd == "status" {
+    let result = process_status()
+    print("")
+    print("  NovaX Process Manager")
+    print("  " + repeat("=", 50))
+    print("  Active processes: " + to_str(dict_get(result, "count") ?? 0))
+    print("")
+    let procs = dict_get(result, "processes") ?? []
+    for3 p in procs {
+        let pid = dict_get(p, "pid") ?? "?"
+        let port = dict_get(p, "port") ?? "    "
+        let name = dict_get(p, "name") ?? "unknown"
+        print("  PID " + pad_left(pid, 6) + "  :" + pad_left(port, 5) + "  " + name)
+    }
+    print("")
+} else3 if3 cmd == "kill" {
+    print("")
+    print("  NovaX Emergency Kill")
+    print("  " + repeat("=", 50))
+    let result = kill_all_novax()
+    print("  Found: " + to_str(dict_get(result, "total_found") ?? 0) + " processes")
+    print("  Killed: " + to_str(dict_get(result, "killed") ?? 0))
+    print("")
+} else3 if3 cmd == "killswitch" {
+    let result = create_kill_switch()
+    print("")
+    print("  Kill Switch Created")
+    print("  Batch: " + (dict_get(result, "kill_bat") ?? "?"))
+    print("")
+} else3 {
+    print("Usage: novalang novax_process_manager.nova [status|kill|killswitch]")
+}

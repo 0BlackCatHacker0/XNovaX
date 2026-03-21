@@ -1,0 +1,98 @@
+<script>
+var synth=window.speechSynthesis,voices=[],selV=null,rec=null;
+var micOn=false,speaking=false,processing=false;
+var aiStatus={brain:false,ollama:false};
+var SYS_PROMPT="You are Nova, a helpful female AI assistant with a warm personality. Keep responses concise for voice. Max 2-3 sentences.";
+
+function loadV(){
+  voices=synth.getVoices();if(!voices.length)return;
+  var s=document.getElementById("vsel");s.innerHTML="";
+  var fem=/zira|hazel|susan|samantha|karen|moira|fiona|kate|victoria|alice|anna|helena|heera|elsa|eva|cortana|jenny|aria|sonia|libby|sarah|amy|emma|joanna|kendra|ivy|female/i;
+  var sr=voices.slice().sort(function(a,b){var af=fem.test(a.name)?0:1,bf=fem.test(b.name)?0:1;return af!==bf?af-bf:a.name.localeCompare(b.name)});
+  for(var i=0;i<sr.length;i++){var v=sr[i],o=document.createElement("option");o.value=voices.indexOf(v);o.textContent=(fem.test(v.name)?"\u2605 ":"")+v.name+(v.lang?" ("+v.lang+")":"");s.appendChild(o)}
+  if(sr.length){selV=sr[0];s.value=voices.indexOf(sr[0])}
+  document.getElementById("vcnt").textContent=voices.length+" voices";
+}
+if(synth.onvoiceschanged!==undefined)synth.onvoiceschanged=loadV;
+setTimeout(loadV,300);setTimeout(loadV,1000);
+function pickVoice(){selV=voices[parseInt(document.getElementById("vsel").value)];say("Hello. I am Nova.")}
+
+function say(t){
+  synth.cancel();speaking=true;
+  var u=new SpeechSynthesisUtterance(t);
+  if(selV)u.voice=selV;
+  u.rate=parseFloat(document.getElementById("rsl").value)||1;u.pitch=1.1;
+  u.onstart=function(){document.getElementById("wv1").classList.add("on");document.getElementById("wv2").classList.add("on");stt("nst","Speaking","on");if(rec)try{rec.stop()}catch(e){}};
+  u.onend=function(){document.getElementById("wv1").classList.remove("on");document.getElementById("wv2").classList.remove("on");stt("nst","Ready","on");speaking=false;processing=false;if(micOn)setTimeout(function(){startListening()},400)};
+  synth.speak(u);
+}
+function stt(id,txt,c){document.getElementById(id).innerHTML="<span class=\"dot d"+c+"\"></span> "+txt}
+
+function buildRec(){
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){addM("s","Speech recognition not available.");return false}
+  rec=new SR();rec.continuous=true;rec.interimResults=false;rec.lang="en-US";rec.maxAlternatives=1;
+  rec.onresult=function(e){for(var i=e.resultIndex;i<e.results.length;i++){if(!e.results[i].isFinal)continue;var t=e.results[i][0].transcript.trim();if(!t)continue;var lower=t.toLowerCase();var hasWake=lower.indexOf("nova")!==-1;if(hasWake){var cmd=t.replace(/^(hey|ok|okay)?\s*nova[,.\s]*/i,"").trim();if(cmd.length>0){processVoice(cmd)}else{addM("n","Yes? I am listening.");say("Yes?")}}else{processVoice(t)}}};
+  rec.onerror=function(e){if(e.error==="not-allowed"||e.error==="permission-denied"){document.getElementById("pbanner").style.display="block";addM("s","Mic blocked. Click lock icon > Microphone > Allow > Reload.");micOff()}else if(e.error!=="aborted"&&e.error!=="no-speech"){addM("s","Mic error: "+e.error)}};
+  rec.onend=function(){if(micOn&&!speaking&&!processing)setTimeout(function(){if(micOn&&!speaking)startListening()},300)};
+  return true;
+}
+function startListening(){if(!rec&&!buildRec())return;if(speaking)return;try{rec.start()}catch(e){try{rec.abort()}catch(x){}setTimeout(function(){try{rec.start()}catch(y){}},200)}}
+
+function toggleMic(){if(micOn){micOff()}else{micEnable()}}
+function micEnable(){
+  navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){
+    stream.getTracks().forEach(function(t){t.stop()});
+    micOn=true;document.getElementById("mbtn").classList.add("live");document.getElementById("mbtn").classList.remove("hot");
+    document.getElementById("mlbl").textContent="Hands-Free Active";stt("mst","Mic Live","on");
+    document.getElementById("pbanner").style.display="none";
+    addM("s","Voice activated. Speak freely or say Nova.");startListening();
+  }).catch(function(){document.getElementById("pbanner").style.display="block";addM("s","Mic denied. Click lock icon > Microphone > Allow > Reload.")});
+}
+function micOff(){micOn=false;document.getElementById("mbtn").classList.remove("live","hot");document.getElementById("mlbl").textContent="Click to Enable Voice";stt("mst","Mic Off","off");try{rec.stop()}catch(e){}try{rec.abort()}catch(e){}addM("s","Voice deactivated.")}
+
+function processVoice(text){
+  if(!text||processing)return;processing=true;
+  document.getElementById("mbtn").classList.add("hot");addM("u",text);
+  if(text.charAt(0)==="!"){
+    fetch("http://localhost:9999/api/terminal",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({command:text.substring(1).trim(),timeout:15})}).then(function(r){return r.json()}).then(function(d){var o=(d.output||d.error||"No output").substring(0,800);addM("n",o);say("Command complete.")}).catch(function(){addM("n","Terminal offline.");say("Terminal offline.");processing=false;document.getElementById("mbtn").classList.remove("hot")});return;
+  }
+  tryAI(text);
+}
+
+function tryAI(text){
+  tryBrain(text).catch(function(){return tryOllama(text)}).catch(function(){
+    document.getElementById("mbtn").classList.remove("hot");
+    var f="Both AI services offline. I heard: "+text;addM("n",f);say(f);
+  });
+}
+function tryBrain(text){
+  return fetch("http://localhost:9990/v1/chat/completions",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"local",messages:[{role:"system",content:SYS_PROMPT},{role:"user",content:text}],max_tokens:200}),signal:AbortSignal.timeout(10000)}).then(function(r){if(!r.ok)throw new Error("brain "+r.status);return r.json()}).then(function(d){var r=d.choices&&d.choices[0]&&d.choices[0].message?d.choices[0].message.content:null;if(!r)throw new Error("empty");aiStatus.brain=true;document.getElementById("mbtn").classList.remove("hot");addM("n",r);say(r);updateAI()});
+}
+function tryOllama(text){
+  return fetch("http://localhost:11434/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"llama3:latest",messages:[{role:"system",content:SYS_PROMPT},{role:"user",content:text}],stream:false}),signal:AbortSignal.timeout(30000)}).then(function(r){if(!r.ok)throw new Error("ollama "+r.status);return r.json()}).then(function(d){var r=d.message&&d.message.content?d.message.content:null;if(!r)throw new Error("empty");aiStatus.ollama=true;document.getElementById("mbtn").classList.remove("hot");addM("n",r);say(r);updateAI()});
+}
+function updateAI(){
+  var el=document.getElementById("nst");
+  if(aiStatus.brain&&aiStatus.ollama)el.innerHTML="<span class=\"dot don\"></span> Both AI Online";
+  else if(aiStatus.brain)el.innerHTML="<span class=\"dot don\"></span> Brain Active";
+  else if(aiStatus.ollama)el.innerHTML="<span class=\"dot don\"></span> Ollama Active";
+  else el.innerHTML="<span class=\"dot doff\"></span> AI Offline";
+}
+setInterval(function(){
+  fetch("http://localhost:9990/health",{signal:AbortSignal.timeout(2000)}).then(function(){aiStatus.brain=true}).catch(function(){aiStatus.brain=false});
+  fetch("http://localhost:11434/api/tags",{signal:AbortSignal.timeout(2000)}).then(function(){aiStatus.ollama=true}).catch(function(){aiStatus.ollama=false});
+  updateAI();
+},10000);
+setTimeout(function(){fetch("http://localhost:11434/api/tags",{signal:AbortSignal.timeout(2000)}).then(function(){aiStatus.ollama=true;updateAI()}).catch(function(){})},2000);
+
+function addM(type,text){var c=document.getElementById("chat"),d=document.createElement("div");if(type==="u"){d.className="msg mu";d.textContent=text}else if(type==="n"){d.className="msg mn";d.innerHTML="<div class=\"tg\">Nova</div>"+esc(text)}else{d.className="msg ms";d.textContent=text}c.appendChild(d);c.scrollTop=c.scrollHeight;while(c.children.length>80)c.removeChild(c.firstChild)}
+function esc(t){var d=document.createElement("div");d.textContent=t;return d.innerHTML}
+function doSend(){var t=document.getElementById("tin").value.trim();if(t){processVoice(t);document.getElementById("tin").value=""}}
+
+window.addEventListener("load",function(){
+  addM("n","Hello. I am Nova. Click the microphone to enable hands-free voice. Say my name or speak freely.");
+  if(navigator.permissions&&navigator.permissions.query){navigator.permissions.query({name:"microphone"}).then(function(p){if(p.state==="granted")addM("s","Mic permission granted. Click the button to go live.")}).catch(function(){})}
+  setTimeout(function(){say("Hello. I am Nova. Click the microphone to enable voice.")},800);
+});
+</script></body></html>

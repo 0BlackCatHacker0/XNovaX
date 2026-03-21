@@ -1,0 +1,1394 @@
+// NovaX TSQLite Service v1.0 - Ternary SQLite Database Wrapper (NovaLang)
+// Port 9916: SQLite database operations through ternary-native micro-tools
+//
+// 7 ternary-native sqlite tools on 3-5-7-13 harmonic constants:
+//   1. /tsqlite/query   -- Run SELECT query, return rows
+//   2. /tsqlite/exec    -- Run INSERT/UPDATE/DELETE/CREATE, return affected rows
+//   3. /tsqlite/tables  -- List all tables in database
+//   4. /tsqlite/schema  -- Get schema for a table (columns, types, keys)
+//   5. /tsqlite/backup  -- Backup database to file
+//   6. /tsqlite/import  -- Import CSV data into table
+//   7. /tsqlite/export  -- Export table to CSV
+//
+// N-S Mapping:
+//   query_stream     = velocity_field (queries flowing through database)
+//   lock_pressure    = turbulent_energy (concurrent access contention)
+//   Reynolds(sqlite) = query_ops * H5
+//   RE_LAMINAR=27    = low query load (few ops)
+//   RE_TRANSITION=125= moderate query load
+//   RE_TURBULENT=343 = heavy query load
+//
+// Endpoints:
+//   GET  /health                -- Health check
+//   GET  /tsqlite/service-status -- Full service status with stats
+//   POST /tsqlite/query          -- Run SELECT query
+//   POST /tsqlite/exec           -- Run INSERT/UPDATE/DELETE/CREATE
+//   POST /tsqlite/tables         -- List all tables
+//   POST /tsqlite/schema         -- Get table schema
+//   POST /tsqlite/backup         -- Backup database
+//   POST /tsqlite/import         -- Import CSV into table
+//   POST /tsqlite/export         -- Export table to CSV
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9916
+let server = tserve(PORT, "TSQLite v1.0 - Ternary SQLite Database Wrapper")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE     = 2187
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+let TOOLS_COUNT    = 7
+let VERSION        = "1.0.0"
+let SERVICE_NAME   = "nova-tsqlite"
+let SQLITE_TIMEOUT = 13
+let DEFAULT_DB     = "C:\\NovaX\\data\\nova.db"
+
+// -- Global Stats --
+let stat_ops         = 0
+let stat_trit_true   = 0
+let stat_trit_maybe  = 0
+let stat_trit_false  = 0
+let stat_t0          = time()
+
+// by_tool counters (one per tool)
+let by_tool_query    = 0
+let by_tool_exec     = 0
+let by_tool_tables   = 0
+let by_tool_schema   = 0
+let by_tool_backup   = 0
+let by_tool_import   = 0
+let by_tool_export   = 0
+
+// -- Query cache (last N query hashes for dedup) --
+let _query_cache = {}
+
+// -- Dangerous SQL patterns for safety checks --
+let DANGEROUS_PATTERNS = "drop database;drop table;drop index;truncate;alter table drop;--;"
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_stat(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "query" {
+        by_tool_query = by_tool_query + 1
+    }
+    if3 tool_name == "exec" {
+        by_tool_exec = by_tool_exec + 1
+    }
+    if3 tool_name == "tables" {
+        by_tool_tables = by_tool_tables + 1
+    }
+    if3 tool_name == "schema" {
+        by_tool_schema = by_tool_schema + 1
+    }
+    if3 tool_name == "backup" {
+        by_tool_backup = by_tool_backup + 1
+    }
+    if3 tool_name == "import" {
+        by_tool_import = by_tool_import + 1
+    }
+    if3 tool_name == "export" {
+        by_tool_export = by_tool_export + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: run a shell command with standard timeout
+// Returns stripped output string
+// ===========================================================================
+fn run_cmd(cmd) {
+    let raw = nova_run(cmd, SQLITE_TIMEOUT)
+    let output = trim(str(raw))
+    return output
+}
+
+// ===========================================================================
+// HELPER: check if output indicates a python/sqlite error
+// ===========================================================================
+fn is_db_error(output) {
+    let lc = lower(output)
+    if3 contains(lc, "error") {
+        return true
+    }
+    if3 contains(lc, "traceback") {
+        return true
+    }
+    if3 contains(lc, "exception") {
+        return true
+    }
+    if3 contains(lc, "no such table") {
+        return true
+    }
+    if3 contains(lc, "syntax error") {
+        return true
+    }
+    if3 contains(lc, "operational") {
+        if3 contains(lc, "error") {
+            return true
+        }
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: validate SQL for dangerous patterns
+// Returns true if SQL is safe, false if dangerous
+// ===========================================================================
+fn is_sql_safe(sql) {
+    let lc = lower(sql)
+    // Check for dangerous patterns
+    if3 contains(lc, "drop database") {
+        return false
+    }
+    if3 contains(lc, "drop table") {
+        return false
+    }
+    if3 contains(lc, "drop index") {
+        return false
+    }
+    if3 contains(lc, "truncate") {
+        return false
+    }
+    // Check for SQL comment injection
+    if3 contains(lc, "--") {
+        return false
+    }
+    if3 contains(lc, "/*") {
+        return false
+    }
+    return true
+}
+
+// ===========================================================================
+// HELPER: check if SQL is a SELECT query (read-only)
+// ===========================================================================
+fn is_select_query(sql) {
+    let lc = lower(trim(sql))
+    if3 starts_with(lc, "select") {
+        return true
+    }
+    if3 starts_with(lc, "pragma") {
+        return true
+    }
+    if3 starts_with(lc, "explain") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: check if SQL is a write operation
+// ===========================================================================
+fn is_write_query(sql) {
+    let lc = lower(trim(sql))
+    if3 starts_with(lc, "insert") {
+        return true
+    }
+    if3 starts_with(lc, "update") {
+        return true
+    }
+    if3 starts_with(lc, "delete") {
+        return true
+    }
+    if3 starts_with(lc, "create") {
+        return true
+    }
+    if3 starts_with(lc, "alter") {
+        return true
+    }
+    if3 starts_with(lc, "replace") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: escape single quotes for SQL (doubles them per SQL standard)
+// ===========================================================================
+fn escape_sql(sql) {
+    let result = replace(sql, "'", "''")
+    return result
+}
+
+// ===========================================================================
+// HELPER: normalize path (forward slashes for sqlite3.exe)
+// ===========================================================================
+fn escape_path(path) {
+    return replace(path, "\\", "/")
+}
+
+// ===========================================================================
+// HELPER: path for shell commands (backslashes)
+// ===========================================================================
+fn win_path(path) {
+    return replace(path, "/", "\\")
+}
+
+// ===========================================================================
+// HELPER: run SQL via sqlite3.exe CLI (pure NovaLang, zero Python)
+// Writes SQL to temp file to avoid quoting issues, returns JSON output
+// ===========================================================================
+let SQLITE3 = "C:/NovaX/tools/sqlite3.exe"
+
+fn run_sql_query(db_path, sql) {
+    // Write SQL to temp file
+    let sql_file = "C:/NovaX/temp/tsql_" + str(int(time() * 1000)) + ".sql"
+    nova_write(sql_file, sql)
+    let cmd = SQLITE3 + " -json \"" + db_path + "\" < \"" + win_path(sql_file) + "\""
+    let output = trim(shell(cmd))
+    shell("del /q \"" + win_path(sql_file) + "\" 2>NUL")
+    return output
+}
+
+fn run_sql_exec(db_path, sql) {
+    // Write SQL to temp file for exec (non-query) commands
+    let sql_file = "C:/NovaX/temp/tsql_" + str(int(time() * 1000)) + ".sql"
+    nova_write(sql_file, sql)
+    let cmd = SQLITE3 + " \"" + db_path + "\" < \"" + win_path(sql_file) + "\""
+    let output = trim(shell(cmd))
+    shell("del /q \"" + win_path(sql_file) + "\" 2>NUL")
+    return output
+}
+
+fn run_sql_dot(db_path, dot_commands) {
+    // Run dot-commands via temp file
+    let sql_file = "C:/NovaX/temp/tsql_" + str(int(time() * 1000)) + ".sql"
+    nova_write(sql_file, dot_commands)
+    let cmd = SQLITE3 + " \"" + db_path + "\" < \"" + win_path(sql_file) + "\""
+    let output = trim(shell(cmd))
+    shell("del /q \"" + win_path(sql_file) + "\" 2>NUL")
+    return output
+}
+
+// ===========================================================================
+// TOOL 1: POST /tsqlite/query
+// Run SELECT query, return rows
+// Body: {db: "path/to/db", sql: "SELECT ..."}
+// Trit: +1=rows returned, 0=empty result, -1=error
+// ===========================================================================
+fn handle_query(body) {
+    let db_path = dict_get(body, "db") ?? DEFAULT_DB
+    let sql = dict_get(body, "sql") ?? ""
+
+    // Validate SQL present
+    if3 len(sql) == 0 {
+        record_stat("query", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "query",
+            "db": db_path,
+            "sql": sql,
+            "rows": [],
+            "row_count": 0,
+            "error": "sql parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Validate it is a SELECT-type query
+    if3 is_select_query(sql) == false {
+        record_stat("query", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "query",
+            "db": db_path,
+            "sql": sql,
+            "rows": [],
+            "row_count": 0,
+            "error": "query endpoint only accepts SELECT/PRAGMA/EXPLAIN statements. Use /tsqlite/exec for write operations.",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Safety check
+    if3 is_sql_safe(sql) == false {
+        record_stat("query", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "query",
+            "db": db_path,
+            "sql": sql,
+            "rows": [],
+            "row_count": 0,
+            "error": "SQL contains dangerous patterns (DROP/TRUNCATE/comment injection). Blocked for safety.",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Pure NovaLang: run SELECT via sqlite3.exe CLI (zero Python)
+    let output = run_sql_query(db_path, sql)
+
+    // Check for errors in output
+    if3 is_db_error(output) == true {
+        record_stat("query", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "query",
+            "db": db_path,
+            "sql": sql,
+            "rows": [],
+            "row_count": 0,
+            "error": "command execution failed",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 is_db_error(output) == true {
+        record_stat("query", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "query",
+            "db": db_path,
+            "sql": sql,
+            "rows": [],
+            "row_count": 0,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // sqlite3 -json returns a JSON array of objects: [{col:val,...},...]
+    // Parse to get row count
+    let row_count = 0
+    let parsed_rows = []
+    if3 len(output) > 2 {
+        let try_parse = try3 { json_decode(output) } { [] }
+        parsed_rows = try_parse
+        row_count = len(parsed_rows)
+    }
+
+    // Determine trit
+    let query_trit = T_TRUE
+    if3 row_count == 0 {
+        query_trit = T_MAYBE
+    }
+
+    // Reynolds from query ops
+    let re = stat_ops * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    record_stat("query", query_trit)
+    return {
+        "ok": true,
+        "tool": "query",
+        "db": db_path,
+        "sql": sql,
+        "result": output,
+        "row_count": row_count,
+        "reynolds": re,
+        "regime": regime,
+        "trit": query_trit,
+        "char": bt_one(query_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 2: POST /tsqlite/exec
+// Run INSERT/UPDATE/DELETE/CREATE, return affected rows
+// Body: {db: "path", sql: "INSERT ...", allow_dangerous: false}
+// Trit: +1=rows affected, 0=no rows affected, -1=error
+// ===========================================================================
+fn handle_exec(body) {
+    let db_path = dict_get(body, "db") ?? DEFAULT_DB
+    let sql = dict_get(body, "sql") ?? ""
+    let allow_dangerous = dict_get(body, "allow_dangerous") ?? false
+
+    // Validate SQL present
+    if3 len(sql) == 0 {
+        record_stat("exec", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "exec",
+            "db": db_path,
+            "sql": sql,
+            "affected_rows": 0,
+            "error": "sql parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Prevent SELECT through exec endpoint
+    if3 is_select_query(sql) == true {
+        record_stat("exec", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "exec",
+            "db": db_path,
+            "sql": sql,
+            "affected_rows": 0,
+            "error": "exec endpoint does not accept SELECT statements. Use /tsqlite/query instead.",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Safety check (unless explicitly allowed)
+    if3 allow_dangerous == false {
+        if3 is_sql_safe(sql) == false {
+            record_stat("exec", T_FALSE)
+            return {
+                "ok": false,
+                "tool": "exec",
+                "db": db_path,
+                "sql": sql,
+                "affected_rows": 0,
+                "error": "SQL contains dangerous patterns (DROP/TRUNCATE/comment injection). Set allow_dangerous=true to override.",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+    }
+
+    // Pure NovaLang: run SQL via sqlite3.exe CLI, then get changes() (zero Python)
+    let exec_output = run_sql_exec(db_path, sql)
+
+    if3 is_db_error(exec_output) == true {
+        record_stat("exec", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "exec",
+            "db": db_path,
+            "sql": sql,
+            "affected_rows": 0,
+            "error": exec_output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Get affected rows via changes() and last_insert_rowid()
+    let changes_output = run_sql_query(db_path, "SELECT changes() as affected_rows, last_insert_rowid() as lastrowid")
+    let affected_rows = 0
+    let lastrowid = 0
+    if3 len(changes_output) > 2 {
+        let changes_data = try3 { json_decode(changes_output) } { [] }
+        if3 len(changes_data) > 0 {
+            affected_rows = to_int(str(dict_get(changes_data[0], "affected_rows") ?? 0))
+            lastrowid = to_int(str(dict_get(changes_data[0], "lastrowid") ?? 0))
+        }
+    }
+    let output = exec_output
+
+    // Determine trit
+    let exec_trit = T_TRUE
+    if3 affected_rows == 0 {
+        // CREATE TABLE returns 0 affected rows but is still success
+        let lc_sql = lower(trim(sql))
+        if3 starts_with(lc_sql, "create") {
+            exec_trit = T_TRUE
+        }
+        if3 starts_with(lc_sql, "create") == false {
+            exec_trit = T_MAYBE
+        }
+    }
+
+    // Reynolds from ops
+    let re = stat_ops * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    record_stat("exec", exec_trit)
+    return {
+        "ok": true,
+        "tool": "exec",
+        "db": db_path,
+        "sql": sql,
+        "affected_rows": affected_rows,
+        "lastrowid": lastrowid,
+        "result": output,
+        "reynolds": re,
+        "regime": regime,
+        "trit": exec_trit,
+        "char": bt_one(exec_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 3: POST /tsqlite/tables
+// List all tables in database
+// Body: {db: "path"}
+// Trit: +1=tables found, 0=no tables, -1=error
+// ===========================================================================
+fn handle_tables(body) {
+    let db_path = dict_get(body, "db") ?? DEFAULT_DB
+
+    // Pure NovaLang: list tables via sqlite3.exe CLI (zero Python)
+    let output = run_sql_query(db_path, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+
+    if3 is_db_error(output) == true {
+        record_stat("tables", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "tables",
+            "db": db_path,
+            "tables": [],
+            "table_count": 0,
+            "error": "command execution failed",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 is_db_error(output) == true {
+        record_stat("tables", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "tables",
+            "db": db_path,
+            "tables": [],
+            "table_count": 0,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse table count from sqlite3 -json output (array of {name: ...})
+    let table_count = 0
+    if3 len(output) > 2 {
+        let tables_parsed = try3 { json_decode(output) } { [] }
+        table_count = len(tables_parsed)
+    }
+
+    // Determine trit
+    let tables_trit = T_TRUE
+    if3 table_count == 0 {
+        tables_trit = T_MAYBE
+    }
+
+    record_stat("tables", tables_trit)
+    return {
+        "ok": true,
+        "tool": "tables",
+        "db": db_path,
+        "result": output,
+        "table_count": table_count,
+        "trit": tables_trit,
+        "char": bt_one(tables_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 4: POST /tsqlite/schema
+// Get schema for a table (columns, types, keys)
+// Body: {db: "path", table: "table_name"}
+// Trit: +1=schema returned, 0=table exists but empty schema, -1=error
+// ===========================================================================
+fn handle_schema(body) {
+    let db_path = dict_get(body, "db") ?? DEFAULT_DB
+    let table = dict_get(body, "table") ?? ""
+
+    // Validate table name
+    if3 len(table) == 0 {
+        record_stat("schema", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "schema",
+            "db": db_path,
+            "table": "",
+            "columns": [],
+            "column_count": 0,
+            "error": "table parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Safety: validate table name (alphanumeric + underscore only)
+    let safe_table = table
+    let lc_table = lower(table)
+    if3 contains(lc_table, ";") {
+        record_stat("schema", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "schema",
+            "db": db_path,
+            "table": table,
+            "columns": [],
+            "column_count": 0,
+            "error": "invalid table name: contains disallowed characters",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+    if3 contains(lc_table, "'") {
+        record_stat("schema", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "schema",
+            "db": db_path,
+            "table": table,
+            "columns": [],
+            "column_count": 0,
+            "error": "invalid table name: contains disallowed characters",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+    if3 contains(lc_table, "\"") {
+        record_stat("schema", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "schema",
+            "db": db_path,
+            "table": table,
+            "columns": [],
+            "column_count": 0,
+            "error": "invalid table name: contains disallowed characters",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Pure NovaLang: get schema via sqlite3.exe PRAGMA table_info (zero Python)
+    let output = run_sql_query(db_path, "PRAGMA table_info(" + safe_table + ")")
+
+    if3 is_db_error(output) == true {
+        record_stat("schema", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "schema",
+            "db": db_path,
+            "table": table,
+            "columns": [],
+            "column_count": 0,
+            "error": "command execution failed",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 is_db_error(output) == true {
+        record_stat("schema", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "schema",
+            "db": db_path,
+            "table": table,
+            "columns": [],
+            "column_count": 0,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse column count from sqlite3 -json output
+    let column_count = 0
+    if3 len(output) > 2 {
+        let cols_parsed = try3 { json_decode(output) } { [] }
+        column_count = len(cols_parsed)
+    }
+
+    // Determine trit
+    let schema_trit = T_TRUE
+    if3 column_count == 0 {
+        schema_trit = T_MAYBE
+    }
+
+    record_stat("schema", schema_trit)
+    return {
+        "ok": true,
+        "tool": "schema",
+        "db": db_path,
+        "table": table,
+        "result": output,
+        "column_count": column_count,
+        "trit": schema_trit,
+        "char": bt_one(schema_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 5: POST /tsqlite/backup
+// Backup database to file
+// Body: {db: "path", backup_path: "path/to/backup.db"}
+// Trit: +1=backup success, 0=backup exists (overwritten), -1=error
+// ===========================================================================
+fn handle_backup(body) {
+    let db_path = dict_get(body, "db") ?? DEFAULT_DB
+    let backup_path = dict_get(body, "backup_path") ?? ""
+
+    // Generate default backup path if not provided
+    if3 len(backup_path) == 0 { ts = str(int(time()))
+        backup_path = "C:\\NovaX\\data\\nova_backup_" + ts + ".db"
+    }
+
+    // Pure NovaLang: check backup exists via shell (zero Python)
+    let win_backup = win_path(backup_path)
+    let check_res = trim(shell("if exist \"" + win_backup + "\" (echo exists) else (echo new)"))
+
+    let backup_existed = false
+    if3 contains(check_res, "exists") {
+        backup_existed = true
+    }
+
+    // Use sqlite3.exe .backup command (zero Python)
+    let backup_output = run_sql_dot(db_path, ".backup " + backup_path)
+
+    if3 is_db_error(backup_output) == true {
+        record_stat("backup", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "backup",
+            "db": db_path,
+            "backup_path": backup_path,
+            "error": backup_output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Get backup file size via shell
+    let size_bytes = 0
+    let size_result = trim(shell("for %I in (\"" + win_backup + "\") do @echo %~zI"))
+    if3 len(size_result) > 0 {
+        size_bytes = to_int(size_result)
+    }
+    let output = "{\"status\":\"ok\",\"size_bytes\":" + str(size_bytes) + "}"
+
+    // Determine trit
+    let backup_trit = T_TRUE
+    if3 backup_existed == true {
+        backup_trit = T_MAYBE
+    }
+
+    record_stat("backup", backup_trit)
+    return {
+        "ok": true,
+        "tool": "backup",
+        "db": db_path,
+        "backup_path": backup_path,
+        "size_bytes": size_bytes,
+        "overwritten": backup_existed,
+        "result": output,
+        "trit": backup_trit,
+        "char": bt_one(backup_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 6: POST /tsqlite/import
+// Import CSV data into table
+// Body: {db: "path", table: "table_name", file: "path/to/data.csv",
+//        create_table: true, delimiter: ","}
+// Trit: +1=rows imported, 0=no rows imported, -1=error
+// ===========================================================================
+fn handle_import(body) {
+    let db_path = dict_get(body, "db") ?? DEFAULT_DB
+    let table = dict_get(body, "table") ?? ""
+    let file = dict_get(body, "file") ?? ""
+    let create_table = dict_get(body, "create_table") ?? true
+    let delimiter = dict_get(body, "delimiter") ?? ","
+
+    // Validate params
+    if3 len(table) == 0 {
+        record_stat("import", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "import",
+            "db": db_path,
+            "table": "",
+            "file": file,
+            "rows_imported": 0,
+            "error": "table parameter required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(file) == 0 {
+        record_stat("import", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "import",
+            "db": db_path,
+            "table": table,
+            "file": "",
+            "rows_imported": 0,
+            "error": "file parameter required (path to CSV file)",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Safety: validate table name
+    let lc_table = lower(table)
+    if3 contains(lc_table, ";") {
+        record_stat("import", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "import",
+            "db": db_path,
+            "table": table,
+            "file": file,
+            "rows_imported": 0,
+            "error": "invalid table name",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+    if3 contains(lc_table, "'") {
+        record_stat("import", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "import",
+            "db": db_path,
+            "table": table,
+            "file": file,
+            "rows_imported": 0,
+            "error": "invalid table name",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Pure NovaLang: import CSV via sqlite3.exe CLI .import command (zero Python)
+    // Build dot-commands for import
+    let dot_cmds = ".mode csv\n.separator \"" + delimiter + "\"\n"
+    if3 create_table == true {
+        // Read header line to create table with TEXT columns
+        let header_raw = read_file(file)
+        let header_lines = split(header_raw, "\n")
+        if3 len(header_lines) > 0 {
+            let header_line = trim(header_lines[0])
+            let header_cols = split(header_line, delimiter)
+            let col_defs = ""
+            let ci = 0
+            while3 ci < len(header_cols) {
+                let col_name = trim(header_cols[ci])
+                // Remove surrounding quotes if present
+                if3 starts_with(col_name, "\"") {
+                    col_name = slice(col_name, 1, len(col_name) - 1)
+                }
+                if3 ci > 0 {
+                    col_defs = col_defs + ", "
+                }
+                col_defs = col_defs + col_name + " TEXT"
+                ci = ci + 1
+            }
+            dot_cmds = dot_cmds + "CREATE TABLE IF NOT EXISTS " + table + " (" + col_defs + ");\n"
+        }
+    }
+    dot_cmds = dot_cmds + ".import " + file + " " + table + "\n"
+
+    let output = run_sql_dot(db_path, dot_cmds)
+
+    // Count rows after import
+    let count_output = run_sql_query(db_path, "SELECT COUNT(*) as cnt FROM " + table)
+    let rows_count_result = try3 { json_decode(count_output) } { [] }
+    let post_import_count = 0
+    if3 len(rows_count_result) > 0 {
+        post_import_count = to_int(str(dict_get(rows_count_result[0], "cnt") ?? 0))
+    }
+
+    if3 is_db_error(output) == true {
+        record_stat("import", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "import",
+            "db": db_path,
+            "table": table,
+            "file": file,
+            "rows_imported": 0,
+            "error": "import command execution failed",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 is_db_error(output) == true {
+        record_stat("import", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "import",
+            "db": db_path,
+            "table": table,
+            "file": file,
+            "rows_imported": 0,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Rows imported = total count after import (best approximation with CLI)
+    let rows_imported = post_import_count
+
+    // Determine trit
+    let import_trit = T_TRUE
+    if3 rows_imported == 0 {
+        import_trit = T_MAYBE
+    }
+
+    // Reynolds from import size
+    let re = rows_imported * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    record_stat("import", import_trit)
+    return {
+        "ok": true,
+        "tool": "import",
+        "db": db_path,
+        "table": table,
+        "file": file,
+        "rows_imported": rows_imported,
+        "result": output,
+        "reynolds": re,
+        "regime": regime,
+        "trit": import_trit,
+        "char": bt_one(import_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 7: POST /tsqlite/export
+// Export table to CSV
+// Body: {db: "path", table: "table_name", file: "path/to/output.csv",
+//        sql: "SELECT ..." (optional, overrides table)}
+// Trit: +1=rows exported, 0=no rows exported, -1=error
+// ===========================================================================
+fn handle_export(body) {
+    let db_path = dict_get(body, "db") ?? DEFAULT_DB
+    let table = dict_get(body, "table") ?? ""
+    let file = dict_get(body, "file") ?? ""
+    let custom_sql = dict_get(body, "sql") ?? ""
+
+    // Validate: need either table or custom sql
+    if3 len(table) == 0 {
+        if3 len(custom_sql) == 0 {
+            record_stat("export", T_FALSE)
+            return {
+                "ok": false,
+                "tool": "export",
+                "db": db_path,
+                "table": "",
+                "file": file,
+                "rows_exported": 0,
+                "error": "table or sql parameter required",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+    }
+
+    // Validate file path
+    if3 len(file) == 0 {
+        // Generate default export path
+        let ts = str(int(time()))
+        let export_name = table
+        if3 len(export_name) == 0 {
+            export_name = "export"
+        }
+        file = "C:\\NovaX\\data\\" + export_name + "_" + ts + ".csv"
+    }
+
+    // Safety: validate table name if provided
+    if3 len(table) > 0 { lc_table = lower(table)
+        if3 contains(lc_table, ";") {
+            record_stat("export", T_FALSE)
+            return {
+                "ok": false,
+                "tool": "export",
+                "db": db_path,
+                "table": table,
+                "file": file,
+                "rows_exported": 0,
+                "error": "invalid table name",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+        if3 contains(lc_table, "'") {
+            record_stat("export", T_FALSE)
+            return {
+                "ok": false,
+                "tool": "export",
+                "db": db_path,
+                "table": table,
+                "file": file,
+                "rows_exported": 0,
+                "error": "invalid table name",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+    }
+
+    // Determine the SQL to use
+    let export_sql = "SELECT * FROM " + table
+    if3 len(custom_sql) > 0 {
+        export_sql = custom_sql
+    }
+
+    // Safety check on custom SQL
+    if3 is_sql_safe(export_sql) == false {
+        record_stat("export", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "export",
+            "db": db_path,
+            "table": table,
+            "file": file,
+            "rows_exported": 0,
+            "error": "SQL contains dangerous patterns. Blocked for safety.",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Pure NovaLang: export to CSV via sqlite3.exe CLI (zero Python)
+    let win_file = win_path(file)
+    let dot_cmds = ".headers on\n.mode csv\n.output " + file + "\n" + export_sql + ";\n.output stdout\n"
+    let output = run_sql_dot(db_path, dot_cmds)
+
+    if3 is_db_error(output) == true {
+        record_stat("export", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "export",
+            "db": db_path,
+            "table": table,
+            "file": file,
+            "rows_exported": 0,
+            "error": "export command execution failed",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 is_db_error(output) == true {
+        record_stat("export", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "export",
+            "db": db_path,
+            "table": table,
+            "file": file,
+            "rows_exported": 0,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Count rows in exported file (lines - 1 for header)
+    let rows_exported = 0
+    let export_content = read_file(file)
+    if3 len(export_content) > 0 {
+        let export_lines = split(export_content, "\n")
+        rows_exported = len(export_lines) - 1
+        if3 rows_exported < 0 {
+            rows_exported = 0
+        }
+        // Subtract trailing empty line if present
+        if3 len(export_lines) > 0 {
+            if3 len(trim(export_lines[len(export_lines) - 1])) == 0 {
+                rows_exported = rows_exported - 1
+            }
+        }
+    }
+
+    // Determine trit
+    let export_trit = T_TRUE
+    if3 rows_exported == 0 {
+        export_trit = T_MAYBE
+    }
+
+    record_stat("export", export_trit)
+    return {
+        "ok": true,
+        "tool": "export",
+        "db": db_path,
+        "table": table,
+        "file": file,
+        "rows_exported": rows_exported,
+        "result": output,
+        "trit": export_trit,
+        "char": bt_one(export_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// ROUTE HANDLER WRAPPERS
+// These extract body from request and delegate to tool handlers
+// ===========================================================================
+
+fn route_query(req) {
+    let body = treq_body(req)
+    return handle_query(body)
+}
+
+fn route_exec(req) {
+    let body = treq_body(req)
+    return handle_exec(body)
+}
+
+fn route_tables(req) {
+    let body = treq_body(req)
+    return handle_tables(body)
+}
+
+fn route_schema(req) {
+    let body = treq_body(req)
+    return handle_schema(body)
+}
+
+fn route_backup(req) {
+    let body = treq_body(req)
+    return handle_backup(body)
+}
+
+fn route_import(req) {
+    let body = treq_body(req)
+    return handle_import(body)
+}
+
+fn route_export(req) {
+    let body = treq_body(req)
+    return handle_export(body)
+}
+
+// ===========================================================================
+// GET /health -- Standard health endpoint
+// ===========================================================================
+fn health() {
+    let uptime = time() - stat_t0
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        self_trit = T_TRUE
+    }
+
+    // Quick DB connectivity check via sqlite3.exe (pure NovaLang, zero Python)
+    let db_ok = true
+    let check_output = run_sql_exec(DEFAULT_DB, "SELECT 1;")
+    if3 is_db_error(check_output) == true {
+        db_ok = false
+        self_trit = T_FALSE
+    }
+
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "default_db", DEFAULT_DB)
+    resp = dict_set(resp, "db_accessible", db_ok)
+    resp = dict_set(resp, "self_trit", self_trit)
+    resp = dict_set(resp, "char", bt_one(self_trit))
+    resp = dict_set(resp, "uptime_s", uptime)
+    resp = dict_set(resp, "quality", {"strong": stat_trit_true, "partial": stat_trit_maybe, "failed": stat_trit_false})
+    return resp
+}
+
+// ===========================================================================
+// GET /tsqlite/service-status -- Full service status with stats
+// ===========================================================================
+fn tsqlite_service_status() {
+    let uptime = time() - stat_t0
+
+    // Service Reynolds from total ops (N-S: query_ops * H5)
+    let re = stat_ops * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    // Lock pressure Reynolds (errors indicate contention)
+    let lock_re = stat_trit_false * H5
+    if3 lock_re > 999 {
+        lock_re = 999
+    }
+    let lock_regime = flow_regime(lock_re)
+
+    // System trit
+    let sys_trit = T_TRUE
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    let by_tool = {}
+    by_tool = dict_set(by_tool, "query", by_tool_query)
+    by_tool = dict_set(by_tool, "exec", by_tool_exec)
+    by_tool = dict_set(by_tool, "tables", by_tool_tables)
+    by_tool = dict_set(by_tool, "schema", by_tool_schema)
+    by_tool = dict_set(by_tool, "backup", by_tool_backup)
+    by_tool = dict_set(by_tool, "import", by_tool_import)
+    by_tool = dict_set(by_tool, "export", by_tool_export)
+
+    // DB file info via shell (pure NovaLang, zero Python)
+    let db_size = 0
+    let win_db = win_path(DEFAULT_DB)
+    let size_output = trim(shell("for %I in (\"" + win_db + "\") do @echo %~zI"))
+    if3 len(size_output) > 0 {
+        db_size = to_int(size_output)
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "total_ops": stat_ops,
+        "by_tool": by_tool,
+        "trits": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        },
+        "default_db": DEFAULT_DB,
+        "db_size_bytes": db_size,
+        "ns_flow": {
+            "query_stream_reynolds": re,
+            "query_stream_regime": regime,
+            "lock_pressure_reynolds": lock_re,
+            "lock_pressure_regime": lock_regime
+        },
+        "reynolds": re,
+        "regime": regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE
+    }
+}
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+troute(server, "GET",  "/health",                 "health")
+troute(server, "GET",  "/tsqlite/service-status",  "tsqlite_service_status")
+troute(server, "POST", "/tsqlite/query",           "handle_query")
+troute(server, "POST", "/tsqlite/exec",            "handle_exec")
+troute(server, "POST", "/tsqlite/tables",          "handle_tables")
+troute(server, "POST", "/tsqlite/schema",          "handle_schema")
+troute(server, "POST", "/tsqlite/backup",          "handle_backup")
+troute(server, "POST", "/tsqlite/import",          "handle_import")
+troute(server, "POST", "/tsqlite/export",          "handle_export")
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[TSQLite] NovaX Ternary SQLite Database Wrapper v" + VERSION + " on port " + str(PORT))
+print("[TSQLite] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[TSQLite] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TSQLite] Re boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TSQLite] N-S: query_stream=velocity_field | lock_pressure=turbulent_energy | Re=query_ops*H5")
+print("[TSQLite] Default database: " + DEFAULT_DB)
+print("[TSQLite] SQLite timeout: " + str(SQLITE_TIMEOUT) + "s (H13)")
+print("[TSQLite] SQL safety: DROP/TRUNCATE/comment injection blocked by default")
+print("[TSQLite] Routes: /health, /tsqlite/service-status")
+print("[TSQLite]         /tsqlite/query, /tsqlite/exec, /tsqlite/tables, /tsqlite/schema")
+print("[TSQLite]         /tsqlite/backup, /tsqlite/import, /tsqlite/export")
+print("[TSQLite] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

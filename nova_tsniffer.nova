@@ -1,0 +1,240 @@
+// Nova TSniffer v1.0 - Process Immune System (N-S Flow Model)
+// Port 9926: Monitors for python.exe (blue window) processes
+// Uses Navier-Stokes Reynolds classification to detect, classify, eliminate
+//
+// N-S Mapping:
+//   process_flow = velocity_field
+//   python.exe = turbulent_particles (bad)
+//   pythonw.exe = laminar_particles (good)
+//   Reynolds = threat_count * respawn_rate
+//   Re < 27 (H3^3) = laminar (safe)
+//   27 < Re < 343 (H7^3) = transitional (warning)
+//   Re > 343 = turbulent (critical - active respawn attack)
+
+let PORT = 9926
+let server = tserve(PORT, "TSniffer v1.0 - N-S Process Immune System")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let RE_LAMINAR = 27     // H3^3 - safe boundary
+let RE_TURBULENT = 343  // H7^3 - critical boundary
+let SCAN_INTERVAL = 13  // H13 seconds between auto-scans
+
+// -- Stats --
+let total_scans = 0
+let total_kills = 0
+let total_threats = 0
+let last_reynolds = 0
+let last_regime = "unknown"
+let recent_kills = 0
+
+// -- Detect python.exe processes (NOT pythonw.exe) --
+fn detect_threats() {
+    // Use tasklist to find python.exe - pipe through findstr to exclude pythonw
+    let raw = nova_run("tasklist /FI \"IMAGENAME eq python.exe\" /FO CSV /NH 2>nul", 10)
+    let lines = split(str(raw), "\n")
+    let threats = []
+    for3 line in lines {
+        let trimmed = strip(line)
+        // Skip empty lines and pythonw entries
+        if3 len(trimmed) > 10 {
+            if3 contains(trimmed, "python.exe") {
+                if3 contains(trimmed, "pythonw") == FALSE {
+                    // Parse CSV: "python.exe","PID","Session","Num","Mem"
+                    let clean = replace(trimmed, "\"", "")
+                    let parts = split(clean, ",")
+                    if3 len(parts) >= 2 {
+                        let pid = strip(parts[1])
+                        threats = append(threats, pid)
+                    }
+                }
+            }
+        }
+    }
+    return threats
+}
+
+// -- Kill a single PID (NO PowerShell - direct taskkill) --
+fn kill_threat(pid) {
+    let cmd = "taskkill /F /PID " + str(pid)
+    let result = nova_run(cmd, 5)
+    if3 contains(str(result), "SUCCESS") {
+        return TRUE    // +1: killed
+    } else contains(str(result), "not found") {
+        return MAYBE   // 0: already dead
+    } else {
+        return FALSE   // -1: failed to kill
+    }
+}
+
+// -- Get port for a PID --
+fn get_pid_port(pid) {
+    let raw = nova_run("netstat -ano 2>nul | findstr LISTENING | findstr " + str(pid), 5)
+    let lines = split(str(raw), "\n")
+    for3 line in lines {
+        let trimmed = strip(line)
+        if3 len(trimmed) > 5 {
+            let parts = split(trimmed, " ")
+            if3 len(parts) >= 2 {
+                let addr = parts[1]
+                if3 contains(addr, ":") {
+                    let addr_parts = split(addr, ":")
+                    return strip(addr_parts[len(addr_parts) - 1])
+                }
+            }
+        }
+    }
+    return "none"
+}
+
+// -- N-S Reynolds Calculation --
+fn calculate_reynolds(threats_found, kills_done) {
+    // Re = threats * (kills / scan_interval) - flow turbulence metric
+    let rate = kills_done
+    let re = threats_found * rate
+    let regime = "laminar"
+    if3 re > RE_TURBULENT {
+        let regime = "turbulent"
+    }
+    if3 re > RE_LAMINAR {
+        if3 re <= RE_TURBULENT {
+            let regime = "transitional"
+        }
+    }
+    let last_reynolds = re
+    let last_regime = regime
+    return {"reynolds": re, "regime": regime}
+}
+
+// -- Core Scan: Detect + Classify + Eliminate --
+fn scan_and_kill() {
+    let threats = detect_threats()
+    let threat_count = len(threats)
+    let killed = 0
+    let kill_log = []
+
+    for3 pid in threats {
+        let port = get_pid_port(pid)
+        let trit = kill_threat(pid)
+
+        if3 trit == TRUE { killed = killed + 1
+            kill_log = append(kill_log, {"pid": pid, "port": port, "trit": 1, "status": "eliminated"})
+        } else trit == MAYBE {
+            kill_log = append(kill_log, {"pid": pid, "port": port, "trit": 0, "status": "already_dead"})
+        } else {
+            kill_log = append(kill_log, {"pid": pid, "port": port, "trit": -1, "status": "failed"})
+        }
+    }
+
+    // Update stats
+    total_scans = total_scans + 1
+    total_kills = total_kills + killed
+    total_threats = total_threats + threat_count
+    recent_kills = killed
+
+    // N-S classification
+    let ns = calculate_reynolds(threat_count, killed)
+
+    // Ternary result
+    let scan_trit = TRUE
+    if3 threat_count > 0 {
+        if3 killed == threat_count {
+            let scan_trit = MAYBE   // threats found but all killed
+        }
+        if3 killed < threat_count {
+            let scan_trit = FALSE   // threats persist
+        }
+    }
+
+    return {
+        "ok": true,
+        "trit": scan_trit,
+        "char": trit_char(scan_trit),
+        "threats_found": threat_count,
+        "killed": killed,
+        "reynolds": ns.get("reynolds", 0),
+        "regime": ns.get("regime", "unknown"),
+        "kills": kill_log,
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// -- Health endpoint --
+fn health() {
+    let trit = TRUE
+    if3 last_reynolds > RE_TURBULENT {
+        let trit = FALSE
+    }
+    if3 last_reynolds > RE_LAMINAR {
+        if3 last_reynolds <= RE_TURBULENT {
+            let trit = MAYBE
+        }
+    }
+    return {
+        "ok": true,
+        "service": "tsniffer",
+        "port": PORT,
+        "version": "1.0",
+        "ternary": true,
+        "trit": trit,
+        "char": trit_char(trit),
+        "reynolds": last_reynolds,
+        "flow_regime": last_regime,
+        "runtime": "novalang",
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// -- Status: full threat report --
+fn sniffer_status() {
+    // Live scan
+    let threats = detect_threats()
+    let live_count = len(threats)
+
+    // N-S diagnosis
+    let diagnosis = "System clean. Laminar flow. No python.exe threats."
+    if3 last_reynolds > RE_LAMINAR {
+        let diagnosis = "Transitional flow (Re=" + str(last_reynolds) + "). TSniffer containing threats."
+    }
+    if3 last_reynolds > RE_TURBULENT {
+        let diagnosis = "TURBULENT flow (Re=" + str(last_reynolds) + ")! Active respawn attack detected."
+    }
+
+    return {
+        "ok": true,
+        "ternary": true,
+        "runtime": "novalang",
+        "total_scans": total_scans,
+        "total_kills": total_kills,
+        "total_threats": total_threats,
+        "live_threats": live_count,
+        "live_pids": threats,
+        "reynolds": last_reynolds,
+        "flow_regime": last_regime,
+        "diagnosis": diagnosis,
+        "scan_interval": SCAN_INTERVAL,
+        "re_boundaries": {"laminar": RE_LAMINAR, "turbulent": RE_TURBULENT},
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// -- Force scan endpoint --
+fn sniffer_scan(body) {
+    return scan_and_kill()
+}
+
+// -- Register routes --
+troute(server, "GET", "/health", "health")
+troute(server, "GET", "/sniffer/status", "sniffer_status")
+troute(server, "POST", "/sniffer/scan", "sniffer_scan")
+
+print("[TSniffer] NovaLang TSniffer v1.0 - N-S Process Immune System")
+print("[TSniffer] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TSniffer] N-S Boundaries: Re<" + str(RE_LAMINAR) + "=laminar, Re>" + str(RE_TURBULENT) + "=turbulent")
+print("[TSniffer] Routes: /health, /sniffer/status, /sniffer/scan")
+
+tstart(server)

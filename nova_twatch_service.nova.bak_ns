@@ -1,0 +1,487 @@
+// Nova TWatch Service v1.0 - Ternary Watchdog (NovaLang port)
+// Port 9950: Monitors services, restarts dead ones on demand
+// States: +1 ALIVE, 0 DEGRADED/GRACE, -1 DEAD
+// 3-5-7-13 constants: check timeout=3 (H3), fail threshold=3 (H3),
+//   grace=7s (H7), sweep interval=13s (H13)
+//
+// NOTE: NovaLang has no background threads.
+//   Sweep is on-demand via POST /twatch/sweep.
+//   Health does a quick per-service port check via http_get.
+
+let PORT = 9950
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+
+let HEALTH_TIMEOUT = 3    // H3: seconds for http_get timeout
+let FAIL_THRESHOLD = 3    // H3: consecutive failures before restart
+let STARTUP_GRACE  = 7    // H7: seconds grace after restart
+let SWEEP_INTERVAL = 13   // H13: seconds (informational, not enforced here)
+
+// -- Global Stats --
+let total_sweeps   = 0
+let total_restarts = 0
+let last_sweep_ts  = 0
+
+// -- Service Registry --
+// Each entry: {port, cmd, state, failures, restarts, last_check, grace_until}
+// state: 1=ALIVE, 0=DEGRADED/UNKNOWN, -1=DEAD
+// cmd: shell command string or "" for no-restart services
+
+let registry = {}
+
+// -- Trit constants --
+let TRUE  =  1
+let MAYBE =  0
+let FALSE = -1
+
+// -- Load default services into registry --
+fn init_services() {
+    dict_set(registry, "orchestrator",       {"port": 9999, "cmd": "", "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-hivemind",      {"port": 9881, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_hivemind.py",      "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-cloud-router",  {"port": 9878, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_cloud_router.py",   "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-sentinel",      {"port": 9876, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_sentinel.py",        "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-nexus",         {"port": 9882, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_nexus.py",           "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-deepstorage",   {"port": 9883, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_deepstorage.py",     "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-vault",         {"port": 9884, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_vault.py",           "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-tbuffer",       {"port": 9886, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_tbuffer.py",         "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-tbus",          {"port": 9945, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_tbus.py",            "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-tresilience",   {"port": 9948, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_tresilience.py",     "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-tintelligence", {"port": 9924, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_tintelligence.py",   "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-novacore",      {"port": 9890, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_novacore.py",        "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-tsecurity",     {"port": 9888, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_tsecurity.py",       "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-exec",          {"port": 9877, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\launchers\\exec_server.py", "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-tnet",          {"port": 9889, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_tnet.py",            "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-relay",         {"port": 9880, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_relay.py",           "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "websocket",          {"port": 9998, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\ws_server.py",            "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-stt",           {"port": 9875, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_stt.py",             "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-tts",           {"port": 9874, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_tts.py",             "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-cortex",        {"port": 9879, "cmd": "", "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-tzip",          {"port": 9885, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_tzip.py",            "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+    dict_set(registry, "nova-appcontrol",    {"port": 9887, "cmd": "start /b C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe C:\\NovaX\\nova_appcontrol.py",      "state": 0, "failures": 0, "restarts": 0, "last_check": 0, "grace_until": 0})
+}
+
+// -- Check a single port via http_get --
+// Returns TRUE (+1) if alive, FALSE (-1) if dead
+fn check_port(port) {
+    let url = "http://127.0.0.1:" + str(port) + "/health"
+    try3 {
+        let resp = http_get(url, HEALTH_TIMEOUT)
+        return TRUE
+    } catch {
+        return FALSE
+    }
+}
+
+// -- Restart a service via nova_run (start /b = no window) --
+// Returns TRUE if command launched, FALSE if no cmd or empty cmd
+fn restart_service(name) {
+    let svc = dict_get(registry, name)
+    let cmd = dict_get(svc, "cmd")
+    if3 cmd == "" {
+        return FALSE  // no-restart service (orchestrator, nova-cortex, etc.)
+    } else cmd == FALSE {
+        return FALSE
+    } else {
+        try3 {
+            nova_run(cmd)
+            // Update state fields in registry entry
+            let now = time()
+            let grace_ts = now + STARTUP_GRACE
+            dict_set(svc, "state",       MAYBE)
+            dict_set(svc, "failures",    0)
+            dict_set(svc, "restarts",    dict_get(svc, "restarts") + 1)
+            dict_set(svc, "last_check",  now)
+            dict_set(svc, "grace_until", grace_ts)
+            dict_set(registry, name, svc)
+            total_restarts = total_restarts + 1
+            return TRUE
+        } catch {
+            return FALSE
+        }
+    }
+}
+
+// -- Check one service, update its registry state, return result dict --
+fn check_one(name) {
+    let svc = dict_get(registry, name)
+    let now = time()
+
+    // Still in startup grace window? Skip check, report GRACE
+    let grace_until = dict_get(svc, "grace_until")
+    if3 now < grace_until {
+        return {"name": name, "state": "GRACE", "trit": MAYBE, "port": dict_get(svc, "port")}
+    } else grace_until == FALSE {
+        // grace_until key missing - proceed with check
+    } else {
+        // grace expired - proceed with check
+    }
+
+    let port = dict_get(svc, "port")
+    let alive = check_port(port)
+
+    // Update registry state
+    if3 alive == TRUE {
+        dict_set(svc, "state",      TRUE)
+        dict_set(svc, "failures",   0)
+        dict_set(svc, "last_check", now)
+        dict_set(registry, name, svc)
+        return {"name": name, "state": "ALIVE", "trit": TRUE, "port": port}
+    } else alive == MAYBE {
+        // Should not happen from check_port, treat as dead
+        dict_set(svc, "failures",   dict_get(svc, "failures") + 1)
+        dict_set(svc, "last_check", now)
+        dict_set(registry, name, svc)
+        return {"name": name, "state": "DEGRADED", "trit": MAYBE, "port": port}
+    } else {
+        // Dead path: increment failures
+        let fails = dict_get(svc, "failures") + 1
+        dict_set(svc, "failures",   fails)
+        dict_set(svc, "last_check", now)
+
+        if3 fails >= FAIL_THRESHOLD {
+            // Attempt restart
+            dict_set(svc, "state", FALSE)
+            dict_set(registry, name, svc)
+            let restarted = restart_service(name)
+            if3 restarted == TRUE {
+                return {"name": name, "state": "RESTARTING", "trit": MAYBE, "port": port, "restarts": dict_get(dict_get(registry, name), "restarts")}
+            } else restarted == MAYBE {
+                return {"name": name, "state": "DEAD", "trit": FALSE, "port": port, "failures": fails}
+            } else {
+                return {"name": name, "state": "DEAD", "trit": FALSE, "port": port, "failures": fails}
+            }
+        } else fails == FAIL_THRESHOLD {
+            dict_set(registry, name, svc)
+            return {"name": name, "state": "DEGRADED", "trit": MAYBE, "port": port, "failures": fails, "threshold": FAIL_THRESHOLD}
+        } else {
+            dict_set(registry, name, svc)
+            return {"name": name, "state": "DEGRADED", "trit": MAYBE, "port": port, "failures": fails, "threshold": FAIL_THRESHOLD}
+        }
+    }
+}
+
+// -- Full sweep: check every registered service --
+fn do_sweep() {
+    let svc_names = keys(registry)
+    let results = {}
+    let alive_count = 0
+    let dead_count  = 0
+    let grace_count = 0
+
+    let i = 0
+    let total = len(svc_names)
+    while3 i < total {
+        let name = svc_names[i]
+        let res  = check_one(name)
+        dict_set(results, name, res)
+        let t = dict_get(res, "trit")
+        if3 t == TRUE {
+            let alive_count = alive_count + 1
+        } else t == MAYBE {
+            let grace_count = grace_count + 1
+        } else {
+            let dead_count = dead_count + 1
+        }
+        let i = i + 1
+    }
+
+    total_sweeps  = total_sweeps + 1
+    let last_sweep_ts = time()
+
+    let sweep_trit = TRUE
+    if dead_count > 0 {
+        let sweep_trit = MAYBE
+        if dead_count >= H3 {
+            let sweep_trit = FALSE
+        }
+    }
+
+    return {
+        "ok": true,
+        "trit": sweep_trit,
+        "alive": alive_count,
+        "dead": dead_count,
+        "grace": grace_count,
+        "total": total,
+        "sweep_number": total_sweeps,
+        "results": results,
+        "runtime": "novalang",
+        "ternary": true
+    }
+}
+
+// ================================================================
+// Route Handlers
+// ================================================================
+
+// GET /health -- quick self + port-check summary
+fn health() {
+    // Use cached registry state (no live probing -- sweeps handle that)
+    let svc_names = keys(registry)
+    let total = len(svc_names)
+    let alive_count = 0
+    let dead_count  = 0
+
+    let i = 0
+    while3 i < total {
+        let name = svc_names[i]
+        let svc  = dict_get(registry, name)
+        let status = dict_get(svc, "status")
+        if3 status == "" { let status = "unknown" }
+        if3 status == "alive" {
+            let alive_count = alive_count + 1
+        } else {
+            let dead_count = dead_count + 1
+        }
+        let i = i + 1
+    }
+
+    let trit = TRUE
+    if dead_count > 0 {
+        let trit = MAYBE
+        if dead_count >= H3 {
+            let trit = FALSE
+        }
+    }
+
+    return {
+        "ok": true,
+        "service": "nova-twatch",
+        "port": PORT,
+        "version": "1.0",
+        "ternary": true,
+        "runtime": "novalang",
+        "trit": trit,
+        "watching": total,
+        "alive": alive_count,
+        "dead": dead_count,
+        "total_sweeps": total_sweeps,
+        "total_restarts": total_restarts,
+        "last_sweep": last_sweep_ts,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "constants": {
+            "health_timeout": HEALTH_TIMEOUT,
+            "fail_threshold": FAIL_THRESHOLD,
+            "startup_grace":  STARTUP_GRACE,
+            "sweep_interval": SWEEP_INTERVAL
+        }
+    }
+}
+
+// GET /twatch/status -- full registry state (no live checks, reads stored state)
+fn twatch_status() {
+    let svc_names = keys(registry)
+    let total = len(svc_names)
+    let alive_count   = 0
+    let dead_count    = 0
+    let degraded_count = 0
+    let states = {}
+
+    let i = 0
+    while3 i < total {
+        let name = svc_names[i]
+        let svc  = dict_get(registry, name)
+        let st   = dict_get(svc, "state")
+        let state_label = "UNKNOWN"
+        if3 st == TRUE {
+            let state_label = "ALIVE"
+            let alive_count = alive_count + 1
+        } else st == FALSE {
+            let state_label = "DEAD"
+            let dead_count  = dead_count + 1
+        } else {
+            let state_label = "DEGRADED"
+            let degraded_count = degraded_count + 1
+        }
+        let has_cmd = dict_get(svc, "cmd") != ""
+        dict_set(states, name, {
+            "port":       dict_get(svc, "port"),
+            "state":      state_label,
+            "trit":       st,
+            "failures":   dict_get(svc, "failures"),
+            "restarts":   dict_get(svc, "restarts"),
+            "last_check": round(dict_get(svc, "last_check"), 1),
+            "grace_until": dict_get(svc, "grace_until"),
+            "has_cmd":    has_cmd
+        })
+        let i = i + 1
+    }
+
+    let summary_trit = TRUE
+    if dead_count > 0 {
+        let summary_trit = MAYBE
+        if dead_count >= H3 {
+            let summary_trit = FALSE
+        }
+    }
+
+    return {
+        "ok": true,
+        "ternary": true,
+        "runtime": "novalang",
+        "trit": summary_trit,
+        "alive": alive_count,
+        "degraded": degraded_count,
+        "dead": dead_count,
+        "total": total,
+        "total_sweeps": total_sweeps,
+        "total_restarts": total_restarts,
+        "last_sweep": last_sweep_ts,
+        "sweep_interval": SWEEP_INTERVAL,
+        "services": states
+    }
+}
+
+// POST /twatch/check -- check one specific service right now
+fn twatch_check(body) {
+    let name = dict_get(body, "name")
+    if3 name == FALSE {
+        return {"ok": false, "trit": FALSE, "error": "name required"}
+    } else name == "" {
+        return {"ok": false, "trit": FALSE, "error": "name required"}
+    } else {
+        let has = dict_has(registry, name)
+        if3 has == TRUE {
+            let res = check_one(name)
+            return {"ok": true, "trit": dict_get(res, "trit"), "result": res}
+        } else has == MAYBE {
+            return {"ok": false, "trit": FALSE, "error": "unknown service: " + str(name)}
+        } else {
+            return {"ok": false, "trit": FALSE, "error": "unknown service: " + str(name)}
+        }
+    }
+}
+
+// POST /twatch/register -- add a new service to the watch list
+fn twatch_register(body) {
+    let name = dict_get(body, "name")
+    let port = dict_get(body, "port")
+    let cmd  = dict_get(body, "cmd")
+
+    if3 name == FALSE {
+        return {"ok": false, "trit": FALSE, "error": "name and port required"}
+    } else port == FALSE {
+        return {"ok": false, "trit": FALSE, "error": "name and port required"}
+    } else {
+        // Default cmd to empty string if not provided
+        let safe_cmd = ""
+        if3 cmd == FALSE {
+            let safe_cmd = ""
+        } else cmd == "" {
+            let safe_cmd = ""
+        } else {
+            let safe_cmd = str(cmd)
+        }
+
+        dict_set(registry, name, {
+            "port":       int(port),
+            "cmd":        safe_cmd,
+            "state":      MAYBE,
+            "failures":   0,
+            "restarts":   0,
+            "last_check": 0,
+            "grace_until": 0
+        })
+
+        return {
+            "ok": true,
+            "trit": TRUE,
+            "name": name,
+            "port": int(port),
+            "watching": len(keys(registry))
+        }
+    }
+}
+
+// POST /twatch/unregister -- remove a service from the watch list
+fn twatch_unregister(body) {
+    let name = dict_get(body, "name")
+    if3 name == FALSE {
+        return {"ok": false, "trit": FALSE, "error": "name required"}
+    } else name == "" {
+        return {"ok": false, "trit": FALSE, "error": "name required"}
+    } else {
+        let has = dict_has(registry, name)
+        if3 has == TRUE {
+            dict_del(registry, name)
+            return {"ok": true, "trit": TRUE, "removed": name, "watching": len(keys(registry))}
+        } else has == MAYBE {
+            return {"ok": false, "trit": FALSE, "error": "not found: " + str(name)}
+        } else {
+            return {"ok": false, "trit": FALSE, "error": "not found: " + str(name)}
+        }
+    }
+}
+
+// POST /twatch/restart -- force-restart one service immediately
+fn twatch_restart(body) {
+    let name = dict_get(body, "name")
+    if3 name == FALSE {
+        return {"ok": false, "trit": FALSE, "error": "name required"}
+    } else name == "" {
+        return {"ok": false, "trit": FALSE, "error": "name required"}
+    } else {
+        let has = dict_has(registry, name)
+        if3 has == FALSE {
+            return {"ok": false, "trit": FALSE, "error": "unknown service: " + str(name)}
+        } else has == MAYBE {
+            return {"ok": false, "trit": FALSE, "error": "unknown service: " + str(name)}
+        } else {
+            let svc = dict_get(registry, name)
+            let cmd = dict_get(svc, "cmd")
+            if3 cmd == "" {
+                return {"ok": false, "trit": FALSE, "error": str(name) + " has no restart command (manual-only)"}
+            } else cmd == FALSE {
+                return {"ok": false, "trit": FALSE, "error": str(name) + " has no restart command (manual-only)"}
+            } else {
+                let ok = restart_service(name)
+                let svc_after = dict_get(registry, name)
+                return {
+                    "ok": ok == TRUE,
+                    "trit": ok,
+                    "name": name,
+                    "restarts": dict_get(svc_after, "restarts"),
+                    "grace_until": dict_get(svc_after, "grace_until")
+                }
+            }
+        }
+    }
+}
+
+// POST /twatch/sweep -- on-demand full sweep across all services
+fn twatch_sweep(body) {
+    let result = do_sweep()
+    return result
+}
+
+// ================================================================
+// Boot: initialise registry and wire up routes
+// ================================================================
+
+init_services()
+
+let svc_count = len(keys(registry))
+print("[TWatch] NovaLang TWatch v1.0 - Ternary Watchdog")
+print("[TWatch] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TWatch] Watching " + str(svc_count) + " services")
+print("[TWatch] H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TWatch] Fail threshold: " + str(FAIL_THRESHOLD) + " | Grace: " + str(STARTUP_GRACE) + "s | Sweep interval: " + str(SWEEP_INTERVAL) + "s")
+print("[TWatch] NOTE: No background thread - sweep is on-demand via POST /twatch/sweep")
+
+let server = tserve(PORT, "TWatch v1.0 - Ternary Watchdog")
+
+troute(server, "GET",  "/health",           "health")
+troute(server, "GET",  "/twatch/status",    "twatch_status")
+troute(server, "POST", "/twatch/check",     "twatch_check")
+troute(server, "POST", "/twatch/register",  "twatch_register")
+troute(server, "POST", "/twatch/unregister","twatch_unregister")
+troute(server, "POST", "/twatch/restart",   "twatch_restart")
+troute(server, "POST", "/twatch/sweep",     "twatch_sweep")
+
+print("[TWatch] Routes: /health, /twatch/status, /twatch/check, /twatch/register, /twatch/unregister, /twatch/restart, /twatch/sweep")
+
+tstart(server)

@@ -1,0 +1,630 @@
+// nova_tcompress_service.nova -- NovaX Ternary Compression Micro-Tool (port 9972)
+// Pure NovaLang port of nova_tcompress.py
+//
+// Compress/decompress data using multiple algorithms with ternary state classification.
+// Powers efficient storage and transmission across the NovaX service mesh.
+//
+// Algorithms (represented as string tags -- actual compression delegated to nova_run):
+//   zlib    -- fast general purpose deflate
+//   gzip    -- interoperable, slightly larger header
+//   ternary -- NovaX native TZip: bytes -> balanced ternary trits -> pack 5 trits/byte
+//   auto    -- analyze data, pick best algorithm automatically
+//
+// TZip header: TZIP magic (4 bytes) + original length (4 bytes) + trit count (4 bytes)
+//              + flags (1 byte) = 13 bytes (H13 carrier frame).
+//
+// Trit states for compression quality:
+//   TRUE  (+1): ratio < 0.5  (saved more than half -- excellent)
+//   MAYBE  (0): ratio 0.5-0.9 (some savings -- acceptable)
+//   FALSE (-1): ratio >= 0.9  (not worth compressing -- poor)
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3  = ternary base, trit states
+//   H5=5  = trit packing factor (3^5 = 243 values per byte)
+//   H7=7  = composition unit
+//   H13=13 = carrier frame, header size in bytes
+//   BLOCK=2187 = 3^7 ternary block boundary
+//
+// N-S Reynolds routing:
+//   Re < 27  = laminar     (small payload, simple algo)
+//   Re < 125 = transitional (medium payload)
+//   Re < 343 = turbulent   (large payload)
+//   Re >= 343 = chaotic    (very large or incompressible)
+//
+// Endpoints:
+//   GET  /tcompress/health     -- health check with ternary stats
+//   POST /tcompress/compress   -- compress data with chosen algorithm
+//   POST /tcompress/decompress -- decompress data back to original
+//   POST /tcompress/analyze    -- entropy analysis + algorithm recommendation
+//   GET  /tcompress/stats      -- cumulative compression statistics
+
+// -- Port and server --
+let PORT = 9972
+let server = tserve(PORT, "TCompress v1.0 - NovaX Ternary Compression")
+
+// -- Harmonic constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK = 2187        // 3^7 ternary block
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// -- Service identity --
+let VERSION = "1.0"
+let SERVICE_NAME = "nova-tcompress"
+
+// -- Reynolds boundaries (N-S flow regime thresholds) --
+let RE_LAMINAR = 27     // 3^3
+let RE_TRANS = 125      // 5^3
+let RE_TURBULENT = 343  // 7^3
+
+// -- Body size limit: 3 blocks * H13 = 28431 bytes --
+let MAX_BODY = 28431
+
+// -- Algorithms list (used for validation checks) --
+let ALGO_ZLIB = "zlib"
+let ALGO_GZIP = "gzip"
+let ALGO_TERNARY = "ternary"
+let ALGO_AUTO = "auto"
+
+// -- Cumulative statistics state --
+// No threading in NovaLang -- all state is single-flow
+let _total_original = 0
+let _total_compressed = 0
+let _total_ops = 0
+let _algo_zlib_count = 0
+let _algo_gzip_count = 0
+let _algo_ternary_count = 0
+let _algo_zlib_saved = 0
+let _algo_gzip_saved = 0
+let _algo_ternary_saved = 0
+let _start_time = time()
+
+// -- Helper: classify compression ratio into ternary trit --
+// TRUE  (+1): ratio < 0.5  (saved more than half)
+// MAYBE  (0): ratio 0.5-0.9 (some savings)
+// FALSE (-1): ratio >= 0.9  (not worth it)
+fn ratio_trit(ratio) {
+    if3 ratio < 0.5 {
+        return T_TRUE
+    } else ratio < 0.9 {
+        return T_MAYBE
+    } else {
+        return T_FALSE
+    }
+}
+
+// -- Helper: map trit to single-char label --
+fn tchar(t) {
+    if3 t == T_TRUE {
+        return "+"
+    } else t == T_MAYBE {
+        return "0"
+    } else {
+        return "T"
+    }
+}
+
+// -- Helper: is algorithm string valid for compress --
+fn algo_valid_compress(algo) {
+    if3 algo == ALGO_ZLIB {
+        return T_TRUE
+    } else algo == ALGO_GZIP {
+        return T_TRUE
+    } else algo == ALGO_TERNARY {
+        return T_TRUE
+    } else {
+        if3 algo == ALGO_AUTO {
+            return T_TRUE
+        } else {
+            return T_FALSE
+        }
+    }
+}
+
+// -- Helper: is algorithm string valid for decompress --
+fn algo_valid_decompress(algo) {
+    if3 algo == ALGO_ZLIB {
+        return T_TRUE
+    } else algo == ALGO_GZIP {
+        return T_TRUE
+    } else algo == ALGO_TERNARY {
+        return T_TRUE
+    } else {
+        return T_FALSE
+    }
+}
+
+// -- Helper: record a compression operation into cumulative stats --
+fn record_stats(algo, orig_size, comp_size) {
+    let _total_ops = _total_ops + 1
+    let _total_original = _total_original + orig_size
+    let _total_compressed = _total_compressed + comp_size
+    let saved = orig_size - comp_size
+    if3 saved < 0 {
+        let saved = 0
+    } else {
+        // keep positive saved value
+    }
+    if3 algo == ALGO_ZLIB {
+        let _algo_zlib_count = _algo_zlib_count + 1
+        let _algo_zlib_saved = _algo_zlib_saved + saved
+    } else algo == ALGO_GZIP {
+        let _algo_gzip_count = _algo_gzip_count + 1
+        let _algo_gzip_saved = _algo_gzip_saved + saved
+    } else algo == ALGO_TERNARY {
+        let _algo_ternary_count = _algo_ternary_count + 1
+        let _algo_ternary_saved = _algo_ternary_saved + saved
+    } else {
+        // unknown algo -- no per-algo stat
+    }
+}
+
+// -- Helper: recommend algorithm from entropy/repetition/size heuristics --
+// Low entropy + high repetition  -> ternary (pattern-heavy data)
+// Very high entropy              -> zlib    (near-random, minimize overhead)
+// Large + medium entropy         -> gzip    (better for larger payloads)
+// Default                        -> zlib
+fn recommend_algo(entropy, repetition, data_size) {
+    if3 entropy < 4.0 {
+        if3 repetition > 0.3 {
+            return ALGO_TERNARY
+        } else {
+            return ALGO_ZLIB
+        }
+    } else entropy > 7.5 {
+        return ALGO_ZLIB
+    } else {
+        if3 data_size > BLOCK {
+            if3 entropy < 6.5 {
+                return ALGO_GZIP
+            } else {
+                return ALGO_ZLIB
+        } else {
+            return ALGO_ZLIB
+        }
+    }
+}
+
+// -- Helper: classify data by Shannon entropy level --
+}
+fn classify_data(entropy) {
+    if3 entropy < 2.0 {
+        return "highly_repetitive"
+    } else entropy < 4.0 {
+        return "structured"
+    } else entropy < 6.0 {
+        return "mixed"
+    } else entropy < 7.5 {
+        return "dense"
+    } else {
+        return "near_random"
+    }
+}
+
+// -- Helper: N-S Reynolds flow regime label from Reynolds number --
+fn reynolds_regime(re) {
+    if3 re < RE_LAMINAR {
+        return "laminar"
+    } else re < RE_TRANS {
+        return "transitional"
+    } else re < RE_TURBULENT {
+        return "turbulent"
+    } else {
+        return "chaotic"
+    }
+}
+
+// -- Helper: compute N-S Reynolds number for a payload --
+// Re = (size * algo_complexity) / viscosity
+// algo_complexity: zlib=1, gzip=2, ternary=3, auto=2
+// viscosity constant = 13 (H13 carrier)
+fn payload_reynolds(data_size, algo) {
+    let complexity = 1
+    if3 algo == ALGO_GZIP {
+        let complexity = 2
+    } else algo == ALGO_TERNARY {
+        let complexity = 3
+    } else algo == ALGO_AUTO {
+        let complexity = 2
+    } else {
+        // zlib or default: complexity=1
+    }
+    let re = (data_size * complexity) / H13
+    return re
+}
+
+// -- Actual compression via nova_run delegate --
+// NovaLang has no zlib/gzip/struct builtins.
+// We delegate to a thin Python helper via nova_run() which returns JSON.
+// Format: nova_run("tcompress_helper.py", json_args_string) -> JSON string result
+// The result contains: {"ok": true/false, "data_b64": "...", "size": N} or {"ok":false,"error":"..."}
+fn compress_via_helper(data_str, algo) {
+    let args = json_encode({"op": "compress", "data": data_str, "algo": algo})
+    let result_str = nova_run("tcompress_helper.py", args)
+    let result = json_decode(result_str)
+    return result
+}
+
+fn decompress_via_helper(data_b64, algo) {
+    let args = json_encode({"op": "decompress", "data_b64": data_b64, "algo": algo})
+    let result_str = nova_run("tcompress_helper.py", args)
+    let result = json_decode(result_str)
+    return result
+}
+
+fn analyze_via_helper(data_str) {
+    let args = json_encode({"op": "analyze", "data": data_str})
+    let result_str = nova_run("tcompress_helper.py", args)
+    let result = json_decode(result_str)
+    return result
+}
+
+// ============================================================
+// ROUTE: GET /tcompress/health
+// ============================================================
+fn tcompress_health() {
+    let uptime = round(time() - _start_time, 2)
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "runtime": "novalang",
+        "algorithms": ["zlib", "gzip", "ternary", "auto"],
+        "total_operations": _total_ops,
+        "total_saved_bytes": _total_original - _total_compressed,
+        "uptime_seconds": uptime,
+        "trit": T_TRUE,
+        "char": "+",
+        "harmonics": {
+            "H3": H3,
+            "H5": H5,
+            "H7": H7,
+            "H13": H13,
+            "BLOCK": BLOCK
+        }
+    }
+}
+
+// ============================================================
+// ROUTE: GET /tcompress/stats
+// ============================================================
+fn tcompress_stats() {
+    let uptime = round(time() - _start_time, 2)
+    let total_saved = _total_original - _total_compressed
+    if3 total_saved < 0 {
+        let total_saved = 0
+    } else {
+        // keep positive
+    }
+
+    let avg_ratio = 0.0
+    let avg_savings = 0.0
+    if3 _total_original > 0 {
+        let avg_ratio = round(float(_total_compressed) / float(_total_original), 4)
+        let avg_savings = round((1.0 - avg_ratio) * 100, 2)
+    } else {
+        // no ops yet -- keep zeros
+    }
+
+    let t = ratio_trit(avg_ratio)
+    if3 _total_ops == 0 {
+        let t = T_MAYBE
+    } else {
+        // use ratio-based trit
+    }
+
+    return {
+        "ok": true,
+        "total_operations": _total_ops,
+        "total_original_bytes": _total_original,
+        "total_compressed_bytes": _total_compressed,
+        "total_saved_bytes": total_saved,
+        "average_ratio": avg_ratio,
+        "average_savings_pct": avg_savings,
+        "algorithm_usage": {
+            "zlib": _algo_zlib_count,
+            "gzip": _algo_gzip_count,
+            "ternary": _algo_ternary_count
+        },
+        "algorithm_saved_bytes": {
+            "zlib": _algo_zlib_saved,
+            "gzip": _algo_gzip_saved,
+            "ternary": _algo_ternary_saved
+        },
+        "uptime_seconds": uptime,
+        "trit": t,
+        "char": tchar(t),
+        "harmonics": {
+            "H3": H3,
+            "H5": H5,
+            "H7": H7,
+            "H13": H13,
+            "BLOCK": BLOCK
+        },
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tcompress/compress
+// Input:  {"data": "...", "algorithm": "zlib"|"gzip"|"ternary"|"auto"}
+// Output: {"ok": true, "compressed": "<base64>", "algorithm": "...",
+//          "original_size": N, "compressed_size": N, "ratio": 0.xx,
+//          "savings_pct": "xx.x%", "seal": "...", "trit": +1/0/-1, "char": "+/0/T"}
+// ============================================================
+fn tcompress_compress(body) {
+    let raw_data = dict_get(body, "data", "")
+    let algorithm = dict_get(body, "algorithm", "auto")
+
+    if3 len(raw_data) == 0 {
+        return {
+            "ok": false,
+            "error": "missing 'data' field",
+            "trit": T_FALSE,
+            "char": "T"
+    } else {
+        // Normalize algorithm to lowercase
+        let algorithm = lower(algorithm)
+
+        // Validate algorithm
+        let algo_ok = algo_valid_compress(algorithm)
+        if3 algo_ok == T_FALSE {
+            return {
+                "ok": false,
+                "error": "unknown algorithm -- use: zlib, gzip, ternary, auto",
+                "trit": T_FALSE,
+                "char": "T"
+        } else {
+            // Proceed with compression
+            // For auto mode we resolve the algo via analyze first
+            let resolved_algo = algorithm
+            if3 algorithm == ALGO_AUTO {
+                // Analyze to pick best algorithm
+                let ana = analyze_via_helper(raw_data)
+                let ana_ok = dict_get(ana, "ok", false)
+                if3 ana_ok == true {
+                    let resolved_algo = dict_get(ana, "recommended", ALGO_ZLIB)
+                } else {
+                    let resolved_algo = ALGO_ZLIB
+            } else {
+                // keep resolved_algo as algorithm
+            }
+
+            // N-S Reynolds for this payload
+            let data_size = len(raw_data)
+            let re = payload_reynolds(data_size, resolved_algo)
+            let regime = reynolds_regime(re)
+
+            // Delegate actual compression to helper
+            let result = compress_via_helper(raw_data, resolved_algo)
+            let comp_ok = dict_get(result, "ok", false)
+
+            if3 comp_ok == false {
+                let err = dict_get(result, "error", "compression failed")
+                return {
+                    "ok": false,
+                    "error": err,
+                    "trit": T_FALSE,
+                    "char": "T"
+            } else {
+                let compressed_b64 = dict_get(result, "data_b64", "")
+                let compressed_size = dict_get(result, "size", 0)
+                let seal = dict_get(result, "seal", "")
+                let original_size = data_size
+
+                let ratio = 0.0
+                if3 original_size > 0 {
+                    let ratio = round(float(compressed_size) / float(original_size), 4)
+                } else {
+                    // keep 0.0
+                }
+
+                let savings_pct = round((1.0 - ratio) * 100, 2)
+                let t = ratio_trit(ratio)
+
+                // Record into cumulative stats
+                record_stats(resolved_algo, original_size, compressed_size)
+
+                return {
+                    "ok": true,
+                    "compressed": compressed_b64,
+                    "algorithm": resolved_algo,
+                    "original_size": original_size,
+                    "compressed_size": compressed_size,
+                    "ratio": ratio,
+                    "savings_pct": str(savings_pct) + "%",
+                    "seal": seal,
+                    "trit": t,
+                    "char": tchar(t),
+                    "reynolds": re,
+                    "flow_regime": regime,
+                    "runtime": "novalang"
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tcompress/decompress
+// Input:  {"data": "<base64>", "algorithm": "zlib"|"gzip"|"ternary",
+//          "seal": "<optional integrity hash>"}
+// Output: {"ok": true, "data": "...", "size": N, "algorithm": "...",
+//          "encoding": "utf-8"|"base64", "trit": +1}
+// ============================================================
+}
+}
+}
+}
+fn tcompress_decompress(body) {
+    let b64_data = dict_get(body, "data", "")
+    let algorithm = dict_get(body, "algorithm", "")
+    let seal = dict_get(body, "seal", "")
+
+    if3 len(b64_data) == 0 {
+        return {
+            "ok": false,
+            "error": "missing 'data' field (base64-encoded)",
+            "trit": T_FALSE,
+            "char": "T"
+    } else {
+        let algorithm = lower(algorithm)
+
+        // If no algorithm provided, fail with clear message
+        // (auto-detect of ternary magic header is done inside the helper)
+        if3 len(algorithm) == 0 {
+            return {
+                "ok": false,
+                "error": "algorithm required -- use: zlib, gzip, ternary",
+                "trit": T_FALSE,
+                "char": "T"
+        } else {
+            let algo_ok = algo_valid_decompress(algorithm)
+            if3 algo_ok == T_FALSE {
+                return {
+                    "ok": false,
+                    "error": "unknown algorithm -- use: zlib, gzip, ternary",
+                    "trit": T_FALSE,
+                    "char": "T"
+            } else {
+                // Delegate to helper (seal verification happens inside helper)
+                let result = decompress_via_helper(b64_data, algorithm)
+                let decomp_ok = dict_get(result, "ok", false)
+
+                if3 decomp_ok == false {
+                    let err = dict_get(result, "error", "decompression failed")
+                    return {
+                        "ok": false,
+                        "error": err,
+                        "trit": T_FALSE,
+                        "char": "T"
+                } else {
+                    let out_data = dict_get(result, "data", "")
+                    let out_size = dict_get(result, "size", 0)
+                    let encoding = dict_get(result, "encoding", "utf-8")
+
+                    return {
+                        "ok": true,
+                        "data": out_data,
+                        "size": out_size,
+                        "algorithm": algorithm,
+                        "encoding": encoding,
+                        "trit": T_TRUE,
+                        "char": "+",
+                        "runtime": "novalang"
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tcompress/analyze
+// Input:  {"data": "..."}
+// Output: entropy analysis, per-algorithm trial ratios, recommendation
+// ============================================================
+}
+}
+}
+}
+fn tcompress_analyze(body) {
+    let raw_data = dict_get(body, "data", "")
+
+    if3 len(raw_data) == 0 {
+        return {
+            "ok": false,
+            "error": "missing 'data' field",
+            "trit": T_FALSE,
+            "char": "T"
+    } else {
+        let data_size = len(raw_data)
+
+        // Delegate full entropy analysis and trial compressions to helper
+        let result = analyze_via_helper(raw_data)
+        let ana_ok = dict_get(result, "ok", false)
+
+        if3 ana_ok == false {
+            let err = dict_get(result, "error", "analysis failed")
+            return {
+                "ok": false,
+                "error": err,
+                "trit": T_FALSE,
+                "char": "T"
+        } else {
+            let entropy = dict_get(result, "entropy", 0.0)
+            let unique_ratio = dict_get(result, "unique_byte_ratio", 0.0)
+            let repetition = dict_get(result, "repetition_score", 0.0)
+            let estimates = dict_get(result, "estimates", {})
+            let best_actual = dict_get(result, "best_actual", ALGO_ZLIB)
+
+            // Recommendation from NovaLang heuristic
+            let recommended = recommend_algo(entropy, repetition, data_size)
+
+            // Data class label
+            let data_class = classify_data(entropy)
+
+            // N-S Reynolds for this data at recommended algo
+            let re = payload_reynolds(data_size, recommended)
+            let regime = reynolds_regime(re)
+
+            // Entropy efficiency
+            let efficiency = round(entropy / 8.0, 4)
+
+            return {
+                "ok": true,
+                "original_size": data_size,
+                "entropy": {
+                    "shannon_bits_per_byte": entropy,
+                    "max_possible": 8.0,
+                    "efficiency": efficiency
+                },
+                "unique_byte_ratio": unique_ratio,
+                "repetition_score": repetition,
+                "data_class": data_class,
+                "estimates": estimates,
+                "best_actual": best_actual,
+                "recommended": recommended,
+                "reynolds": re,
+                "flow_regime": regime,
+                "trit": T_TRUE,
+                "char": "+",
+                "runtime": "novalang"
+            }
+        }
+    }
+}
+
+// ============================================================
+// Route registrations
+// ============================================================
+}
+}
+troute(server, "GET",  "/tcompress/health",     "tcompress_health")
+troute(server, "GET",  "/tcompress/stats",       "tcompress_stats")
+troute(server, "POST", "/tcompress/compress",    "tcompress_compress")
+troute(server, "POST", "/tcompress/decompress",  "tcompress_decompress")
+troute(server, "POST", "/tcompress/analyze",     "tcompress_analyze")
+
+// ============================================================
+// Startup banner
+// ============================================================
+print("[TCompress] NovaX Ternary Compression v" + VERSION + " -- NovaLang runtime")
+print("[TCompress] Port: " + str(PORT) + " | Service: " + SERVICE_NAME)
+print("[TCompress] Algorithms: zlib, gzip, ternary, auto")
+print("[TCompress] TZip: H5=" + str(H5) + " trits/byte, header=H13=" + str(H13) + "B carrier frame")
+print("[TCompress] Trit states: TRUE(ratio<0.5) MAYBE(0.5-0.9) FALSE(>=0.9)")
+print("[TCompress] N-S Re<" + str(RE_LAMINAR) + "=laminar Re<" + str(RE_TRANS) + "=transitional Re<" + str(RE_TURBULENT) + "=turbulent Re>=" + str(RE_TURBULENT) + "=chaotic")
+print("[TCompress] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13) + " BLOCK=" + str(BLOCK))
+print("[TCompress] GET  /tcompress/health | /tcompress/stats")
+print("[TCompress] POST /tcompress/compress | /tcompress/decompress | /tcompress/analyze")
+
+troute(server, "GET", "/health", fn(req) { return json_decode(http_get("http://127.0.0.1:9972/tcompress/health")) })
+
+tstart(server)

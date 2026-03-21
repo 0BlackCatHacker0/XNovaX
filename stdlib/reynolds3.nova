@@ -1,0 +1,65 @@
+// ============================================================================
+// reynolds3.nova — Navier-Stokes Reynolds Number Routing Engine
+// ============================================================================
+// Maps request flow dynamics to routing strategies using fluid dynamics:
+//
+//   Re < 27   → LAMINAR:     Direct route, no retry, single path
+//   Re < 343  → TRANSITIONAL: Load balance, 1 retry, 2-3 paths
+//   Re > 343  → TURBULENT:    Full fan-out, max retry, all paths
+//
+// Reynolds Number = (request_rate * payload_size) / service_capacity
+//
+// Uses v1.4 features: ??, ranges, default params, in operator
+// ============================================================================
+
+// ── 3-5-7-13 Thresholds (powers of 3) ──
+let RE_LAMINAR = 27        // 3^3 — smooth, predictable
+let RE_TRANSITIONAL = 125  // 5^3 — edge of chaos
+let RE_TURBULENT = 343     // 7^3 — full chaos, fan-out required
+
+fn reynolds_classify(re) {
+    if3 re < RE_LAMINAR {
+        return {"regime": "laminar", "trit": 1, "strategy": "direct", "retries": 0, "paths": 1}
+    }
+    if3 re < RE_TURBULENT {
+        return {"regime": "transitional", "trit": 0, "strategy": "balance", "retries": 1, "paths": 3}
+    }
+    return {"regime": "turbulent", "trit": -1, "strategy": "fanout", "retries": H7, "paths": H13}
+}
+
+fn reynolds_calculate(rate, payload_size = 256, capacity = 1000) {
+    if3 capacity == 0 {
+        return 9999  // infinite Re = turbulent
+    }
+    return (rate * payload_size) / capacity
+}
+
+fn reynolds_route(services, re_number = 0) {
+    let regime = reynolds_classify(re_number)
+    let strategy = dict_get(regime, "strategy") ?? "direct"
+    let paths = dict_get(regime, "paths") ?? 1
+
+    if3 is_empty(services) {
+        return []
+    }
+
+    match3 cmp3(dict_get(regime, "trit") ?? 0, 0) {
+        TRUE => {
+            // Laminar: first healthy service only
+            return take(services, 1)
+        }
+        MAYBE => {
+            // Transitional: top N by health score
+            return take(services, clamp(paths, 1, len(services)))
+        }
+        FALSE_ => {
+            // Turbulent: fan out to all
+            return services
+        }
+    }
+}
+
+fn reynolds_describe(re) {
+    let r = reynolds_classify(re)
+    return f"Re={re} → {dict_get(r, 'regime')} ({dict_get(r, 'strategy')}, {dict_get(r, 'retries')} retries, {dict_get(r, 'paths')} paths)"
+}

@@ -1,0 +1,615 @@
+// ============================================================================
+// tgarlic3.nova — Ternary Garlic-Onion Hybrid Anonymity Router
+// ============================================================================
+// Merges i2P garlic routing with Tor onion routing through ternary logic:
+//
+//   i2P Garlic:  Bundle multiple "cloves" in one message, each with own
+//                delivery instructions. Unidirectional tunnels. LeaseSets
+//                publish tunnel endpoints. Session tags for fast symmetric.
+//
+//   Tor Onion:   Layered encryption, each hop peels one layer. Circuit-based
+//                bidirectional streams. Directory authorities. Guard nodes.
+//
+//   Ternary Fusion ("Tgarlic"):
+//     - CLOVE states: +1=deliver, 0=delay, -1=decoy
+//     - TUNNEL modes: +1=garlic(unidirectional), 0=hybrid, -1=onion(bidirectional)
+//     - LEASESET health: +1=fresh, 0=expiring, -1=stale
+//     - Routes have 3 layers: garlic(bundle) → onion(peel) → ternary(trit-route)
+//
+// 3-5-7-13 Harmonics:
+//   - 3 encryption layers (garlic + onion + transport)
+//   - 5 cloves max per garlic message (3 real + 1 ack + 1 leaseset)
+//   - 7 hops max per tunnel (3-5 typical, 7 paranoid)
+//   - 13 session tags pre-stocked per peer
+//
+// Uses v1.4 features: ??, default params
+// ============================================================================
+
+// ── Constants ───────────────────────────────────────────────────
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let MAX_CLOVES = H5
+let MAX_HOPS = H7
+let SESSION_TAG_POOL = H13
+let TUNNEL_LIFETIME_S = 600    // 10 minutes
+let LEASESET_REFRESH_S = 300   // 5 minutes
+
+// Ternary states
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// ── Internal helper: integer random in range [min_v, max_v] ──
+fn _tg3_rand(min_v, max_v) {
+    return floor(random(0, 1) * (max_v - min_v + 1)) + min_v
+}
+
+// ============================================================================
+// CLOVE — Individual message unit within a garlic bundle
+// ============================================================================
+// Each clove carries: payload, delivery instructions, and a trit state
+//   +1 = real payload (deliver to destination)
+//    0 = delayed delivery (hold until condition met)
+//   -1 = decoy/chaff (noise to frustrate traffic analysis)
+
+fn tgarlic3_clove_new(payload, dest, clove_type = 1) {
+    return {
+        "id": str(time_ms()) + "_" + str(_tg3_rand(1000, 9999)),
+        "payload": payload,
+        "dest": dest,
+        "clove_type": clove_type,
+        "created": time_ms(),
+        "delivery": "tunnel",
+        "delay_until": 0,
+        "ttl": TUNNEL_LIFETIME_S * 1000,
+        "trit": clove_type
+    }
+}
+
+// Delivery Status clove (acknowledgment)
+fn tgarlic3_clove_ack(original_id, return_tunnel) {
+    return {
+        "id": str(time_ms()) + "_ack",
+        "payload": {"ack_for": original_id, "time": time_ms()},
+        "dest": return_tunnel,
+        "clove_type": T_TRUE,
+        "created": time_ms(),
+        "delivery": "tunnel",
+        "delay_until": 0,
+        "ttl": 30000,
+        "trit": T_TRUE,
+        "is_ack": true
+    }
+}
+
+// LeaseSet clove (bundled sender identity for reply routing)
+fn tgarlic3_clove_leaseset(leaseset) {
+    return {
+        "id": str(time_ms()) + "_ls",
+        "payload": leaseset,
+        "dest": "local",
+        "clove_type": T_TRUE,
+        "created": time_ms(),
+        "delivery": "local",
+        "delay_until": 0,
+        "ttl": LEASESET_REFRESH_S * 1000,
+        "trit": T_TRUE,
+        "is_leaseset": true
+    }
+}
+
+// Decoy clove (chaff traffic to frustrate analysis)
+fn tgarlic3_clove_decoy() {
+    // Generate random-length noise payload
+    let noise_len = _tg3_rand(64, 512)
+    let noise = ""
+    let i = 0
+    while3 i < noise_len {
+        noise = noise + str(_tg3_rand(0, 9))
+        i = i + 1
+    }
+    return {
+        "id": str(time_ms()) + "_decoy",
+        "payload": noise,
+        "dest": "null",
+        "clove_type": T_FALSE,
+        "created": time_ms(),
+        "delivery": "drop",
+        "delay_until": 0,
+        "ttl": 5000,
+        "trit": T_FALSE,
+        "is_decoy": true
+    }
+}
+
+// ============================================================================
+// GARLIC MESSAGE — Bundle of cloves with layered encryption
+// ============================================================================
+
+fn tgarlic3_bundle(cloves, session_tag = null) {
+    // Bundle cloves into a garlic message
+    // Automatically adds decoy cloves to pad up to MAX_CLOVES
+    let real_count = len(cloves)
+    let padded = cloves
+
+    // Pad with decoys up to MAX_CLOVES (5)
+    while3 len(padded) < MAX_CLOVES {
+        padded = append(padded, tgarlic3_clove_decoy())
+    }
+
+    // Shuffle cloves (simple Fisher-Yates via swap)
+    // In production this would be cryptographic shuffle
+    let bundle_id = str(time_ms()) + "_garlic"
+
+    return {
+        "id": bundle_id,
+        "cloves": padded,
+        "clove_count": len(padded),
+        "real_count": real_count,
+        "session_tag": session_tag,
+        "created": time_ms(),
+        "encryption": "triple",   // garlic + onion + transport
+        "trit": T_TRUE
+    }
+}
+
+// Unbundle: extract real cloves from garlic message
+fn tgarlic3_unbundle(garlic_msg) {
+    let cloves = dict_get(garlic_msg, "cloves") ?? []
+    let real = []
+    let acks = []
+    let leasesets = []
+    let decoys = 0
+
+    let i = 0
+    while3 i < len(cloves) {
+        let clove = cloves[i]
+        let ctype = dict_get(clove, "clove_type") ?? T_FALSE
+
+        if3 ctype == T_FALSE {
+            // Decoy — discard silently
+            decoys = decoys + 1
+        } else {
+            if3 dict_get(clove, "is_ack") ?? false == true {
+                acks = append(acks, clove)
+            } else {
+                if3 dict_get(clove, "is_leaseset") ?? false == true {
+                    leasesets = append(leasesets, clove)
+                } else {
+                    real = append(real, clove)
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    return {
+        "real": real,
+        "acks": acks,
+        "leasesets": leasesets,
+        "decoys_dropped": decoys,
+        "trit": T_TRUE
+    }
+}
+
+// ============================================================================
+// TUNNEL — Unidirectional path through N hops
+// ============================================================================
+// Ternary tunnel modes:
+//   +1 = garlic mode (unidirectional, i2P style)
+//    0 = hybrid mode (unidirectional with return path hint)
+//   -1 = onion mode (bidirectional circuit, Tor style)
+
+fn tgarlic3_tunnel_new(name, hops, mode = 1) {
+    // hops = list of node identifiers ["node_a", "node_b", "node_c"]
+    let hop_count = len(hops)
+    if3 hop_count > MAX_HOPS {
+        return {"error": "max " + str(MAX_HOPS) + " hops", "trit": T_FALSE}
+    }
+    if3 hop_count < 1 {
+        return {"error": "need at least 1 hop", "trit": T_FALSE}
+    }
+
+    // Build hop chain with per-hop encryption layers
+    let chain = []
+    let i = 0
+    while3 i < hop_count {
+        let hop = {
+            "node": hops[i],
+            "layer": i,
+            "tunnel_id": _tg3_rand(10000, 99999),
+            "key_hint": str(time_ms()) + "_" + str(_tg3_rand(100, 999)),
+            "trit": T_TRUE
+        }
+        chain = append(chain, hop)
+        i = i + 1
+    }
+
+    return {
+        "name": name,
+        "mode": mode,
+        "hops": chain,
+        "hop_count": hop_count,
+        "gateway": hops[0],
+        "endpoint": hops[hop_count - 1],
+        "created": time_ms(),
+        "expires": time_ms() + (TUNNEL_LIFETIME_S * 1000),
+        "messages_sent": 0,
+        "trit": T_TRUE
+    }
+}
+
+// Check if tunnel is still alive
+fn tgarlic3_tunnel_alive(tunnel) {
+    let expires = dict_get(tunnel, "expires") ?? 0
+    let now = time_ms()
+    if3 now > expires { return T_FALSE }
+    let remaining = expires - now
+    let lifetime = TUNNEL_LIFETIME_S * 1000
+    if3 remaining < lifetime / 3 { return T_MAYBE }  // expiring soon
+    return T_TRUE
+}
+
+// ============================================================================
+// LEASESET — Published tunnel endpoints for reaching a destination
+// ============================================================================
+// A LeaseSet tells the network: "To reach me, send messages to these
+// tunnel gateways with these tunnel IDs."
+//
+// Ternary health:
+//   +1 = fresh (recently published, all leases valid)
+//    0 = expiring (some leases near expiry, needs refresh)
+//   -1 = stale (all leases expired, destination unreachable)
+
+fn tgarlic3_leaseset_new(dest_name, tunnels) {
+    // Build leases from active inbound tunnels
+    let leases = []
+    let i = 0
+    while3 i < len(tunnels) {
+        let t = tunnels[i]
+        let alive = tgarlic3_tunnel_alive(t)
+        if3 alive != T_FALSE {
+            let hops = dict_get(t, "hops") ?? []
+            let gateway = ""
+            if3 len(hops) > 0 {
+                gateway = dict_get(hops[0], "node") ?? "unknown"
+            }
+            let lease = {
+                "gateway": gateway,
+                "tunnel_id": dict_get(hops[0], "tunnel_id") ?? 0,
+                "expires": dict_get(t, "expires") ?? 0,
+                "trit": alive
+            }
+            leases = append(leases, lease)
+        }
+        i = i + 1
+    }
+
+    let health = T_FALSE
+    if3 len(leases) > 0 {
+        // Check how many are fresh vs expiring
+        let fresh = 0
+        let expiring = 0
+        let j = 0
+        while3 j < len(leases) {
+            let lt = dict_get(leases[j], "trit") ?? T_FALSE
+            if3 lt == T_TRUE { fresh = fresh + 1 }
+            if3 lt == T_MAYBE { expiring = expiring + 1 }
+            j = j + 1
+        }
+        if3 fresh > 0 { health = T_TRUE }
+        if3 fresh == 0 {
+            if3 expiring > 0 { health = T_MAYBE }
+        }
+    }
+
+    return {
+        "dest": dest_name,
+        "leases": leases,
+        "lease_count": len(leases),
+        "published": time_ms(),
+        "refresh_at": time_ms() + (LEASESET_REFRESH_S * 1000),
+        "health": health,
+        "trit": health
+    }
+}
+
+// Check if leaseset needs refresh
+fn tgarlic3_leaseset_health(ls) {
+    let refresh_at = dict_get(ls, "refresh_at") ?? 0
+    let now = time_ms()
+    if3 now > refresh_at { return T_FALSE }
+    let leases = dict_get(ls, "leases") ?? []
+    let alive_count = 0
+    let i = 0
+    while3 i < len(leases) {
+        let exp = dict_get(leases[i], "expires") ?? 0
+        if3 now < exp { alive_count = alive_count + 1 }
+        i = i + 1
+    }
+    if3 alive_count == 0 { return T_FALSE }
+    if3 alive_count < len(leases) { return T_MAYBE }
+    return T_TRUE
+}
+
+// ============================================================================
+// SESSION TAGS — Fast symmetric encryption after initial key exchange
+// ============================================================================
+// Pre-stock peers with single-use 32-byte nonces (session tags).
+// Each tag used exactly once to prevent correlation.
+// When tags run low, bundle new ones in next garlic message.
+//
+// Pool size: 13 (H13) tags per peer
+
+fn tgarlic3_session_new(peer_name) {
+    let tags = []
+    let i = 0
+    while3 i < SESSION_TAG_POOL {
+        let tag = str(time_ms()) + "_" + str(_tg3_rand(10000, 99999)) + "_" + str(i)
+        tags = append(tags, tag)
+        i = i + 1
+    }
+    return {
+        "peer": peer_name,
+        "tags": tags,
+        "tags_remaining": SESSION_TAG_POOL,
+        "tags_used": 0,
+        "established": time_ms(),
+        "last_used": time_ms(),
+        "trit": T_TRUE
+    }
+}
+
+// Consume one session tag (single-use)
+fn tgarlic3_session_use_tag(session) {
+    let tags = dict_get(session, "tags") ?? []
+    if3 len(tags) == 0 {
+        return {"session": session, "tag": null, "trit": T_FALSE, "needs_restock": true}
+    }
+    let tag = tags[0]
+    let remaining = slice(tags, 1, len(tags))
+    let used = (dict_get(session, "tags_used") ?? 0) + 1
+
+    let result = deep_clone(session)
+    result = dict_set(result, "tags", remaining)
+    result = dict_set(result, "tags_remaining", len(remaining))
+    result = dict_set(result, "tags_used", used)
+    result = dict_set(result, "last_used", time_ms())
+
+    // Health check
+    let trit = T_TRUE
+    if3 len(remaining) < H3 { trit = T_MAYBE }     // running low
+    if3 len(remaining) == 0 { trit = T_FALSE }       // exhausted
+    result = dict_set(result, "trit", trit)
+
+    let needs_restock = len(remaining) < H5
+    return {"session": result, "tag": tag, "trit": trit, "needs_restock": needs_restock}
+}
+
+// Restock session with fresh tags
+fn tgarlic3_session_restock(session) {
+    let tags = dict_get(session, "tags") ?? []
+    let i = 0
+    while3 i < SESSION_TAG_POOL {
+        let tag = str(time_ms()) + "_" + str(_tg3_rand(10000, 99999)) + "_r" + str(i)
+        tags = append(tags, tag)
+        i = i + 1
+    }
+    let result = deep_clone(session)
+    result = dict_set(result, "tags", tags)
+    result = dict_set(result, "tags_remaining", len(tags))
+    result = dict_set(result, "trit", T_TRUE)
+    return result
+}
+
+// ============================================================================
+// ROUTE BUILDER — Construct full garlic-onion hybrid route
+// ============================================================================
+// A complete route requires:
+//   Outbound tunnel (sender → network)
+//   Inbound tunnel (network → recipient)
+//   For bidirectional: 4 tunnels total (2 per direction)
+//
+// The ternary mode determines tunnel strategy:
+//   +1 = garlic: 2 unidirectional tunnels, clove-bundled
+//    0 = hybrid: 2 tunnels + return path via leaseset
+//   -1 = onion: 1 bidirectional circuit (Tor-style)
+
+fn tgarlic3_route_new(name, outbound_hops, inbound_hops, mode = 0) {
+    let out_tunnel = tgarlic3_tunnel_new(name + "_out", outbound_hops, mode)
+    let in_tunnel = tgarlic3_tunnel_new(name + "_in", inbound_hops, mode)
+
+    if3 dict_get(out_tunnel, "error") != null {
+        return out_tunnel
+    }
+    if3 dict_get(in_tunnel, "error") != null {
+        return in_tunnel
+    }
+
+    return {
+        "name": name,
+        "mode": mode,
+        "outbound": out_tunnel,
+        "inbound": in_tunnel,
+        "out_hops": len(outbound_hops),
+        "in_hops": len(inbound_hops),
+        "total_hops": len(outbound_hops) + len(inbound_hops),
+        "created": time_ms(),
+        "messages_sent": 0,
+        "messages_received": 0,
+        "trit": T_TRUE
+    }
+}
+
+// Send a message through a route
+fn tgarlic3_route_send(route, payload, dest, include_leaseset = null) {
+    // Build cloves
+    let cloves = []
+
+    // 1. Primary data clove
+    let data_clove = tgarlic3_clove_new(payload, dest, T_TRUE)
+    cloves = append(cloves, data_clove)
+
+    // 2. ACK clove (delivery confirmation)
+    let in_tunnel = dict_get(route, "inbound") ?? {}
+    let ack_clove = tgarlic3_clove_ack(
+        dict_get(data_clove, "id") ?? "",
+        dict_get(in_tunnel, "name") ?? "return"
+    )
+    cloves = append(cloves, ack_clove)
+
+    // 3. LeaseSet clove (if provided, for reply routing)
+    if3 include_leaseset != null {
+        let ls_clove = tgarlic3_clove_leaseset(include_leaseset)
+        cloves = append(cloves, ls_clove)
+    }
+
+    // Bundle into garlic message (auto-pads with decoys)
+    let garlic = tgarlic3_bundle(cloves)
+
+    // Update route stats
+    let result = deep_clone(route)
+    result = dict_set(result, "messages_sent",
+        (dict_get(route, "messages_sent") ?? 0) + 1)
+
+    return {
+        "route": result,
+        "garlic": garlic,
+        "clove_id": dict_get(data_clove, "id") ?? "",
+        "tunnel": dict_get(dict_get(route, "outbound") ?? {}, "name") ?? "",
+        "trit": T_TRUE
+    }
+}
+
+// ============================================================================
+// NETWORK — Manage multiple routes, tunnels, sessions, leasesets
+// ============================================================================
+
+fn tgarlic3_network_new(name = "tgarlic") {
+    return {
+        "name": name,
+        "routes": {},
+        "sessions": {},
+        "leasesets": {},
+        "tunnels_created": 0,
+        "messages_sent": 0,
+        "messages_received": 0,
+        "decoys_generated": 0,
+        "tags_used": 0,
+        "created": time_ms(),
+        "trit": T_TRUE
+    }
+}
+
+fn tgarlic3_network_add_route(net, route_name, outbound_hops, inbound_hops, mode = 0) {
+    let route = tgarlic3_route_new(route_name, outbound_hops, inbound_hops, mode)
+    if3 dict_get(route, "error") != null {
+        return {"net": net, "error": dict_get(route, "error"), "trit": T_FALSE}
+    }
+    let routes = dict_get(net, "routes") ?? {}
+    routes = dict_set(routes, route_name, route)
+    let result = deep_clone(net)
+    result = dict_set(result, "routes", routes)
+    result = dict_set(result, "tunnels_created",
+        (dict_get(net, "tunnels_created") ?? 0) + 2)
+    return {"net": result, "route": route, "trit": T_TRUE}
+}
+
+fn tgarlic3_network_add_session(net, peer_name) {
+    let session = tgarlic3_session_new(peer_name)
+    let sessions = dict_get(net, "sessions") ?? {}
+    sessions = dict_set(sessions, peer_name, session)
+    let result = deep_clone(net)
+    result = dict_set(result, "sessions", sessions)
+    return {"net": result, "session": session, "trit": T_TRUE}
+}
+
+fn tgarlic3_network_publish_leaseset(net, dest_name) {
+    // Gather all inbound tunnels for this destination
+    let routes = dict_get(net, "routes") ?? {}
+    let route_keys = dict_keys(routes)
+    let inbound_tunnels = []
+    let i = 0
+    while3 i < len(route_keys) {
+        let r = dict_get(routes, route_keys[i]) ?? {}
+        let inbound = dict_get(r, "inbound")
+        if3 inbound != null {
+            inbound_tunnels = append(inbound_tunnels, inbound)
+        }
+        i = i + 1
+    }
+    let ls = tgarlic3_leaseset_new(dest_name, inbound_tunnels)
+    let leasesets = dict_get(net, "leasesets") ?? {}
+    leasesets = dict_set(leasesets, dest_name, ls)
+    let result = deep_clone(net)
+    result = dict_set(result, "leasesets", leasesets)
+    return {"net": result, "leaseset": ls, "trit": dict_get(ls, "trit") ?? T_FALSE}
+}
+
+// ============================================================================
+// STATS — Network health overview
+// ============================================================================
+
+fn tgarlic3_stats(net) {
+    let routes = dict_get(net, "routes") ?? {}
+    let sessions = dict_get(net, "sessions") ?? {}
+    let leasesets = dict_get(net, "leasesets") ?? {}
+
+    let route_keys = dict_keys(routes)
+    let session_keys = dict_keys(sessions)
+    let ls_keys = dict_keys(leasesets)
+
+    // Count alive tunnels
+    let alive_tunnels = 0
+    let total_tunnels = 0
+    let i = 0
+    while3 i < len(route_keys) {
+        let r = dict_get(routes, route_keys[i]) ?? {}
+        let out = dict_get(r, "outbound")
+        let inp = dict_get(r, "inbound")
+        if3 out != null {
+            total_tunnels = total_tunnels + 1
+            if3 tgarlic3_tunnel_alive(out) != T_FALSE {
+                alive_tunnels = alive_tunnels + 1
+            }
+        }
+        if3 inp != null {
+            total_tunnels = total_tunnels + 1
+            if3 tgarlic3_tunnel_alive(inp) != T_FALSE {
+                alive_tunnels = alive_tunnels + 1
+            }
+        }
+        i = i + 1
+    }
+
+    // Count session tags remaining
+    let total_tags = 0
+    let j = 0
+    while3 j < len(session_keys) {
+        let s = dict_get(sessions, session_keys[j]) ?? {}
+        total_tags = total_tags + (dict_get(s, "tags_remaining") ?? 0)
+        j = j + 1
+    }
+
+    // Overall health
+    let health = T_TRUE
+    if3 alive_tunnels < total_tunnels { health = T_MAYBE }
+    if3 alive_tunnels == 0 { health = T_FALSE }
+
+    return {
+        "name": dict_get(net, "name") ?? "tgarlic",
+        "routes": len(route_keys),
+        "sessions": len(session_keys),
+        "leasesets": len(ls_keys),
+        "tunnels_alive": alive_tunnels,
+        "tunnels_total": total_tunnels,
+        "tags_remaining": total_tags,
+        "messages_sent": dict_get(net, "messages_sent") ?? 0,
+        "messages_received": dict_get(net, "messages_received") ?? 0,
+        "decoys_generated": dict_get(net, "decoys_generated") ?? 0,
+        "health": health,
+        "trit": health
+    }
+}

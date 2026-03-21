@@ -1,0 +1,535 @@
+// Nova TResilience v1.0 - Circuit Breaker + Rate Limiter (N-S Flow Model)
+// Port 9948: TCircuit + TRate combined into single server
+// Uses Navier-Stokes Reynolds classification for flow health
+//
+// N-S Mapping:
+//   service_calls   = velocity_field (requests flowing through pipes)
+//   circuit_state   = pressure_gradient (CLOSED=high, OPEN=zero, HALF-OPEN=recovering)
+//   failure_rate    = viscosity (higher viscosity = more resistance = more failures)
+//   token_bucket    = fluid_volume (fills at rate, drains per request)
+//   Re < H3^3 (27)  = laminar (healthy, low failure)
+//   Re > H7^3 (343) = turbulent (cascading failures, circuit open)
+//
+// Circuit Breaker: +1 CLOSED (healthy), 0 HALF-OPEN (testing), -1 OPEN (broken)
+// Rate Limiter:    +1 ALLOW,            0 THROTTLE,             -1 DENY
+
+let PORT = 9948
+let server = tserve(PORT, "TResilience v1.0 - Circuit Breaker + Rate Limiter")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3    // failure threshold: 3 consecutive failures -> OPEN
+let H5  = 5    // default token rate: 5 tokens/sec
+let H7  = 7    // default burst cap:  7 max tokens
+let H13 = 13   // recovery window:    13 seconds -> HALF-OPEN
+
+// -- Ternary State Values --
+let T_TRUE  =  1   // CLOSED / ALLOW
+let T_MAYBE =  0   // HALF-OPEN / THROTTLE
+let T_FALSE = -1   // OPEN / DENY
+
+// -- N-S Boundaries --
+let RE_LAMINAR    = 27    // H3^3 - healthy boundary
+let RE_TURBULENT  = 343   // H7^3 - critical boundary
+
+// -- Circuit Breaker Storage --
+// circuits: dict keyed by service_name
+// Each entry: state, failures, last_failure, last_success, total_calls, total_failures
+let circuits = {}
+
+// -- Rate Limiter Storage --
+// buckets: dict keyed by rate key string
+// Each entry: tokens, rate, burst, last_refill, total_allowed, total_denied
+let buckets = {}
+
+// -- Global Stats --
+let total_circuit_calls = 0
+let total_rate_calls    = 0
+let circuit_count       = 0
+let bucket_count        = 0
+
+
+// -----------------------------------------------------------------------------
+// CIRCUIT BREAKER HELPERS
+// -----------------------------------------------------------------------------
+
+fn ensure_circuit(name) {
+    // Returns the key prefix used in circuits dict for this service name
+    // Stores flattened keys: circuits.<name>.state, .failures, etc.
+    let exists = dict_has(circuits, name)
+    if3 exists == false {
+        let now = time()
+        let entry = {
+            "state":           T_TRUE,
+            "failures":        0,
+            "last_failure":    0,
+            "last_success":    now,
+            "total_calls":     0,
+            "total_failures":  0
+        }
+        dict_set(circuits, name, entry)
+        let circuit_count = circuit_count + 1
+    } else {
+    }
+    return dict_get(circuits, name, {})
+}
+
+fn circuit_state_name(trit) {
+    if3 trit == T_TRUE {
+        return "CLOSED"
+    } else trit == T_MAYBE {
+        return "HALF-OPEN"
+    } else {
+        return "OPEN"
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// CIRCUIT BREAKER ROUTE HANDLERS
+// -----------------------------------------------------------------------------
+
+fn tcircuit_check(body) {
+    // POST /tcircuit/check  { "service_name": "my-svc" }
+    // Returns trit: +1 CLOSED (proceed), 0 HALF-OPEN (test), -1 OPEN (reject)
+    total_circuit_calls = total_circuit_calls + 1
+
+    let name = dict_get(body, "service_name", "")
+    if3 len(name) == 0 {
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "error": "service_name required"
+    } else {
+    }
+
+    let c = ensure_circuit(name)
+    let st = dict_get(c, "state", T_TRUE)
+    let now = time()
+
+    // CLOSED -- allow immediately
+    if3 st == T_TRUE {
+        return {
+            "ok":      true,
+            "trit":    T_TRUE,
+            "state":   "CLOSED",
+            "service": name
+        }
+    } else st == T_FALSE {
+        // OPEN -- check if recovery window has elapsed
+        let last_fail = dict_get(c, "last_failure", 0)
+        let elapsed = now - last_fail
+        if3 elapsed >= H13 {
+            // Transition to HALF-OPEN
+            dict_set(c, "state", T_MAYBE)
+            dict_set(circuits, name, c)
+            return {
+                "ok":      true,
+                "trit":    T_MAYBE,
+                "state":   "HALF-OPEN",
+                "service": name,
+                "msg":     "testing recovery"
+        } else {
+            let retry_in = round(H13 - elapsed, 1)
+            return {
+                "ok":       true,
+                "trit":     T_FALSE,
+                "state":    "OPEN",
+                "service":  name,
+                "retry_in": retry_in
+    } else {
+        // HALF-OPEN -- allow one test call through
+        return {
+            "ok":      true,
+            "trit":    T_MAYBE,
+            "state":   "HALF-OPEN",
+            "service": name
+        }
+    }
+}
+}
+}
+}
+}
+
+fn tcircuit_report(body) {
+    // POST /tcircuit/report  { "service_name": "my-svc", "success": true/false }
+    // Reports outcome of a call; updates circuit state
+    total_circuit_calls = total_circuit_calls + 1
+
+    let name    = dict_get(body, "service_name", "")
+    let success = dict_get(body, "success", -999)
+
+    if3 len(name) == 0 {
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "error": "service_name required"
+    } else {
+    }
+
+    if3 success == -999 {
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "error": "success (bool) required"
+    } else {
+    }
+
+    let c   = ensure_circuit(name)
+    let now = time()
+    let tc  = dict_get(c, "total_calls", 0)
+    dict_set(c, "total_calls", tc + 1)
+
+    if3 success == true {
+        // Reset failures, close circuit
+        dict_set(c, "failures",     0)
+        dict_set(c, "last_success", now)
+        dict_set(c, "state",        T_TRUE)
+        dict_set(circuits, name, c)
+        return {
+            "ok":      true,
+            "trit":    T_TRUE,
+            "state":   "CLOSED",
+            "service": name
+    } else {
+        // Record failure
+        let f  = dict_get(c, "failures", 0)
+        let tf = dict_get(c, "total_failures", 0)
+        let new_f = f + 1
+        dict_set(c, "failures",        new_f)
+        dict_set(c, "total_failures",  tf + 1)
+        dict_set(c, "last_failure",    now)
+
+        if3 new_f >= H3 {
+            // Trip the breaker -- OPEN
+            dict_set(c, "state", T_FALSE)
+            dict_set(circuits, name, c)
+            return {
+                "ok":          true,
+                "trit":        T_FALSE,
+                "state":       "OPEN",
+                "service":     name,
+                "failures":    new_f,
+                "recovery_in": H13
+        } else {
+            dict_set(c, "state", T_MAYBE)
+            dict_set(circuits, name, c)
+            return {
+                "ok":       true,
+                "trit":     T_MAYBE,
+                "state":    "DEGRADED",
+                "service":  name,
+                "failures": new_f,
+                "threshold": H3
+            }
+        }
+    }
+}
+}
+}
+}
+}
+
+fn tcircuit_states(body) {
+    // GET /tcircuit/states -- dump all circuit states
+    let all_keys = keys(circuits)
+    let out = {}
+    let i = 0
+    while3 i < len(all_keys) {
+        let k   = all_keys[i]
+        let c   = dict_get(circuits, k, {})
+        let st  = dict_get(c, "state",       T_TRUE)
+        let sn  = circuit_state_name(st)
+        let f   = dict_get(c, "failures",    0)
+        let tc2 = dict_get(c, "total_calls", 0)
+        let entry = {
+            "state":       sn,
+            "trit":        st,
+            "failures":    f,
+            "total_calls": tc2
+        }
+        dict_set(out, k, entry)
+        let i = i + 1
+    }
+    return {
+        "ok":      true,
+        "trit":    T_TRUE,
+        "circuits": out,
+        "count":   len(all_keys)
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// RATE LIMITER HELPERS
+// -----------------------------------------------------------------------------
+
+fn ensure_bucket(key) {
+    let exists = dict_has(buckets, key)
+    if3 exists == false {
+        let now = time()
+        let entry = {
+            "tokens":        H7,
+            "rate":          H5,
+            "burst":         H7,
+            "last_refill":   now,
+            "total_allowed": 0,
+            "total_denied":  0
+        }
+        dict_set(buckets, key, entry)
+        let bucket_count = bucket_count + 1
+    } else {
+    }
+    return dict_get(buckets, key, {})
+}
+
+fn refill_bucket(b) {
+    // Token bucket refill: add elapsed * rate tokens, capped at burst
+    let now     = time()
+    let last    = dict_get(b, "last_refill", now)
+    let elapsed = now - last
+    let rate    = dict_get(b, "rate",  H5)
+    let burst   = dict_get(b, "burst", H7)
+    let tokens  = dict_get(b, "tokens", 0)
+    let gained  = elapsed * rate
+    let new_tok = min(burst, tokens + gained)
+    dict_set(b, "tokens",      new_tok)
+    dict_set(b, "last_refill", now)
+    return b
+}
+
+
+// -----------------------------------------------------------------------------
+// RATE LIMITER ROUTE HANDLERS
+// -----------------------------------------------------------------------------
+
+fn trate_check(body) {
+    // POST /trate/check  { "key": "user-123", "cost": 1 }
+    // Returns trit: +1 ALLOW, 0 THROTTLE, -1 DENY
+    total_rate_calls = total_rate_calls + 1
+
+    let key  = dict_get(body, "key",  "default")
+    let cost = dict_get(body, "cost", 1)
+    let cost = max(1, int(cost))
+
+    let b   = ensure_bucket(key)
+    let b   = refill_bucket(b)
+
+    let tokens = dict_get(b, "tokens", 0)
+    let rate   = dict_get(b, "rate",   H5)
+    let ta     = dict_get(b, "total_allowed", 0)
+    let td     = dict_get(b, "total_denied",  0)
+
+    if3 tokens >= cost {
+        // Full token deduction -- ALLOW
+        dict_set(b, "tokens",        tokens - cost)
+        dict_set(b, "total_allowed", ta + 1)
+        dict_set(buckets, key, b)
+        return {
+            "ok":        true,
+            "trit":      T_TRUE,
+            "action":    "ALLOW",
+            "remaining": round(tokens - cost, 1),
+            "key":       key
+        }
+    } else tokens >= cost * 0.5 {
+        // Partial deduction -- THROTTLE
+        let half = cost * 0.5
+        dict_set(b, "tokens",        tokens - half)
+        dict_set(b, "total_allowed", ta + 1)
+        dict_set(buckets, key, b)
+        return {
+            "ok":        true,
+            "trit":      T_MAYBE,
+            "action":    "THROTTLE",
+            "remaining": round(tokens - half, 1),
+            "key":       key,
+            "msg":       "slow down"
+    } else {
+        // No tokens -- DENY
+        let retry_in = round((cost - tokens) / rate, 2)
+        dict_set(b, "total_denied", td + 1)
+        dict_set(buckets, key, b)
+        return {
+            "ok":        true,
+            "trit":      T_FALSE,
+            "action":    "DENY",
+            "remaining": round(tokens, 1),
+            "key":       key,
+            "retry_in":  retry_in
+        }
+    }
+}
+}
+
+fn trate_config(body) {
+    // POST /trate/config  { "key": "user-123", "rate": 10.0, "burst": 20 }
+    // Reconfigure a bucket's rate and burst
+    let key   = dict_get(body, "key",   "default")
+    let rate  = dict_get(body, "rate",  H5)
+    let burst = dict_get(body, "burst", H7)
+
+    let b       = ensure_bucket(key)
+    let rate    = max(0.1, float(rate))
+    let burst   = max(1,   int(burst))
+    let tokens  = dict_get(b, "tokens", 0)
+
+    dict_set(b, "rate",   rate)
+    dict_set(b, "burst",  burst)
+    dict_set(b, "tokens", min(tokens, burst))
+    dict_set(buckets, key, b)
+
+    return {
+        "ok":    true,
+        "trit":  T_TRUE,
+        "key":   key,
+        "rate":  rate,
+        "burst": burst
+    }
+}
+
+fn trate_stats(body) {
+    // GET /trate/stats -- dump all bucket stats (after refill)
+    let all_keys = keys(buckets)
+    let out = {}
+    let i = 0
+    while3 i < len(all_keys) {
+        let k  = all_keys[i]
+        let b  = dict_get(buckets, k, {})
+        let b  = refill_bucket(b)
+        dict_set(buckets, k, b)
+        let tok  = dict_get(b, "tokens",        0)
+        let r    = dict_get(b, "rate",           H5)
+        let bst  = dict_get(b, "burst",          H7)
+        let ta   = dict_get(b, "total_allowed",  0)
+        let td   = dict_get(b, "total_denied",   0)
+        let entry = {
+            "tokens":  round(tok, 1),
+            "rate":    r,
+            "burst":   bst,
+            "allowed": ta,
+            "denied":  td
+        }
+        dict_set(out, k, entry)
+        let i = i + 1
+    }
+    return {
+        "ok":     true,
+        "trit":   T_TRUE,
+        "buckets": out,
+        "count":  len(all_keys)
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// HEALTH + STATUS
+// -----------------------------------------------------------------------------
+
+fn health(body) {
+    // GET /health -- overall service health
+    // Compute a quick Reynolds number from open circuit ratio
+    let all_keys = keys(circuits)
+    let total_c  = len(all_keys)
+    let open_c   = 0
+    let i = 0
+    while3 i < total_c {
+        let k  = all_keys[i]
+        let c  = dict_get(circuits, k, {})
+        let st = dict_get(c, "state", T_TRUE)
+        if3 st == T_FALSE {
+            let open_c = open_c + 1
+        } else {
+        }
+        let i = i + 1
+    }
+
+    // Reynolds analog: open_circuits * total_calls / H13
+    let re   = open_c * total_circuit_calls
+    let trit = T_TRUE
+    if3 re > RE_TURBULENT {
+        let trit = T_FALSE
+    } else re > RE_LAMINAR {
+        let trit = T_MAYBE
+    } else {
+    }
+
+    return {
+        "ok":              true,
+        "service":         "tresilience",
+        "port":            PORT,
+        "version":         "1.0",
+        "ternary":         true,
+        "trit":            trit,
+        "runtime":         "novalang",
+        "circuit_count":   total_c,
+        "bucket_count":    len(keys(buckets)),
+        "open_circuits":   open_c,
+        "reynolds":        re,
+        "harmonics":       {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+fn tresilience_status(body) {
+    // GET /status -- combined summary
+    let c_keys  = keys(circuits)
+    let b_keys  = keys(buckets)
+    let open_c  = 0
+    let i = 0
+    while3 i < len(c_keys) {
+        let k  = c_keys[i]
+        let c  = dict_get(circuits, k, {})
+        let st = dict_get(c, "state", T_TRUE)
+        if3 st == T_FALSE {
+            let open_c = open_c + 1
+        } else {
+        }
+        let i = i + 1
+    }
+    return {
+        "ok":                   true,
+        "ternary":              true,
+        "runtime":              "novalang",
+        "port":                 PORT,
+        "total_circuit_calls":  total_circuit_calls,
+        "total_rate_calls":     total_rate_calls,
+        "circuit_count":        len(c_keys),
+        "open_circuits":        open_c,
+        "bucket_count":         len(b_keys),
+        "harmonics":            {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "re_boundaries":        {"laminar": RE_LAMINAR, "turbulent": RE_TURBULENT}
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// ROUTE REGISTRATION
+// -----------------------------------------------------------------------------
+
+// Health + Status
+troute(server, "GET", "/health",         "health")
+troute(server, "GET", "/status",         "tresilience_status")
+
+// TCircuit routes
+troute(server, "POST", "/tcircuit/check",   "tcircuit_check")
+troute(server, "POST", "/tcircuit/report",  "tcircuit_report")
+troute(server, "GET",  "/tcircuit/states",  "tcircuit_states")
+
+// TRate routes
+troute(server, "POST", "/trate/check",   "trate_check")
+troute(server, "POST", "/trate/config",  "trate_config")
+troute(server, "GET",  "/trate/stats",   "trate_stats")
+
+// -----------------------------------------------------------------------------
+// STARTUP BANNER
+// -----------------------------------------------------------------------------
+
+print("[TResilience] NovaLang TResilience v1.0 - Circuit Breaker + Rate Limiter")
+print("[TResilience] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TResilience] Circuit: 3 failures -> OPEN | " + str(H13) + "s -> HALF-OPEN")
+print("[TResilience] Rate: " + str(H5) + " tok/s default | " + str(H7) + " burst cap")
+print("[TResilience] Routes: /health, /status, /tcircuit/check, /tcircuit/report, /tcircuit/states")
+print("[TResilience] Routes: /trate/check, /trate/config, /trate/stats")
+print("[TResilience] N-S Boundaries: Re<" + str(RE_LAMINAR) + "=laminar | Re>" + str(RE_TURBULENT) + "=turbulent")
+
+tstart(server)

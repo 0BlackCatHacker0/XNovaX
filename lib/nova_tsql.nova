@@ -1,0 +1,465 @@
+// ═══════════════════════════════════════════════════════════════════
+// nova_tsql.nova — Ternary SQL Engine v1.0.0
+// ═══════════════════════════════════════════════════════════════════
+// Pure NovaLang SQL. No SQLite. No Python. No external deps.
+// Tables = JSON files. Rows = dicts. Every query = trit result.
+// Ternary WHERE: fields can be +1 (true), 0 (maybe), -1 (false).
+// ═══════════════════════════════════════════════════════════════════
+
+let TSQL_VERSION = "1.0.0"
+let TSQL_DATA_DIR = "C:/NovaX/data/tsql"
+
+// ── Ensure data dir exists ──
+let _tsql_init = try3 {
+    let _exists = file_exists(TSQL_DATA_DIR)
+    if3 _exists == -1 {
+        mkdir(TSQL_DATA_DIR)
+    }
+    1
+} { 0 }
+
+// ══════════════════════════════════════════════════════════════
+// TABLE OPERATIONS
+// ══════════════════════════════════════════════════════════════
+
+// Table path from name
+fn _table_path(table_name) {
+    return join([TSQL_DATA_DIR, "/", table_name, ".json"], "")
+}
+
+// CREATE TABLE — defines schema + creates empty JSON file
+fn tsql_create(table_name, columns) {
+    let path = _table_path(table_name)
+    let exists = file_exists(path)
+    if3 exists == 1 {
+        return {"trit": 0, "warning": "table already exists", "table": table_name}
+    }
+    let table = {
+        "name": table_name,
+        "columns": columns,
+        "rows": [],
+        "next_id": 1,
+        "created": time(),
+        "trit": 1
+    }
+    let data = json_encode(table)
+    write_file(path, data)
+    return {"trit": 1, "table": table_name, "columns": columns}
+}
+
+// DROP TABLE
+fn tsql_drop(table_name) {
+    let path = _table_path(table_name)
+    let exists = file_exists(path)
+    if3 exists == -1 {
+        return {"trit": -1, "error": "table not found"}
+    }
+    write_file(path, "")
+    return {"trit": 1, "dropped": table_name}
+}
+
+// LOAD TABLE from disk
+fn _load_table(table_name) {
+    let path = _table_path(table_name)
+    let raw = try3 { read_file(path) } { "" }
+    if3 len(raw) < 3 {
+        return {"trit": -1, "error": join(["table not found: ", table_name], "")}
+    }
+    let table = try3 { json_decode(raw) } { {} }
+    return table
+}
+
+// SAVE TABLE to disk
+fn _save_table(table_name, table) {
+    let path = _table_path(table_name)
+    let data = json_encode(table)
+    write_file(path, data)
+    return 1
+}
+
+// ══════════════════════════════════════════════════════════════
+// INSERT — add row to table
+// ══════════════════════════════════════════════════════════════
+
+fn tsql_insert(table_name, row) {
+    let table = _load_table(table_name)
+    let trit = dict_get(table, "trit") ?? 0
+    if3 trit == -1 {
+        return table
+    }
+
+    let next_id = dict_get(table, "next_id") ?? 1
+    row = dict_set(row, "_id", next_id)
+    row = dict_set(row, "_trit", 1)
+    row = dict_set(row, "_ts", time())
+
+    let rows = dict_get(table, "rows") ?? []
+    rows = append(rows, row)
+    table = dict_set(table, "rows", rows)
+    table = dict_set(table, "next_id", next_id + 1)
+
+    _save_table(table_name, table)
+    return {"trit": 1, "inserted": next_id, "table": table_name}
+}
+
+// ══════════════════════════════════════════════════════════════
+// SELECT — query rows with WHERE filter
+// ══════════════════════════════════════════════════════════════
+
+// Check if a row matches a single condition
+// condition = {"field": "name", "op": "==", "value": "Jupiter"}
+fn _match_condition(row, cond) {
+    let field = dict_get(cond, "field") ?? ""
+    let op = dict_get(cond, "op") ?? "=="
+    let val = dict_get(cond, "value") ?? ""
+    let row_val = dict_get(row, field) ?? ""
+
+    // Convert to strings for comparison
+    let rv = to_str(row_val)
+    let cv = to_str(val)
+
+    if3 op == "==" {
+        if3 rv == cv { return 1 }
+        return -1
+    }
+    if3 op == "!=" {
+        if3 rv != cv { return 1 }
+        return -1
+    }
+    if3 op == ">" {
+        if3 to_num(row_val) > to_num(val) { return 1 }
+        return -1
+    }
+    if3 op == "<" {
+        if3 to_num(row_val) < to_num(val) { return 1 }
+        return -1
+    }
+    if3 op == ">=" {
+        if3 to_num(row_val) >= to_num(val) { return 1 }
+        return -1
+    }
+    if3 op == "<=" {
+        if3 to_num(row_val) <= to_num(val) { return 1 }
+        return -1
+    }
+    if3 op == "contains" {
+        if3 contains(rv, cv) { return 1 }
+        return -1
+    }
+    if3 op == "starts" {
+        if3 starts_with(rv, cv) { return 1 }
+        return -1
+    }
+    if3 op == "trit" {
+        // Ternary match: field must be exact trit value (-1, 0, or 1)
+        let ft = to_num(row_val)
+        let ct = to_num(val)
+        if3 ft == ct { return 1 }
+        return -1
+    }
+    if3 op == "exists" {
+        if3 len(rv) > 0 { return 1 }
+        return -1
+    }
+    // Unknown op = maybe
+    return 0
+}
+
+// Check all conditions (AND logic with ternary)
+fn _match_all(row, conditions) {
+    let result = 1
+    for3 i in range(len(conditions)) {
+        let cond = conditions[i]
+        let m = _match_condition(row, cond)
+        // Ternary AND: if any is -1, result is -1. If any is 0, result is 0.
+        if3 m == -1 {
+            return -1
+        }
+        if3 m == 0 {
+            result = 0
+        }
+    }
+    return result
+}
+
+// SELECT with conditions, optional fields, limit, offset
+fn tsql_select(table_name, conditions, fields, limit, offset) {
+    let table = _load_table(table_name)
+    let trit = dict_get(table, "trit") ?? 0
+    if3 trit == -1 {
+        return table
+    }
+
+    let rows = dict_get(table, "rows") ?? []
+    let results = []
+    let matched = 0
+    let skipped = 0
+
+    for3 i in range(len(rows)) {
+        let row = rows[i]
+        // Skip rows with trit -1 (soft deleted)
+        let row_trit = dict_get(row, "_trit") ?? 1
+        if3 row_trit == -1 {
+            continue3
+        }
+
+        let match_result = 1
+        if3 len(conditions) > 0 {
+            match_result = _match_all(row, conditions)
+        }
+
+        if3 match_result == 1 {
+            if3 skipped < offset {
+                skipped = skipped + 1
+                continue3
+            }
+            // Project fields if specified
+            if3 len(fields) > 0 {
+                let projected = {}
+                for3 f in range(len(fields)) {
+                    let fname = fields[f]
+                    projected = dict_set(projected, fname, dict_get(row, fname) ?? "")
+                }
+                projected = dict_set(projected, "_id", dict_get(row, "_id") ?? 0)
+                results = append(results, projected)
+            }
+            if3 len(fields) == 0 {
+                results = append(results, row)
+            }
+            matched = matched + 1
+            if3 limit > 0 {
+                if3 matched >= limit {
+                    break3
+                }
+            }
+        }
+    }
+
+    let result_trit = -1
+    if3 len(results) > 0 {
+        result_trit = 1
+    }
+    if3 len(results) == 0 {
+        if3 len(rows) > 0 {
+            result_trit = 0
+        }
+    }
+
+    return {
+        "trit": result_trit,
+        "rows": results,
+        "count": len(results),
+        "total": len(rows),
+        "table": table_name
+    }
+}
+
+// SELECT ALL — shorthand
+fn tsql_all(table_name) {
+    return tsql_select(table_name, [], [], 0, 0)
+}
+
+// ══════════════════════════════════════════════════════════════
+// UPDATE — modify rows matching conditions
+// ══════════════════════════════════════════════════════════════
+
+fn tsql_update(table_name, conditions, updates) {
+    let table = _load_table(table_name)
+    let trit = dict_get(table, "trit") ?? 0
+    if3 trit == -1 {
+        return table
+    }
+
+    let rows = dict_get(table, "rows") ?? []
+    let updated_count = 0
+    let new_rows = []
+
+    for3 i in range(len(rows)) {
+        let row = rows[i]
+        let match_result = _match_all(row, conditions)
+
+        if3 match_result == 1 {
+            // Apply updates
+            let update_keys = dict_keys(updates)
+            for3 u in range(len(update_keys)) {
+                let uk = update_keys[u]
+                row = dict_set(row, uk, dict_get(updates, uk) ?? "")
+            }
+            row = dict_set(row, "_updated", time())
+            updated_count = updated_count + 1
+        }
+        new_rows = append(new_rows, row)
+    }
+
+    table = dict_set(table, "rows", new_rows)
+    _save_table(table_name, table)
+
+    let result_trit = -1
+    if3 updated_count > 0 {
+        result_trit = 1
+    }
+
+    return {"trit": result_trit, "updated": updated_count, "table": table_name}
+}
+
+// ══════════════════════════════════════════════════════════════
+// DELETE — soft delete (set _trit to -1) or hard delete
+// ══════════════════════════════════════════════════════════════
+
+fn tsql_delete(table_name, conditions, hard) {
+    let table = _load_table(table_name)
+    let trit = dict_get(table, "trit") ?? 0
+    if3 trit == -1 {
+        return table
+    }
+
+    let rows = dict_get(table, "rows") ?? []
+    let deleted_count = 0
+    let new_rows = []
+
+    for3 i in range(len(rows)) {
+        let row = rows[i]
+        let match_result = _match_all(row, conditions)
+
+        if3 match_result == 1 {
+            deleted_count = deleted_count + 1
+            if3 hard == 1 {
+                // Hard delete — skip row entirely
+                continue3
+            }
+            // Soft delete — set trit to -1
+            row = dict_set(row, "_trit", -1)
+            row = dict_set(row, "_deleted", time())
+        }
+        new_rows = append(new_rows, row)
+    }
+
+    table = dict_set(table, "rows", new_rows)
+    _save_table(table_name, table)
+
+    let result_trit = -1
+    if3 deleted_count > 0 {
+        result_trit = 1
+    }
+
+    return {"trit": result_trit, "deleted": deleted_count, "table": table_name, "mode": "soft"}
+}
+
+// ══════════════════════════════════════════════════════════════
+// COUNT — count matching rows
+// ══════════════════════════════════════════════════════════════
+
+fn tsql_count(table_name, conditions) {
+    let result = tsql_select(table_name, conditions, [], 0, 0)
+    return {
+        "trit": dict_get(result, "trit") ?? 0,
+        "count": dict_get(result, "count") ?? 0,
+        "total": dict_get(result, "total") ?? 0,
+        "table": table_name
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// AGGREGATE — sum, avg, min, max on a field
+// ══════════════════════════════════════════════════════════════
+
+fn tsql_aggregate(table_name, conditions, field, op) {
+    let result = tsql_select(table_name, conditions, [field], 0, 0)
+    let rows = dict_get(result, "rows") ?? []
+
+    if3 len(rows) == 0 {
+        return {"trit": -1, "error": "no matching rows", "table": table_name}
+    }
+
+    let total = 0
+    let min_v = 999999999
+    let max_v = -999999999
+    let count = 0
+
+    for3 i in range(len(rows)) {
+        let val = to_num(dict_get(rows[i], field) ?? 0)
+        total = total + val
+        count = count + 1
+        if3 val < min_v { min_v = val }
+        if3 val > max_v { max_v = val }
+    }
+
+    let agg_result = 0
+    if3 op == "sum" { agg_result = total }
+    if3 op == "avg" {
+        if3 count > 0 { agg_result = total / count }
+    }
+    if3 op == "min" { agg_result = min_v }
+    if3 op == "max" { agg_result = max_v }
+    if3 op == "count" { agg_result = count }
+
+    return {"trit": 1, "result": agg_result, "op": op, "field": field, "count": count, "table": table_name}
+}
+
+// ══════════════════════════════════════════════════════════════
+// ORDER BY — sort results
+// ══════════════════════════════════════════════════════════════
+
+fn tsql_order(rows, field, direction) {
+    // Simple bubble sort (sufficient for NovaX-scale tables)
+    let n = len(rows)
+    let sorted = rows
+    for3 i in range(n) {
+        for3 j in range(n - 1 - i) {
+            let a = to_num(dict_get(sorted[j], field) ?? 0)
+            let b = to_num(dict_get(sorted[j + 1], field) ?? 0)
+            let swap = 0
+            if3 direction == "asc" {
+                if3 a > b { swap = 1 }
+            }
+            if3 direction == "desc" {
+                if3 a < b { swap = 1 }
+            }
+            if3 swap == 1 {
+                let tmp = sorted[j]
+                sorted = list_set(sorted, j, sorted[j + 1])
+                sorted = list_set(sorted, j + 1, tmp)
+            }
+        }
+    }
+    return sorted
+}
+
+// ══════════════════════════════════════════════════════════════
+// LIST TABLES
+// ══════════════════════════════════════════════════════════════
+
+fn tsql_tables() {
+    let files = try3 { dir_list(TSQL_DATA_DIR) } { [] }
+    let tables = []
+    for3 i in range(len(files)) {
+        let f = files[i]
+        if3 contains(f, ".json") {
+            let name = replace(f, ".json", "")
+            tables = append(tables, name)
+        }
+    }
+    return {"trit": 1, "tables": tables, "count": len(tables)}
+}
+
+// ══════════════════════════════════════════════════════════════
+// SCHEMA — describe table structure
+// ══════════════════════════════════════════════════════════════
+
+fn tsql_schema(table_name) {
+    let table = _load_table(table_name)
+    let trit = dict_get(table, "trit") ?? 0
+    if3 trit == -1 {
+        return table
+    }
+    return {
+        "trit": 1,
+        "table": table_name,
+        "columns": dict_get(table, "columns") ?? [],
+        "row_count": len(dict_get(table, "rows") ?? []),
+        "next_id": dict_get(table, "next_id") ?? 1,
+        "created": dict_get(table, "created") ?? 0
+    }
+}
+
+print(join(["[tsql] Ternary SQL Engine v", TSQL_VERSION, " loaded | data: ", TSQL_DATA_DIR], ""))
