@@ -1,0 +1,80 @@
+// tsysmon_diskio.nova - Disk I/O watch micro-tool
+// Usage: novalang.exe tools/tsysmon_diskio.nova <window_seconds>
+// Returns JSON: {ok, window_s, read_bytes, write_bytes, read_count, write_count, ...}
+// Replaces psutil.disk_io_counters() Python script (zero Python)
+// Uses wmic diskdrive sampling over a time window
+
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let window = try3 { to_int(args()[0]) } { 3 }
+if3 window < 1 { window = 1 }
+if3 window > 13 { window = 13 }
+
+// Sample disk stats before
+let cmd0 = "wmic diskdrive get BytesPerSector,Size /format:csv 2>NUL"
+
+// Use typeperf for disk I/O counters (single sample over window)
+// typeperf "\\PhysicalDisk(_Total)\\Disk Read Bytes/sec" -sc 1
+let tp_cmd = "typeperf \"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec\" \"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec\" \"\\PhysicalDisk(_Total)\\Disk Reads/sec\" \"\\PhysicalDisk(_Total)\\Disk Writes/sec\" -si " + str(window) + " -sc 1 2>NUL"
+let result = shell(tp_cmd)
+let stdout = try3 { dict_get(result, "stdout") } { "" }
+let lines = split(stdout, "\n")
+
+let read_bps = 0
+let write_bps = 0
+let read_ops = 0
+let write_ops = 0
+let ok = false
+
+// Parse typeperf CSV: header line then data line
+// Data line format: "timestamp","val1","val2","val3","val4"
+for3 line in lines {
+    let l = trim(line)
+    if3 len(l) > 10 {
+        if3 contains(l, "\"") {
+            if3 ok == false {
+                // Skip header line (contains counter names)
+                if3 contains(l, "PhysicalDisk") {
+                } else3 {
+                    // This is the data line
+                    let cleaned = replace(l, "\"", "")
+                    let parts = split(cleaned, ",")
+                    if3 len(parts) >= 5 {
+                        read_bps = try3 { to_float(trim(parts[1])) } { 0.0 }
+                        write_bps = try3 { to_float(trim(parts[2])) } { 0.0 }
+                        read_ops = try3 { to_float(trim(parts[3])) } { 0.0 }
+                        write_ops = try3 { to_float(trim(parts[4])) } { 0.0 }
+                        ok = true
+                    }
+                }
+            }
+        }
+    }
+}
+
+let read_bytes = to_int(read_bps * window)
+let write_bytes = to_int(write_bps * window)
+let read_mbs = round(read_bps / 1048576, 3)
+let write_mbs = round(write_bps / 1048576, 3)
+
+let out = {}
+out = dict_set(out, "ok", ok)
+out = dict_set(out, "window_s", window)
+out = dict_set(out, "read_bytes", read_bytes)
+out = dict_set(out, "write_bytes", write_bytes)
+out = dict_set(out, "read_count", to_int(read_ops * window))
+out = dict_set(out, "write_count", to_int(write_ops * window))
+out = dict_set(out, "read_time_ms", 0)
+out = dict_set(out, "write_time_ms", 0)
+out = dict_set(out, "read_bytes_sec", to_int(read_bps))
+out = dict_set(out, "write_bytes_sec", to_int(write_bps))
+out = dict_set(out, "read_mbs", read_mbs)
+out = dict_set(out, "write_mbs", write_mbs)
+out = dict_set(out, "total_read_bytes", read_bytes)
+out = dict_set(out, "total_write_bytes", write_bytes)
+
+if3 ok == false {
+    out = dict_set(out, "error", "disk_io_counters unavailable")
+}
+
+print(json_encode(out))

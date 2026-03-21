@@ -1,0 +1,108 @@
+// ═══════════════════════════════════════════════════════════════════
+// nova_trate_service.nova — Rate Limiter v1.0.0
+// ═══════════════════════════════════════════════════════════════════
+// Ternary rate limiting: +1 = under limit, 0 = near limit, -1 = throttled
+// 3-5-7-13 harmonic windows for request tracking
+// ═══════════════════════════════════════════════════════════════════
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+import3("C:/NovaX/lib/nova_http_utils.nova")
+
+let PORT = 9949
+let _ns = ns_init_counters()
+
+// Rate windows: H3=3s burst, H5=5s short, H7=7s medium, H13=13s long
+let _windows = {}
+let _limits = {"burst": 30, "short": 100, "medium": 500, "long": 2000}
+
+fn get_window(client_id) {
+    let w = dict_get(_windows, client_id) ?? {}
+    if3 len(keys(w)) == 0 {
+        w = {"burst": 0, "short": 0, "medium": 0, "long": 0, "last_reset": time(), "throttled": 0}
+        _windows = dict_set(_windows, client_id, w)
+    }
+    return w
+}
+
+fn check_rate(client_id) {
+    let w = get_window(client_id)
+    let now = time()
+    let elapsed = now - (dict_get(w, "last_reset") ?? now)
+
+    // Reset windows based on harmonic intervals
+    if3 elapsed > 13 {
+        w = {"burst": 0, "short": 0, "medium": 0, "long": 0, "last_reset": now, "throttled": 0}
+        _windows = dict_set(_windows, client_id, w)
+        return {"trit": 1, "status": "ok", "remaining": dict_get(_limits, "burst") ?? 30}
+    }
+
+    let burst = dict_get(w, "burst") ?? 0
+    let burst_limit = dict_get(_limits, "burst") ?? 30
+
+    if3 burst >= burst_limit {
+        return {"trit": -1, "status": "throttled", "retry_after": 3}
+    }
+    if3 burst > (burst_limit * 8 / 10) {
+        return {"trit": 0, "status": "near_limit", "remaining": burst_limit - burst}
+    }
+    return {"trit": 1, "status": "ok", "remaining": burst_limit - burst}
+}
+
+fn record_request(client_id) {
+    let w = get_window(client_id)
+    w = dict_set(w, "burst", (dict_get(w, "burst") ?? 0) + 1)
+    w = dict_set(w, "short", (dict_get(w, "short") ?? 0) + 1)
+    w = dict_set(w, "medium", (dict_get(w, "medium") ?? 0) + 1)
+    w = dict_set(w, "long", (dict_get(w, "long") ?? 0) + 1)
+    _windows = dict_set(_windows, client_id, w)
+    return check_rate(client_id)
+}
+
+// ── Handlers ──
+fn handle_health(req) {
+    return ns_health_dict("nova-trate", "1.0.0", PORT, _ns)
+}
+
+fn handle_check(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let client = dict_get(body, "client") ?? "default"
+    return check_rate(client)
+}
+
+fn handle_stats(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let total_clients = len(keys(_windows))
+    let throttled = 0
+    let wkeys = keys(_windows)
+    for3 i in range(len(wkeys)) {
+        let w = dict_get(_windows, wkeys[i]) ?? {}
+        if3 (dict_get(w, "throttled") ?? 0) > 0 { throttled = throttled + 1 }
+    }
+    return {
+        "ok": 1,
+        "trit": 1,
+        "total_clients": total_clients,
+        "throttled_clients": throttled,
+        "limits": _limits,
+        "harmonics": {"H3": 3, "H5": 5, "H7": 7, "H13": 13}
+    }
+}
+
+fn handle_record(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let client = dict_get(body, "client") ?? "default"
+    return record_request(client)
+}
+
+// ── Routes ──
+let server = tserve(PORT, "nova-trate")
+troute(server, "GET",  "/health",       "handle_health")
+troute(server, "GET",  "/trate/stats",  "handle_stats")
+troute(server, "POST", "/trate/check",  "handle_check")
+troute(server, "POST", "/trate/record", "handle_record")
+
+print("[trate] Rate Limiter v1.0.0 on port 9949")
+tstart(server)

@@ -1,0 +1,300 @@
+// generate_training_set.nova - Extract LLM training pairs from NovaX collected data
+// NovaX Script | Reads super_archive + classified_reflections, outputs training JSON
+// Ternary: +1=success, 0=partial, -1=fail
+// 3-5-7-13: batch=243(3^5), min_len=100, domains~H7
+
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+print("=== NovaX LLM Training Set Generator ===")
+print("")
+
+let archive_dir = "C:/NovaX/data/super_archive"
+let reflect_dir = "C:/NovaX/data/classified_reflections"
+let out_dir = "C:/NovaX/data/llm_training"
+let MIN_RESPONSE_LEN = 100
+
+// Ensure output directory exists
+try3 { mkdir(out_dir) } fail { print("[INFO] Output dir exists or mkdir unavailable") }
+
+let training_pairs = []
+let total_read = 0
+let total_skipped_short = 0
+let total_skipped_noresponse = 0
+let total_errors = 0
+
+// -- Stats accumulators --
+let domain_counts = {}
+let provider_counts = {}
+let total_response_len = 0
+
+// ============================================================
+// PHASE 1: Process super_archive files
+// ============================================================
+print("[PHASE 1] Reading super_archive...")
+
+let archive_entries = try3 { dir_list(archive_dir) } fail { [] }
+let archive_count = len(archive_entries)
+print("  Found " + str(archive_count) + " entries")
+
+let ai = 0
+while3 ai < archive_count {
+    let entry = archive_entries[ai]
+    let fname = ""
+    // dir_list may return strings or dicts
+    if3 type(entry) == "string" {
+        fname = entry
+    } {
+        fname = dict_get(entry, "name") ?? (dict_get(entry, "path") ?? "")
+    }
+
+    // Only process .json files
+    if3 contains(fname, ".json") == true {
+        let fpath = archive_dir + "/" + fname
+        let raw = try3 { read_file(fpath) } fail { "" }
+        if3 len(raw) > 0 {
+            let data = try3 { json_decode(raw) } fail { {} }
+            let response = dict_get(data, "response") ?? ""
+            let resp_len = len(response)
+
+            if3 resp_len >= MIN_RESPONSE_LEN {
+                let provider = dict_get(data, "provider") ?? "unknown"
+                let model = dict_get(data, "model") ?? "unknown"
+                let prompt = dict_get(data, "prompt") ?? ""
+                // super_archive often lacks prompt — use response start as context
+                if3 len(prompt) == 0 {
+                    // Extract first sentence as pseudo-prompt
+                    let dot_pos = index_of(response, ".")
+                    if3 dot_pos > 0 {
+                        if3 dot_pos < 120 {
+                            prompt = slice(response, 0, dot_pos + 1)
+                        } {
+                            prompt = slice(response, 0, 100) + "..."
+                        }
+                    } {
+                        prompt = slice(response, 0, 100) + "..."
+                    }
+                }
+
+                // Classify domain from response content
+                let domain = "GENERAL"
+                let lr = lower(response)
+                if3 contains(lr, "ternary") == true { domain = "REASON" }
+                if3 contains(lr, "algorithm") == true { domain = "CODE" }
+                if3 contains(lr, "equation") == true { domain = "MATH" }
+                if3 contains(lr, "translate") == true { domain = "LANGUAGE" }
+                if3 contains(lr, "function") == true { if3 domain == "GENERAL" { domain = "CODE" } }
+                if3 contains(lr, "calculate") == true { if3 domain == "GENERAL" { domain = "MATH" } }
+                if3 contains(lr, "security") == true { if3 domain == "GENERAL" { domain = "DOMAIN" } }
+
+                let pair = {
+                    "input": prompt,
+                    "output": response,
+                    "domain": domain,
+                    "provider": provider,
+                    "model": model,
+                    "source": "super_archive",
+                    "score": 1.0
+                }
+                training_pairs = append(training_pairs, pair)
+                total_read = total_read + 1
+                total_response_len = total_response_len + resp_len
+
+                // Accumulate stats
+                let dc = dict_get(domain_counts, domain) ?? 0
+                domain_counts = dict_set(domain_counts, domain, dc + 1)
+                let pc = dict_get(provider_counts, provider) ?? 0
+                provider_counts = dict_set(provider_counts, provider, pc + 1)
+            } {
+                total_skipped_short = total_skipped_short + 1
+            }
+        } {
+            total_skipped_noresponse = total_skipped_noresponse + 1
+        }
+    }
+    ai = ai + 1
+}
+print("  Extracted: " + str(total_read) + " pairs")
+print("  Skipped (short): " + str(total_skipped_short))
+print("  Skipped (no response): " + str(total_skipped_noresponse))
+
+// ============================================================
+// PHASE 2: Process classified_reflections files
+// ============================================================
+print("")
+print("[PHASE 2] Reading classified_reflections...")
+
+let reflect_entries = try3 { dir_list(reflect_dir) } fail { [] }
+let reflect_count = len(reflect_entries)
+print("  Found " + str(reflect_count) + " entries")
+
+let reflect_read = 0
+let reflect_skipped = 0
+let ri = 0
+while3 ri < reflect_count {
+    let entry = reflect_entries[ri]
+    let fname = ""
+    if3 type(entry) == "string" {
+        fname = entry
+    } {
+        fname = dict_get(entry, "name") ?? (dict_get(entry, "path") ?? "")
+    }
+
+    if3 contains(fname, ".json") == true {
+        let fpath = reflect_dir + "/" + fname
+        let raw = try3 { read_file(fpath) } fail { "" }
+        if3 len(raw) > 0 {
+            let data = try3 { json_decode(raw) } fail { {} }
+            let response = dict_get(data, "response") ?? ""
+            let resp_len = len(response)
+
+            if3 resp_len >= MIN_RESPONSE_LEN {
+                let provider = dict_get(data, "provider") ?? "unknown"
+                let model = dict_get(data, "model") ?? "unknown"
+                let prompt = dict_get(data, "prompt") ?? ""
+                let capability = dict_get(data, "capability") ?? "GENERAL"
+
+                // Map capability to domain
+                let domain = "GENERAL"
+                if3 capability == "ADVANCED_ANALYSIS" { domain = "REASON" }
+                if3 capability == "PATTERN_RECOGNITION" { domain = "REASON" }
+                if3 capability == "AUTONOMOUS_SYSTEMS" { domain = "AGENT" }
+                if3 capability == "SECURITY_RESEARCH" { domain = "DOMAIN" }
+                if3 capability == "SPATIAL_REASONING" { domain = "REASON" }
+                if3 capability == "STRATEGIC_PLANNING" { domain = "AGENT" }
+                if3 capability == "GLOBAL_MONITORING" { domain = "FACT" }
+                if3 capability == "CROSS_LANGUAGE" { domain = "LANGUAGE" }
+
+                if3 len(prompt) == 0 {
+                    prompt = "Explain " + lower(replace(capability, "_", " "))
+                }
+
+                let pair = {
+                    "input": prompt,
+                    "output": response,
+                    "domain": domain,
+                    "provider": provider,
+                    "model": model,
+                    "source": "classified_reflections",
+                    "capability": capability,
+                    "score": 1.0
+                }
+                training_pairs = append(training_pairs, pair)
+                total_read = total_read + 1
+                reflect_read = reflect_read + 1
+                total_response_len = total_response_len + resp_len
+
+                let dc = dict_get(domain_counts, domain) ?? 0
+                domain_counts = dict_set(domain_counts, domain, dc + 1)
+                let pc = dict_get(provider_counts, provider) ?? 0
+                provider_counts = dict_set(provider_counts, provider, pc + 1)
+            } {
+                reflect_skipped = reflect_skipped + 1
+                total_skipped_short = total_skipped_short + 1
+            }
+        } {
+            total_errors = total_errors + 1
+        }
+    }
+    ri = ri + 1
+}
+print("  Extracted: " + str(reflect_read) + " pairs")
+print("  Skipped (short): " + str(reflect_skipped))
+
+// ============================================================
+// PHASE 3: Save training pairs
+// ============================================================
+print("")
+print("[PHASE 3] Saving training data...")
+
+let total_pairs = len(training_pairs)
+let pairs_json = json_encode(training_pairs)
+let pairs_path = out_dir + "/training_pairs.json"
+try3 {
+    write_file(pairs_path, pairs_json)
+    print("  Saved " + str(total_pairs) + " pairs to " + pairs_path)
+    print("  File size: " + str(len(pairs_json)) + " chars")
+} fail {
+    print("  ERROR: Failed to write training_pairs.json")
+    total_errors = total_errors + 1
+}
+
+// ============================================================
+// PHASE 4: Generate and save stats
+// ============================================================
+print("")
+print("[PHASE 4] Generating stats...")
+
+let avg_len = 0
+if3 total_pairs > 0 {
+    avg_len = floor(total_response_len / total_pairs)
+}
+
+let stats = {
+    "total_pairs": total_pairs,
+    "total_skipped_short": total_skipped_short,
+    "total_skipped_noresponse": total_skipped_noresponse,
+    "total_errors": total_errors,
+    "min_response_length": MIN_RESPONSE_LEN,
+    "avg_response_length": avg_len,
+    "total_response_chars": total_response_len,
+    "per_domain": domain_counts,
+    "per_provider": provider_counts,
+    "sources": {
+        "super_archive_dir": archive_dir,
+        "super_archive_files": archive_count,
+        "classified_reflections_dir": reflect_dir,
+        "classified_reflections_files": reflect_count
+    },
+    "generated_at": str(time()),
+    "trit": 1
+}
+
+let stats_json = json_encode(stats)
+let stats_path = out_dir + "/training_stats.json"
+try3 {
+    write_file(stats_path, stats_json)
+    print("  Saved stats to " + stats_path)
+} fail {
+    print("  ERROR: Failed to write training_stats.json")
+    total_errors = total_errors + 1
+}
+
+// ============================================================
+// Summary
+// ============================================================
+print("")
+print("=== Training Set Summary ===")
+print("  Total pairs: " + str(total_pairs))
+print("  Avg response length: " + str(avg_len) + " chars")
+print("")
+
+// Print domain breakdown
+print("  Per-domain counts:")
+let dk = dict_keys(domain_counts)
+let dki = 0
+while3 dki < len(dk) {
+    let dname = dk[dki]
+    let dcount = dict_get(domain_counts, dname) ?? 0
+    print("    " + dname + ": " + str(dcount))
+    dki = dki + 1
+}
+
+print("")
+print("  Per-provider counts:")
+let pk = dict_keys(provider_counts)
+let pki = 0
+while3 pki < len(pk) {
+    let pname = pk[pki]
+    let pcount = dict_get(provider_counts, pname) ?? 0
+    print("    " + pname + ": " + str(pcount))
+    pki = pki + 1
+}
+
+print("")
+if3 total_errors == 0 {
+    print("[+1] SUCCESS — Training set generated")
+} {
+    print("[0] PARTIAL — " + str(total_errors) + " errors encountered")
+}
+
+return 1

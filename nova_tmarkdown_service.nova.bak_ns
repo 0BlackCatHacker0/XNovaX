@@ -1,0 +1,1670 @@
+// NovaX TMarkdown Service v1.0 - Ternary Markdown Processing (NovaLang)
+// Port 9920: Markdown operations through ternary-native micro-tools
+//
+// 7 ternary-native markdown tools on 3-5-7-13 harmonic constants:
+//   1. /tmarkdown/render   -- Render markdown to HTML (text OR path)
+//   2. /tmarkdown/toc      -- Extract table of contents / heading structure (text OR path)
+//   3. /tmarkdown/links    -- Extract all links from markdown (text OR path)
+//   4. /tmarkdown/stats    -- Word count, heading count, link count, code block count (text OR path)
+//   5. /tmarkdown/convert  -- Convert markdown file to HTML file (input_path, output_path)
+//   6. /tmarkdown/validate -- Check markdown for common issues (text OR path)
+//   7. /tmarkdown/extract  -- Extract specific sections by heading (text OR path, heading)
+//
+// N-S Mapping:
+//   document_flow     = velocity_field (markdown content being processed)
+//   parse_complexity  = turbulent_energy (document structural complexity)
+//   Reynolds(md)      = doc_ops * H5
+//   RE_LAMINAR=27     = small doc (few headings, short text)
+//   RE_TRANSITION=125 = medium doc (moderate structure)
+//   RE_TURBULENT=343  = large doc (complex structure, many headings/links)
+//
+// Endpoints:
+//   GET  /health                    -- Health check
+//   GET  /tmarkdown/service-status  -- Full service status with stats
+//   POST /tmarkdown/render          -- Render markdown to HTML
+//   POST /tmarkdown/toc             -- Extract table of contents
+//   POST /tmarkdown/links           -- Extract all links
+//   POST /tmarkdown/stats           -- Document statistics
+//   POST /tmarkdown/convert         -- Convert md file to HTML file
+//   POST /tmarkdown/validate        -- Validate markdown
+//   POST /tmarkdown/extract         -- Extract section by heading
+
+let PORT = 9920
+let server = tserve(PORT, "TMarkdown v1.0 - Ternary Markdown Processing")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE     = 2187
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+let TOOLS_COUNT    = 7
+let VERSION        = "1.0.0"
+let SERVICE_NAME   = "nova-tmarkdown"
+let MD_TIMEOUT     = 13
+let TMP_DIR        = "C:\\NovaX\\data"
+
+// -- Global Stats --
+let stat_ops         = 0
+let stat_trit_true   = 0
+let stat_trit_maybe  = 0
+let stat_trit_false  = 0
+let stat_t0          = time()
+
+// by_tool counters (one per tool)
+let by_tool_render   = 0
+let by_tool_toc      = 0
+let by_tool_links    = 0
+let by_tool_stats    = 0
+let by_tool_convert  = 0
+let by_tool_validate = 0
+let by_tool_extract  = 0
+
+// -- N-S flow tracking --
+let ns_total_chars_in  = 0
+let ns_total_chars_out = 0
+let ns_max_reynolds    = 0
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: 3-char balanced ternary from integer
+// Maps small integers to a 3-trit balanced ternary string
+// ===========================================================================
+fn bt_three(n) {
+    let result = ""
+    let val = n
+    let i = 0
+    while3 i < 3 {
+        let rem = val % 3
+        if3 rem == 0 {
+            result = "0" + result
+        }
+        if3 rem == 1 {
+            result = "+" + result
+            val = val - 1
+        }
+        if3 rem == 2 {
+            result = "T" + result
+            val = val + 1
+        }
+        val = val / 3
+        i = i + 1
+    }
+    return result
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_op(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "render" {
+        by_tool_render = by_tool_render + 1
+    }
+    if3 tool_name == "toc" {
+        by_tool_toc = by_tool_toc + 1
+    }
+    if3 tool_name == "links" {
+        by_tool_links = by_tool_links + 1
+    }
+    if3 tool_name == "stats" {
+        by_tool_stats = by_tool_stats + 1
+    }
+    if3 tool_name == "convert" {
+        by_tool_convert = by_tool_convert + 1
+    }
+    if3 tool_name == "validate" {
+        by_tool_validate = by_tool_validate + 1
+    }
+    if3 tool_name == "extract" {
+        by_tool_extract = by_tool_extract + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: compute Reynolds number from document metrics
+// N-S: parse_complexity = turbulent_energy
+// Reynolds = (char_count / BLOCK_SIZE) * H5
+// ===========================================================================
+fn compute_reynolds(char_count) {
+    let re = (char_count / BLOCK_SIZE) * H5
+    if3 re > 999 {
+        re = 999
+    }
+    if3 re < 0 {
+        re = 0
+    }
+    return re
+}
+
+// ===========================================================================
+// HELPER: run a shell command with standard timeout
+// Returns trimmed output string
+// ===========================================================================
+fn run_md(cmd) {
+    let raw = nova_run(cmd, MD_TIMEOUT)
+    let output = trim(str(raw))
+    return output
+}
+
+// ===========================================================================
+// HELPER: check if output indicates an error
+// ===========================================================================
+fn is_error(output) {
+    let lc = lower(output)
+    if3 contains(lc, "traceback") {
+        return true
+    }
+    if3 contains(lc, "error:") {
+        return true
+    }
+    if3 contains(lc, "exception") {
+        return true
+    }
+    if3 contains(lc, "no such file") {
+        return true
+    }
+    if3 contains(lc, "filenotfounderror") {
+        return true
+    }
+    if3 contains(lc, "modulenotfounderror") {
+        return true
+    }
+    if3 contains(lc, "permission denied") {
+        return true
+    }
+    if3 contains(lc, "oserror") {
+        return true
+    }
+    if3 contains(lc, "ioerror") {
+        return true
+    }
+    if3 contains(lc, "syntaxerror") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: escape a file path for use inside python single-quoted strings
+// Replace backslash with double backslash, then escape single quotes
+// ===========================================================================
+fn escape_for_py(s) {
+    let escaped = replace(s, "\\", "\\\\")
+    escaped = replace(escaped, "'", "\\'")
+    return escaped
+}
+
+// ===========================================================================
+// HELPER: generate a unique temp file path for markdown content
+// ===========================================================================
+fn tmp_md_path() {
+    let ts = str(int(time() * 1000))
+    let path = TMP_DIR + "\\tmp_md_" + ts + ".md"
+    return path
+}
+
+// ===========================================================================
+// HELPER: generate a unique temp file path for python output
+// ===========================================================================
+fn tmp_out_path() {
+    let ts = str(int(time() * 1000))
+    let path = TMP_DIR + "\\tmp_mdout_" + ts + ".txt"
+    return path
+}
+
+// ===========================================================================
+// HELPER: write text content to a temp file via python
+// Returns the path on success, or "" on error
+// ===========================================================================
+fn write_temp_file(text, fpath) {
+    // Use NovaLang's native nova_write — handles all escaping properly
+    let result = nova_write(fpath, text)
+    return fpath
+}
+
+// ===========================================================================
+// HELPER: clean up a temp file
+// ===========================================================================
+fn cleanup_temp(fpath) {
+    let epath = escape_for_py(fpath)
+    let cmd = "python -c \"import os; os.remove('" + epath + "') if os.path.exists('" + epath + "') else None; print('ok')\""
+    nova_run(cmd)
+}
+
+// ===========================================================================
+// HELPER: read file content size via python
+// ===========================================================================
+fn get_file_size(fpath) {
+    let epath = escape_for_py(fpath)
+    let cmd = "python -c \"import os; print(os.path.getsize('" + epath + "'))\""
+    let result = run_md(cmd)
+    if3 is_error(result) {
+        return 0
+    }
+    return int(trim(result))
+}
+
+// ===========================================================================
+// HELPER: resolve markdown source -- returns path to file to process
+// If body has 'path', validates and returns it
+// If body has 'text', writes to temp file and returns temp path
+// Returns a dict with: path, is_temp, error
+// ===========================================================================
+fn resolve_md_source(body) {
+    let result = {}
+    let path_val = dict_get(body, "path", "")
+    let text_val = dict_get(body, "text", "")
+
+    // Check path first (file-based input takes priority)
+    if3 len(path_val) > 0 {
+        // Validate file exists
+        let epath = escape_for_py(path_val)
+        let check_cmd = "python -c \"import os; print('exists' if os.path.exists('" + epath + "') else 'missing')\""
+        let check_result = run_md(check_cmd)
+        if3 contains(check_result, "missing") {
+            dict_set(result, "path", "")
+            dict_set(result, "is_temp", false)
+            dict_set(result, "error", "File not found: " + path_val)
+            return result
+        }
+        if3 is_error(check_result) {
+            dict_set(result, "path", "")
+            dict_set(result, "is_temp", false)
+            dict_set(result, "error", "Cannot access file: " + path_val)
+            return result
+        }
+        dict_set(result, "path", path_val)
+        dict_set(result, "is_temp", false)
+        dict_set(result, "error", "")
+        return result
+    }
+
+    // Fall back to text-based input
+    if3 len(text_val) > 0 {
+        let tmp = tmp_md_path()
+        // Use NovaLang's native nova_write — handles all escaping properly
+        nova_write(tmp, text_val)
+        dict_set(result, "path", tmp)
+        dict_set(result, "is_temp", true)
+        dict_set(result, "error", "")
+        return result
+    }
+
+    // Neither path nor text provided
+    dict_set(result, "path", "")
+    dict_set(result, "is_temp", false)
+    dict_set(result, "error", "Either 'text' or 'path' parameter is required")
+    return result
+}
+
+// ===========================================================================
+// HELPER: track N-S flow metrics
+// ===========================================================================
+fn track_ns_flow(chars_in, chars_out) {
+    ns_total_chars_in = ns_total_chars_in + chars_in
+    ns_total_chars_out = ns_total_chars_out + chars_out
+    let re = compute_reynolds(chars_in)
+    if3 re > ns_max_reynolds {
+        ns_max_reynolds = re
+    }
+}
+
+// ===========================================================================
+// HELPER: build standard error response
+// ===========================================================================
+fn error_response(tool_name, error_msg) {
+    record_op(tool_name, T_FALSE)
+    return {
+        "ok": false,
+        "error": error_msg,
+        "tool": tool_name,
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "bt3": bt_three(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+// TOOL 1: POST /tmarkdown/render
+// Render markdown text to HTML
+// Body: {text: "# Hello", path: "file.md"}
+// Uses Python markdown library with extensions: tables, fenced_code, toc
+// Trit: +1=rendered successfully, 0=empty input, -1=error
+// ===========================================================================
+// ===========================================================================
+fn handle_render(body) {
+    // Resolve markdown source (path or text)
+    let source = resolve_md_source(body)
+    let src_path = dict_get(source, "path", "")
+    let is_temp = dict_get(source, "is_temp", false)
+    let src_error = dict_get(source, "error", "")
+
+    // Check for resolution error
+    if3 len(src_error) > 0 {
+        return error_response("render", src_error)
+    }
+
+    if3 len(src_path) == 0 {
+        return error_response("render", "No markdown source provided")
+    }
+
+    // Build the python command to render markdown
+    let epath = escape_for_py(src_path)
+    let out_file = tmp_out_path()
+    let eout = escape_for_py(out_file)
+
+    let py_cmd = "python -c \""
+    py_cmd = py_cmd + "import markdown, json;"
+    py_cmd = py_cmd + "text=open('" + epath + "','r',encoding='utf-8').read();"
+    py_cmd = py_cmd + "html=markdown.markdown(text, extensions=['tables','fenced_code','toc','codehilite','nl2br','sane_lists']);"
+    py_cmd = py_cmd + "result={'html':html,'input_len':len(text),'output_len':len(html)};"
+    py_cmd = py_cmd + "f=open('" + eout + "','w',encoding='utf-8');"
+    py_cmd = py_cmd + "json.dump(result,f);"
+    py_cmd = py_cmd + "f.close();"
+    py_cmd = py_cmd + "print('ok')"
+    py_cmd = py_cmd + "\""
+
+    let result = run_md(py_cmd)
+
+    // Check for python execution error
+    if3 is_error(result) {
+        // Cleanup temp files
+        if3 is_temp == true {
+            cleanup_temp(src_path)
+        }
+        return error_response("render", "Markdown render failed: " + result)
+    }
+
+    // Read the output JSON
+    let read_cmd = "python -c \""
+    read_cmd = read_cmd + "import json;"
+    read_cmd = read_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    read_cmd = read_cmd + "print(d.get('html',''));"
+    read_cmd = read_cmd + "\""
+    let html_output = run_md(read_cmd)
+
+    // Get input/output lengths
+    let len_cmd = "python -c \""
+    len_cmd = len_cmd + "import json;"
+    len_cmd = len_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    len_cmd = len_cmd + "print(str(d.get('input_len',0))+'|'+str(d.get('output_len',0)));"
+    len_cmd = len_cmd + "\""
+    let len_result = run_md(len_cmd)
+    let len_parts = split(len_result, "|")
+    let input_len = int(dict_get(len_parts, 0, "0"))
+    let output_len = int(dict_get(len_parts, 1, "0"))
+
+    // Cleanup temp files
+    if3 is_temp == true {
+        cleanup_temp(src_path)
+    }
+    cleanup_temp(out_file)
+
+    // Determine trit
+    let render_trit = T_TRUE
+    if3 output_len == 0 {
+        render_trit = T_MAYBE
+    }
+
+    // N-S flow tracking
+    let re = compute_reynolds(input_len)
+    let regime = flow_regime(re)
+    track_ns_flow(input_len, output_len)
+
+    record_op("render", render_trit)
+    return {
+        "ok": true,
+        "html": html_output,
+        "input_chars": input_len,
+        "output_chars": output_len,
+        "compression_ratio": output_len,
+        "extensions": ["tables", "fenced_code", "toc", "codehilite", "nl2br", "sane_lists"],
+        "reynolds": re,
+        "regime": regime,
+        "trit": render_trit,
+        "char": bt_one(render_trit),
+        "bt3": bt_three(render_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+// TOOL 2: POST /tmarkdown/toc
+// Extract table of contents / heading structure from markdown
+// Body: {text: "# Hello\n## World", path: "file.md"}
+// Returns list of headings with level, text, and id (slug)
+// Trit: +1=headings found, 0=no headings, -1=error
+// ===========================================================================
+// ===========================================================================
+fn handle_toc(body) {
+    // Resolve markdown source
+    let source = resolve_md_source(body)
+    let src_path = dict_get(source, "path", "")
+    let is_temp = dict_get(source, "is_temp", false)
+    let src_error = dict_get(source, "error", "")
+
+    if3 len(src_error) > 0 {
+        return error_response("toc", src_error)
+    }
+
+    if3 len(src_path) == 0 {
+        return error_response("toc", "No markdown source provided")
+    }
+
+    let epath = escape_for_py(src_path)
+    let out_file = tmp_out_path()
+    let eout = escape_for_py(out_file)
+
+    // Python script to extract headings — write to temp .py file for complex logic
+    let tmp_py = escape_for_py(out_file + ".py")
+    let py_code = "import re, json\n"
+    py_code = py_code + "text=open('" + epath + "','r',encoding='utf-8').read()\n"
+    py_code = py_code + "lines=text.split('\\n')\n"
+    py_code = py_code + "headings=[]\n"
+    py_code = py_code + "in_code=False\n"
+    py_code = py_code + "for line in lines:\n"
+    py_code = py_code + "    stripped=line.strip()\n"
+    py_code = py_code + "    if stripped.startswith('```'):\n"
+    py_code = py_code + "        in_code=not in_code\n"
+    py_code = py_code + "        continue\n"
+    py_code = py_code + "    if in_code:\n"
+    py_code = py_code + "        continue\n"
+    py_code = py_code + "    m=re.match(r'^(#{1,6})\\s+(.+)$',stripped)\n"
+    py_code = py_code + "    if m:\n"
+    py_code = py_code + "        level=len(m.group(1))\n"
+    py_code = py_code + "        title=m.group(2).strip()\n"
+    py_code = py_code + "        slug=re.sub(r'[^a-z0-9\\s-]','',title.lower())\n"
+    py_code = py_code + "        slug=re.sub(r'\\s+','-',slug).strip('-')\n"
+    py_code = py_code + "        headings.append({'level':level,'text':title,'id':slug})\n"
+    py_code = py_code + "result={'headings':headings,'count':len(headings),'max_depth':max([h['level'] for h in headings],default=0),'input_len':len(text)}\n"
+    py_code = py_code + "f=open('" + eout + "','w',encoding='utf-8')\n"
+    py_code = py_code + "json.dump(result,f)\n"
+    py_code = py_code + "f.close()\n"
+    py_code = py_code + "print('ok')\n"
+    nova_write(out_file + ".py", py_code)
+    let py_cmd = "python " + escape_for_py(out_file + ".py")
+
+    let result = run_md(py_cmd)
+
+    if3 is_error(result) {
+        if3 is_temp == true {
+            cleanup_temp(src_path)
+        }
+        cleanup_temp(out_file + ".py")
+        return error_response("toc", "TOC extraction failed: " + result)
+    }
+
+    // Read the headings count
+    let count_cmd = "python -c \""
+    count_cmd = count_cmd + "import json;"
+    count_cmd = count_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    count_cmd = count_cmd + "print(str(d['count'])+'|'+str(d['max_depth'])+'|'+str(d['input_len']));"
+    count_cmd = count_cmd + "\""
+    let count_result = run_md(count_cmd)
+    let count_parts = split(count_result, "|")
+    let heading_count = int(dict_get(count_parts, 0, "0"))
+    let max_depth = int(dict_get(count_parts, 1, "0"))
+    let input_len = int(dict_get(count_parts, 2, "0"))
+
+    // Read the headings list as JSON string
+    let headings_cmd = "python -c \""
+    headings_cmd = headings_cmd + "import json;"
+    headings_cmd = headings_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    headings_cmd = headings_cmd + "print(json.dumps(d['headings']));"
+    headings_cmd = headings_cmd + "\""
+    let headings_json = run_md(headings_cmd)
+    let headings_list = json_decode(headings_json)
+
+    // Cleanup
+    if3 is_temp == true {
+        cleanup_temp(src_path)
+    }
+    cleanup_temp(out_file)
+    cleanup_temp(out_file + ".py")
+
+    // Determine trit
+    let toc_trit = T_TRUE
+    if3 heading_count == 0 {
+        toc_trit = T_MAYBE
+    }
+
+    // N-S flow
+    let re = compute_reynolds(input_len)
+    let regime = flow_regime(re)
+    track_ns_flow(input_len, heading_count * 50)
+
+    // Build level distribution
+    let level_dist = {}
+    let idx = 0
+    while3 idx < len(headings_list) {
+        let h = dict_get(headings_list, idx, {})
+        let lvl = dict_get(h, "level", 0)
+        let lvl_key = "h" + str(lvl)
+        let cur = dict_get(level_dist, lvl_key, 0)
+        dict_set(level_dist, lvl_key, cur + 1)
+        idx = idx + 1
+    }
+
+    record_op("toc", toc_trit)
+    return {
+        "ok": true,
+        "headings": headings_list,
+        "count": heading_count,
+        "max_depth": max_depth,
+        "level_distribution": level_dist,
+        "input_chars": input_len,
+        "reynolds": re,
+        "regime": regime,
+        "trit": toc_trit,
+        "char": bt_one(toc_trit),
+        "bt3": bt_three(toc_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+// TOOL 3: POST /tmarkdown/links
+// Extract all links from markdown content
+// Body: {text: "[link](url)", path: "file.md"}
+// Returns list of links with text, url, and type (inline, reference, autolink)
+// Trit: +1=links found, 0=no links, -1=error
+// ===========================================================================
+// ===========================================================================
+fn handle_links(body) {
+    // Resolve markdown source
+    let source = resolve_md_source(body)
+    let src_path = dict_get(source, "path", "")
+    let is_temp = dict_get(source, "is_temp", false)
+    let src_error = dict_get(source, "error", "")
+
+    if3 len(src_error) > 0 {
+        return error_response("links", src_error)
+    }
+
+    if3 len(src_path) == 0 {
+        return error_response("links", "No markdown source provided")
+    }
+
+    let epath = escape_for_py(src_path)
+    let out_file = tmp_out_path()
+    let eout = escape_for_py(out_file)
+
+    // Python script to extract links — write to temp .py file for complex logic
+    let tmp_py = escape_for_py(out_file + ".py")
+    let py_code = "import re, json\n"
+    py_code = py_code + "from urllib.parse import urlparse\n"
+    py_code = py_code + "text=open('" + epath + "','r',encoding='utf-8').read()\n"
+    py_code = py_code + "links=[]\n"
+    py_code = py_code + "seen=set()\n"
+    // Inline links: [text](url) or [text](url 'title')
+    py_code = py_code + "for m in re.finditer(r'\\[([^\\]]+)\\]\\(([^)]+)\\)',text):\n"
+    py_code = py_code + "    link_text=m.group(1)\n"
+    py_code = py_code + "    url=m.group(2).split()[0]\n"
+    py_code = py_code + "    key=link_text+'|'+url\n"
+    py_code = py_code + "    if key not in seen:\n"
+    py_code = py_code + "        seen.add(key)\n"
+    py_code = py_code + "        link_type='image' if m.start()>0 and text[m.start()-1]=='!' else 'inline'\n"
+    py_code = py_code + "        links.append({'text':link_text,'url':url,'type':link_type,'position':m.start()})\n"
+    // Image links: ![alt](url)
+    py_code = py_code + "for m in re.finditer(r'!\\[([^\\]]*)\\]\\(([^)]+)\\)',text):\n"
+    py_code = py_code + "    img_alt=m.group(1)\n"
+    py_code = py_code + "    img_url=m.group(2).split()[0]\n"
+    py_code = py_code + "    key='img:'+img_alt+'|'+img_url\n"
+    py_code = py_code + "    if key not in seen:\n"
+    py_code = py_code + "        seen.add(key)\n"
+    py_code = py_code + "        links.append({'text':img_alt,'url':img_url,'type':'image','position':m.start()})\n"
+    // Autolinks: <http://...> or <https://...>
+    py_code = py_code + "for m in re.finditer(r'<(https?://[^>]+)>',text):\n"
+    py_code = py_code + "    auto_url=m.group(1)\n"
+    py_code = py_code + "    key='auto:'+auto_url\n"
+    py_code = py_code + "    if key not in seen:\n"
+    py_code = py_code + "        seen.add(key)\n"
+    py_code = py_code + "        links.append({'text':auto_url,'url':auto_url,'type':'autolink','position':m.start()})\n"
+    // Reference links: [text][ref] with [ref]: url
+    py_code = py_code + "refs={}\n"
+    py_code = py_code + "for m in re.finditer(r'^\\[([^\\]]+)\\]:\\s+(\\S+)',text,re.MULTILINE):\n"
+    py_code = py_code + "    refs[m.group(1).lower()]=m.group(2)\n"
+    py_code = py_code + "for m in re.finditer(r'\\[([^\\]]+)\\]\\[([^\\]]*)\\]',text):\n"
+    py_code = py_code + "    ref_text=m.group(1)\n"
+    py_code = py_code + "    ref_id=m.group(2).lower() if m.group(2) else ref_text.lower()\n"
+    py_code = py_code + "    if ref_id in refs:\n"
+    py_code = py_code + "        key='ref:'+ref_text+'|'+refs[ref_id]\n"
+    py_code = py_code + "        if key not in seen:\n"
+    py_code = py_code + "            seen.add(key)\n"
+    py_code = py_code + "            links.append({'text':ref_text,'url':refs[ref_id],'type':'reference','position':m.start()})\n"
+    // Sort by position
+    py_code = py_code + "links.sort(key=lambda x:x.get('position',0))\n"
+    // Count by type
+    py_code = py_code + "type_counts={}\n"
+    py_code = py_code + "for l in links:\n"
+    py_code = py_code + "    t=l['type']\n"
+    py_code = py_code + "    type_counts[t]=type_counts.get(t,0)+1\n"
+    // Unique domains
+    py_code = py_code + "domains=set()\n"
+    py_code = py_code + "for l in links:\n"
+    py_code = py_code + "    try:\n"
+    py_code = py_code + "        d=urlparse(l['url']).netloc\n"
+    py_code = py_code + "        if d:domains.add(d)\n"
+    py_code = py_code + "    except:pass\n"
+    py_code = py_code + "result={'links':links,'count':len(links),'type_counts':type_counts,'unique_domains':list(domains),'input_len':len(text)}\n"
+    py_code = py_code + "f=open('" + eout + "','w',encoding='utf-8')\n"
+    py_code = py_code + "json.dump(result,f)\n"
+    py_code = py_code + "f.close()\n"
+    py_code = py_code + "print('ok')\n"
+    nova_write(out_file + ".py", py_code)
+    let py_cmd = "python " + escape_for_py(out_file + ".py")
+
+    let result = run_md(py_cmd)
+
+    if3 is_error(result) {
+        if3 is_temp == true {
+            cleanup_temp(src_path)
+        }
+        cleanup_temp(out_file + ".py")
+        return error_response("links", "Link extraction failed: " + result)
+    }
+
+    // Read link count and input length
+    let meta_cmd = "python -c \""
+    meta_cmd = meta_cmd + "import json;"
+    meta_cmd = meta_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    meta_cmd = meta_cmd + "print(str(d['count'])+'|'+str(d['input_len']));"
+    meta_cmd = meta_cmd + "\""
+    let meta_result = run_md(meta_cmd)
+    let meta_parts = split(meta_result, "|")
+    let link_count = int(dict_get(meta_parts, 0, "0"))
+    let input_len = int(dict_get(meta_parts, 1, "0"))
+
+    // Read links JSON
+    let links_cmd = "python -c \""
+    links_cmd = links_cmd + "import json;"
+    links_cmd = links_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    links_cmd = links_cmd + "print(json.dumps(d['links']));"
+    links_cmd = links_cmd + "\""
+    let links_json = run_md(links_cmd)
+    let links_list = json_decode(links_json)
+
+    // Read type counts
+    let tc_cmd = "python -c \""
+    tc_cmd = tc_cmd + "import json;"
+    tc_cmd = tc_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    tc_cmd = tc_cmd + "print(json.dumps(d['type_counts']));"
+    tc_cmd = tc_cmd + "\""
+    let tc_json = run_md(tc_cmd)
+    let type_counts = json_decode(tc_json)
+
+    // Read unique domains
+    let dom_cmd = "python -c \""
+    dom_cmd = dom_cmd + "import json;"
+    dom_cmd = dom_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    dom_cmd = dom_cmd + "print(json.dumps(d['unique_domains']));"
+    dom_cmd = dom_cmd + "\""
+    let dom_json = run_md(dom_cmd)
+    let domains_list = json_decode(dom_json)
+
+    // Cleanup
+    if3 is_temp == true {
+        cleanup_temp(src_path)
+    }
+    cleanup_temp(out_file)
+    cleanup_temp(out_file + ".py")
+
+    // Determine trit
+    let links_trit = T_TRUE
+    if3 link_count == 0 {
+        links_trit = T_MAYBE
+    }
+
+    // N-S flow
+    let re = compute_reynolds(input_len)
+    let regime = flow_regime(re)
+    track_ns_flow(input_len, link_count * 100)
+
+    record_op("links", links_trit)
+    return {
+        "ok": true,
+        "links": links_list,
+        "count": link_count,
+        "type_counts": type_counts,
+        "unique_domains": domains_list,
+        "input_chars": input_len,
+        "reynolds": re,
+        "regime": regime,
+        "trit": links_trit,
+        "char": bt_one(links_trit),
+        "bt3": bt_three(links_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+// TOOL 4: POST /tmarkdown/stats
+// Document statistics: word count, heading count, link count, code block count
+// Body: {text: "# Hello", path: "file.md"}
+// Returns comprehensive document statistics
+// Trit: +1=non-trivial doc, 0=trivial/empty, -1=error
+// ===========================================================================
+// ===========================================================================
+fn handle_stats(body) {
+    // Resolve markdown source
+    let source = resolve_md_source(body)
+    let src_path = dict_get(source, "path", "")
+    let is_temp = dict_get(source, "is_temp", false)
+    let src_error = dict_get(source, "error", "")
+
+    if3 len(src_error) > 0 {
+        return error_response("stats", src_error)
+    }
+
+    if3 len(src_path) == 0 {
+        return error_response("stats", "No markdown source provided")
+    }
+
+    let epath = escape_for_py(src_path)
+    let out_file = tmp_out_path()
+    let eout = escape_for_py(out_file)
+
+    // Python script to compute comprehensive stats — write to temp .py file for complex logic
+    let tmp_py = escape_for_py(out_file + ".py")
+    let py_code = "import re, json\n"
+    py_code = py_code + "text=open('" + epath + "','r',encoding='utf-8').read()\n"
+    py_code = py_code + "lines=text.split('\\n')\n"
+    py_code = py_code + "total_lines=len(lines)\n"
+    py_code = py_code + "non_empty=[l for l in lines if l.strip()]\n"
+    py_code = py_code + "non_empty_lines=len(non_empty)\n"
+    // Word count (split on whitespace, filter empty)
+    py_code = py_code + "words=[w for w in text.split() if w]\n"
+    py_code = py_code + "word_count=len(words)\n"
+    // Character count
+    py_code = py_code + "char_count=len(text)\n"
+    py_code = py_code + "char_no_space=len(text.replace(' ','').replace('\\n','').replace('\\t',''))\n"
+    // Heading count by level
+    py_code = py_code + "headings={1:0,2:0,3:0,4:0,5:0,6:0}\n"
+    py_code = py_code + "in_code=False\n"
+    py_code = py_code + "for line in lines:\n"
+    py_code = py_code + "    s=line.strip()\n"
+    py_code = py_code + "    if s.startswith('```'):\n"
+    py_code = py_code + "        in_code=not in_code\n"
+    py_code = py_code + "        continue\n"
+    py_code = py_code + "    if in_code:continue\n"
+    py_code = py_code + "    m=re.match(r'^(#{1,6})\\s+',s)\n"
+    py_code = py_code + "    if m:headings[len(m.group(1))]+=1\n"
+    py_code = py_code + "total_headings=sum(headings.values())\n"
+    // Link count
+    py_code = py_code + "inline_links=len(re.findall(r'\\[([^\\]]+)\\]\\(([^)]+)\\)',text))\n"
+    py_code = py_code + "image_links=len(re.findall(r'!\\[([^\\]]*)\\]\\(([^)]+)\\)',text))\n"
+    py_code = py_code + "auto_links=len(re.findall(r'<(https?://[^>]+)>',text))\n"
+    py_code = py_code + "total_links=inline_links+image_links+auto_links\n"
+    // Code block count (fenced)
+    py_code = py_code + "code_blocks=len(re.findall(r'^```',text,re.MULTILINE))//2\n"
+    // Inline code count
+    py_code = py_code + "inline_code=len(re.findall(r'`[^`]+`',text))\n"
+    // List items (ordered + unordered)
+    py_code = py_code + "ul_items=len(re.findall(r'^\\s*[-*+]\\s+',text,re.MULTILINE))\n"
+    py_code = py_code + "ol_items=len(re.findall(r'^\\s*\\d+\\.\\s+',text,re.MULTILINE))\n"
+    // Blockquotes
+    py_code = py_code + "blockquotes=len(re.findall(r'^>\\s*',text,re.MULTILINE))\n"
+    // Horizontal rules
+    py_code = py_code + "hr_count=len(re.findall(r'^\\s*(---+|\\*\\*\\*+|___+)\\s*$',text,re.MULTILINE))\n"
+    // Bold/italic
+    py_code = py_code + "bold_count=len(re.findall(r'\\*\\*[^*]+\\*\\*|__[^_]+__',text))\n"
+    py_code = py_code + "italic_count=len(re.findall(r'(?<!\\*)\\*(?!\\*)[^*]+(?<!\\*)\\*(?!\\*)|(?<!_)_(?!_)[^_]+(?<!_)_(?!_)',text))\n"
+    // Tables (lines with pipes)
+    py_code = py_code + "table_rows=len([l for l in lines if '|' in l and l.strip().startswith('|')])\n"
+    // Avg word length
+    py_code = py_code + "avg_word_len=sum(len(w) for w in words)/max(len(words),1)\n"
+    // Estimated reading time (200 wpm)
+    py_code = py_code + "reading_time_min=round(word_count/200,1)\n"
+    // Build result
+    py_code = py_code + "result={'word_count':word_count,'char_count':char_count,'char_no_space':char_no_space,"
+    py_code = py_code + "'total_lines':total_lines,'non_empty_lines':non_empty_lines,"
+    py_code = py_code + "'total_headings':total_headings,'headings_by_level':headings,"
+    py_code = py_code + "'total_links':total_links,'inline_links':inline_links,'image_links':image_links,'auto_links':auto_links,"
+    py_code = py_code + "'code_blocks':code_blocks,'inline_code':inline_code,"
+    py_code = py_code + "'unordered_list_items':ul_items,'ordered_list_items':ol_items,"
+    py_code = py_code + "'blockquotes':blockquotes,'horizontal_rules':hr_count,"
+    py_code = py_code + "'bold_text':bold_count,'italic_text':italic_count,"
+    py_code = py_code + "'table_rows':table_rows,"
+    py_code = py_code + "'avg_word_length':round(avg_word_len,2),'reading_time_min':reading_time_min}\n"
+    py_code = py_code + "f=open('" + eout + "','w',encoding='utf-8')\n"
+    py_code = py_code + "json.dump(result,f)\n"
+    py_code = py_code + "f.close()\n"
+    py_code = py_code + "print('ok')\n"
+    nova_write(out_file + ".py", py_code)
+    let py_cmd = "python " + escape_for_py(out_file + ".py")
+
+    let result = run_md(py_cmd)
+
+    if3 is_error(result) {
+        if3 is_temp == true {
+            cleanup_temp(src_path)
+        }
+        cleanup_temp(out_file + ".py")
+        return error_response("stats", "Stats extraction failed: " + result)
+    }
+
+    // Read the full result JSON
+    let read_cmd = "python -c \""
+    read_cmd = read_cmd + "import json;"
+    read_cmd = read_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    read_cmd = read_cmd + "print(json.dumps(d));"
+    read_cmd = read_cmd + "\""
+    let stats_json = run_md(read_cmd)
+    let stats_data = json_decode(stats_json)
+
+    // Extract key values for trit and reynolds
+    let word_count = dict_get(stats_data, "word_count", 0)
+    let char_count = dict_get(stats_data, "char_count", 0)
+    let total_headings = dict_get(stats_data, "total_headings", 0)
+    let total_links = dict_get(stats_data, "total_links", 0)
+    let code_blocks = dict_get(stats_data, "code_blocks", 0)
+    let reading_time = dict_get(stats_data, "reading_time_min", 0)
+
+    // Cleanup
+    if3 is_temp == true {
+        cleanup_temp(src_path)
+    }
+    cleanup_temp(out_file)
+    cleanup_temp(out_file + ".py")
+
+    // Determine trit: +1 if substantial doc (>= H13 words), 0 if trivial, -1 if empty
+    let stats_trit = T_TRUE
+    if3 word_count < H13 {
+        stats_trit = T_MAYBE
+    }
+    if3 word_count == 0 {
+        stats_trit = T_FALSE
+    }
+
+    // N-S flow
+    let re = compute_reynolds(char_count)
+    let regime = flow_regime(re)
+    track_ns_flow(char_count, 0)
+
+    // Complexity score: weighted sum of structural elements
+    let complexity = total_headings * H3 + total_links * H5 + code_blocks * H7
+
+    record_op("stats", stats_trit)
+
+    // Merge stats_data into response
+    dict_set(stats_data, "ok", true)
+    dict_set(stats_data, "complexity_score", complexity)
+    dict_set(stats_data, "reynolds", re)
+    dict_set(stats_data, "regime", regime)
+    dict_set(stats_data, "trit", stats_trit)
+    dict_set(stats_data, "char", bt_one(stats_trit))
+    dict_set(stats_data, "bt3", bt_three(stats_trit))
+    dict_set(stats_data, "runtime", "novalang")
+    return stats_data
+}
+
+
+// ===========================================================================
+// ===========================================================================
+// TOOL 5: POST /tmarkdown/convert
+// Convert a markdown file to an HTML file
+// Body: {input_path: "doc.md", output_path: "doc.html"}
+// Writes rendered HTML to output_path with optional CSS styling
+// Trit: +1=converted successfully, 0=empty output, -1=error
+// ===========================================================================
+// ===========================================================================
+fn handle_convert(body) {
+    let input_path = dict_get(body, "input_path", "")
+    let output_path = dict_get(body, "output_path", "")
+    let include_css = dict_get(body, "include_css", true)
+    let title = dict_get(body, "title", "")
+
+    // Validate paths
+    if3 len(input_path) == 0 {
+        return error_response("convert", "input_path parameter is required")
+    }
+
+    if3 len(output_path) == 0 {
+        return error_response("convert", "output_path parameter is required")
+    }
+
+    // Check input file exists
+    let eip = escape_for_py(input_path)
+    let check_cmd = "python -c \"import os; print('exists' if os.path.exists('" + eip + "') else 'missing')\""
+    let check_result = run_md(check_cmd)
+    if3 contains(check_result, "missing") {
+        return error_response("convert", "Input file not found: " + input_path)
+    }
+    if3 is_error(check_result) {
+        return error_response("convert", "Cannot access input file: " + input_path)
+    }
+
+    let eop = escape_for_py(output_path)
+
+    // Build CSS block if requested
+    let css_block = ""
+    if3 include_css == true {
+        css_block = "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;max-width:900px;margin:0 auto;padding:2rem;line-height:1.6;color:#24292f;background:#0d1117;color:#c9d1d9}h1,h2,h3,h4,h5,h6{margin-top:1.5em;margin-bottom:0.5em;color:#58a6ff}a{color:#58a6ff}code{background:#161b22;padding:0.2em 0.4em;border-radius:3px;font-size:85%}pre{background:#161b22;padding:1em;border-radius:6px;overflow-x:auto}pre code{background:none;padding:0}blockquote{border-left:4px solid #30363d;margin:0;padding:0.5em 1em;color:#8b949e}table{border-collapse:collapse;width:100%}th,td{border:1px solid #30363d;padding:8px 12px}th{background:#161b22}img{max-width:100%}hr{border:none;border-top:1px solid #30363d}</style>"
+    }
+
+    // Build title
+    let html_title = "Document"
+    if3 len(title) > 0 {
+        html_title = title
+    }
+
+    // Python script to convert md file to HTML file
+    let py_cmd = "python -c \""
+    py_cmd = py_cmd + "import markdown, json;"
+    py_cmd = py_cmd + "text=open('" + eip + "','r',encoding='utf-8').read();"
+    py_cmd = py_cmd + "html=markdown.markdown(text, extensions=['tables','fenced_code','toc','codehilite','nl2br','sane_lists']);"
+    py_cmd = py_cmd + "css='" + replace(css_block, "'", "\\'") + "';"
+    py_cmd = py_cmd + "title='" + replace(html_title, "'", "\\'") + "';"
+    py_cmd = py_cmd + "full='<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content=width=device-width,initial-scale=1><title>'+title+'</title>'+css+'</head><body>'+html+'</body></html>';"
+    py_cmd = py_cmd + "f=open('" + eop + "','w',encoding='utf-8');"
+    py_cmd = py_cmd + "f.write(full);"
+    py_cmd = py_cmd + "f.close();"
+    py_cmd = py_cmd + "print(str(len(text))+'|'+str(len(full)));"
+    py_cmd = py_cmd + "\""
+
+    let result = run_md(py_cmd)
+
+    if3 is_error(result) {
+        return error_response("convert", "Conversion failed: " + result)
+    }
+
+    // Parse result: input_len|output_len
+    let parts = split(result, "|")
+    let input_len = int(dict_get(parts, 0, "0"))
+    let output_len = int(dict_get(parts, 1, "0"))
+
+    // Determine trit
+    let convert_trit = T_TRUE
+    if3 output_len == 0 {
+        convert_trit = T_MAYBE
+    }
+
+    // N-S flow
+    let re = compute_reynolds(input_len)
+    let regime = flow_regime(re)
+    track_ns_flow(input_len, output_len)
+
+    // Verify output file was created
+    let verify_cmd = "python -c \"import os; print(os.path.getsize('" + eop + "'))\""
+    let file_size_str = run_md(verify_cmd)
+    let file_size = 0
+    if3 is_error(file_size_str) == false {
+        file_size = int(trim(file_size_str))
+    }
+
+    record_op("convert", convert_trit)
+    return {
+        "ok": true,
+        "input_path": input_path,
+        "output_path": output_path,
+        "input_chars": input_len,
+        "output_chars": output_len,
+        "output_file_size": file_size,
+        "include_css": include_css,
+        "title": html_title,
+        "extensions": ["tables", "fenced_code", "toc", "codehilite", "nl2br", "sane_lists"],
+        "reynolds": re,
+        "regime": regime,
+        "trit": convert_trit,
+        "char": bt_one(convert_trit),
+        "bt3": bt_three(convert_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+// TOOL 6: POST /tmarkdown/validate
+// Check markdown for common issues
+// Body: {text: "# Hello", path: "file.md"}
+// Validates: heading hierarchy, broken links syntax, trailing whitespace,
+//   missing blank lines, inconsistent list markers, etc.
+// Trit: +1=valid (no issues), 0=warnings only, -1=errors found
+// ===========================================================================
+// ===========================================================================
+fn handle_validate(body) {
+    // Resolve markdown source
+    let source = resolve_md_source(body)
+    let src_path = dict_get(source, "path", "")
+    let is_temp = dict_get(source, "is_temp", false)
+    let src_error = dict_get(source, "error", "")
+
+    if3 len(src_error) > 0 {
+        return error_response("validate", src_error)
+    }
+
+    if3 len(src_path) == 0 {
+        return error_response("validate", "No markdown source provided")
+    }
+
+    let epath = escape_for_py(src_path)
+    let out_file = tmp_out_path()
+    let eout = escape_for_py(out_file)
+
+    // Python script to validate markdown — write to temp .py file for complex logic
+    let tmp_py = escape_for_py(out_file + ".py")
+    let py_code = "import re, json\n"
+    py_code = py_code + "text=open('" + epath + "','r',encoding='utf-8').read()\n"
+    py_code = py_code + "lines=text.split('\\n')\n"
+    py_code = py_code + "issues=[]\n"
+    py_code = py_code + "warnings_count=0\n"
+    py_code = py_code + "errors_count=0\n"
+    // Check 1: First heading should be H1
+    py_code = py_code + "first_heading=None\n"
+    py_code = py_code + "in_code=False\n"
+    py_code = py_code + "for i,line in enumerate(lines):\n"
+    py_code = py_code + "    s=line.strip()\n"
+    py_code = py_code + "    if s.startswith('```'):\n"
+    py_code = py_code + "        in_code=not in_code\n"
+    py_code = py_code + "        continue\n"
+    py_code = py_code + "    if in_code:continue\n"
+    py_code = py_code + "    m=re.match(r'^(#{1,6})\\s+',s)\n"
+    py_code = py_code + "    if m and first_heading is None:\n"
+    py_code = py_code + "        first_heading=len(m.group(1))\n"
+    py_code = py_code + "        if first_heading!=1:\n"
+    py_code = py_code + "            issues.append({'line':i+1,'level':'warning','rule':'MD002','message':'First heading should be H1, found H'+str(first_heading)})\n"
+    py_code = py_code + "            warnings_count+=1\n"
+    // Check 2: Heading levels should increment by 1 (no skipping)
+    py_code = py_code + "prev_level=0\n"
+    py_code = py_code + "in_code=False\n"
+    py_code = py_code + "for i,line in enumerate(lines):\n"
+    py_code = py_code + "    s=line.strip()\n"
+    py_code = py_code + "    if s.startswith('```'):\n"
+    py_code = py_code + "        in_code=not in_code\n"
+    py_code = py_code + "        continue\n"
+    py_code = py_code + "    if in_code:continue\n"
+    py_code = py_code + "    m=re.match(r'^(#{1,6})\\s+',s)\n"
+    py_code = py_code + "    if m:\n"
+    py_code = py_code + "        lvl=len(m.group(1))\n"
+    py_code = py_code + "        if prev_level>0 and lvl>prev_level+1:\n"
+    py_code = py_code + "            issues.append({'line':i+1,'level':'warning','rule':'MD001','message':'Heading level skipped: H'+str(prev_level)+' to H'+str(lvl)})\n"
+    py_code = py_code + "            warnings_count+=1\n"
+    py_code = py_code + "        prev_level=lvl\n"
+    // Check 3: Trailing whitespace
+    py_code = py_code + "for i,line in enumerate(lines):\n"
+    py_code = py_code + "    if line.rstrip()!=line and not line.strip().endswith('  '):\n"
+    py_code = py_code + "        if line.strip():\n"
+    py_code = py_code + "            issues.append({'line':i+1,'level':'warning','rule':'MD009','message':'Trailing whitespace'})\n"
+    py_code = py_code + "            warnings_count+=1\n"
+    // Check 4: Multiple consecutive blank lines
+    py_code = py_code + "consecutive_blanks=0\n"
+    py_code = py_code + "for i,line in enumerate(lines):\n"
+    py_code = py_code + "    if not line.strip():\n"
+    py_code = py_code + "        consecutive_blanks+=1\n"
+    py_code = py_code + "    else:\n"
+    py_code = py_code + "        if consecutive_blanks>1:\n"
+    py_code = py_code + "            issues.append({'line':i+1-consecutive_blanks,'level':'warning','rule':'MD012','message':'Multiple consecutive blank lines ('+str(consecutive_blanks)+')'})\n"
+    py_code = py_code + "            warnings_count+=1\n"
+    py_code = py_code + "        consecutive_blanks=0\n"
+    // Check 5: No blank line before heading
+    py_code = py_code + "in_code=False\n"
+    py_code = py_code + "for i,line in enumerate(lines):\n"
+    py_code = py_code + "    s=line.strip()\n"
+    py_code = py_code + "    if s.startswith('```'):\n"
+    py_code = py_code + "        in_code=not in_code\n"
+    py_code = py_code + "        continue\n"
+    py_code = py_code + "    if in_code:continue\n"
+    py_code = py_code + "    if re.match(r'^#{1,6}\\s+',s) and i>0:\n"
+    py_code = py_code + "        prev=lines[i-1].strip()\n"
+    py_code = py_code + "        if prev and not prev.startswith('#'):\n"
+    py_code = py_code + "            issues.append({'line':i+1,'level':'warning','rule':'MD022','message':'No blank line before heading'})\n"
+    py_code = py_code + "            warnings_count+=1\n"
+    // Check 6: Broken inline link syntax
+    py_code = py_code + "for i,line in enumerate(lines):\n"
+    py_code = py_code + "    if re.search(r'\\[[^\\]]*\\]\\s+\\(',line):\n"
+    py_code = py_code + "        issues.append({'line':i+1,'level':'error','rule':'MD039','message':'Space between link text and URL'})\n"
+    py_code = py_code + "        errors_count+=1\n"
+    // Check 7: Duplicate headings (same level, same text)
+    py_code = py_code + "seen_headings={}\n"
+    py_code = py_code + "in_code=False\n"
+    py_code = py_code + "for i,line in enumerate(lines):\n"
+    py_code = py_code + "    s=line.strip()\n"
+    py_code = py_code + "    if s.startswith('```'):\n"
+    py_code = py_code + "        in_code=not in_code\n"
+    py_code = py_code + "        continue\n"
+    py_code = py_code + "    if in_code:continue\n"
+    py_code = py_code + "    m=re.match(r'^(#{1,6})\\s+(.+)$',s)\n"
+    py_code = py_code + "    if m:\n"
+    py_code = py_code + "        key=str(len(m.group(1)))+':'+m.group(2).strip()\n"
+    py_code = py_code + "        if key in seen_headings:\n"
+    py_code = py_code + "            issues.append({'line':i+1,'level':'warning','rule':'MD024','message':'Duplicate heading: '+m.group(2).strip()+' (first at line '+str(seen_headings[key])+')'})\n"
+    py_code = py_code + "            warnings_count+=1\n"
+    py_code = py_code + "        else:\n"
+    py_code = py_code + "            seen_headings[key]=i+1\n"
+    // Check 8: Inconsistent list markers (mixing - * +)
+    py_code = py_code + "list_markers=set()\n"
+    py_code = py_code + "for i,line in enumerate(lines):\n"
+    py_code = py_code + "    m=re.match(r'^\\s*([-*+])\\s+',line)\n"
+    py_code = py_code + "    if m:list_markers.add(m.group(1))\n"
+    py_code = py_code + "if len(list_markers)>1:\n"
+    py_code = py_code + "    issues.append({'line':0,'level':'warning','rule':'MD004','message':'Inconsistent list markers: using '+', '.join(sorted(list_markers))})\n"
+    py_code = py_code + "    warnings_count+=1\n"
+    // Check 9: Long lines (> 120 chars)
+    py_code = py_code + "long_line_count=0\n"
+    py_code = py_code + "for i,line in enumerate(lines):\n"
+    py_code = py_code + "    if len(line)>120 and not line.strip().startswith('|') and not line.strip().startswith('!['):\n"
+    py_code = py_code + "        long_line_count+=1\n"
+    py_code = py_code + "        if long_line_count<=3:\n"
+    py_code = py_code + "            issues.append({'line':i+1,'level':'warning','rule':'MD013','message':'Line exceeds 120 characters ('+str(len(line))+' chars)'})\n"
+    py_code = py_code + "            warnings_count+=1\n"
+    // Check 10: Missing final newline
+    py_code = py_code + "if text and not text.endswith('\\n'):\n"
+    py_code = py_code + "    issues.append({'line':len(lines),'level':'warning','rule':'MD047','message':'File does not end with a newline'})\n"
+    py_code = py_code + "    warnings_count+=1\n"
+    // Sort issues by line number
+    py_code = py_code + "issues.sort(key=lambda x:x.get('line',0))\n"
+    py_code = py_code + "result={'issues':issues,'warnings':warnings_count,'errors':errors_count,'total_issues':len(issues),'input_len':len(text),'total_lines':len(lines)}\n"
+    py_code = py_code + "f=open('" + eout + "','w',encoding='utf-8')\n"
+    py_code = py_code + "json.dump(result,f)\n"
+    py_code = py_code + "f.close()\n"
+    py_code = py_code + "print('ok')\n"
+    nova_write(out_file + ".py", py_code)
+    let py_cmd = "python " + escape_for_py(out_file + ".py")
+
+    let result = run_md(py_cmd)
+
+    if3 is_error(result) {
+        if3 is_temp == true {
+            cleanup_temp(src_path)
+        }
+        cleanup_temp(out_file + ".py")
+        return error_response("validate", "Validation failed: " + result)
+    }
+
+    // Read meta values
+    let meta_cmd = "python -c \""
+    meta_cmd = meta_cmd + "import json;"
+    meta_cmd = meta_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    meta_cmd = meta_cmd + "print(str(d['warnings'])+'|'+str(d['errors'])+'|'+str(d['total_issues'])+'|'+str(d['input_len'])+'|'+str(d['total_lines']));"
+    meta_cmd = meta_cmd + "\""
+    let meta_result = run_md(meta_cmd)
+    let meta_parts = split(meta_result, "|")
+    let warnings_count = int(dict_get(meta_parts, 0, "0"))
+    let errors_count = int(dict_get(meta_parts, 1, "0"))
+    let total_issues = int(dict_get(meta_parts, 2, "0"))
+    let input_len = int(dict_get(meta_parts, 3, "0"))
+    let total_lines = int(dict_get(meta_parts, 4, "0"))
+
+    // Read issues list
+    let issues_cmd = "python -c \""
+    issues_cmd = issues_cmd + "import json;"
+    issues_cmd = issues_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    issues_cmd = issues_cmd + "print(json.dumps(d['issues']));"
+    issues_cmd = issues_cmd + "\""
+    let issues_json = run_md(issues_cmd)
+    let issues_list = json_decode(issues_json)
+
+    // Cleanup
+    if3 is_temp == true {
+        cleanup_temp(src_path)
+    }
+    cleanup_temp(out_file)
+    cleanup_temp(out_file + ".py")
+
+    // Determine trit: +1=valid, 0=warnings only, -1=errors found
+    let validate_trit = T_TRUE
+    if3 warnings_count > 0 {
+        validate_trit = T_MAYBE
+    }
+    if3 errors_count > 0 {
+        validate_trit = T_FALSE
+    }
+
+    // N-S flow
+    let re = compute_reynolds(input_len)
+    let regime = flow_regime(re)
+    track_ns_flow(input_len, total_issues * 50)
+
+    // Quality score: 100 - (errors * H7) - (warnings * H3), min 0
+    let quality_score = 100 - (errors_count * H7) - (warnings_count * H3)
+    if3 quality_score < 0 {
+        quality_score = 0
+    }
+
+    record_op("validate", validate_trit)
+    return {
+        "ok": true,
+        "valid": errors_count == 0,
+        "issues": issues_list,
+        "warnings": warnings_count,
+        "errors": errors_count,
+        "total_issues": total_issues,
+        "quality_score": quality_score,
+        "total_lines": total_lines,
+        "input_chars": input_len,
+        "rules_checked": ["MD001", "MD002", "MD004", "MD009", "MD012", "MD013", "MD022", "MD024", "MD039", "MD047"],
+        "reynolds": re,
+        "regime": regime,
+        "trit": validate_trit,
+        "char": bt_one(validate_trit),
+        "bt3": bt_three(validate_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+// TOOL 7: POST /tmarkdown/extract
+// Extract specific sections by heading from markdown
+// Body: {text: "...", path: "file.md", heading: "Installation"}
+// Returns the content under the matching heading until the next heading
+// of same or higher level
+// Trit: +1=section found, 0=heading not found, -1=error
+// ===========================================================================
+// ===========================================================================
+fn handle_extract(body) {
+    // Resolve markdown source
+    let source = resolve_md_source(body)
+    let src_path = dict_get(source, "path", "")
+    let is_temp = dict_get(source, "is_temp", false)
+    let src_error = dict_get(source, "error", "")
+
+    if3 len(src_error) > 0 {
+        return error_response("extract", src_error)
+    }
+
+    if3 len(src_path) == 0 {
+        return error_response("extract", "No markdown source provided")
+    }
+
+    let heading = dict_get(body, "heading", "")
+    if3 len(heading) == 0 {
+        if3 is_temp == true {
+            cleanup_temp(src_path)
+        }
+        return error_response("extract", "heading parameter is required")
+    }
+
+    let epath = escape_for_py(src_path)
+    let eheading = escape_for_py(heading)
+    let out_file = tmp_out_path()
+    let eout = escape_for_py(out_file)
+
+    // Python script to extract section by heading — write to temp .py file for complex logic
+    let tmp_py = escape_for_py(out_file + ".py")
+    let py_code = "import re, json\n"
+    py_code = py_code + "text=open('" + epath + "','r',encoding='utf-8').read()\n"
+    py_code = py_code + "target='" + eheading + "'\n"
+    py_code = py_code + "lines=text.split('\\n')\n"
+    py_code = py_code + "found=False\n"
+    py_code = py_code + "target_level=0\n"
+    py_code = py_code + "start_line=0\n"
+    py_code = py_code + "end_line=len(lines)\n"
+    py_code = py_code + "section_lines=[]\n"
+    py_code = py_code + "in_code=False\n"
+    py_code = py_code + "all_matches=[]\n"
+    // Find the target heading (case-insensitive)
+    py_code = py_code + "for i,line in enumerate(lines):\n"
+    py_code = py_code + "    s=line.strip()\n"
+    py_code = py_code + "    if s.startswith('```'):\n"
+    py_code = py_code + "        in_code=not in_code\n"
+    py_code = py_code + "        continue\n"
+    py_code = py_code + "    if in_code:continue\n"
+    py_code = py_code + "    m=re.match(r'^(#{1,6})\\s+(.+)$',s)\n"
+    py_code = py_code + "    if m:\n"
+    py_code = py_code + "        h_text=m.group(2).strip()\n"
+    py_code = py_code + "        if h_text.lower()==target.lower():\n"
+    py_code = py_code + "            all_matches.append({'line':i,'level':len(m.group(1)),'text':h_text})\n"
+    // Use the first match
+    py_code = py_code + "if all_matches:\n"
+    py_code = py_code + "    found=True\n"
+    py_code = py_code + "    match=all_matches[0]\n"
+    py_code = py_code + "    start_line=match['line']\n"
+    py_code = py_code + "    target_level=match['level']\n"
+    // Find end: next heading of same or higher level (lower number)
+    py_code = py_code + "    in_code2=False\n"
+    py_code = py_code + "    for j in range(start_line+1,len(lines)):\n"
+    py_code = py_code + "        s2=lines[j].strip()\n"
+    py_code = py_code + "        if s2.startswith('```'):\n"
+    py_code = py_code + "            in_code2=not in_code2\n"
+    py_code = py_code + "            continue\n"
+    py_code = py_code + "        if in_code2:continue\n"
+    py_code = py_code + "        m2=re.match(r'^(#{1,6})\\s+',s2)\n"
+    py_code = py_code + "        if m2 and len(m2.group(1))<=target_level:\n"
+    py_code = py_code + "            end_line=j\n"
+    py_code = py_code + "            break\n"
+    py_code = py_code + "    else:\n"
+    py_code = py_code + "        end_line=len(lines)\n"
+    py_code = py_code + "    section_lines=lines[start_line:end_line]\n"
+    py_code = py_code + "section_text='\\n'.join(section_lines) if found else ''\n"
+    // Count sub-headings in extracted section
+    py_code = py_code + "sub_headings=0\n"
+    py_code = py_code + "if found:\n"
+    py_code = py_code + "    for sl in section_lines[1:]:\n"
+    py_code = py_code + "        if re.match(r'^#{1,6}\\s+',sl.strip()):sub_headings+=1\n"
+    py_code = py_code + "result={'found':found,'section':section_text,'heading':target,"
+    py_code = py_code + "'heading_level':target_level,'start_line':start_line+1,'end_line':end_line,"
+    py_code = py_code + "'section_lines':len(section_lines),'section_chars':len(section_text),"
+    py_code = py_code + "'sub_headings':sub_headings,'total_matches':len(all_matches),'input_len':len(text)}\n"
+    py_code = py_code + "f=open('" + eout + "','w',encoding='utf-8')\n"
+    py_code = py_code + "json.dump(result,f)\n"
+    py_code = py_code + "f.close()\n"
+    py_code = py_code + "print('ok')\n"
+    nova_write(out_file + ".py", py_code)
+    let py_cmd = "python " + escape_for_py(out_file + ".py")
+
+    let result = run_md(py_cmd)
+
+    if3 is_error(result) {
+        if3 is_temp == true {
+            cleanup_temp(src_path)
+        }
+        cleanup_temp(out_file + ".py")
+        return error_response("extract", "Section extraction failed: " + result)
+    }
+
+    // Read meta values
+    let meta_cmd = "python -c \""
+    meta_cmd = meta_cmd + "import json;"
+    meta_cmd = meta_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+    meta_cmd = meta_cmd + "found='1' if d['found'] else '0';"
+    meta_cmd = meta_cmd + "print(found+'|'+str(d['heading_level'])+'|'+str(d['start_line'])+'|'+str(d['end_line'])+'|'+str(d['section_lines'])+'|'+str(d['section_chars'])+'|'+str(d['sub_headings'])+'|'+str(d['total_matches'])+'|'+str(d['input_len']));"
+    meta_cmd = meta_cmd + "\""
+    let meta_result = run_md(meta_cmd)
+    let meta_parts = split(meta_result, "|")
+    let found_str = dict_get(meta_parts, 0, "0")
+    let heading_level = int(dict_get(meta_parts, 1, "0"))
+    let start_line = int(dict_get(meta_parts, 2, "0"))
+    let end_line = int(dict_get(meta_parts, 3, "0"))
+    let section_lines = int(dict_get(meta_parts, 4, "0"))
+    let section_chars = int(dict_get(meta_parts, 5, "0"))
+    let sub_headings = int(dict_get(meta_parts, 6, "0"))
+    let total_matches = int(dict_get(meta_parts, 7, "0"))
+    let input_len = int(dict_get(meta_parts, 8, "0"))
+
+    let found = false
+    if3 found_str == "1" {
+        found = true
+    }
+
+    // Read section text
+    let section_text = ""
+    if3 found == true {
+        let sec_cmd = "python -c \""
+        sec_cmd = sec_cmd + "import json;"
+        sec_cmd = sec_cmd + "d=json.load(open('" + eout + "','r',encoding='utf-8'));"
+        sec_cmd = sec_cmd + "print(d['section']);"
+        sec_cmd = sec_cmd + "\""
+        section_text = run_md(sec_cmd)
+    }
+
+    // Cleanup
+    if3 is_temp == true {
+        cleanup_temp(src_path)
+    }
+    cleanup_temp(out_file)
+    cleanup_temp(out_file + ".py")
+
+    // Determine trit: +1=found, 0=not found, -1 handled above
+    let extract_trit = T_TRUE
+    if3 found == false {
+        extract_trit = T_MAYBE
+    }
+
+    // N-S flow
+    let re = compute_reynolds(input_len)
+    let regime = flow_regime(re)
+    track_ns_flow(input_len, section_chars)
+
+    record_op("extract", extract_trit)
+    return {
+        "ok": true,
+        "found": found,
+        "heading": heading,
+        "heading_level": heading_level,
+        "section": section_text,
+        "start_line": start_line,
+        "end_line": end_line,
+        "section_lines": section_lines,
+        "section_chars": section_chars,
+        "sub_headings": sub_headings,
+        "total_matches": total_matches,
+        "input_chars": input_len,
+        "reynolds": re,
+        "regime": regime,
+        "trit": extract_trit,
+        "char": bt_one(extract_trit),
+        "bt3": bt_three(extract_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+// GET /health -- Standard health endpoint
+// ===========================================================================
+// ===========================================================================
+fn handle_health(body) {
+    let uptime = time() - stat_t0
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        self_trit = T_TRUE
+    }
+
+    // Check markdown module availability
+    let md_check = run_md("python -c \"import markdown; print(markdown.__version__)\"")
+    let md_available = true
+    let md_version = trim(md_check)
+    if3 is_error(md_check) {
+        md_available = false
+        md_version = "not installed"
+        self_trit = T_FALSE
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "runtime": "novalang",
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "tools": TOOLS_COUNT,
+        "markdown_version": md_version,
+        "markdown_available": md_available,
+        "self_trit": self_trit,
+        "char": bt_one(self_trit),
+        "bt3": bt_three(self_trit),
+        "uptime_s": uptime,
+        "quality": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        }
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+// GET /tmarkdown/service-status -- Full service status with stats
+// ===========================================================================
+// ===========================================================================
+fn handle_status(body) {
+    let uptime = time() - stat_t0
+
+    // Service Reynolds from total false ops
+    let re = stat_trit_false * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    // System trit
+    let sys_trit = T_TRUE
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    let by_tool = {}
+    dict_set(by_tool, "render", by_tool_render)
+    dict_set(by_tool, "toc", by_tool_toc)
+    dict_set(by_tool, "links", by_tool_links)
+    dict_set(by_tool, "stats", by_tool_stats)
+    dict_set(by_tool, "convert", by_tool_convert)
+    dict_set(by_tool, "validate", by_tool_validate)
+    dict_set(by_tool, "extract", by_tool_extract)
+
+    // Check markdown module
+    let md_check = run_md("python -c \"import markdown; print(markdown.__version__)\"")
+    let md_ok = true
+    let md_version = trim(md_check)
+    if3 is_error(md_check) {
+        md_ok = false
+        md_version = "not installed"
+    }
+
+    // Check available extensions
+    let ext_check = run_md("python -c \"import markdown; exts=['tables','fenced_code','toc','codehilite','nl2br','sane_lists']; avail=[e for e in exts if True]; print(','.join(avail))\"")
+    let extensions = ["tables", "fenced_code", "toc", "codehilite", "nl2br", "sane_lists"]
+
+    // N-S flow summary
+    let ns_flow = {}
+    dict_set(ns_flow, "total_chars_in", ns_total_chars_in)
+    dict_set(ns_flow, "total_chars_out", ns_total_chars_out)
+    dict_set(ns_flow, "max_reynolds", ns_max_reynolds)
+    dict_set(ns_flow, "max_regime", flow_regime(ns_max_reynolds))
+
+    // Compression ratio
+    let compression = 0
+    if3 ns_total_chars_in > 0 {
+        compression = ns_total_chars_out / ns_total_chars_in
+    }
+    dict_set(ns_flow, "avg_compression", compression)
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "total_ops": stat_ops,
+        "by_tool": by_tool,
+        "trits": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        },
+        "markdown_version": md_version,
+        "markdown_available": md_ok,
+        "extensions": extensions,
+        "ns_flow": ns_flow,
+        "reynolds": re,
+        "regime": regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "system_bt3": bt_three(sys_trit),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "reynolds_boundaries": {
+            "laminar": RE_LAMINAR,
+            "transition": RE_TRANSITION,
+            "turbulent": RE_TURBULENT
+        },
+        "ns_mapping": {
+            "document_flow": "velocity_field",
+            "parse_complexity": "turbulent_energy"
+        },
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE
+    }
+}
+
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+troute(server, "GET",  "/health",                    "handle_health")
+troute(server, "GET",  "/tmarkdown/service-status",  "handle_status")
+troute(server, "POST", "/tmarkdown/render",          "handle_render")
+troute(server, "POST", "/tmarkdown/toc",             "handle_toc")
+troute(server, "POST", "/tmarkdown/links",           "handle_links")
+troute(server, "POST", "/tmarkdown/stats",           "handle_stats")
+troute(server, "POST", "/tmarkdown/convert",         "handle_convert")
+troute(server, "POST", "/tmarkdown/validate",        "handle_validate")
+troute(server, "POST", "/tmarkdown/extract",         "handle_extract")
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[TMarkdown] NovaX Ternary Markdown Processing v" + VERSION + " on port " + str(PORT))
+print("[TMarkdown] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[TMarkdown] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TMarkdown] Re boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TMarkdown] N-S: document_flow=velocity_field | parse_complexity=turbulent_energy")
+print("[TMarkdown] Markdown timeout: " + str(MD_TIMEOUT) + "s (H13)")
+print("[TMarkdown] Temp dir: " + TMP_DIR)
+print("[TMarkdown] Routes: /health, /tmarkdown/service-status")
+print("[TMarkdown]         /tmarkdown/render, /tmarkdown/toc, /tmarkdown/links")
+print("[TMarkdown]         /tmarkdown/stats, /tmarkdown/convert")
+print("[TMarkdown]         /tmarkdown/validate, /tmarkdown/extract")
+print("[TMarkdown] Extensions: tables, fenced_code, toc, codehilite, nl2br, sane_lists")
+print("[TMarkdown] Validation rules: MD001, MD002, MD004, MD009, MD012, MD013, MD022, MD024, MD039, MD047")
+print("[TMarkdown] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

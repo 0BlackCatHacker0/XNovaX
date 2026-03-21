@@ -1,0 +1,2159 @@
+// NovaX TDocker Service v1.0 - Ternary Docker Wrapper (NovaLang)
+// Port 9914: Docker operations through ternary-native micro-tools
+//
+// 12 ternary-native docker tools on 3-5-7-13 harmonic constants:
+//   1.  /tdocker/images      -- List/pull/remove images
+//   2.  /tdocker/containers  -- List containers (running/all/filtered)
+//   3.  /tdocker/run         -- Run a container (image, name, ports, env, detach)
+//   4.  /tdocker/stop        -- Stop/start/restart/remove a container
+//   5.  /tdocker/build       -- Build image from Dockerfile
+//   6.  /tdocker/logs        -- Get container logs (tail N)
+//   7.  /tdocker/inspect     -- Inspect container/image details
+//   8.  /tdocker/compose     -- Docker Compose operations (Tier 3)
+//   9.  /tdocker/exec        -- Exec command in container (Tier 3)
+//   10. /tdocker/push        -- Push image to registry (Tier 5)
+//   11. /tdocker/network     -- Network management: list/create/remove/connect/disconnect (Tier 5)
+//   12. /tdocker/volume      -- Volume management: list/create/remove/inspect/prune (Tier 5)
+//
+// N-S Mapping:
+//   container_stream = velocity_field (containers flowing through Docker)
+//   resource_pressure = turbulent_energy (CPU/memory pressure)
+//   Reynolds(docker)  = container_ops * H5
+//   RE_LAMINAR=27     = low container churn
+//   RE_TRANSITION=125 = moderate container activity
+//   RE_TURBULENT=343  = heavy container operations
+//
+// Endpoints:
+//   GET  /health                  -- Health check
+//   GET  /tdocker/service-status  -- Full service status with stats
+//   POST /tdocker/images          -- Image operations
+//   POST /tdocker/containers      -- Container listing
+//   POST /tdocker/run             -- Run container
+//   POST /tdocker/stop            -- Stop/start/restart/remove container
+//   POST /tdocker/build           -- Build image
+//   POST /tdocker/logs            -- Container logs
+//   POST /tdocker/inspect         -- Inspect container/image
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9914
+let server = tserve(PORT, "TDocker v1.0 - Ternary Docker Wrapper")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE     = 2187
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+let TOOLS_COUNT    = 12
+let VERSION        = "1.0.0"
+let SERVICE_NAME   = "nova-tdocker"
+let DOCKER_TIMEOUT = 13
+
+// -- Global Stats --
+let stat_ops         = 0
+let stat_trit_true   = 0
+let stat_trit_maybe  = 0
+let stat_trit_false  = 0
+let stat_t0          = time()
+
+// by_tool counters (one per tool)
+let by_tool_images     = 0
+let by_tool_containers = 0
+let by_tool_run        = 0
+let by_tool_stop       = 0
+let by_tool_build      = 0
+let by_tool_logs       = 0
+let by_tool_inspect    = 0
+let by_tool_compose    = 0
+let by_tool_exec       = 0
+let by_tool_push       = 0
+let by_tool_network    = 0
+let by_tool_volume     = 0
+
+// -- Container cache (name -> last known info) --
+let _container_cache = {}
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_stat(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "images" {
+        by_tool_images = by_tool_images + 1
+    }
+    if3 tool_name == "containers" {
+        by_tool_containers = by_tool_containers + 1
+    }
+    if3 tool_name == "run" {
+        by_tool_run = by_tool_run + 1
+    }
+    if3 tool_name == "stop" {
+        by_tool_stop = by_tool_stop + 1
+    }
+    if3 tool_name == "build" {
+        by_tool_build = by_tool_build + 1
+    }
+    if3 tool_name == "logs" {
+        by_tool_logs = by_tool_logs + 1
+    }
+    if3 tool_name == "inspect" {
+        by_tool_inspect = by_tool_inspect + 1
+    }
+    if3 tool_name == "push" {
+        by_tool_push = by_tool_push + 1
+    }
+    if3 tool_name == "network" {
+        by_tool_network = by_tool_network + 1
+    }
+    if3 tool_name == "volume" {
+        by_tool_volume = by_tool_volume + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: run a docker command with standard timeout (H13)
+// Returns stripped output string
+// ===========================================================================
+fn run_docker(cmd) {
+    let raw = nova_run(cmd, DOCKER_TIMEOUT)
+    let output = trim(str(raw))
+    return output
+}
+
+// ===========================================================================
+// HELPER: check if output indicates a docker error
+// ===========================================================================
+fn is_docker_error(output) {
+    let lc = lower(output)
+    if3 contains(lc, "error") {
+        // Exclude "error response" substring false positives on success
+        // But still catch real errors
+        if3 contains(lc, "error response from daemon") {
+            return true
+        }
+        if3 contains(lc, "error:") {
+            return true
+        }
+        if3 contains(lc, "error during connect") {
+            return true
+        }
+    }
+    if3 contains(lc, "cannot connect to the docker daemon") {
+        return true
+    }
+    if3 contains(lc, "is the docker daemon running") {
+        return true
+    }
+    if3 contains(lc, "no such container") {
+        return true
+    }
+    if3 contains(lc, "no such image") {
+        return true
+    }
+    if3 contains(lc, "not found") {
+        // Only return true if it looks like a docker not-found
+        if3 contains(lc, "repository") {
+            return true
+        }
+        if3 contains(lc, "manifest") {
+            return true
+        }
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: check if docker daemon is accessible
+// ===========================================================================
+fn check_docker_alive() {
+    let cmd = "docker info --format \"{{.ServerVersion}}\" 2>&1"
+    let output = run_docker(cmd)
+    let lc = lower(output)
+    if3 contains(lc, "cannot connect") {
+        return false
+    }
+    if3 contains(lc, "error") {
+        return false
+    }
+    if3 len(output) == 0 {
+        return false
+    }
+    return true
+}
+
+// ===========================================================================
+// HELPER: parse a line of docker images output
+// Format: "repo:tag size id"
+// ===========================================================================
+fn parse_image_line(line) {
+    let trimmed = trim(line)
+    if3 len(trimmed) == 0 {
+        return {}
+    }
+    let parts = split(trimmed, " ")
+    let entry = {}
+    // First part: repo:tag
+    let repo_tag = parts[0]
+    entry = dict_set(entry, "repository_tag", repo_tag)
+    // Split repo:tag on ":"
+    let rt_parts = split(repo_tag, ":")
+    entry = dict_set(entry, "repository", rt_parts[0])
+    if3 len(rt_parts) > 1 {
+        entry = dict_set(entry, "tag", rt_parts[1])
+    }
+    if3 len(rt_parts) <= 1 {
+        entry = dict_set(entry, "tag", "latest")
+    }
+    // Remaining parts: try to get size and id
+    // Format varies; we take second non-empty as size, third as id
+    let pi = 1
+    let extra_idx = 0
+    while3 pi < len(parts) {
+        let p = trim(parts[pi])
+        if3 len(p) > 0 {
+            if3 extra_idx == 0 {
+                entry = dict_set(entry, "size", p)
+                extra_idx = extra_idx + 1
+            }
+            if3 extra_idx == 1 {
+                // Check if this is actually size continued (e.g. "1.2 GB")
+                // or the image ID
+                let is_unit = false
+                if3 contains(lower(p), "mb") {
+                    is_unit = true
+                }
+                if3 contains(lower(p), "gb") {
+                    is_unit = true
+                }
+                if3 contains(lower(p), "kb") {
+                    is_unit = true
+                }
+                if3 is_unit == true {
+                    // Append to size
+                    let prev_size = dict_get(entry, "size") ?? ""
+                    entry = dict_set(entry, "size", prev_size + " " + p)
+                }
+                if3 is_unit == false {
+                    entry = dict_set(entry, "id", p)
+                    extra_idx = extra_idx + 1
+                }
+            }
+        }
+        pi = pi + 1
+    }
+    return entry
+}
+
+// ===========================================================================
+// HELPER: parse a line of docker ps output
+// Format: "id name status image ports"
+// ===========================================================================
+fn parse_container_line(line) {
+    let trimmed = trim(line)
+    if3 len(trimmed) == 0 {
+        return {}
+    }
+    let parts = split(trimmed, " ")
+    let entry = {}
+    // docker ps --format "{{.ID}} {{.Names}} {{.Status}} {{.Image}} {{.Ports}}"
+    // At minimum: id names status_word image
+    // Status can be multi-word: "Up 3 hours"
+    // Ports can be multi-part or empty
+    entry = dict_set(entry, "id", parts[0])
+    entry = dict_set(entry, "name", parts[1])
+
+    // Status: everything from index 2 until we hit something that
+    // looks like an image name (contains "/" or ":" or is known pattern)
+    // Simple approach: take parts[2] as status_prefix
+    let status_str = parts[2]
+    let image_str = ""
+    let ports_str = ""
+
+    // Heuristic: walk from index 3 forward
+    // "Up" or "Exited" are status prefixes
+    // Status ends when we see a part containing ":" or "/" (likely image)
+    let si = 3
+    let found_image = false
+    while3 si < len(parts) {
+        let p = trim(parts[si])
+        if3 len(p) > 0 {
+            if3 found_image == false {
+                // Check if this looks like an image reference
+                let has_colon = contains(p, ":")
+                let has_slash = contains(p, "/")
+                // If it looks like image ref or we are past typical status words
+                if3 has_colon == true {
+                    image_str = p
+                    found_image = true
+                }
+                if3 has_slash == true {
+                    if3 found_image == false {
+                        image_str = p
+                        found_image = true
+                    }
+                }
+                if3 found_image == false {
+                    // Still part of status
+                    status_str = status_str + " " + p
+                }
+            }
+            if3 found_image == true {
+                if3 len(image_str) > 0 {
+                    if3 p != image_str {
+                        // This is ports
+                        if3 len(ports_str) > 0 {
+                            ports_str = ports_str + " " + p
+                        }
+                        if3 len(ports_str) == 0 {
+                            ports_str = p
+                        }
+                    }
+                }
+            }
+        }
+        si = si + 1
+    }
+
+    // If we never found an image, the third-to-last might be it
+    if3 len(image_str) == 0 {
+        if3 len(parts) >= 4 {
+            image_str = parts[3]
+            // Re-trim status
+            status_str = parts[2]
+        }
+    }
+
+    entry = dict_set(entry, "status", trim(status_str))
+    entry = dict_set(entry, "image", image_str)
+    entry = dict_set(entry, "ports", ports_str)
+    return entry
+}
+
+// ===========================================================================
+// HELPER: count non-empty lines
+// ===========================================================================
+fn count_nonempty_lines(output) {
+    let count = 0
+    if3 len(output) == 0 {
+        return 0
+    }
+    let lines = split(output, "\n")
+    let i = 0
+    while3 i < len(lines) {
+        let line = trim(lines[i])
+        if3 len(line) > 0 {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ===========================================================================
+// TOOL 1: POST /tdocker/images
+// Image operations: list, pull, remove
+// Body: {action: "list"|"pull"|"remove", image: "name:tag", filter: ""}
+// Trit: +1=success, 0=partial/empty, -1=error
+// ===========================================================================
+fn handle_images(body) {
+    let action = dict_get(body, "action") ?? "list"
+    let image = dict_get(body, "image") ?? ""
+    let filter_str = dict_get(body, "filter") ?? ""
+
+    // ---------------------------------------------------------------
+    // ACTION: list
+    // ---------------------------------------------------------------
+    if3 action == "list" { cmd = "docker images --format \"{{.Repository}}:{{.Tag}} {{.Size}} {{.ID}}\""
+        if3 len(filter_str) > 0 {
+            cmd = "docker images --format \"{{.Repository}}:{{.Tag}} {{.Size}} {{.ID}}\" --filter \"reference=" + filter_str + "\""
+        }
+        cmd = cmd + " 2>&1"
+
+        let output = ""
+        let run_trit = T_TRUE
+        output = run_docker(cmd)
+
+        if3 is_docker_error(output) == true {
+            record_stat("images", T_FALSE)
+            return {
+                "ok": false,
+                "action": "list",
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Parse image lines
+        let images = []
+        let image_count = 0
+        if3 len(output) > 0 { lines = split(output, "\n")
+            let i = 0
+            while3 i < len(lines) {
+                let line = trim(lines[i])
+                if3 len(line) > 0 { entry = parse_image_line(line)
+                    let repo = dict_get(entry, "repository") ?? ""
+                    if3 len(repo) > 0 {
+                        images = append(images, entry)
+                        image_count = image_count + 1
+                    }
+                }
+                i = i + 1
+            }
+        }
+
+        let list_trit = T_TRUE
+        if3 image_count == 0 {
+            list_trit = T_MAYBE
+        }
+
+        // N-S: container_stream = velocity_field
+        let re = image_count * H5
+        let regime = flow_regime(re)
+
+        record_stat("images", list_trit)
+        return {
+            "ok": true,
+            "action": "list",
+            "images": images,
+            "count": image_count,
+            "filter": filter_str,
+            "reynolds": re,
+            "regime": regime,
+            "trit": list_trit,
+            "char": bt_one(list_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // ACTION: pull
+    // ---------------------------------------------------------------
+    if3 action == "pull" {
+        if3 len(image) == 0 {
+            record_stat("images", T_FALSE)
+            return {
+                "ok": false,
+                "action": "pull",
+                "error": "image name required for pull",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "docker pull " + image + " 2>&1"
+        let output = ""
+        let pull_trit = T_TRUE
+        output = run_docker(cmd)
+
+        let lc_output = lower(output)
+        if3 is_docker_error(output) == true {
+            record_stat("images", T_FALSE)
+            return {
+                "ok": false,
+                "action": "pull",
+                "image": image,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Check for success indicators
+        if3 contains(lc_output, "pull complete") {
+            pull_trit = T_TRUE
+        }
+        if3 contains(lc_output, "downloaded newer image") {
+            pull_trit = T_TRUE
+        }
+        if3 contains(lc_output, "image is up to date") {
+            pull_trit = T_TRUE
+        }
+        if3 contains(lc_output, "already exists") {
+            pull_trit = T_TRUE
+        }
+
+        // Extract digest if present
+        let digest = ""
+        if3 contains(output, "Digest:") { digest_parts = split(output, "Digest: ")
+            if3 len(digest_parts) > 1 { digest_line = digest_parts[1]
+                let digest_lines = split(digest_line, "\n")
+                digest = trim(digest_lines[0])
+            }
+        }
+
+        record_stat("images", pull_trit)
+        return {
+            "ok": true,
+            "action": "pull",
+            "image": image,
+            "digest": digest,
+            "output": output,
+            "trit": pull_trit,
+            "char": bt_one(pull_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // ACTION: remove (rmi)
+    // ---------------------------------------------------------------
+    if3 action == "remove" {
+        if3 len(image) == 0 {
+            record_stat("images", T_FALSE)
+            return {
+                "ok": false,
+                "action": "remove",
+                "error": "image name required for remove",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let force = dict_get(body, "force") ?? false
+        let cmd = "docker rmi"
+        if3 force == true {
+            cmd = cmd + " -f"
+        }
+        cmd = cmd + " " + image + " 2>&1"
+
+        let output = ""
+        let remove_trit = T_TRUE
+        output = run_docker(cmd)
+
+        if3 is_docker_error(output) == true {
+            record_stat("images", T_FALSE)
+            return {
+                "ok": false,
+                "action": "remove",
+                "image": image,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let lc_output = lower(output)
+        if3 contains(lc_output, "untagged") {
+            remove_trit = T_TRUE
+        }
+        if3 contains(lc_output, "deleted") {
+            remove_trit = T_TRUE
+        }
+
+        record_stat("images", remove_trit)
+        return {
+            "ok": true,
+            "action": "remove",
+            "image": image,
+            "output": output,
+            "trit": remove_trit,
+            "char": bt_one(remove_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // Unknown action -- default to list
+    record_stat("images", T_FALSE)
+    return {
+        "ok": false,
+        "action": action,
+        "error": "unknown action: " + action + " (use list/pull/remove)",
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 2: POST /tdocker/containers
+// List containers: running, all, filtered
+// Body: {action: "list"|"all", filter_name: "", filter_status: ""}
+// Trit: +1=found, 0=empty, -1=error
+// ===========================================================================
+fn handle_containers(body) {
+    let action = dict_get(body, "action") ?? "list"
+    let filter_name = dict_get(body, "filter_name") ?? ""
+    let filter_status = dict_get(body, "filter_status") ?? ""
+
+    let cmd = "docker ps --format \"{{.ID}} {{.Names}} {{.Status}} {{.Image}} {{.Ports}}\""
+    if3 action == "all" {
+        cmd = "docker ps -a --format \"{{.ID}} {{.Names}} {{.Status}} {{.Image}} {{.Ports}}\""
+    }
+
+    // Add filters
+    if3 len(filter_name) > 0 {
+        cmd = cmd + " --filter \"name=" + filter_name + "\""
+    }
+    if3 len(filter_status) > 0 {
+        cmd = cmd + " --filter \"status=" + filter_status + "\""
+    }
+    cmd = cmd + " 2>&1"
+
+    let output = ""
+    output = run_docker(cmd)
+
+    if3 is_docker_error(output) == true {
+        record_stat("containers", T_FALSE)
+        return {
+            "ok": false,
+            "action": action,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse container lines
+    let containers = []
+    let container_count = 0
+    if3 len(output) > 0 { lines = split(output, "\n")
+        let i = 0
+        while3 i < len(lines) {
+            let line = trim(lines[i])
+            if3 len(line) > 0 { entry = parse_container_line(line)
+                let cid = dict_get(entry, "id") ?? ""
+                if3 len(cid) > 0 {
+                    containers = append(containers, entry)
+                    container_count = container_count + 1
+                    // Cache container info
+                    let cname = dict_get(entry, "name") ?? ""
+                    if3 len(cname) > 0 { cache_entry = {}
+                        cache_entry = dict_set(cache_entry, "id", cid)
+                        cache_entry = dict_set(cache_entry, "status", dict_get(entry, "status") ?? "")
+                        cache_entry = dict_set(cache_entry, "last_check", time())
+                        _container_cache = dict_set(_container_cache, cname, cache_entry)
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    let list_trit = T_TRUE
+    if3 container_count == 0 {
+        list_trit = T_MAYBE
+    }
+
+    // N-S: container_stream = velocity_field
+    let re = container_count * H5
+    let regime = flow_regime(re)
+
+    record_stat("containers", list_trit)
+    return {
+        "ok": true,
+        "action": action,
+        "containers": containers,
+        "count": container_count,
+        "filter_name": filter_name,
+        "filter_status": filter_status,
+        "reynolds": re,
+        "regime": regime,
+        "trit": list_trit,
+        "char": bt_one(list_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 3: POST /tdocker/run
+// Run a container
+// Body: {image, name, ports: [], env: [], cmd: "", detach: true, volumes: []}
+// ports: ["8080:80", "443:443"]
+// env: ["KEY=VAL", "FOO=BAR"]
+// volumes: ["C:/data:/data"]
+// Trit: +1=started, 0=partial, -1=error
+// ===========================================================================
+fn handle_run(body) {
+    let image = dict_get(body, "image") ?? ""
+    let name = dict_get(body, "name") ?? ""
+    let ports = dict_get(body, "ports") ?? []
+    let env_vars = dict_get(body, "env") ?? []
+    let user_cmd = dict_get(body, "cmd") ?? ""
+    let detach = dict_get(body, "detach") ?? true
+    let volumes = dict_get(body, "volumes") ?? []
+    let restart_policy = dict_get(body, "restart") ?? ""
+    let network = dict_get(body, "network") ?? ""
+
+    // Image is required
+    if3 len(image) == 0 {
+        record_stat("run", T_FALSE)
+        return {
+            "ok": false,
+            "action": "run",
+            "error": "image name required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Build the docker run command
+    let cmd = "docker run"
+
+    // Detach flag
+    if3 detach == true {
+        cmd = cmd + " -d"
+    }
+
+    // Container name
+    if3 len(name) > 0 {
+        cmd = cmd + " --name " + name
+    }
+
+    // Port mappings
+    let pi = 0
+    while3 pi < len(ports) {
+        let port_map = dict_get(ports, pi) ?? ""
+        if3 len(port_map) > 0 {
+            cmd = cmd + " -p " + port_map
+        }
+        pi = pi + 1
+    }
+
+    // Environment variables
+    let ei = 0
+    while3 ei < len(env_vars) {
+        let env_var = dict_get(env_vars, ei) ?? ""
+        if3 len(env_var) > 0 {
+            cmd = cmd + " -e \"" + env_var + "\""
+        }
+        ei = ei + 1
+    }
+
+    // Volume mounts
+    let vi = 0
+    while3 vi < len(volumes) {
+        let vol = volumes[vi]
+        if3 len(vol) > 0 {
+            cmd = cmd + " -v \"" + vol + "\""
+        }
+        vi = vi + 1
+    }
+
+    // Restart policy
+    if3 len(restart_policy) > 0 {
+        cmd = cmd + " --restart " + restart_policy
+    }
+
+    // Network
+    if3 len(network) > 0 {
+        cmd = cmd + " --network " + network
+    }
+
+    // Image
+    cmd = cmd + " " + image
+
+    // User command
+    if3 len(user_cmd) > 0 {
+        cmd = cmd + " " + user_cmd
+    }
+
+    cmd = cmd + " 2>&1"
+
+    let output = ""
+    let run_trit = T_TRUE
+    output = run_docker(cmd)
+
+    let lc_output = lower(output)
+    if3 is_docker_error(output) == true {
+        record_stat("run", T_FALSE)
+        return {
+            "ok": false,
+            "action": "run",
+            "image": image,
+            "name": name,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // In detached mode, output is the container ID
+    let container_id = ""
+    if3 detach == true { out_lines = split(output, "\n")
+        let li = 0
+        while3 li < len(out_lines) {
+            let oline = trim(out_lines[li])
+            if3 len(oline) > 0 {
+                // The last non-empty line should be the container ID (64-char hex)
+                container_id = oline
+            }
+            li = li + 1
+        }
+    }
+
+    // Determine trit
+    if3 len(container_id) > 0 {
+        run_trit = T_TRUE
+    }
+    if3 detach == false {
+        // Non-detached run: check if output looks successful
+        if3 len(output) > 0 {
+            run_trit = T_TRUE
+        }
+        if3 len(output) == 0 {
+            run_trit = T_MAYBE
+        }
+    }
+
+    // Check for conflict (name already in use)
+    if3 contains(lc_output, "is already in use") {
+        record_stat("run", T_FALSE)
+        return {
+            "ok": false,
+            "action": "run",
+            "image": image,
+            "name": name,
+            "error": "container name already in use",
+            "output": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Cache container info
+    if3 len(name) > 0 { cache_entry = {}
+        cache_entry = dict_set(cache_entry, "id", container_id)
+        cache_entry = dict_set(cache_entry, "image", image)
+        cache_entry = dict_set(cache_entry, "status", "running")
+        cache_entry = dict_set(cache_entry, "last_check", time())
+        _container_cache = dict_set(_container_cache, name, cache_entry)
+    }
+
+    // N-S: resource_pressure = turbulent_energy
+    let port_count = len(ports)
+    let env_count = len(env_vars)
+    let resource_pressure = port_count + env_count + len(volumes)
+    let re = resource_pressure * H5
+    let regime = flow_regime(re)
+
+    record_stat("run", run_trit)
+    return {
+        "ok": true,
+        "action": "run",
+        "image": image,
+        "name": name,
+        "container_id": container_id,
+        "detach": detach,
+        "ports": ports,
+        "env_count": env_count,
+        "volume_count": len(volumes),
+        "resource_pressure": resource_pressure,
+        "reynolds": re,
+        "regime": regime,
+        "output": output,
+        "trit": run_trit,
+        "char": bt_one(run_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 4: POST /tdocker/stop
+// Stop/start/restart/remove a container
+// Body: {action: "stop"|"start"|"restart"|"remove", container: "name_or_id",
+//        timeout: 13, force: false}
+// Trit: +1=success, 0=already in that state, -1=error
+// ===========================================================================
+fn handle_stop(body) {
+    let action = dict_get(body, "action") ?? "stop"
+    let container = dict_get(body, "container") ?? ""
+    let timeout_val = dict_get(body, "timeout") ?? H13
+    let force = dict_get(body, "force") ?? false
+
+    if3 len(container) == 0 {
+        record_stat("stop", T_FALSE)
+        return {
+            "ok": false,
+            "action": action,
+            "error": "container name or ID required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // ACTION: stop
+    // ---------------------------------------------------------------
+    if3 action == "stop" { timeout_str = str(timeout_val)
+        let cmd = "docker stop -t " + timeout_str + " " + container + " 2>&1"
+        let output = ""
+        output = run_docker(cmd)
+
+        if3 is_docker_error(output) == true {
+            record_stat("stop", T_FALSE)
+            return {
+                "ok": false,
+                "action": "stop",
+                "container": container,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let lc_output = lower(output)
+        let stop_trit = T_TRUE
+        if3 contains(lc_output, "is not running") {
+            stop_trit = T_MAYBE
+        }
+
+        // Update cache
+        _container_cache = dict_set(_container_cache, container, {})
+
+        record_stat("stop", stop_trit)
+        return {
+            "ok": true,
+            "action": "stop",
+            "container": container,
+            "timeout": timeout_val,
+            "output": output,
+            "trit": stop_trit,
+            "char": bt_one(stop_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // ACTION: start
+    // ---------------------------------------------------------------
+    if3 action == "start" { cmd = "docker start " + container + " 2>&1"
+        let output = ""
+        output = run_docker(cmd)
+
+        if3 is_docker_error(output) == true {
+            record_stat("stop", T_FALSE)
+            return {
+                "ok": false,
+                "action": "start",
+                "container": container,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let start_trit = T_TRUE
+        let lc_output = lower(output)
+        if3 contains(lc_output, "is already running") {
+            start_trit = T_MAYBE
+        }
+
+        record_stat("stop", start_trit)
+        return {
+            "ok": true,
+            "action": "start",
+            "container": container,
+            "output": output,
+            "trit": start_trit,
+            "char": bt_one(start_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // ACTION: restart
+    // ---------------------------------------------------------------
+    if3 action == "restart" { timeout_str = str(timeout_val)
+        let cmd = "docker restart -t " + timeout_str + " " + container + " 2>&1"
+        let output = ""
+        output = run_docker(cmd)
+
+        if3 is_docker_error(output) == true {
+            record_stat("stop", T_FALSE)
+            return {
+                "ok": false,
+                "action": "restart",
+                "container": container,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let restart_trit = T_TRUE
+
+        record_stat("stop", restart_trit)
+        return {
+            "ok": true,
+            "action": "restart",
+            "container": container,
+            "timeout": timeout_val,
+            "output": output,
+            "trit": restart_trit,
+            "char": bt_one(restart_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // ACTION: remove (rm)
+    // ---------------------------------------------------------------
+    if3 action == "remove" { cmd = "docker rm"
+        if3 force == true {
+            cmd = cmd + " -f"
+        }
+        cmd = cmd + " " + container + " 2>&1"
+
+        let output = ""
+        output = run_docker(cmd)
+
+        if3 is_docker_error(output) == true {
+            // Check if container was already removed
+            let lc_output = lower(output)
+            if3 contains(lc_output, "no such container") {
+                record_stat("stop", T_MAYBE)
+                return {
+                    "ok": true,
+                    "action": "remove",
+                    "container": container,
+                    "note": "container does not exist (already removed?)",
+                    "trit": T_MAYBE,
+                    "char": bt_one(T_MAYBE),
+                    "runtime": "novalang"
+                }
+            }
+            record_stat("stop", T_FALSE)
+            return {
+                "ok": false,
+                "action": "remove",
+                "container": container,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Remove from cache
+        _container_cache = dict_set(_container_cache, container, {})
+
+        record_stat("stop", T_TRUE)
+        return {
+            "ok": true,
+            "action": "remove",
+            "container": container,
+            "force": force,
+            "output": output,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Unknown action
+    record_stat("stop", T_FALSE)
+    return {
+        "ok": false,
+        "action": action,
+        "error": "unknown action: " + action + " (use stop/start/restart/remove)",
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 5: POST /tdocker/build
+// Build image from Dockerfile
+// Body: {tag: "myimage:latest", context: ".", dockerfile: "", no_cache: false,
+//        build_args: []}
+// Trit: +1=built successfully, 0=warnings, -1=error
+// ===========================================================================
+fn handle_build(body) {
+    let tag = dict_get(body, "tag") ?? ""
+    let context_path = dict_get(body, "context") ?? "."
+    let dockerfile = dict_get(body, "dockerfile") ?? ""
+    let no_cache = dict_get(body, "no_cache") ?? false
+    let build_args = dict_get(body, "build_args") ?? []
+
+    if3 len(tag) == 0 {
+        record_stat("build", T_FALSE)
+        return {
+            "ok": false,
+            "action": "build",
+            "error": "tag name required (e.g. myimage:latest)",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Build the docker build command
+    let cmd = "docker build -t " + tag
+
+    // Dockerfile path
+    if3 len(dockerfile) > 0 {
+        cmd = cmd + " -f \"" + dockerfile + "\""
+    }
+
+    // No cache
+    if3 no_cache == true {
+        cmd = cmd + " --no-cache"
+    }
+
+    // Build args
+    let bi = 0
+    while3 bi < len(build_args) {
+        let barg = dict_get(build_args, bi) ?? ""
+        if3 len(barg) > 0 {
+            cmd = cmd + " --build-arg \"" + barg + "\""
+        }
+        bi = bi + 1
+    }
+
+    // Context path
+    cmd = cmd + " \"" + context_path + "\" 2>&1"
+
+    // Build can take a long time -- use extended timeout (H13 * H7 = 91s)
+    let build_timeout = H13 * H7
+    let output = ""
+    let build_trit = T_TRUE
+    let raw = nova_run(cmd, build_timeout)
+    output = trim(str(raw))
+
+    let lc_output = lower(output)
+
+    if3 is_docker_error(output) == true {
+        record_stat("build", T_FALSE)
+        return {
+            "ok": false,
+            "action": "build",
+            "tag": tag,
+            "context": context_path,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Check for success indicators
+    let built_ok = false
+    if3 contains(lc_output, "successfully built") {
+        built_ok = true
+    }
+    if3 contains(lc_output, "successfully tagged") {
+        built_ok = true
+    }
+    // Buildkit style
+    if3 contains(lc_output, "exporting to image") {
+        built_ok = true
+    }
+    if3 contains(lc_output, "writing image") {
+        built_ok = true
+    }
+
+    if3 built_ok == true {
+        build_trit = T_TRUE
+    }
+    if3 built_ok == false {
+        // Check for warnings
+        if3 contains(lc_output, "warning") {
+            build_trit = T_MAYBE
+        }
+    }
+
+    // Count build steps from output
+    let step_count = 0
+    let lines = split(output, "\n")
+    let li = 0
+    while3 li < len(lines) {
+        let line = lower(trim(lines[li]))
+        if3 contains(line, "step ") {
+            step_count = step_count + 1
+        }
+        // Buildkit style: numbered steps
+        if3 starts_with(line, "#") {
+            step_count = step_count + 1
+        }
+        li = li + 1
+    }
+
+    // Extract image ID from output if present
+    let image_id = ""
+    let oi = 0
+    while3 oi < len(lines) {
+        let oline = trim(lines[oi])
+        let lc_oline = lower(oline)
+        if3 contains(lc_oline, "successfully built ") { id_parts = split(oline, "Successfully built ")
+            if3 len(id_parts) > 1 {
+                image_id = trim(id_parts[1])
+            }
+        }
+        if3 contains(lc_oline, "writing image sha256:") { sha_parts = split(oline, "sha256:")
+            if3 len(sha_parts) > 1 { sha_raw = sha_parts[1]
+                let sha_clean = split(sha_raw, " ")
+                image_id = trim(sha_clean[0])
+            }
+        }
+        oi = oi + 1
+    }
+
+    // N-S: resource_pressure from build complexity
+    let resource_pressure = step_count + len(build_args)
+    let re = resource_pressure * H5
+    let regime = flow_regime(re)
+
+    record_stat("build", build_trit)
+    return {
+        "ok": true,
+        "action": "build",
+        "tag": tag,
+        "context": context_path,
+        "image_id": image_id,
+        "steps": step_count,
+        "no_cache": no_cache,
+        "build_args_count": len(build_args),
+        "resource_pressure": resource_pressure,
+        "reynolds": re,
+        "regime": regime,
+        "output_lines": len(lines),
+        "trit": build_trit,
+        "char": bt_one(build_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 6: POST /tdocker/logs
+// Get container logs
+// Body: {container: "name_or_id", tail: 13, since: "", follow: false}
+// Trit: +1=got logs, 0=empty, -1=error
+// ===========================================================================
+fn handle_logs(body) {
+    let container = dict_get(body, "container") ?? ""
+    let tail_count = dict_get(body, "tail") ?? H13
+    let since = dict_get(body, "since") ?? ""
+    let timestamps = dict_get(body, "timestamps") ?? false
+
+    if3 len(container) == 0 {
+        record_stat("logs", T_FALSE)
+        return {
+            "ok": false,
+            "action": "logs",
+            "error": "container name or ID required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Clamp tail count
+    if3 tail_count < 1 {
+        tail_count = 1
+    }
+    if3 tail_count > BLOCK_SIZE {
+        tail_count = BLOCK_SIZE
+    }
+
+    let tail_str = str(tail_count)
+    let cmd = "docker logs --tail " + tail_str
+
+    // Timestamps
+    if3 timestamps == true {
+        cmd = cmd + " --timestamps"
+    }
+
+    // Since filter
+    if3 len(since) > 0 {
+        cmd = cmd + " --since " + since
+    }
+
+    cmd = cmd + " " + container + " 2>&1"
+
+    let output = ""
+    output = run_docker(cmd)
+
+    if3 is_docker_error(output) == true {
+        record_stat("logs", T_FALSE)
+        return {
+            "ok": false,
+            "action": "logs",
+            "container": container,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse log lines
+    let log_lines = []
+    let line_count = 0
+    if3 len(output) > 0 { lines = split(output, "\n")
+        let i = 0
+        while3 i < len(lines) {
+            let line = lines[i]
+            // Don't strip log lines -- preserve original formatting
+            if3 len(line) > 0 {
+                log_lines = append(log_lines, line)
+                line_count = line_count + 1
+            }
+            i = i + 1
+        }
+    }
+
+    let logs_trit = T_TRUE
+    if3 line_count == 0 {
+        logs_trit = T_MAYBE
+    }
+
+    // N-S: line count as flow metric
+    let re = line_count * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    record_stat("logs", logs_trit)
+    return {
+        "ok": true,
+        "action": "logs",
+        "container": container,
+        "tail": tail_count,
+        "log_lines": log_lines,
+        "line_count": line_count,
+        "reynolds": re,
+        "regime": regime,
+        "trit": logs_trit,
+        "char": bt_one(logs_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 7: POST /tdocker/inspect
+// Inspect container or image details
+// Body: {target: "name_or_id", type: "container"|"image"}
+// Trit: +1=found, 0=partial data, -1=not found/error
+// ===========================================================================
+fn handle_inspect(body) {
+    let target = dict_get(body, "target") ?? ""
+    let inspect_type = dict_get(body, "type") ?? "container"
+
+    if3 len(target) == 0 {
+        record_stat("inspect", T_FALSE)
+        return {
+            "ok": false,
+            "action": "inspect",
+            "error": "target name or ID required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let cmd = "docker inspect " + target + " 2>&1"
+    // For image type, use docker image inspect
+    if3 inspect_type == "image" {
+        cmd = "docker image inspect " + target + " 2>&1"
+    }
+
+    let output = ""
+    output = run_docker(cmd)
+
+    if3 is_docker_error(output) == true {
+        record_stat("inspect", T_FALSE)
+        return {
+            "ok": false,
+            "action": "inspect",
+            "target": target,
+            "type": inspect_type,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse key fields from docker inspect JSON output
+    // The raw output is a JSON array; we return it as raw_json
+    // Also try to extract some commonly needed fields
+    let inspect_data = {}
+    inspect_data = dict_set(inspect_data, "raw_json", output)
+
+    // Try to extract some useful fields from the raw output
+    // State
+    let state_str = ""
+    if3 contains(output, "\"Status\":") { status_parts = split(output, "\"Status\": \"")
+        if3 len(status_parts) > 1 { status_raw = status_parts[1]
+            let status_end = split(status_raw, "\"")
+            state_str = status_end[0]
+        }
+    }
+    inspect_data = dict_set(inspect_data, "status", state_str)
+
+    // Image
+    let image_str = ""
+    if3 contains(output, "\"Image\":") { image_parts = split(output, "\"Image\": \"")
+        if3 len(image_parts) > 1 { image_raw = image_parts[1]
+            let image_end = split(image_raw, "\"")
+            image_str = image_end[0]
+        }
+    }
+    inspect_data = dict_set(inspect_data, "image", image_str)
+
+    // Name (containers have Name field)
+    let name_str = ""
+    if3 contains(output, "\"Name\":") { name_parts = split(output, "\"Name\": \"")
+        if3 len(name_parts) > 1 { name_raw = name_parts[1]
+            let name_end = split(name_raw, "\"")
+            name_str = name_end[0]
+            // Remove leading /
+            if3 starts_with(name_str, "/") {
+                name_str = slice(name_str, 1, len(name_str))
+            }
+        }
+    }
+    inspect_data = dict_set(inspect_data, "name", name_str)
+
+    // Platform / Architecture
+    let arch_str = ""
+    if3 contains(output, "\"Architecture\":") { arch_parts = split(output, "\"Architecture\": \"")
+        if3 len(arch_parts) > 1 { arch_raw = arch_parts[1]
+            let arch_end = split(arch_raw, "\"")
+            arch_str = arch_end[0]
+        }
+    }
+    inspect_data = dict_set(inspect_data, "architecture", arch_str)
+
+    // Created timestamp
+    let created_str = ""
+    if3 contains(output, "\"Created\":") { created_parts = split(output, "\"Created\": \"")
+        if3 len(created_parts) > 1 { created_raw = created_parts[1]
+            let created_end = split(created_raw, "\"")
+            created_str = created_end[0]
+        }
+    }
+    inspect_data = dict_set(inspect_data, "created", created_str)
+
+    // Determine trit
+    let inspect_trit = T_TRUE
+    if3 len(output) == 0 {
+        inspect_trit = T_MAYBE
+    }
+    if3 len(state_str) == 0 {
+        if3 len(image_str) == 0 {
+            if3 len(arch_str) == 0 {
+                // Got JSON but could not parse any fields
+                inspect_trit = T_MAYBE
+            }
+        }
+    }
+
+    // Output size for Reynolds
+    let output_size = len(output)
+    let re = output_size * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    record_stat("inspect", inspect_trit)
+    return {
+        "ok": true,
+        "action": "inspect",
+        "target": target,
+        "type": inspect_type,
+        "data": inspect_data,
+        "output_size": output_size,
+        "reynolds": re,
+        "regime": regime,
+        "trit": inspect_trit,
+        "char": bt_one(inspect_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 8: POST /tdocker/compose
+// Docker Compose orchestration (multi-container apps)
+// Body: {action: "up|down|ps|logs|restart", path: "compose-dir", file: ""}
+// Trit: +1=success, 0=partial, -1=error
+// ===========================================================================
+fn handle_compose(body) {
+    let action = dict_get(body, "action") ?? "ps"
+    let path = dict_get(body, "path") ?? "."
+    let file = dict_get(body, "file") ?? ""
+
+    let file_flag = ""
+    if3 len(file) > 0 {
+        file_flag = " -f \"" + file + "\""
+    }
+
+    let base_cmd = "docker compose" + file_flag
+
+    if3 action == "up" { detach = dict_get(body, "detach") ?? true
+        let d_flag = ""
+        if3 detach == true {
+            d_flag = " -d"
+        }
+        let cmd = "cd /d \"" + path + "\" && " + base_cmd + " up" + d_flag + " 2>&1"
+        let output = run_docker(cmd)
+        if3 is_docker_error(output) == true {
+            record_stat("compose", T_FALSE)
+            return {"ok": false, "action": "up", "error": output, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("compose", T_TRUE)
+        return {"ok": true, "action": "up", "path": path, "output": output, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "down" { volumes = dict_get(body, "volumes") ?? false
+        let v_flag = ""
+        if3 volumes == true {
+            v_flag = " -v"
+        }
+        let cmd = "cd /d \"" + path + "\" && " + base_cmd + " down" + v_flag + " 2>&1"
+        let output = run_docker(cmd)
+        if3 is_docker_error(output) == true {
+            record_stat("compose", T_FALSE)
+            return {"ok": false, "action": "down", "error": output, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("compose", T_TRUE)
+        return {"ok": true, "action": "down", "path": path, "output": output, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "ps" { cmd = "cd /d \"" + path + "\" && " + base_cmd + " ps --format json 2>&1"
+        let output = run_docker(cmd)
+        if3 is_docker_error(output) == true {
+            record_stat("compose", T_FALSE)
+            return {"ok": false, "action": "ps", "error": output, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("compose", T_TRUE)
+        return {"ok": true, "action": "ps", "path": path, "services": output, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "logs" { service = dict_get(body, "service") ?? ""
+        let tail = dict_get(body, "tail") ?? H13
+        let svc_arg = ""
+        if3 len(service) > 0 {
+            svc_arg = " " + service
+        }
+        let cmd = "cd /d \"" + path + "\" && " + base_cmd + " logs --tail " + str(tail) + svc_arg + " 2>&1"
+        let output = run_docker(cmd)
+        record_stat("compose", T_TRUE)
+        return {"ok": true, "action": "logs", "path": path, "service": service, "output": output, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "restart" { service = dict_get(body, "service") ?? ""
+        let svc_arg = ""
+        if3 len(service) > 0 {
+            svc_arg = " " + service
+        }
+        let cmd = "cd /d \"" + path + "\" && " + base_cmd + " restart" + svc_arg + " 2>&1"
+        let output = run_docker(cmd)
+        if3 is_docker_error(output) == true {
+            record_stat("compose", T_FALSE)
+            return {"ok": false, "action": "restart", "error": output, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("compose", T_TRUE)
+        return {"ok": true, "action": "restart", "path": path, "output": output, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    record_stat("compose", T_FALSE)
+    return {"ok": false, "error": "unknown action: " + action + " (use up/down/ps/logs/restart)", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+}
+
+// ===========================================================================
+// TOOL 9: POST /tdocker/exec
+// Execute command in running container
+// Body: {container: "name/id", command: "cmd", interactive: false}
+// Trit: +1=success, 0=no output, -1=error
+// ===========================================================================
+fn handle_exec(body) {
+    let container = dict_get(body, "container") ?? ""
+    let command = dict_get(body, "command") ?? ""
+
+    if3 len(container) == 0 {
+        record_stat("exec", T_FALSE)
+        return {"ok": false, "error": "container required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+    }
+    if3 len(command) == 0 {
+        record_stat("exec", T_FALSE)
+        return {"ok": false, "error": "command required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+    }
+
+    let cmd = "docker exec " + container + " " + command + " 2>&1"
+    let output = run_docker(cmd)
+
+    if3 is_docker_error(output) == true {
+        record_stat("exec", T_FALSE)
+        return {"ok": false, "container": container, "command": command, "error": output, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+    }
+
+    let exec_trit = T_TRUE
+    if3 len(output) == 0 {
+        exec_trit = T_MAYBE
+    }
+
+    record_stat("exec", exec_trit)
+    return {
+        "ok": true,
+        "container": container,
+        "command": command,
+        "output": output,
+        "trit": exec_trit,
+        "char": bt_one(exec_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// ROUTE HANDLER WRAPPERS
+// These extract body from request and delegate to the handler functions
+// ===========================================================================
+
+fn route_images(req) {
+    let body = treq_body(req)
+    let result = handle_images(body)
+    return result
+}
+
+fn route_containers(req) {
+    let body = treq_body(req)
+    let result = handle_containers(body)
+    return result
+}
+
+fn route_run(req) {
+    let body = treq_body(req)
+    let result = handle_run(body)
+    return result
+}
+
+fn route_stop(req) {
+    let body = treq_body(req)
+    let result = handle_stop(body)
+    return result
+}
+
+fn route_build(req) {
+    let body = treq_body(req)
+    let result = handle_build(body)
+    return result
+}
+
+fn route_logs(req) {
+    let body = treq_body(req)
+    let result = handle_logs(body)
+    return result
+}
+
+fn route_inspect(req) {
+    let body = treq_body(req)
+    let result = handle_inspect(body)
+    return result
+}
+
+fn route_compose(req) {
+    let body = treq_body(req)
+    let result = handle_compose(body)
+    return result
+}
+
+fn route_exec(req) {
+    let body = treq_body(req)
+    let result = handle_exec(body)
+    return result
+}
+
+// ===========================================================================
+// GET /health -- Standard health endpoint
+// ===========================================================================
+fn health() {
+    let _counters = {"total_requests": stat_trit_true + stat_trit_maybe + stat_trit_false, "total_errors": stat_trit_false}
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, _counters)
+    let docker_alive = check_docker_alive()
+    resp = dict_set(resp, "docker_alive", docker_alive)
+    resp = dict_set(resp, "harmonics", {"H3": H3, "H5": H5, "H7": H7, "H13": H13})
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "uptime_s", time() - stat_t0)
+    resp = dict_set(resp, "quality", {"strong": stat_trit_true, "partial": stat_trit_maybe, "failed": stat_trit_false})
+    return resp
+}
+
+// ===========================================================================
+// GET /tdocker/service-status -- Full service status with stats
+// ===========================================================================
+fn tdocker_service_status() {
+    let uptime = time() - stat_t0
+
+    // Service Reynolds from total false ops
+    let re = stat_trit_false * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    // System trit
+    let sys_trit = T_TRUE
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    // Check Docker daemon
+    let docker_alive = check_docker_alive()
+    if3 docker_alive == false {
+        sys_trit = T_MAYBE
+    }
+
+    let by_tool = {}
+    by_tool = dict_set(by_tool, "images", by_tool_images)
+    by_tool = dict_set(by_tool, "containers", by_tool_containers)
+    by_tool = dict_set(by_tool, "run", by_tool_run)
+    by_tool = dict_set(by_tool, "stop", by_tool_stop)
+    by_tool = dict_set(by_tool, "build", by_tool_build)
+    by_tool = dict_set(by_tool, "logs", by_tool_logs)
+    by_tool = dict_set(by_tool, "inspect", by_tool_inspect)
+    by_tool = dict_set(by_tool, "compose", by_tool_compose)
+    by_tool = dict_set(by_tool, "exec", by_tool_exec)
+    by_tool = dict_set(by_tool, "push", by_tool_push)
+    by_tool = dict_set(by_tool, "network", by_tool_network)
+    by_tool = dict_set(by_tool, "volume", by_tool_volume)
+
+    // Cached containers
+    let cached_containers = keys(_container_cache)
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "docker_alive": docker_alive,
+        "total_ops": stat_ops,
+        "by_tool": by_tool,
+        "trits": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        },
+        "cached_containers": len(cached_containers),
+        "reynolds": re,
+        "regime": regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "ns_mapping": {
+            "container_stream": "velocity_field",
+            "resource_pressure": "turbulent_energy",
+            "reynolds_formula": "container_ops * H5"
+        },
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE
+    }
+}
+
+// ===========================================================================
+// TIER 5: /tdocker/push -- Push image to registry
+// ===========================================================================
+fn handle_push(body) {
+    let image = dict_get(body, "image") ?? ""
+    let registry = dict_get(body, "registry") ?? ""
+    let tag = dict_get(body, "tag") ?? "latest"
+
+    if3 len(image) == 0 {
+        record_stat("push", T_FALSE)
+        return {
+            "ok": false,
+            "action": "push",
+            "error": "image name required (e.g. myapp:latest)",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Build full image reference: registry/image:tag or image:tag
+    let full_ref = image
+    if3 len(registry) > 0 {
+        full_ref = registry + "/" + image
+    }
+    // Append tag if not already in image name
+    if3 contains(full_ref, ":") == false {
+        full_ref = full_ref + ":" + tag
+    }
+
+    // If registry provided, tag first then push
+    let push_output = ""
+    if3 len(registry) > 0 { tag_cmd = "docker tag " + image + " " + full_ref + " 2>&1"
+        let tag_raw = nova_run(tag_cmd, H13 * H5)
+        let tag_out = trim(str(tag_raw))
+        if3 is_docker_error(tag_out) == true {
+            record_stat("push", T_FALSE)
+            return {
+                "ok": false,
+                "action": "push",
+                "image": image,
+                "full_ref": full_ref,
+                "error": "tag failed: " + tag_out,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+    }
+
+    // Execute push (extended timeout -- pushes can be slow)
+    let push_cmd = "docker push " + full_ref + " 2>&1"
+    let push_timeout = H13 * H13
+    let raw = nova_run(push_cmd, push_timeout)
+    push_output = trim(str(raw))
+
+    if3 is_docker_error(push_output) == true {
+        record_stat("push", T_FALSE)
+        return {
+            "ok": false,
+            "action": "push",
+            "image": full_ref,
+            "error": push_output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Check for success indicators
+    let lc_out = lower(push_output)
+    let push_ok = false
+    if3 contains(lc_out, "pushed") {
+        push_ok = true
+    }
+    if3 contains(lc_out, "digest:") {
+        push_ok = true
+    }
+    if3 contains(lc_out, "latest:") {
+        push_ok = true
+    }
+
+    let push_trit = T_MAYBE
+    if3 push_ok == true {
+        push_trit = T_TRUE
+    }
+
+    record_stat("push", push_trit)
+    return {
+        "ok": true,
+        "action": "push",
+        "image": full_ref,
+        "output": push_output,
+        "trit": push_trit,
+        "char": bt_one(push_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TIER 5: /tdocker/network -- Docker network management
+// ===========================================================================
+fn handle_network(body) {
+    let action = dict_get(body, "action") ?? "list"
+    let name = dict_get(body, "name") ?? ""
+    let driver = dict_get(body, "driver") ?? "bridge"
+    let container = dict_get(body, "container") ?? ""
+
+    if3 action == "list" { cmd = "docker network ls --format \"{{.ID}}|{{.Name}}|{{.Driver}}|{{.Scope}}\" 2>&1"
+        let raw = nova_run(cmd, H13)
+        let out = trim(str(raw))
+        if3 is_docker_error(out) == true {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "list", "error": out, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let lines = split(out, "\n")
+        let networks = []
+        let ni = 0
+        while3 ni < len(lines) {
+            let line = trim(lines[ni])
+            if3 len(line) > 0 { parts = split(line, "|")
+                if3 len(parts) >= 4 {
+                    append(networks, {
+                        "id": parts[0],
+                        "name": parts[1],
+                        "driver": parts[2],
+                        "scope": parts[3]
+                    })
+                }
+            }
+            ni = ni + 1
+        }
+        record_stat("network", T_TRUE)
+        return {"ok": true, "action": "list", "networks": networks, "count": len(networks), "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "create" {
+        if3 len(name) == 0 {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "create", "error": "network name required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "docker network create --driver " + driver + " " + name + " 2>&1"
+        let raw = nova_run(cmd, H13)
+        let out = trim(str(raw))
+        if3 is_docker_error(out) == true {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "create", "name": name, "error": out, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("network", T_TRUE)
+        return {"ok": true, "action": "create", "name": name, "driver": driver, "network_id": out, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "remove" {
+        if3 len(name) == 0 {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "remove", "error": "network name required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "docker network rm " + name + " 2>&1"
+        let raw = nova_run(cmd, H13)
+        let out = trim(str(raw))
+        if3 is_docker_error(out) == true {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "remove", "name": name, "error": out, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("network", T_TRUE)
+        return {"ok": true, "action": "remove", "name": name, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "connect" {
+        if3 len(name) == 0 {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "connect", "error": "network name required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        if3 len(container) == 0 {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "connect", "error": "container name required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "docker network connect " + name + " " + container + " 2>&1"
+        let raw = nova_run(cmd, H13)
+        let out = trim(str(raw))
+        if3 is_docker_error(out) == true {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "connect", "network": name, "container": container, "error": out, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("network", T_TRUE)
+        return {"ok": true, "action": "connect", "network": name, "container": container, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "disconnect" {
+        if3 len(name) == 0 {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "disconnect", "error": "network name required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        if3 len(container) == 0 {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "disconnect", "error": "container name required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "docker network disconnect " + name + " " + container + " 2>&1"
+        let raw = nova_run(cmd, H13)
+        let out = trim(str(raw))
+        if3 is_docker_error(out) == true {
+            record_stat("network", T_FALSE)
+            return {"ok": false, "action": "disconnect", "network": name, "container": container, "error": out, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("network", T_TRUE)
+        return {"ok": true, "action": "disconnect", "network": name, "container": container, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    record_stat("network", T_FALSE)
+    return {"ok": false, "action": action, "error": "unknown action: use list/create/remove/connect/disconnect", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+}
+
+// ===========================================================================
+// TIER 5: /tdocker/volume -- Docker volume management
+// ===========================================================================
+fn handle_volume(body) {
+    let action = dict_get(body, "action") ?? "list"
+    let name = dict_get(body, "name") ?? ""
+    let driver = dict_get(body, "driver") ?? "local"
+
+    if3 action == "list" { cmd = "docker volume ls --format \"{{.Name}}|{{.Driver}}|{{.Mountpoint}}\" 2>&1"
+        let raw = nova_run(cmd, H13)
+        let out = trim(str(raw))
+        if3 is_docker_error(out) == true {
+            record_stat("volume", T_FALSE)
+            return {"ok": false, "action": "list", "error": out, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let lines = split(out, "\n")
+        let volumes = []
+        let vi = 0
+        while3 vi < len(lines) {
+            let line = trim(lines[vi])
+            if3 len(line) > 0 { parts = split(line, "|")
+                if3 len(parts) >= 3 {
+                    append(volumes, {
+                        "name": parts[0],
+                        "driver": parts[1],
+                        "mountpoint": parts[2]
+                    })
+                }
+            }
+            vi = vi + 1
+        }
+        record_stat("volume", T_TRUE)
+        return {"ok": true, "action": "list", "volumes": volumes, "count": len(volumes), "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "create" {
+        if3 len(name) == 0 {
+            record_stat("volume", T_FALSE)
+            return {"ok": false, "action": "create", "error": "volume name required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "docker volume create --driver " + driver + " " + name + " 2>&1"
+        let raw = nova_run(cmd, H13)
+        let out = trim(str(raw))
+        if3 is_docker_error(out) == true {
+            record_stat("volume", T_FALSE)
+            return {"ok": false, "action": "create", "name": name, "error": out, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("volume", T_TRUE)
+        return {"ok": true, "action": "create", "name": name, "driver": driver, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "remove" {
+        if3 len(name) == 0 {
+            record_stat("volume", T_FALSE)
+            return {"ok": false, "action": "remove", "error": "volume name required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "docker volume rm " + name + " 2>&1"
+        let raw = nova_run(cmd, H13)
+        let out = trim(str(raw))
+        if3 is_docker_error(out) == true {
+            record_stat("volume", T_FALSE)
+            return {"ok": false, "action": "remove", "name": name, "error": out, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("volume", T_TRUE)
+        return {"ok": true, "action": "remove", "name": name, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "inspect" {
+        if3 len(name) == 0 {
+            record_stat("volume", T_FALSE)
+            return {"ok": false, "action": "inspect", "error": "volume name required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "docker volume inspect " + name + " 2>&1"
+        let raw = nova_run(cmd, H13)
+        let out = trim(str(raw))
+        if3 is_docker_error(out) == true {
+            record_stat("volume", T_FALSE)
+            return {"ok": false, "action": "inspect", "name": name, "error": out, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("volume", T_TRUE)
+        return {"ok": true, "action": "inspect", "name": name, "details": out, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "prune" { cmd = "docker volume prune -f 2>&1"
+        let raw = nova_run(cmd, H13 * H5)
+        let out = trim(str(raw))
+        if3 is_docker_error(out) == true {
+            record_stat("volume", T_FALSE)
+            return {"ok": false, "action": "prune", "error": out, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("volume", T_TRUE)
+        return {"ok": true, "action": "prune", "output": out, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    record_stat("volume", T_FALSE)
+    return {"ok": false, "action": action, "error": "unknown action: use list/create/remove/inspect/prune", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+}
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+troute(server, "GET",  "/health",                  "health")
+troute(server, "GET",  "/tdocker/service-status",   "tdocker_service_status")
+troute(server, "POST", "/tdocker/images",           "handle_images")
+troute(server, "POST", "/tdocker/containers",       "handle_containers")
+troute(server, "POST", "/tdocker/run",              "handle_run")
+troute(server, "POST", "/tdocker/stop",             "handle_stop")
+troute(server, "POST", "/tdocker/build",            "handle_build")
+troute(server, "POST", "/tdocker/logs",             "handle_logs")
+troute(server, "POST", "/tdocker/inspect",          "handle_inspect")
+troute(server, "POST", "/tdocker/compose",          "handle_compose")
+troute(server, "POST", "/tdocker/exec",             "handle_exec")
+troute(server, "POST", "/tdocker/push",             "handle_push")
+troute(server, "POST", "/tdocker/network",          "handle_network")
+troute(server, "POST", "/tdocker/volume",           "handle_volume")
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[TDocker] NovaX Ternary Docker Wrapper v" + VERSION + " on port " + str(PORT))
+print("[TDocker] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[TDocker] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TDocker] Re boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TDocker] N-S: container_stream=velocity_field | resource_pressure=turbulent_energy | Re=ops*H5")
+print("[TDocker] Docker timeout: " + str(DOCKER_TIMEOUT) + "s (H13)")
+print("[TDocker] Routes: /health, /tdocker/service-status")
+print("[TDocker]         /tdocker/images, /tdocker/containers, /tdocker/run, /tdocker/stop")
+print("[TDocker]         /tdocker/build, /tdocker/logs, /tdocker/inspect")
+print("[TDocker] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

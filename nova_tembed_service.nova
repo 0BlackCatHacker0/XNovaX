@@ -1,0 +1,502 @@
+// Nova TEmbed v1.0 - Ternary Vector Embedding Service (N-S Flow Model)
+// Port 9960: Character trigram hashing -> 128-dim unit vectors
+// Cosine similarity powers semantic search across NovaX
+//
+// N-S Mapping:
+//   text_corpus = velocity_field
+//   trigram_density = flow_viscosity
+//   cosine_similarity = pressure_gradient
+//   sim > 0.7 = TRUE  (+1) strong match
+//   sim > 0.4 = MAYBE ( 0) partial match
+//   sim <= 0.4 = FALSE (-1) no match
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3 (ternary base), H5=5 (TZip pack), H7=7 (composition), H13=13 (carrier)
+//   MAX_VECTORS = 3^7 = 2187
+//   DIM = 128 (2^7, fast hashing alignment)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9960
+let server = tserve(PORT, "TEmbed v1.0 - Ternary Vector Embedding")
+
+// -- 3-5-7-13 Harmonic Constants --
+
+let DIM = 128
+let MAX_VECTORS = 2187    // 3^7 = H3^H7
+let SIM_STRONG = 0.7      // TRUE threshold
+let SIM_PARTIAL = 0.4     // MAYBE threshold
+
+// -- Vector Store (id -> entry dict) --
+// Each entry: {id, text, vector, timestamp}
+// store_ids is a list of all known ids (insertion order)
+let store_ids = []
+let store_data = {}
+let total_queries = 0
+let total_stored = 0
+
+// -- Embed a single text into 128-dim vector --
+// Algorithm:
+//   1. Normalize (lowercase)
+//   2. Slide 3-char window over text
+//   3. sha256 each trigram, use hash bytes to accumulate dim weights
+//   4. L2-normalize to unit vector
+fn embed_text(text) {
+    let t = lower(text)
+    let tlen = len(t)
+    // Build zero vector as dict: dim_index -> value
+    // We represent the 128-dim vector as a list of 128 floats
+    // NovaLang: we use a dict keyed by string indices "0".."127"
+    let vec = {}
+    let i = 0
+    while3 i < 128 {
+        vec = dict_set(vec, str(i), 0.0)
+        i = i + 1
+    }
+
+    // Pad very short text to ensure at least one trigram
+    let padded = t
+    if3 tlen < 3 {
+        let padded = t + "   "
+        let tlen = 3
+    }
+
+    // Slide trigram window
+    let gi = 0
+    let gram_count = tlen - 2
+    while3 gi < gram_count {
+        // Extract 3-char window
+        let gram = slice(padded, gi, gi + 3)
+        // Hash the trigram with sha256
+        let h = sha256(gram)
+        // h is a hex string of 64 chars (32 bytes)
+        // We use pairs of hex chars as byte values (0-255)
+        // Use bytes 0..7 (chars 0..15 of hex string) -> 4 pairs
+        // Each pair: byte_i = int(hex[2i:2i+2]) mod 256
+        // pos = byte_even % 128, weight = (byte_odd - 128) / 128.0
+        let bi = 0
+        while3 bi < 4 {
+            let hex_pos = bi * 4
+            // Extract two 2-char hex bytes
+            let hex_a = slice(h, hex_pos, hex_pos + 2)
+            let hex_b = slice(h, hex_pos + 2, hex_pos + 4)
+            let byte_a = int(hex_a, 16)
+            let byte_b = int(hex_b, 16)
+            let pos = byte_a % 128
+            let weight = float(byte_b - 128) / 128.0
+            let pos_key = str(pos)
+            let old = dict_get(vec, pos_key)
+            vec = dict_set(vec, pos_key, old + weight)
+            bi = bi + 1
+        }
+        gi = gi + 1
+    }
+
+    // L2 normalize: compute sum of squares
+    let sum_sq = 0.0
+    let ni = 0
+    while3 ni < 128 {
+        let v = dict_get(vec, str(ni))
+        sum_sq = sum_sq + v * v
+        ni = ni + 1
+    }
+    let norm = sqrt(sum_sq)
+
+    // Build normalized list representation as comma-joined string for storage
+    // We store the vector as a list via append
+    let vec_list = []
+    let li = 0
+    while3 li < 128 {
+        let v = dict_get(vec, str(li))
+        if3 norm > 0.0 {
+            v = v / norm
+        }
+        let rounded = round(v, 6)
+        vec_list = append(vec_list, rounded)
+        li = li + 1
+    }
+
+    return vec_list
+}
+
+// -- Classify similarity into ternary trit --
+fn sim_trit(sim) {
+    if3 sim > SIM_STRONG {
+        return 1    // TRUE: strong match
+    } else sim > SIM_PARTIAL {
+        return 0    // MAYBE: partial match
+    } else {
+        return -1   // FALSE: no match
+    }
+}
+
+// -- Trit to char --
+fn tchar(t) {
+    if3 t == 1 {
+        return "+"
+    } else t == 0 {
+        return "~"
+    } else {
+        return "-"
+    }
+}
+
+// -- GET /health --
+fn handle_health() {
+    let _counters = {"total_requests": total_queries, "total_errors": 0}
+    let resp = ns_health_dict("nova-tembed", "1.0", PORT, _counters)
+    resp = dict_set(resp, "vectors_stored", len(store_ids))
+    resp = dict_set(resp, "max_vectors", MAX_VECTORS)
+    resp = dict_set(resp, "dim", DIM)
+    resp = dict_set(resp, "total_queries", total_queries)
+    resp = dict_set(resp, "thresholds", {"strong": SIM_STRONG, "partial": SIM_PARTIAL})
+    resp = dict_set(resp, "harmonics", {"H3": H3, "H5": H5, "H7": H7, "H13": H13})
+    return resp
+}
+
+// -- POST /tembed/embed -- embed single text, return vector --
+fn handle_embed(body) {
+    let text = dict_get(body, "text")
+    if3 text == null {
+        return {"ok": false, "trit": -1, "error": "text required"}
+    } else len(text) == 0 {
+        return {"ok": false, "trit": -1, "error": "text required"}
+    } else { t0 = time()
+        let vec = embed_text(text)
+        let elapsed = time() - t0
+        let elapsed_ms = round(elapsed * 1000.0, 2)
+        total_queries = total_queries + 1
+        return {
+            "ok": true,
+            "trit": 1,
+            "char": "+",
+            "vector": vec,
+            "dim": DIM,
+            "elapsed_ms": elapsed_ms
+        }
+    }
+}
+
+// -- POST /tembed/batch -- embed multiple texts --
+fn handle_batch(body) {
+    let texts = dict_get(body, "texts")
+    if3 texts == null {
+        return {"ok": false, "trit": -1, "error": "texts array required"}
+    } else len(texts) == 0 {
+        return {"ok": false, "trit": -1, "error": "texts array required"}
+    } else { tlen = len(texts)
+        if3 tlen > MAX_VECTORS {
+            return {"ok": false, "trit": -1, "error": "batch too large, max 2187"}
+        }
+        let t0 = time()
+        let results = []
+        let bi = 0
+        while3 bi < tlen {
+            let txt = texts[bi]
+            let txt_str = str(txt)
+            if3 len(txt_str) == 0 {
+                results = results = append(results, {"vector": [], "dim": DIM, "trit": -1})
+            }
+            if3 len(txt_str) > 0 {
+                let vec = embed_text(txt_str)
+                results = results = append(results, {"vector": vec, "dim": DIM, "trit": 1, "char": "+"})
+            }
+            bi = bi + 1
+        }
+        let elapsed = time() - t0
+        let elapsed_ms = round(elapsed * 1000.0, 2)
+        total_queries = total_queries + 1
+        return {
+            "ok": true,
+            "trit": 1,
+            "char": "+",
+            "embeddings": results,
+            "count": len(results),
+            "elapsed_ms": elapsed_ms
+        }
+    }
+}
+
+// -- POST /tembed/store -- embed and store with id + metadata --
+fn handle_store(body) {
+    let text = dict_get(body, "text")
+    if3 text == null {
+        return {"ok": false, "trit": -1, "error": "text required"}
+    } else len(text) == 0 {
+        return {"ok": false, "trit": -1, "error": "text required"}
+    } else { entry_id = dict_get(body, "id")
+        if3 entry_id == null {
+            let entry_id = slice(uuid_hex(), 0, H13)
+        }
+        if3 len(str(entry_id)) == 0 {
+            let entry_id = slice(uuid_hex(), 0, H13)
+        }
+        let metadata = dict_get(body, "metadata")
+        if3 metadata == null {
+            let metadata = {}
+        }
+
+        // Check capacity (only if new id)
+        let is_new = 1
+        if3 dict_has(store_data, str(entry_id)) {
+            let is_new = 0
+        }
+        if3 is_new == 1 {
+            if3 len(store_ids) >= MAX_VECTORS {
+                return {"ok": false, "trit": -1, "error": "store full, max 2187 vectors"}
+            }
+        }
+
+        let t0 = time()
+        let vec = embed_text(text)
+        let elapsed = time() - t0
+        let elapsed_ms = round(elapsed * 1000.0, 2)
+        let ts = time()
+
+        let entry = {
+            "id": str(entry_id),
+            "text": text,
+            "vector": vec,
+            "metadata": metadata,
+            "timestamp": ts
+        }
+
+        let action = "stored"
+        if3 is_new == 0 {
+            let action = "updated"
+        }
+        if3 is_new == 1 {
+            store_ids = append(store_ids, str(entry_id))
+        }
+        store_data = dict_set(store_data, str(entry_id), entry)
+        total_stored = total_stored + 1
+        total_queries = total_queries + 1
+
+        return {
+            "ok": true,
+            "trit": 1,
+            "char": "+",
+            "id": str(entry_id),
+            "action": action,
+            "dim": DIM,
+            "vectors_stored": len(store_ids),
+            "elapsed_ms": elapsed_ms
+        }
+    }
+}
+
+// -- POST /tembed/search -- semantic search across stored vectors --
+fn handle_search(body) {
+    let text = dict_get(body, "text")
+    if3 text == null {
+        return {"ok": false, "trit": -1, "error": "text required"}
+    } else len(text) == 0 {
+        return {"ok": false, "trit": -1, "error": "text required"}
+    } else { top_k = dict_get(body, "top_k")
+        if3 top_k == null {
+            let top_k = 5
+        }
+        let top_k = int(top_k)
+        if3 top_k < 1 {
+            let top_k = 1
+        }
+        if3 top_k > 100 {
+            let top_k = 100
+        }
+        let threshold = dict_get(body, "threshold")
+        if3 threshold == null {
+            let threshold = 0.0
+        }
+        let threshold = float(threshold)
+
+        let store_count = len(store_ids)
+        if3 store_count == 0 {
+            return {
+                "ok": true,
+                "trit": 0,
+                "char": "~",
+                "results": [],
+                "count": 0,
+                "total_searched": 0,
+                "message": "store empty"
+            }
+        }
+
+        let t0 = time()
+        let query_vec = embed_text(text)
+
+        // Score all stored vectors using cos_sim builtin
+        // Collect (sim, id) pairs above threshold
+        // We do a simple linear scan and track top_k best
+        let results = []
+        let si = 0
+        while3 si < store_count {
+            let eid = store_ids[si]
+            let entry = dict_get(store_data, eid)
+            let stored_vec = dict_get(entry, "vector")
+            let sim = cos_sim(query_vec, stored_vec)
+            if3 sim >= threshold {
+                let st = sim_trit(sim)
+                let sc = tchar(st)
+                results = append(results, {
+                    "id": eid,
+                    "text": dict_get(entry, "text"),
+                    "metadata": dict_get(entry, "metadata"),
+                    "similarity": round(sim, 6),
+                    "trit": st,
+                    "char": sc,
+                    "timestamp": dict_get(entry, "timestamp")
+                })
+            }
+            si = si + 1
+        }
+
+        // Sort results by similarity descending (insertion sort for NovaLang)
+        // NovaLang has no built-in sort, use simple selection sort on results list
+        let rlen = len(results)
+        let oi = 0
+        while3 oi < rlen {
+            let max_idx = oi
+            let ij = oi + 1
+            while3 ij < rlen {
+                let sim_j = dict_get(results[ij], "similarity")
+                let sim_max = dict_get(results[max_idx], "similarity")
+                if3 sim_j > sim_max {
+                    let max_idx = ij
+                }
+                ij = ij + 1
+            }
+            // Swap results[oi] and results[max_idx]
+            if3 max_idx != oi {
+                let tmp = results[oi]
+                // NovaLang list mutation via slice trick not available
+                // We rebuild by collecting in order -- use a second pass approach
+                // Instead, track swap in-place by rebuilding segment
+                // Simplest: mark index and rebuild top_k from sorted pass
+                // We accept O(n^2) for MAX_VECTORS=2187
+                let results[oi] = results[max_idx]
+                let results[max_idx] = tmp
+            }
+            oi = oi + 1
+        }
+
+        // Take top_k
+        let final_results = slice(results, 0, top_k)
+
+        let elapsed = time() - t0
+        let elapsed_ms = round(elapsed * 1000.0, 2)
+        total_queries = total_queries + 1
+
+        // Overall trit from best result
+        let overall = -1
+        let flen = len(final_results)
+        if3 flen > 0 {
+            let best_sim = dict_get(final_results[0], "similarity")
+            let overall = sim_trit(best_sim)
+        }
+        let overall_char = tchar(overall)
+
+        return {
+            "ok": true,
+            "trit": overall,
+            "char": overall_char,
+            "results": final_results,
+            "count": len(final_results),
+            "total_searched": store_count,
+            "elapsed_ms": elapsed_ms
+        }
+    }
+}
+
+// -- POST /tembed/delete -- remove stored vector by id --
+fn handle_delete(body) {
+    let entry_id = dict_get(body, "id")
+    if3 entry_id == null {
+        return {"ok": false, "trit": -1, "error": "id required"}
+    } else len(str(entry_id)) == 0 {
+        return {"ok": false, "trit": -1, "error": "id required"}
+    } else { eid = str(entry_id)
+        if3 dict_has(store_data, eid) == 0 {
+            return {"ok": false, "trit": -1, "error": "id not found"}
+        }
+        dict_del(store_data, eid)
+        // Remove from store_ids list by rebuilding without eid
+        let new_ids = []
+        let di = 0
+        let dlen = len(store_ids)
+        while3 di < dlen {
+            let cur = store_ids[di]
+            if3 cur != eid {
+                new_ids = append(new_ids, cur)
+            }
+            di = di + 1
+        }
+        store_ids = new_ids
+        return {
+            "ok": true,
+            "trit": 1,
+            "char": "+",
+            "deleted": eid,
+            "vectors_stored": len(store_ids)
+        }
+    }
+}
+
+// -- GET /tembed/stats -- store statistics --
+fn handle_stats() {
+    let count = len(store_ids)
+    let cap_pct = 0.0
+    if3 count > 0 {
+        let cap_pct = round(float(count) / float(MAX_VECTORS) * 100.0, 1)
+    }
+    // Compute average text length
+    let avg_len = 0.0
+    if3 count > 0 {
+        let total_len = 0
+        let si = 0
+        while3 si < count {
+            let entry = dict_get(store_data, store_ids[si])
+            let txt = dict_get(entry, "text")
+            total_len = total_len + len(txt)
+            si = si + 1
+        }
+        let avg_len = round(float(total_len) / float(count), 1)
+    }
+    return {
+        "ok": true,
+        "trit": 1,
+        "char": "+",
+        "service": "nova-tembed",
+        "vectors_stored": count,
+        "max_vectors": MAX_VECTORS,
+        "capacity_pct": cap_pct,
+        "dim": DIM,
+        "total_queries": total_queries,
+        "total_stored": total_stored,
+        "avg_text_length": avg_len,
+        "thresholds": {"strong": SIM_STRONG, "partial": SIM_PARTIAL},
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "runtime": "novalang"
+    }
+}
+
+// -- Register routes --
+troute(server, "GET",  "/health",        "handle_health")
+troute(server, "GET",  "/tembed/health", "handle_health")
+troute(server, "GET",  "/tembed/stats",  "handle_stats")
+troute(server, "POST", "/tembed/embed",  "handle_embed")
+troute(server, "POST", "/tembed/batch",  "handle_batch")
+troute(server, "POST", "/tembed/store",  "handle_store")
+troute(server, "POST", "/tembed/search", "handle_search")
+troute(server, "POST", "/tembed/delete", "handle_delete")
+
+print("[TEmbed] NovaLang TEmbed v1.0 - Ternary Vector Embedding Service")
+print("[TEmbed] Port: " + str(PORT) + " | Runtime: NovaLang | DIM=" + str(DIM))
+print("[TEmbed] MAX_VECTORS=" + str(MAX_VECTORS) + " (H3^H7=3^7)")
+print("[TEmbed] Thresholds: strong>" + str(SIM_STRONG) + " partial>" + str(SIM_PARTIAL))
+print("[TEmbed] Routes: /health, /tembed/health, /tembed/stats")
+print("[TEmbed] Routes: POST /tembed/embed, /tembed/batch, /tembed/store, /tembed/search, /tembed/delete")
+
+tstart(server)

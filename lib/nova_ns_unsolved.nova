@@ -1,0 +1,334 @@
+// ═══════════════════════════════════════════════════════════════════
+// nova_ns_unsolved.nova — Unsolved Navier-Stokes Models v1.0.0
+// ═══════════════════════════════════════════════════════════════════
+// Applies the UNSOLVED aspects of Navier-Stokes equations to NovaX:
+//
+// 1. EXISTENCE & SMOOTHNESS — Millennium Prize Problem
+//    → Does a solution always exist? Does it stay smooth?
+//    → Applied: Detect when system flow becomes undefined/singular
+//
+// 2. TURBULENCE CLOSURE — No closed-form solution exists
+//    → Applied: Approximate turbulent routing via energy cascade
+//    → Kolmogorov's 5/3 law for energy spectrum
+//
+// 3. SINGULARITY DETECTION — When does flow break?
+//    → Applied: Predict system failure before it happens
+//    → Beale-Kato-Majda criterion: track vorticity blowup
+//
+// 4. ENERGY DISSIPATION — Onsager's conjecture
+//    → Applied: Measure information loss in the routing pipeline
+//    → Conservation of "query energy" through the system
+//
+// 5. BOUNDARY LAYER SEPARATION — When flow detaches
+//    → Applied: Detect when providers decouple from expected behavior
+//    → Adverse pressure gradient → model degradation
+// ═══════════════════════════════════════════════════════════════════
+
+let NS_UNSOLVED_VERSION = "1.0.0"
+
+// ══════════════════════════════════════════════════════════════
+// 1. EXISTENCE & SMOOTHNESS MONITOR
+// ══════════════════════════════════════════════════════════════
+// The Millennium Prize question: given smooth initial conditions,
+// does the solution remain smooth for all time?
+//
+// In NovaX terms: given stable initial system state, will the
+// routing flow remain stable, or will it develop singularities?
+//
+// We track the "smoothness norm" — H^1 Sobolev norm analog:
+//   ||u||_{H^1}^2 = ||u||^2 + ||∇u||^2
+// If this grows unbounded, smoothness is lost → system failure.
+
+fn ns_smoothness_norm(state) {
+    // u = request rate (velocity field magnitude)
+    let u = to_num(dict_get(state, "request_rate") ?? 0)
+    // grad_u = rate of change of request rate (velocity gradient)
+    let prev_rate = to_num(dict_get(state, "prev_request_rate") ?? 0)
+    let grad_u = abs_val(u - prev_rate)
+    // H^1 norm squared
+    let h1_sq = (u * u) + (grad_u * grad_u)
+    // Sobolev embedding: if norm exceeds threshold, smoothness breaking
+    let threshold = 2187  // 3^7 = BLOCK_SIZE
+    let smooth = 1
+    if3 h1_sq > threshold {
+        smooth = 0
+    }
+    if3 h1_sq > threshold * 3 {
+        smooth = -1
+    }
+    return {
+        "h1_norm_sq": h1_sq,
+        "velocity": u,
+        "gradient": grad_u,
+        "smooth": smooth,
+        "threshold": threshold,
+        "trit": smooth
+    }
+}
+
+// Track smoothness over time — detect impending blowup
+fn ns_smoothness_track(history, new_norm) {
+    history = append(history, new_norm)
+    // Keep last 13 samples (H13 = carrier frame)
+    if3 len(history) > 13 {
+        history = slice(history, len(history) - 13, len(history))
+    }
+    // Check growth rate: if norms are doubling, blowup is coming
+    let growing = 0
+    if3 len(history) >= 3 {
+        let recent = history[len(history) - 1]
+        let older = history[len(history) - 3]
+        if3 recent > older * 2 {
+            growing = 1
+        }
+    }
+    return {
+        "history": history,
+        "samples": len(history),
+        "growing": growing,
+        "latest": new_norm,
+        "trit": growing
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// 2. TURBULENCE CASCADE (Kolmogorov 5/3 Law)
+// ══════════════════════════════════════════════════════════════
+// In real turbulence, energy cascades from large eddies to small.
+// Energy spectrum: E(k) ~ k^(-5/3)
+//
+// In NovaX: "energy" = query complexity. Large queries fragment
+// into smaller sub-queries. The cascade distributes load.
+//
+// k = wavenumber (query granularity level)
+// E(k) = energy at scale k = query_energy * k^(-5/3)
+
+fn ns_energy_at_scale(total_energy, k) {
+    // Kolmogorov 5/3 power law
+    // E(k) = C * epsilon^(2/3) * k^(-5/3)
+    // Simplified: E(k) = total_energy * k^(-5/3)
+    if3 k <= 0 { return total_energy }
+    // k^(-5/3) approximation using integer math
+    // -5/3 ≈ -1.667
+    let k_inv = 1.0 / to_num(k)
+    let e_k = total_energy * k_inv * k_inv / to_num(k)
+    // Scale by 3/5 for the fractional exponent
+    e_k = e_k * 3 / 5
+    return e_k
+}
+
+// Distribute query energy across N sub-tasks using cascade
+fn ns_cascade_distribute(total_energy, num_subtasks) {
+    let distribution = []
+    let remaining = total_energy
+    for3 k in range(num_subtasks) {
+        let scale = k + 1
+        let energy = ns_energy_at_scale(total_energy, scale)
+        distribution = append(distribution, {
+            "scale": scale,
+            "energy": energy,
+            "fraction": energy / total_energy
+        })
+        remaining = remaining - energy
+    }
+    return {
+        "distribution": distribution,
+        "dissipated": remaining,
+        "scales": num_subtasks,
+        "trit": 1
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// 3. SINGULARITY DETECTION (Beale-Kato-Majda)
+// ══════════════════════════════════════════════════════════════
+// BKM criterion: the solution blows up at time T if and only if
+//   ∫₀ᵀ ||ω(t)||_∞ dt = ∞
+// where ω = curl(u) is the vorticity.
+//
+// In NovaX: ω = "system vorticity" = error_rate * latency_variance
+// If the integral of vorticity diverges, system will crash.
+
+fn ns_vorticity(error_rate, latency_variance) {
+    // ω = error_rate × latency_variance
+    // High errors + high variance = spinning out of control
+    return error_rate * latency_variance
+}
+
+fn ns_bkm_integral(vorticity_history) {
+    // Approximate the integral of ||ω||_∞ over the window
+    let integral = 0
+    let max_omega = 0
+    for3 i in range(len(vorticity_history)) {
+        let omega = abs_val(to_num(vorticity_history[i]))
+        integral = integral + omega
+        if3 omega > max_omega {
+            max_omega = omega
+        }
+    }
+    // Blowup prediction: if integral grows faster than linear
+    let n = len(vorticity_history)
+    let avg = 0
+    if3 n > 0 { avg = integral / n }
+    let blowup_risk = 0
+    if3 n > 3 {
+        // Compare recent average to overall average
+        let recent_sum = 0
+        let recent_n = 0
+        let start = n - 3
+        if3 start < 0 { start = 0 }
+        for3 i in range(n) {
+            if3 i >= start {
+                recent_sum = recent_sum + abs_val(to_num(vorticity_history[i]))
+                recent_n = recent_n + 1
+            }
+        }
+        let recent_avg = recent_sum / recent_n
+        if3 recent_avg > avg * 2 {
+            blowup_risk = 1
+        }
+    }
+    return {
+        "integral": integral,
+        "max_vorticity": max_omega,
+        "avg_vorticity": avg,
+        "samples": n,
+        "blowup_risk": blowup_risk,
+        "trit": blowup_risk
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// 4. ENERGY DISSIPATION (Onsager's Conjecture)
+// ══════════════════════════════════════════════════════════════
+// Onsager (1949): turbulent solutions can dissipate energy
+// even without viscosity, if they are rough enough.
+// Holder exponent > 1/3: energy conserved
+// Holder exponent ≤ 1/3: energy can dissipate anomalously
+//
+// In NovaX: track query energy in vs response energy out.
+// "Energy" = tokens_in * complexity_weight
+// If output energy < input energy, information is being lost.
+
+fn ns_energy_conservation(input_tokens, output_tokens, complexity) {
+    let energy_in = input_tokens * complexity
+    let energy_out = output_tokens
+    let dissipation = energy_in - energy_out
+    let ratio = 0
+    if3 energy_in > 0 {
+        ratio = energy_out / energy_in
+    }
+    // Onsager threshold: 1/3
+    let anomalous = 0
+    if3 ratio < 0.333 {
+        anomalous = 1  // Anomalous dissipation — too much info lost
+    }
+    let trit = 1
+    if3 anomalous == 1 { trit = -1 }
+    if3 ratio < 0.667 {
+        if3 ratio >= 0.333 {
+            trit = 0  // Warning zone
+        }
+    }
+    return {
+        "energy_in": energy_in,
+        "energy_out": energy_out,
+        "dissipation": dissipation,
+        "conservation_ratio": ratio,
+        "onsager_threshold": 0.333,
+        "anomalous_dissipation": anomalous,
+        "trit": trit
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// 5. BOUNDARY LAYER SEPARATION
+// ══════════════════════════════════════════════════════════════
+// In fluid dynamics, boundary layer separation occurs when the
+// flow detaches from a surface due to adverse pressure gradient.
+// dp/dx > 0 → adverse gradient → separation → turbulence/stall
+//
+// In NovaX: each provider has a "pressure" (load).
+// If pressure increases along the routing path, the provider
+// "separates" — its responses degrade or timeout.
+
+fn ns_pressure_gradient(provider_pressures) {
+    // provider_pressures = list of {provider, pressure, latency}
+    let gradients = []
+    let separations = 0
+    for3 i in range(len(provider_pressures)) {
+        if3 i == 0 { continue3 }
+        let prev = dict_get(provider_pressures[i - 1], "pressure") ?? 0
+        let curr = dict_get(provider_pressures[i], "pressure") ?? 0
+        let dp = curr - prev
+        let provider = dict_get(provider_pressures[i], "provider") ?? "unknown"
+        let separated = 0
+        if3 dp > 0 {
+            separated = 1  // Adverse pressure gradient
+            separations = separations + 1
+        }
+        gradients = append(gradients, {
+            "provider": provider,
+            "dp": dp,
+            "adverse": separated,
+            "pressure": curr
+        })
+    }
+    let trit = 1
+    if3 separations > 0 { trit = 0 }
+    if3 separations > len(provider_pressures) / 2 { trit = -1 }
+    return {
+        "gradients": gradients,
+        "separations": separations,
+        "total_providers": len(provider_pressures),
+        "trit": trit
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// 6. UNIFIED N-S STATE
+// ══════════════════════════════════════════════════════════════
+// Combines all unsolved models into a single system state
+
+fn ns_unsolved_state(request_rate, prev_rate, error_rate, latency_variance, input_tokens, output_tokens, complexity, provider_pressures) {
+    let smoothness = ns_smoothness_norm({
+        "request_rate": request_rate,
+        "prev_request_rate": prev_rate
+    })
+
+    let vorticity = ns_vorticity(error_rate, latency_variance)
+
+    let conservation = ns_energy_conservation(input_tokens, output_tokens, complexity)
+
+    let separation = ns_pressure_gradient(provider_pressures)
+
+    // Overall system health from unsolved N-S
+    let smooth_trit = dict_get(smoothness, "trit") ?? 0
+    let conserv_trit = dict_get(conservation, "trit") ?? 0
+    let sep_trit = dict_get(separation, "trit") ?? 0
+
+    // Ternary consensus: majority vote
+    let score = smooth_trit + conserv_trit + sep_trit
+    let overall = 0
+    if3 score > 0 { overall = 1 }
+    if3 score < 0 { overall = -1 }
+
+    return {
+        "version": NS_UNSOLVED_VERSION,
+        "smoothness": smoothness,
+        "vorticity": vorticity,
+        "energy_conservation": conservation,
+        "boundary_separation": separation,
+        "overall_trit": overall,
+        "models_applied": [
+            "existence_smoothness (Millennium Prize)",
+            "kolmogorov_cascade (5/3 law)",
+            "beale_kato_majda (singularity)",
+            "onsager_dissipation (energy conservation)",
+            "boundary_layer_separation (adverse gradient)"
+        ]
+    }
+}
+
+print(join(["[ns_unsolved] Unsolved N-S Models v", NS_UNSOLVED_VERSION, " loaded"], ""))
+print("[ns_unsolved] Models: existence/smoothness, Kolmogorov cascade, BKM singularity, Onsager dissipation, boundary separation")

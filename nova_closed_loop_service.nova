@@ -1,0 +1,1492 @@
+// Nova Closed-Loop Autonomous Engine v2.0 (NovaLang Port)
+// Port 9888 | Pure NovaLang port of nova_closed_loop.py
+//
+// The always-running brain: 6 daemon threads become on-demand POST /closed_loop/tick
+// Models talk through 25-channel ternary adjacency matrix.
+//
+// N-S Mapping:
+//   model_flow       = velocity_field
+//   task dispatch     = pressure gradient
+//   self-heal cycle   = viscous correction
+//   capability EMA    = Reynolds smoothing
+//   territory trits   = vorticity measure
+//
+// Ternary states:
+//   +1 (T_TRUE)  = success / healed / trade accepted
+//    0 (T_MAYBE) = partial / degraded / neutral
+//   -1 (T_FALSE) = failed / broken / rejected
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3   H5=5   H7=7   H13=13
+//   BLOCK = 3^7 = 2187
+//   ALPHA_EMA  = 1/H3 = 0.333
+//   TRIT_HIGH  = 2/H3 = 0.667
+//   TRIT_LOW   = 1/H3 = 0.333
+//   RE_LAMINAR = 27 (H3^3)
+//   RE_TRANSITION = 125 (H5^3)
+//   RE_TURBULENT  = 343 (H7^3)
+//
+// Endpoints:
+//   GET  /health                 -- health check
+//   GET  /loop/status            -- engine status + stats
+//   GET  /loop/agents            -- all agent profiles
+//   GET  /loop/deliberations     -- deliberation history
+//   GET  /loop/tasks             -- pending/active/completed tasks
+//   GET  /loop/self-heal         -- heal history
+//   GET  /loop/optimizer         -- optimization report
+//   POST /loop/dispatch          -- queue a task
+//   POST /loop/deliberate        -- queue a deliberation
+//   POST /loop/heal              -- trigger a full heal
+//   POST /loop/optimize          -- benchmark a model
+//   POST /loop/toggle            -- enable/disable engine
+//   POST /loop/anomaly           -- push anomaly to queue
+//   POST /closed_loop/tick       -- run one cycle of all 6 daemons
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9888
+let server = tserve(PORT, "Nova Closed-Loop v2.0 - Autonomous Engine")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let BLOCK = 2187
+
+// -- Ternary state symbols --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds boundaries --
+let RE_LAMINAR    = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT  = 343
+
+// -- Derived harmonic constants --
+// ALPHA_EMA = 1/H3 = 0.333 (harmonic EMA blend factor)
+let ALPHA_EMA = 0.333
+// TRIT_HIGH = 2/H3 = 0.667 (ternary thirds upper boundary)
+let TRIT_HIGH = 0.667
+// TRIT_LOW = 1/H3 = 0.333 (ternary thirds lower boundary)
+let TRIT_LOW = 0.333
+// TRADE_TERRITORY_GAP = H3 = 3 trit territory advantage needed
+let TRADE_TERRITORY_GAP = 3
+
+// -- Service URLs --
+let HIVE_URL     = "http://127.0.0.1:9881"
+let SENTINEL_URL = "http://127.0.0.1:9884"
+let TERNARY_URL  = "http://127.0.0.1:9885"
+let TKILL_URL    = "http://127.0.0.1:9899"
+let MAXPATCH_URL = "http://127.0.0.1:9889"
+
+// -- 25 Ternary Flow Channels --
+let FLOW_CHANNELS = [
+    "REASON", "MATH", "CODE", "INSTRUCT", "FACT",
+    "LONG", "VISION", "LANGUAGE", "AGENT", "DOMAIN",
+    "LOGIC", "ETHICS", "CREATIVE", "SPATIAL", "TEMPORAL",
+    "SOCIAL", "MEDICAL", "LEGAL", "FINANCIAL", "SCIENTIFIC",
+    "TECHNICAL", "EDUCATIONAL", "PHILOSOPHICAL", "STRATEGIC", "EMOTIONAL"
+]
+
+// -- Benchmark prompts (subset for optimizer) --
+let BENCH_PROMPTS = {}
+BENCH_PROMPTS = dict_set(BENCH_PROMPTS, "REASON", "If all roses are flowers and some flowers fade quickly, can we conclude all roses fade quickly? Explain in 2 sentences.")
+BENCH_PROMPTS = dict_set(BENCH_PROMPTS, "MATH", "What is the derivative of x^3 * sin(x)? Show the result.")
+BENCH_PROMPTS = dict_set(BENCH_PROMPTS, "CODE", "Write a Python function to check if a string is a palindrome. Just the function.")
+BENCH_PROMPTS = dict_set(BENCH_PROMPTS, "INSTRUCT", "List 3 steps to reset a Linux password.")
+BENCH_PROMPTS = dict_set(BENCH_PROMPTS, "FACT", "What is the speed of light in meters per second?")
+BENCH_PROMPTS = dict_set(BENCH_PROMPTS, "LOGIC", "If A implies B and B implies C, does A imply C? One sentence.")
+BENCH_PROMPTS = dict_set(BENCH_PROMPTS, "CREATIVE", "Write a one-sentence story about a robot finding a flower.")
+BENCH_PROMPTS = dict_set(BENCH_PROMPTS, "TECHNICAL", "Explain what a TCP three-way handshake is in 2 sentences.")
+BENCH_PROMPTS = dict_set(BENCH_PROMPTS, "AGENT", "You are an agent. What is your first action to diagnose a slow server?")
+BENCH_PROMPTS = dict_set(BENCH_PROMPTS, "DOMAIN", "What is the difference between civil and criminal law in one sentence?")
+
+// -- Diagnostic channel mapping (anomaly type -> best ternary channel) --
+let DIAGNOSTIC_CHANNELS = {}
+DIAGNOSTIC_CHANNELS = dict_set(DIAGNOSTIC_CHANNELS, "channel_degradation", "TECHNICAL")
+DIAGNOSTIC_CHANNELS = dict_set(DIAGNOSTIC_CHANNELS, "service_down",        "AGENT")
+DIAGNOSTIC_CHANNELS = dict_set(DIAGNOSTIC_CHANNELS, "infinite_loop",       "CODE")
+DIAGNOSTIC_CHANNELS = dict_set(DIAGNOSTIC_CHANNELS, "memory_pressure",     "TECHNICAL")
+DIAGNOSTIC_CHANNELS = dict_set(DIAGNOSTIC_CHANNELS, "routing_failure",     "LOGIC")
+DIAGNOSTIC_CHANNELS = dict_set(DIAGNOSTIC_CHANNELS, "latency_spike",       "REASON")
+DIAGNOSTIC_CHANNELS = dict_set(DIAGNOSTIC_CHANNELS, "error_rate_increase", "CODE")
+DIAGNOSTIC_CHANNELS = dict_set(DIAGNOSTIC_CHANNELS, "model_failure",       "AGENT")
+
+// -- Anomaly category strings (replaces enum) --
+let ACAT_CHANNEL   = "channel_degradation"
+let ACAT_SERVICE   = "service_down"
+let ACAT_LOOP      = "infinite_loop"
+let ACAT_MEMORY    = "memory_pressure"
+let ACAT_ROUTING   = "routing_failure"
+let ACAT_LATENCY   = "latency_spike"
+let ACAT_ERROR     = "error_rate_increase"
+let ACAT_MODEL     = "model_failure"
+
+// -- Task type strings (replaces enum) --
+let TT_QUERY       = "query"
+let TT_DELIBERATE  = "deliberate"
+let TT_DELEGATE    = "delegate"
+let TT_TRADE       = "trade"
+let TT_PATCH       = "patch"
+let TT_VERIFY      = "verify"
+let TT_OPTIMIZE    = "optimize"
+let TT_COMMUNICATE = "communicate"
+
+// -- Heal action strings (replaces enum) --
+let HA_RESTART     = "restart_service"
+let HA_ROUTING     = "adjust_routing"
+let HA_CONFIG      = "config_change"
+let HA_CLEAR_Q     = "clear_queue"
+let HA_FALLBACK    = "fallback_model"
+let HA_SNR_RESET   = "snr_reset"
+
+// -- Port map for health verification --
+let PORT_MAP = {}
+PORT_MAP = dict_set(PORT_MAP, "hivemind",     9881)
+PORT_MAP = dict_set(PORT_MAP, "sentinel",     9884)
+PORT_MAP = dict_set(PORT_MAP, "ternary",      9885)
+PORT_MAP = dict_set(PORT_MAP, "tkill",        9899)
+PORT_MAP = dict_set(PORT_MAP, "debugger",     9899)
+PORT_MAP = dict_set(PORT_MAP, "cli",          9887)
+PORT_MAP = dict_set(PORT_MAP, "closedloop",   9888)
+PORT_MAP = dict_set(PORT_MAP, "cloud_router", 9878)
+PORT_MAP = dict_set(PORT_MAP, "tspeak",       9895)
+PORT_MAP = dict_set(PORT_MAP, "nexus",        9882)
+PORT_MAP = dict_set(PORT_MAP, "nova_tools",   9891)
+PORT_MAP = dict_set(PORT_MAP, "cortex",       9896)
+
+// -- Monitor service list --
+let MON_SERVICES = {}
+MON_SERVICES = dict_set(MON_SERVICES, "hivemind",      9881)
+MON_SERVICES = dict_set(MON_SERVICES, "sentinel",      9884)
+MON_SERVICES = dict_set(MON_SERVICES, "tspeak",        9895)
+MON_SERVICES = dict_set(MON_SERVICES, "tkill",         9899)
+MON_SERVICES = dict_set(MON_SERVICES, "maxpatch",      9889)
+MON_SERVICES = dict_set(MON_SERVICES, "nova_tools",    9891)
+MON_SERVICES = dict_set(MON_SERVICES, "cortex",        9896)
+MON_SERVICES = dict_set(MON_SERVICES, "nexus",         9882)
+MON_SERVICES = dict_set(MON_SERVICES, "ternary_tools", 9894)
+MON_SERVICES = dict_set(MON_SERVICES, "deepstorage",   9893)
+MON_SERVICES = dict_set(MON_SERVICES, "tfetch",        9897)
+MON_SERVICES = dict_set(MON_SERVICES, "vault",         9892)
+MON_SERVICES = dict_set(MON_SERVICES, "cloud_router",  9878)
+
+// ================================================================
+// GLOBAL STATE
+// ================================================================
+
+// -- Engine state --
+let engine_enabled = T_TRUE
+let engine_running = T_FALSE
+let engine_start_time = time()
+
+// -- Agent registry: dict of dicts --
+// Each agent: {model_id, is_cloud, current_task, task_count, success_count,
+//              partial_count, fail_count, total_latency, last_active, capabilities}
+let agents = {}
+
+// -- Task queue: list of task dicts, sorted by priority --
+let task_queue = []
+
+// -- Active tasks: task_id -> task dict --
+let active_tasks = {}
+
+// -- Completed tasks: bounded list (max 500) --
+let completed_tasks = []
+let COMPLETED_CAP = 500
+
+// -- Deliberation history: bounded list (max 50) --
+let deliberations = []
+let DELIB_CAP = 50
+
+// -- Anomaly queue: bounded list (max 200) --
+let anomaly_queue = []
+let ANOMALY_CAP = 200
+
+// -- Heal history: bounded list (max 100) --
+let heal_history = []
+let HEAL_CAP = 100
+
+// -- Stats --
+let stat_tasks_dispatched = 0
+let stat_tasks_completed  = 0
+let stat_heals_attempted  = 0
+let stat_heals_succeeded  = 0
+let stat_deliberations    = 0
+let stat_trades           = 0
+let stat_communications   = 0
+let stat_optimizations    = 0
+
+// ================================================================
+// TERNARY HELPER FUNCTIONS
+// ================================================================
+
+// Ternary thirds quantization: >0.667 -> +1, <0.333 -> -1, else 0
+fn float_to_trit(score) {
+    if3 score > TRIT_HIGH {
+        return T_TRUE
+    }
+    if3 score < TRIT_LOW {
+        return T_FALSE
+    }
+    return T_MAYBE
+}
+
+// Map task outcome to ternary quality: +1=good, 0=partial, -1=failed
+fn quality_trit(success, quality) {
+    if3 success == T_FALSE {
+        return T_FALSE
+    }
+    return float_to_trit(quality)
+}
+
+// Trit to character for fingerprint
+fn trit_to_char(t) {
+    if3 t == 1 {
+        return "1"
+    }
+    if3 t == -1 {
+        return "T"
+    }
+    return "0"
+}
+
+// Balanced ternary fingerprint string from capabilities dict
+fn bt_fingerprint(caps) {
+    let result = ""
+    let i = 0
+    let clen = len(FLOW_CHANNELS)
+    while3 i < clen {
+        let ch = FLOW_CHANNELS[i]
+        let score = dict_get(caps, ch) ?? 0.5
+        let t = float_to_trit(score)
+        result = result + trit_to_char(t)
+        i = i + 1
+    }
+    return result
+}
+
+// Territory sum: sum of trits across channels
+fn territory_sum(caps) {
+    let total = 0
+    let i = 0
+    let clen = len(FLOW_CHANNELS)
+    while3 i < clen {
+        let ch = FLOW_CHANNELS[i]
+        let score = dict_get(caps, ch) ?? 0.0
+        total = total + float_to_trit(score)
+        i = i + 1
+    }
+    return total
+}
+
+// ================================================================
+// AGENT MANAGEMENT FUNCTIONS
+// ================================================================
+
+// Create a new agent and register it
+fn create_agent(model_id, is_cloud) {
+    let caps = {}
+    let i = 0
+    let clen = len(FLOW_CHANNELS)
+    while3 i < clen {
+        let ch = FLOW_CHANNELS[i]
+        caps = dict_set(caps, ch, 0.5)
+        i = i + 1
+    }
+    let agent = {}
+    agent = dict_set(agent, "model_id",      model_id)
+    agent = dict_set(agent, "is_cloud",      is_cloud)
+    agent = dict_set(agent, "current_task",  "")
+    agent = dict_set(agent, "task_count",    0)
+    agent = dict_set(agent, "success_count", 0)
+    agent = dict_set(agent, "partial_count", 0)
+    agent = dict_set(agent, "fail_count",    0)
+    agent = dict_set(agent, "total_latency", 0.0)
+    agent = dict_set(agent, "last_active",   time())
+    agent = dict_set(agent, "capabilities",  caps)
+    agents = dict_set(agents, model_id, agent)
+    return agent
+}
+
+// Record a result for an agent: updates capabilities via harmonic EMA
+fn agent_record_result(model_id, channel, success, latency, quality) {
+    let agent = dict_get(agents, model_id) ?? {}
+    if3 len(keys(agent)) == 0 {
+        return T_FALSE
+    }
+    let qt = quality_trit(success, quality)
+    let tc = dict_get(agent, "task_count") ?? 0
+    agent = dict_set(agent, "task_count", tc + 1)
+    if3 qt == 1 { sc = dict_get(agent, "success_count") ?? 0
+        agent = dict_set(agent, "success_count", sc + 1)
+    } else qt == 0 { pc = dict_get(agent, "partial_count") ?? 0
+        agent = dict_set(agent, "partial_count", pc + 1)
+    } else { fc = dict_get(agent, "fail_count") ?? 0
+        agent = dict_set(agent, "fail_count", fc + 1)
+    }
+    let tl = dict_get(agent, "total_latency") ?? 0.0
+    agent = dict_set(agent, "total_latency", tl + latency)
+    agent = dict_set(agent, "last_active", time())
+    // Harmonic EMA: alpha = 1/H3 (0.333)
+    let score = quality
+    if3 success == T_FALSE {
+        let score = quality * TRIT_LOW
+    }
+    let caps = dict_get(agent, "capabilities") ?? {}
+    let old = dict_get(caps, channel) ?? 0.5
+    let new_val = old * (1.0 - ALPHA_EMA) + score * ALPHA_EMA
+    caps = dict_set(caps, channel, new_val)
+    agent = dict_set(agent, "capabilities", caps)
+    agents = dict_set(agents, model_id, agent)
+    return T_TRUE
+}
+
+// Get agent success rate
+fn agent_success_rate(agent) {
+    let tc = dict_get(agent, "task_count") ?? 0
+    if3 tc == 0 {
+        return 0.0
+    }
+    let sc = dict_get(agent, "success_count") ?? 0
+    return sc / tc
+}
+
+// Get agent avg latency
+fn agent_avg_latency(agent) {
+    let tc = dict_get(agent, "task_count") ?? 0
+    if3 tc == 0 {
+        return 0.0
+    }
+    let tl = dict_get(agent, "total_latency") ?? 0.0
+    return tl / tc
+}
+
+// Get fitness for channel
+fn agent_fitness(model_id, channel) {
+    let agent = dict_get(agents, model_id) ?? {}
+    if3 len(keys(agent)) == 0 {
+        return 0.0
+    }
+    let caps = dict_get(agent, "capabilities") ?? {}
+    return dict_get(caps, channel) ?? 0.0
+}
+
+// Get best N channels for an agent, returns list of {channel, score}
+fn agent_best_channels(agent, top_n) {
+    let caps = dict_get(agent, "capabilities") ?? {}
+    let ch_keys = keys(caps)
+    // Build list of {channel, score} then sort
+    let items = []
+    let i = 0
+    let klen = len(ch_keys)
+    while3 i < klen {
+        let ch = ch_keys[i]
+        let sc = dict_get(caps, ch) ?? 0.0
+        items = append(items, {"channel": ch, "score": sc})
+        i = i + 1
+    }
+    // Simple insertion sort by score descending
+    let slen = len(items)
+    let a = 1
+    while3 a < slen {
+        let curr = items[a]
+        let b = a - 1
+        while3 b >= 0 {
+            let bitem = items[b]
+            if3 bitem["score"] >= curr["score"] {
+                let b = -1
+            } else { items[b + 1] = items[b]
+                b = b - 1
+            }
+        }
+        let items[b + 1] = curr
+        a = a + 1
+    }
+    // Reverse for descending
+    let items = reverse(items)
+    if3 top_n < slen {
+        let items = slice(items, 0, top_n)
+    }
+    return items
+}
+
+// Agent to dict for JSON response
+fn agent_to_dict(agent) {
+    let model_id = dict_get(agent, "model_id") ?? ""
+    let caps = dict_get(agent, "capabilities") ?? {}
+    let best = agent_best_channels(agent, 5)
+    let tc = dict_get(agent, "task_count") ?? 0
+    let sr = agent_success_rate(agent)
+    let al = agent_avg_latency(agent)
+    let fp = bt_fingerprint(caps)
+    let ts = territory_sum(caps)
+    let best_rounded = []
+    let bi = 0
+    while3 bi < len(best) {
+        let item = best[bi]
+        best_rounded = append(best_rounded, {"channel": item["channel"], "score": round(item["score"], 3)})
+        bi = bi + 1
+    }
+    return {
+        "model_id":           model_id,
+        "is_cloud":           dict_get(agent, "is_cloud") ?? T_FALSE,
+        "current_task":       dict_get(agent, "current_task") ?? "",
+        "task_count":         tc,
+        "success_count":      dict_get(agent, "success_count") ?? 0,
+        "partial_count":      dict_get(agent, "partial_count") ?? 0,
+        "fail_count":         dict_get(agent, "fail_count") ?? 0,
+        "success_rate":       round(sr, 3),
+        "avg_latency":        round(al, 2),
+        "bt_fingerprint":     fp,
+        "territory_strength": ts,
+        "best_channels":      best_rounded,
+        "last_active":        dict_get(agent, "last_active") ?? 0
+    }
+}
+
+// ================================================================
+// BOOTSTRAP: Load agents from Hivemind
+// ================================================================
+
+fn bootstrap_agents() {
+    try3 {
+        let resp = http_get(HIVE_URL + "/hive/models")
+        let data = json_decode(resp)
+        let models = data
+        if3 type_of(data) != "list" {
+            let models = dict_get(data, "models") ?? []
+        }
+        let i = 0
+        let mlen = len(models)
+        while3 i < mlen {
+            let m = models[i]
+            let mid = ""
+            if3 type_of(m) == "string" {
+                let mid = m
+            } else { mid = dict_get(m, "name") ?? (dict_get(m, "model") ?? "")
+            }
+            if3 len(mid) > 0 {
+                if3 dict_has(agents, mid) == T_FALSE {
+                    let is_cloud = T_FALSE
+                    if3 type_of(m) != "string" {
+                        let is_cloud = dict_get(m, "cloud") ?? T_FALSE
+                    }
+                    let _a = create_agent(mid, is_cloud)
+                }
+            }
+            i = i + 1
+        }
+        print("[CLOSED-LOOP] Bootstrapped " + str(len(keys(agents))) + " agents from Hivemind")
+    } else {
+        print("[CLOSED-LOOP] Bootstrap warning (Hivemind not ready), creating defaults")
+        let _a1 = create_agent("llama3.2:latest", T_FALSE)
+        let _a2 = create_agent("qwen2.5-coder:latest", T_FALSE)
+        let _a3 = create_agent("deepseek-r1:8b", T_FALSE)
+    }
+    return T_TRUE
+}
+
+// ================================================================
+// BEST AGENTS: Get top N agents for a channel
+// ================================================================
+
+fn get_best_agents(channel, n) {
+    let agent_keys = keys(agents)
+    let scored = []
+    let i = 0
+    let klen = len(agent_keys)
+    while3 i < klen {
+        let mid = agent_keys[i]
+        let agent = dict_get(agents, mid) ?? {}
+        let ct = dict_get(agent, "current_task") ?? ""
+        if3 len(ct) == 0 {
+            let fitness = agent_fitness(mid, channel)
+            let ic = dict_get(agent, "is_cloud") ?? T_FALSE
+            scored = append(scored, {"model_id": mid, "fitness": fitness, "is_cloud": ic})
+        }
+        i = i + 1
+    }
+    // Sort: prefer local (is_cloud=0 first), then by fitness descending
+    // Simple sort: local agents first, then by fitness
+    let sorted_list = sort(scored)
+    // Manual sort by fitness descending
+    let slen = len(scored)
+    let a = 0
+    while3 a < slen - 1 {
+        let b = a + 1
+        while3 b < slen {
+            let sa = scored[a]
+            let sb = scored[b]
+            let swap = T_FALSE
+            // Local beats cloud
+            if3 sa["is_cloud"] == T_TRUE {
+                if3 sb["is_cloud"] == T_FALSE {
+                    let swap = T_TRUE
+                }
+            }
+            // Same cloud status: higher fitness wins
+            if3 sa["is_cloud"] == sb["is_cloud"] {
+                if3 sb["fitness"] > sa["fitness"] {
+                    let swap = T_TRUE
+                }
+            }
+            if3 swap == T_TRUE {
+                let scored[a] = sb
+                let scored[b] = sa
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    let result = []
+    let ri = 0
+    while3 ri < n {
+        if3 ri < slen {
+            result = append(result, scored[ri]["model_id"])
+        }
+        ri = ri + 1
+    }
+    return result
+}
+
+// ================================================================
+// TASK MANAGEMENT
+// ================================================================
+
+// Create a task message dict
+fn create_task(sender, receiver, task_type, payload, channel, priority) {
+    let task_id = uuid_hex()
+    let task_id = slice(task_id, 0, 8)
+    let task = {
+        "priority":        priority,
+        "task_id":         task_id,
+        "sender":          sender,
+        "receiver":        receiver,
+        "task_type":       task_type,
+        "payload":         payload,
+        "ternary_channel": channel,
+        "timestamp":       time(),
+        "status":          "pending",
+        "result":          ""
+    }
+    return task
+}
+
+// Dispatch a task into the queue
+fn dispatch_task(sender, receiver, task_type, payload, channel, priority) {
+    let task = create_task(sender, receiver, task_type, payload, channel, priority)
+    task_queue = append(task_queue, task)
+    // Sort by priority (ascending = highest priority first)
+    task_queue = sort(task_queue)
+    stat_tasks_dispatched = stat_tasks_dispatched + 1
+    return {"task_id": task["task_id"], "status": "queued", "priority": priority}
+}
+
+// Process a single task
+fn process_task(task) {
+    task = dict_set(task, "status", "processing")
+    let tid = task["task_id"]
+    active_tasks = dict_set(active_tasks, tid, task)
+
+    let receiver = task["receiver"]
+    let channel = task["ternary_channel"]
+
+    if3 receiver == "auto" {
+        let best = get_best_agents(channel, 1)
+        if3 len(best) > 0 {
+            let receiver = best[0]
+        }
+    }
+    if3 dict_has(agents, receiver) == T_FALSE {
+        let best = get_best_agents(channel, 1)
+        if3 len(best) > 0 {
+            let receiver = best[0]
+        }
+    }
+
+    if3 dict_has(agents, receiver) == T_TRUE {
+        let ragent = dict_get(agents, receiver) ?? {}
+        ragent = dict_set(ragent, "current_task", tid)
+        agents = dict_set(agents, receiver, ragent)
+    }
+
+    let t0 = time()
+    let result_data = {}
+    try3 {
+        let prompt = dict_get(task["payload"], "prompt") ?? json_encode(task["payload"])
+        let req_body = json_encode({
+            "prompt":  prompt,
+            "channel": channel,
+            "model":   receiver
+        })
+        let resp = http_post(HIVE_URL + "/hive/cluster", req_body)
+        let result_obj = json_decode(resp)
+        let latency = time() - t0
+        task = dict_set(task, "status", "completed")
+        let response_text = dict_get(result_obj, "response") ?? (dict_get(result_obj, "result") ?? "")
+        task = dict_set(task, "result", response_text)
+
+        if3 dict_has(agents, receiver) == T_TRUE {
+            let resp_len = len(str(response_text))
+            let quality = 0.5
+            if3 resp_len > 0 {
+                let quality = resp_len / 200.0
+                if3 quality > 1.0 {
+                    let quality = 1.0
+            } else { quality = TRIT_LOW
+            }
+            let _rec = agent_record_result(receiver, channel, T_TRUE, latency, quality)
+            let ragent2 = dict_get(agents, receiver) ?? {}
+            ragent2 = dict_set(ragent2, "current_task", "")
+            agents = dict_set(agents, receiver, ragent2)
+        }
+        stat_tasks_completed = stat_tasks_completed + 1
+        let result_data = {"task_id": tid, "status": "completed", "result": response_text, "latency": round(latency, 2)}
+    } else { latency = time() - t0
+        task = dict_set(task, "status", "failed")
+        task = dict_set(task, "result", "task processing failed")
+        if3 dict_has(agents, receiver) == T_TRUE {
+            let _rec = agent_record_result(receiver, channel, T_FALSE, latency, 0.0)
+            let ragent3 = dict_get(agents, receiver) ?? {}
+            ragent3 = dict_set(ragent3, "current_task", "")
+            agents = dict_set(agents, receiver, ragent3)
+        }
+        let result_data = {"task_id": tid, "status": "failed", "error": "task processing failed"}
+    }
+
+    // Move to completed, remove from active
+    active_tasks = dict_del(active_tasks, tid)
+    completed_tasks = append(completed_tasks, task)
+    if3 len(completed_tasks) > COMPLETED_CAP {
+        completed_tasks = slice(completed_tasks, len(completed_tasks) - COMPLETED_CAP, len(completed_tasks))
+    }
+    return result_data
+}
+
+// ================================================================
+// SELF-HEAL PROTOCOL
+// ================================================================
+
+// Categorize anomaly by type string
+}
+fn categorize_anomaly(anomaly) {
+    let atype = lower(dict_get(anomaly, "type") ?? "")
+    if3 contains(atype, "service_down") { return ACAT_SERVICE }
+    if3 contains(atype, "latency_spike") { return ACAT_LATENCY }
+    if3 contains(atype, "latency") { return ACAT_LATENCY }
+    if3 contains(atype, "error_rate") { return ACAT_ERROR }
+    if3 contains(atype, "channel") { return ACAT_CHANNEL }
+    if3 contains(atype, "routing") { return ACAT_ROUTING }
+    if3 contains(atype, "memory") { return ACAT_MEMORY }
+    if3 contains(atype, "loop") { return ACAT_LOOP }
+    if3 contains(atype, "model") { return ACAT_MODEL }
+    return ACAT_SERVICE
+}
+
+// Diagnose via ternary channel through Hivemind
+fn diagnose_anomaly(anomaly, category) {
+    let channel = dict_get(DIAGNOSTIC_CHANNELS, category) ?? "REASON"
+    let details = json_encode(anomaly)
+    if3 len(details) > 500 {
+        let details = slice(details, 0, 500)
+    }
+    let prompt = "DIAGNOSTIC ANALYSIS -- Anomaly detected in NovaX system.\n"
+    prompt = prompt + "Category: " + str(category) + "\n"
+    prompt = prompt + "Details: " + details + "\n"
+    prompt = prompt + "Diagnose the root cause and suggest a specific fix action. "
+    prompt = prompt + "Choose from: restart_service, adjust_routing, config_change, "
+    prompt = prompt + "clear_queue, fallback_model, snr_reset"
+
+    let diagnosis = "diagnosis_failed"
+    try3 {
+        let req_body = json_encode({"prompt": prompt, "channel": channel})
+        let resp = http_post(HIVE_URL + "/hive/cluster", req_body)
+        let result = json_decode(resp)
+        let diagnosis = dict_get(result, "response") ?? (dict_get(result, "result") ?? "unknown")
+    } else { diagnosis = "diagnosis_failed: hivemind unreachable"
+    }
+    return diagnosis
+}
+
+// Generate fix action from diagnosis
+fn generate_fix(anomaly, category, diagnosis) {
+    let diag_lower = lower(diagnosis)
+    let action = HA_RESTART
+
+    if3 contains(diag_lower, "adjust_routing") { let action = HA_ROUTING }
+    if3 contains(diag_lower, "routing") { let action = HA_ROUTING }
+    if3 contains(diag_lower, "config") { let action = HA_CONFIG }
+    if3 contains(diag_lower, "clear_queue") { let action = HA_CLEAR_Q }
+    if3 contains(diag_lower, "queue") { let action = HA_CLEAR_Q }
+    if3 contains(diag_lower, "fallback") { let action = HA_FALLBACK }
+    if3 contains(diag_lower, "model") { let action = HA_FALLBACK }
+    if3 contains(diag_lower, "snr") { let action = HA_SNR_RESET }
+    if3 contains(diag_lower, "reset") { let action = HA_SNR_RESET }
+    if3 contains(diag_lower, "restart") { let action = HA_RESTART }
+
+    let target = dict_get(anomaly, "service") ?? (dict_get(anomaly, "source") ?? "unknown")
+    let diag_summary = diagnosis
+    if3 len(diagnosis) > 200 {
+        let diag_summary = slice(diagnosis, 0, 200)
+    }
+
+    return {
+        "action":            action,
+        "target":            target,
+        "diagnosis_summary": diag_summary
+    }
+}
+
+// Apply a fix action
+fn apply_fix(fix, anomaly) {
+    let action = dict_get(fix, "action") ?? ""
+    let target = dict_get(fix, "target") ?? "unknown"
+
+    if3 action == HA_RESTART {
+        try3 {
+            let req_body = json_encode({"service": target, "action": "restart"})
+            let resp = http_post(SENTINEL_URL + "/sentinel/self-heal", req_body)
+            return json_decode(resp)
+        } else {
+            return {"applied": T_FALSE, "error": "sentinel unreachable"}
+        }
+    }
+    if3 action == HA_ROUTING {
+        return {"applied": T_TRUE, "action": "routing_adjusted", "target": target}
+    }
+    if3 action == HA_FALLBACK {
+        return {"applied": T_TRUE, "action": "fallback_activated", "target": target}
+    }
+    if3 action == HA_SNR_RESET {
+        return {"applied": T_TRUE, "action": "snr_reset", "target": target}
+    }
+    if3 action == HA_CLEAR_Q {
+        return {"applied": T_TRUE, "action": "queue_cleared", "target": target}
+    }
+    if3 action == HA_CONFIG {
+        return {"applied": T_TRUE, "action": "config_adjusted", "target": target}
+    }
+    return {"applied": T_TRUE, "action": action, "target": target}
+}
+
+// Verify a fix: +1=healthy, 0=degraded, -1=still broken
+fn verify_fix(anomaly, fix) {
+    let target = dict_get(fix, "target") ?? ""
+    let target_lower = lower(target)
+    let port = dict_get(PORT_MAP, target_lower) ?? 0
+    if3 port == 0 {
+        return T_MAYBE
+    }
+    try3 {
+        let t0 = time()
+        let url = "http://127.0.0.1:" + str(port) + "/health"
+        let resp = http_get(url)
+        let latency_ms = (time() - t0) * 1000
+        // Ternary: fast=+1, slow=0
+        if3 latency_ms < RE_TURBULENT {
+            return T_TRUE
+        }
+        return T_MAYBE
+    } else {
+        return T_FALSE
+    }
+}
+
+// Report heal outcome to Sentinel
+fn report_to_sentinel(result) {
+    try3 {
+        let req_body = json_encode({
+            "event":    "HEAL",
+            "heal_id":  dict_get(result, "heal_id") ?? "",
+            "status":   dict_get(result, "status") ?? "",
+            "category": dict_get(result, "category") ?? "",
+            "duration": dict_get(result, "duration") ?? 0,
+            "fix":      dict_get(result, "fix") ?? {}
+        })
+        let _resp = http_post(SENTINEL_URL + "/sentinel/self-heal", req_body)
+    } else {
+        // Don't fail the heal if reporting fails
+    }
+    return T_TRUE
+}
+
+// Full self-heal cycle: categorize -> diagnose -> fix -> apply -> verify -> report
+fn full_heal(anomaly) {
+    let heal_id = slice(uuid_hex(), 0, 8)
+    let ts = time()
+    let result = {
+        "heal_id": heal_id,
+        "anomaly": anomaly,
+        "started": ts,
+        "steps":   []
+    }
+
+    try3 {
+        // 1. Categorize
+        let category = categorize_anomaly(anomaly)
+        result = dict_set(result, "category", category)
+        append(result["steps"], {"step": "categorize", "result": category, "time": time() - ts})
+
+        // 2. Diagnose
+        let diagnosis = diagnose_anomaly(anomaly, category)
+        result = dict_set(result, "diagnosis", diagnosis)
+        let diag_short = diagnosis
+        if3 len(diagnosis) > 200 {
+            let diag_short = slice(diagnosis, 0, 200)
+        }
+        append(result["steps"], {"step": "diagnose", "result": diag_short, "time": time() - ts})
+
+        // 3. Generate fix
+        let fix = generate_fix(anomaly, category, diagnosis)
+        result = dict_set(result, "fix", fix)
+        append(result["steps"], {"step": "generate_fix", "result": fix, "time": time() - ts})
+
+        // 4. Apply fix
+        let apply_result = apply_fix(fix, anomaly)
+        result = dict_set(result, "applied", apply_result)
+        append(result["steps"], {"step": "apply", "result": apply_result, "time": time() - ts})
+
+        // 5. Verify
+        let verified = verify_fix(anomaly, fix)
+        result = dict_set(result, "verified", verified)
+        result = dict_set(result, "verify_trit", verified)
+        append(result["steps"], {"step": "verify", "result": verified, "time": time() - ts})
+
+        // 6. Report to Sentinel
+        let _rep = report_to_sentinel(result)
+
+        // Ternary heal status
+        if3 verified == T_TRUE {
+            result = dict_set(result, "status", "healed")
+        } else verified == T_MAYBE {
+            result = dict_set(result, "status", "partial")
+        } else {
+            result = dict_set(result, "status", "failed")
+    } else {
+        result = dict_set(result, "status", "failed")
+        result = dict_set(result, "error", "heal cycle exception")
+    }
+
+    result = dict_set(result, "duration", time() - ts)
+    heal_history = append(heal_history, result)
+    if3 len(heal_history) > HEAL_CAP {
+        let heal_history = slice(heal_history, len(heal_history) - HEAL_CAP, len(heal_history))
+    }
+    return result
+}
+
+// ================================================================
+// TICK DAEMONS (formerly 6 threads, now single on-demand endpoint)
+// ================================================================
+
+// Daemon 1: Communication -- models share system insights
+}
+fn tick_communication() {
+    let agent_keys = keys(agents)
+    if3 len(agent_keys) < 2 {
+        return {"skipped": T_TRUE, "reason": "too few agents"}
+    }
+    let queue_depth = len(task_queue)
+    let recent_heals = len(heal_history)
+    let prompt = "SYSTEM COMMUNICATION -- NovaX status update.\n"
+    prompt = prompt + "Active agents: " + str(len(agent_keys)) + ", Queue depth: " + str(queue_depth) + ", "
+    prompt = prompt + "Recent heals: " + str(recent_heals) + ".\n"
+    prompt = prompt + "Share one insight about the current system state."
+
+    let model_list = []
+    if3 len(agent_keys) >= 2 {
+        model_list = append(model_list, agent_keys[0])
+        model_list = append(model_list, agent_keys[1])
+    }
+
+    try3 {
+        let req_body = json_encode({
+            "prompt":  prompt,
+            "channel": "AGENT",
+            "models":  model_list
+        })
+        let _resp = http_post(HIVE_URL + "/hive/cluster", req_body)
+        stat_communications = stat_communications + 1
+        return {"completed": T_TRUE}
+    } else {
+        return {"completed": T_FALSE, "error": "hive unreachable"}
+    }
+}
+
+// Daemon 2: Deliberation -- process deliberation tasks
+fn tick_deliberation() {
+    // Find first deliberation task in queue
+    let found_idx = -1
+    let i = 0
+    let qlen = len(task_queue)
+    while3 i < qlen {
+        let task = task_queue[i]
+        if3 task["task_type"] == TT_DELIBERATE {
+            let found_idx = i
+            let i = qlen
+        }
+        i = i + 1
+    }
+    if3 found_idx == -1 {
+        return {"skipped": T_TRUE, "reason": "no deliberation tasks"}
+    }
+
+    let task = task_queue[found_idx]
+    // Remove from queue
+    let new_queue = []
+    let j = 0
+    while3 j < qlen {
+        if3 j != found_idx {
+            new_queue = append(new_queue, task_queue[j])
+        }
+        j = j + 1
+    }
+    task_queue = new_queue
+
+    let topic = dict_get(task["payload"], "topic") ?? ""
+    let channel = task["ternary_channel"]
+
+    // Run deliberation via /hive/discuss
+    let best = get_best_agents(channel, 3)
+    let delib_result = {}
+    try3 {
+        let req_body = json_encode({
+            "topic":   topic,
+            "models":  best,
+            "rounds":  3,
+            "channel": channel
+        })
+        let resp = http_post(HIVE_URL + "/hive/discuss", req_body)
+        let delib_result = json_decode(resp)
+    } else { delib_result = {"error": "deliberation failed"}
+    }
+
+    task = dict_set(task, "status", "completed")
+    task = dict_set(task, "result", delib_result)
+    completed_tasks = append(completed_tasks, task)
+    if3 len(completed_tasks) > COMPLETED_CAP {
+        let completed_tasks = slice(completed_tasks, len(completed_tasks) - COMPLETED_CAP, len(completed_tasks))
+    }
+
+    let delib_record = {
+        "topic":     topic,
+        "channel":   channel,
+        "models":    best,
+        "result":    delib_result,
+        "timestamp": time()
+    }
+    deliberations = append(deliberations, delib_record)
+    if3 len(deliberations) > DELIB_CAP {
+        deliberations = slice(deliberations, len(deliberations) - DELIB_CAP, len(deliberations))
+    }
+    stat_deliberations = stat_deliberations + 1
+    return {"completed": T_TRUE, "topic": topic}
+}
+
+// Daemon 3: Task Trading -- trade tasks using ternary territory comparison
+fn tick_task_trading() {
+    let qlen = len(task_queue)
+    if3 qlen == 0 {
+        return {"skipped": T_TRUE, "reason": "empty queue"}
+    }
+    let trades_made = 0
+    let i = 0
+    while3 i < qlen {
+        let task = task_queue[i]
+        let receiver = task["receiver"]
+        if3 receiver != "auto" {
+            if3 dict_has(agents, receiver) == T_TRUE {
+                let channel = task["ternary_channel"]
+                let current_agent = dict_get(agents, receiver) ?? {}
+                let current_trit = float_to_trit(agent_fitness(receiver, channel))
+                let current_caps = dict_get(current_agent, "capabilities") ?? {}
+                let current_territory = territory_sum(current_caps)
+
+                let best = get_best_agents(channel, 1)
+                if3 len(best) > 0 {
+                    let new_mid = best[0]
+                    if3 new_mid != receiver {
+                        let new_trit = float_to_trit(agent_fitness(new_mid, channel))
+                        let new_agent = dict_get(agents, new_mid) ?? {}
+                        let new_caps = dict_get(new_agent, "capabilities") ?? {}
+                        let new_territory = territory_sum(new_caps)
+                        let gap = new_territory - current_territory
+                        if3 new_trit > current_trit {
+                            task = dict_set(task, "receiver", new_mid)
+                            trades_made = trades_made + 1
+                            stat_trades = stat_trades + 1
+                        }
+                        if3 gap >= TRADE_TERRITORY_GAP {
+                            task = dict_set(task, "receiver", new_mid)
+                            trades_made = trades_made + 1
+                            stat_trades = stat_trades + 1
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return {"trades": trades_made}
+}
+
+// Daemon 4: Self-Heal -- process anomaly queue
+fn tick_self_heal() {
+    let heals_done = 0
+    while3 len(anomaly_queue) > 0 {
+        let anomaly = anomaly_queue[0]
+        anomaly_queue = slice(anomaly_queue, 1, len(anomaly_queue))
+        stat_heals_attempted = stat_heals_attempted + 1
+        let result = full_heal(anomaly)
+        let vt = dict_get(result, "verify_trit") ?? 0
+        if3 vt >= 0 {
+            stat_heals_succeeded = stat_heals_succeeded + 1
+        }
+        heals_done = heals_done + 1
+    }
+    return {"heals": heals_done}
+}
+
+// Daemon 5: Model Optimizer -- benchmark models + sync fingerprints
+fn tick_optimizer() {
+    // Pick model with lowest task count for benchmarking
+    let agent_keys = keys(agents)
+    let alen = len(agent_keys)
+    if3 alen == 0 {
+        return {"skipped": T_TRUE, "reason": "no agents"}
+    }
+
+    let best_mid = agent_keys[0]
+    let best_tc = 999999
+    let i = 0
+    while3 i < alen {
+        let mid = agent_keys[i]
+        let ag = dict_get(agents, mid) ?? {}
+        let tc = dict_get(ag, "task_count") ?? 0
+        if3 tc < best_tc {
+            let best_tc = tc
+            let best_mid = mid
+        }
+        i = i + 1
+    }
+
+    // Benchmark 3 channels
+    let bench_keys = keys(BENCH_PROMPTS)
+    let bench_channels = slice(bench_keys, 0, 3)
+    let bench_results = {}
+    let bi = 0
+    while3 bi < len(bench_channels) {
+        let ch = bench_channels[bi]
+        let prompt = dict_get(BENCH_PROMPTS, ch) ?? ""
+        if3 len(prompt) > 0 {
+            let t0 = time()
+            try3 {
+                let req_body = json_encode({
+                    "prompt":  prompt,
+                    "model":   best_mid,
+                    "channel": ch
+                })
+                let resp = http_post(HIVE_URL + "/hive/cluster", req_body)
+                let result = json_decode(resp)
+                let latency = time() - t0
+                let response = dict_get(result, "response") ?? (dict_get(result, "result") ?? "")
+                let quality = 0.1
+                if3 len(str(response)) > 0 {
+                    let quality = len(str(response)) / 100.0
+                    if3 quality > 1.0 {
+                        let quality = 1.0
+                    }
+                }
+                let _rec = agent_record_result(best_mid, ch, T_TRUE, latency, quality)
+                bench_results = dict_set(bench_results, ch, {"quality": round(quality, 3), "latency": round(latency, 2), "success": T_TRUE})
+                // Feedback to MaxPatch
+                try3 {
+                    let fb_body = json_encode({"model_id": best_mid, "channel": ch, "quality": quality})
+                    let _fb = http_post(MAXPATCH_URL + "/patch/feedback", fb_body)
+                } else {}
+            } else { latency = time() - t0
+                let _rec = agent_record_result(best_mid, ch, T_FALSE, latency, 0.0)
+                bench_results = dict_set(bench_results, ch, {"quality": 0.0, "latency": round(latency, 2), "success": T_FALSE})
+            }
+        }
+        bi = bi + 1
+    }
+    stat_optimizations = stat_optimizations + 1
+
+    // Sync fingerprints from Max Patch Layer
+    try3 {
+        let fp_resp = http_get(MAXPATCH_URL + "/patch/fingerprints")
+        let fp_data = json_decode(fp_resp)
+        let fingerprints = dict_get(fp_data, "fingerprints") ?? {}
+        let fp_keys = keys(fingerprints)
+        let fi = 0
+        while3 fi < len(fp_keys) {
+            let mid = fp_keys[fi]
+            if3 dict_has(agents, mid) == T_TRUE {
+                let fp_entry = dict_get(fingerprints, mid) ?? {}
+                let scores = dict_get(fp_entry, "channel_scores") ?? {}
+                let score_keys = keys(scores)
+                let si = 0
+                while3 si < len(score_keys) {
+                    let ch = score_keys[si]
+                    let new_score = dict_get(scores, ch) ?? 0.5
+                    let ag = dict_get(agents, mid) ?? {}
+                    let caps = dict_get(ag, "capabilities") ?? {}
+                    let old = dict_get(caps, ch) ?? 0.5
+                    // Harmonic blend: 2/H3 old + 1/H3 new
+                    let blended = old * TRIT_HIGH + new_score * TRIT_LOW
+                    caps = dict_set(caps, ch, blended)
+                    ag = dict_set(ag, "capabilities", caps)
+                    agents = dict_set(agents, mid, ag)
+                    si = si + 1
+                }
+            }
+            fi = fi + 1
+    } else {
+        // Max Patch might not be running
+    }
+
+    return {"model": best_mid, "benchmarks": bench_results}
+}
+
+// Daemon 6: Live Monitor -- watch service health + process queue
+}
+fn tick_monitor() {
+    let mon_keys = keys(MON_SERVICES)
+    let mlen = len(mon_keys)
+    let i = 0
+    while3 i < mlen {
+        let name = mon_keys[i]
+        let port = dict_get(MON_SERVICES, name) ?? 0
+        try3 {
+            let _resp = http_get("http://127.0.0.1:" + str(port) + "/health")
+        } else {
+            append(anomaly_queue, {
+                "type":      "service_down",
+                "service":   name,
+                "port":      port,
+                "timestamp": time(),
+                "source":    "live_monitor"
+            })
+            if3 len(anomaly_queue) > ANOMALY_CAP {
+                anomaly_queue = slice(anomaly_queue, len(anomaly_queue) - ANOMALY_CAP, len(anomaly_queue))
+            }
+        }
+        i = i + 1
+    }
+
+    // Process one task from queue (non-deliberation)
+    let qlen = len(task_queue)
+    if3 qlen > 0 {
+        // Find first non-deliberation task
+        let found_idx = -1
+        let j = 0
+        while3 j < qlen {
+            let task = task_queue[j]
+            if3 task["task_type"] != TT_DELIBERATE {
+                let found_idx = j
+                let j = qlen
+            }
+            j = j + 1
+        }
+        if3 found_idx >= 0 {
+            let task = task_queue[found_idx]
+            // Remove from queue
+            let new_q = []
+            let k = 0
+            while3 k < qlen {
+                if3 k != found_idx {
+                    new_q = append(new_q, task_queue[k])
+                }
+                k = k + 1
+            }
+            task_queue = new_q
+            let _result = process_task(task)
+        }
+    }
+    return {"monitored": mlen, "queue_depth": len(task_queue)}
+}
+
+// Master tick: run one cycle of all 6 daemons
+fn tick_all() {
+    let t0 = time()
+    let results = {}
+    results = dict_set(results, "communication", tick_communication())
+    results = dict_set(results, "deliberation", tick_deliberation())
+    results = dict_set(results, "task_trading", tick_task_trading())
+    results = dict_set(results, "self_heal", tick_self_heal())
+    results = dict_set(results, "optimizer", tick_optimizer())
+    results = dict_set(results, "monitor", tick_monitor())
+    results = dict_set(results, "duration", round(time() - t0, 3))
+    return results
+}
+
+// ================================================================
+// OPTIMIZATION REPORT
+// ================================================================
+
+fn optimization_report() {
+    let report = {}
+    let agent_keys = keys(agents)
+    let i = 0
+    while3 i < len(agent_keys) {
+        let mid = agent_keys[i]
+        let ag = dict_get(agents, mid) ?? {}
+        let best = agent_best_channels(ag, 5)
+        let best_r = []
+        let bi = 0
+        while3 bi < len(best) {
+            let item = best[bi]
+            best_r = append(best_r, {"channel": item["channel"], "score": round(item["score"], 3)})
+            bi = bi + 1
+        }
+        report = dict_set(report, mid, {
+            "best_channels": best_r,
+            "task_count":    dict_get(ag, "task_count") ?? 0,
+            "success_rate":  round(agent_success_rate(ag), 3),
+            "avg_latency":   round(agent_avg_latency(ag), 2)
+        })
+        i = i + 1
+    }
+    return report
+}
+
+// ================================================================
+// ROUTE HANDLERS
+// ================================================================
+
+fn health() {
+    let resp = ns_health_dict("closed-loop", "2.0", PORT, {})
+    resp = dict_set(resp, "enabled", engine_enabled)
+    resp = dict_set(resp, "agents", len(keys(agents)))
+    return resp
+}
+
+fn loop_status() {
+    // Build ternary agent fingerprints (cap at H13)
+    let agent_keys = keys(agents)
+    let agent_trits = {}
+    let i = 0
+    let limit = len(agent_keys)
+    if3 limit > H13 {
+        let limit = H13
+    }
+    while3 i < limit {
+        let mid = agent_keys[i]
+        let ag = dict_get(agents, mid) ?? {}
+        let caps = dict_get(ag, "capabilities") ?? {}
+        agent_trits = dict_set(agent_trits, mid, bt_fingerprint(caps))
+        i = i + 1
+    }
+
+    return {
+        "enabled":            engine_enabled,
+        "running":            engine_running,
+        "version":            "2.0",
+        "ternary":            T_TRUE,
+        "uptime":             round(time() - engine_start_time, 1),
+        "agents":             len(agent_keys),
+        "queue_depth":        len(task_queue),
+        "active_tasks":       len(keys(active_tasks)),
+        "completed_tasks":    len(completed_tasks),
+        "anomaly_queue":      len(anomaly_queue),
+        "heal_history":       len(heal_history),
+        "deliberations":      len(deliberations),
+        "stats": {
+            "tasks_dispatched": stat_tasks_dispatched,
+            "tasks_completed":  stat_tasks_completed,
+            "heals_attempted":  stat_heals_attempted,
+            "heals_succeeded":  stat_heals_succeeded,
+            "deliberations_run": stat_deliberations,
+            "trades_executed":  stat_trades,
+            "communications":   stat_communications,
+            "optimizations":    stat_optimizations
+        },
+        "agent_fingerprints": agent_trits,
+        "harmonics": {
+            "H3": H3, "H5": H5, "H7": H7, "H13": H13,
+            "alpha_ema": ALPHA_EMA,
+            "trit_high": TRIT_HIGH,
+            "trit_low":  TRIT_LOW
+        }
+    }
+}
+
+fn loop_agents() {
+    let agent_keys = keys(agents)
+    let result = {}
+    let i = 0
+    while3 i < len(agent_keys) {
+        let mid = agent_keys[i]
+        let ag = dict_get(agents, mid) ?? {}
+        result = dict_set(result, mid, agent_to_dict(ag))
+        i = i + 1
+    }
+    return {"agents": result, "count": len(agent_keys)}
+}
+
+fn loop_deliberations() {
+    return {"deliberations": deliberations}
+}
+
+fn loop_tasks() {
+    // Sort pending by priority
+    let pending = sort(task_queue)
+    let active = active_tasks
+    let clen = len(completed_tasks)
+    let start = 0
+    if3 clen > 20 {
+        let start = clen - 20
+    }
+    let completed = slice(completed_tasks, start, clen)
+    return {"pending": pending, "active": active, "completed": completed}
+}
+
+fn loop_self_heal() {
+    return {"history": heal_history}
+}
+
+fn loop_optimizer() {
+    return {"optimization": optimization_report()}
+}
+
+fn handle_dispatch(body) {
+    let sender    = dict_get(body, "sender") ?? "user"
+    let receiver  = dict_get(body, "receiver") ?? "auto"
+    let task_type = dict_get(body, "task_type") ?? "query"
+    let channel   = dict_get(body, "channel") ?? "REASON"
+    let priority  = dict_get(body, "priority") ?? 5
+    let payload   = dict_get(body, "payload") ?? {}
+    if3 len(keys(payload)) == 0 {
+        let prompt = dict_get(body, "prompt") ?? ""
+        let payload = {"prompt": prompt}
+    }
+    return dispatch_task(sender, receiver, task_type, payload, channel, priority)
+}
+
+fn handle_deliberate(body) {
+    let topic   = dict_get(body, "topic") ?? ""
+    let channel = dict_get(body, "channel") ?? "REASON"
+    return dispatch_task("user", "auto", TT_DELIBERATE, {"topic": topic}, channel, 2)
+}
+
+fn handle_heal(body) {
+    return full_heal(body)
+}
+
+fn handle_optimize(body) {
+    let model_id = dict_get(body, "model_id") ?? (dict_get(body, "model") ?? "")
+    if3 len(model_id) == 0 {
+        return {"error": "model_id required"}
+    }
+    if3 dict_has(agents, model_id) == T_FALSE {
+        return {"error": "unknown model: " + model_id}
+    }
+    // Benchmark all available channels
+    let bench_keys = keys(BENCH_PROMPTS)
+    let bench_results = {}
+    let i = 0
+    while3 i < len(bench_keys) {
+        let ch = bench_keys[i]
+        let prompt = dict_get(BENCH_PROMPTS, ch) ?? ""
+        if3 len(prompt) > 0 {
+            let t0 = time()
+            try3 {
+                let req_body = json_encode({"prompt": prompt, "model": model_id, "channel": ch})
+                let resp = http_post(HIVE_URL + "/hive/cluster", req_body)
+                let result = json_decode(resp)
+                let latency = time() - t0
+                let response = dict_get(result, "response") ?? (dict_get(result, "result") ?? "")
+                let quality = 0.1
+                if3 len(str(response)) > 0 {
+                    let quality = len(str(response)) / 100.0
+                    if3 quality > 1.0 { let quality = 1.0 }
+                }
+                let _rec = agent_record_result(model_id, ch, T_TRUE, latency, quality)
+                bench_results = dict_set(bench_results, ch, {"quality": round(quality, 3), "latency": round(latency, 2), "success": T_TRUE})
+                // Feedback to MaxPatch
+                try3 {
+                    let fb_body = json_encode({"model_id": model_id, "channel": ch, "quality": quality})
+                    let _fb = http_post(MAXPATCH_URL + "/patch/feedback", fb_body)
+                } else {}
+            } else { latency = time() - t0
+                let _rec = agent_record_result(model_id, ch, T_FALSE, latency, 0.0)
+                bench_results = dict_set(bench_results, ch, {"quality": 0.0, "latency": round(latency, 2), "success": T_FALSE})
+            }
+        }
+        i = i + 1
+    }
+    return {"model_id": model_id, "benchmarks": bench_results}
+}
+
+fn handle_toggle(body) {
+    if3 engine_enabled == T_TRUE {
+        let engine_enabled = T_FALSE
+    } else { engine_enabled = T_TRUE
+    }
+    return {"enabled": engine_enabled}
+}
+
+fn handle_anomaly(body) {
+    anomaly_queue = append(anomaly_queue, body)
+    if3 len(anomaly_queue) > ANOMALY_CAP {
+        anomaly_queue = slice(anomaly_queue, len(anomaly_queue) - ANOMALY_CAP, len(anomaly_queue))
+    }
+    return {"queued": T_TRUE, "depth": len(anomaly_queue)}
+}
+
+fn handle_tick(body) {
+    if3 engine_enabled == T_FALSE {
+        return {"skipped": T_TRUE, "reason": "engine disabled"}
+    }
+    return tick_all()
+}
+
+// ================================================================
+// Bootstrap on startup
+// ================================================================
+let _boot = bootstrap_agents()
+let engine_running = T_TRUE
+
+// ================================================================
+// Register routes
+// ================================================================
+troute(server, "GET",  "/health",              "health")
+troute(server, "GET",  "/loop/health",         "health")
+troute(server, "GET",  "/loop/status",         "loop_status")
+troute(server, "GET",  "/loop/agents",         "loop_agents")
+troute(server, "GET",  "/loop/deliberations",  "loop_deliberations")
+troute(server, "GET",  "/loop/tasks",          "loop_tasks")
+troute(server, "GET",  "/loop/self-heal",      "loop_self_heal")
+troute(server, "GET",  "/loop/optimizer",      "loop_optimizer")
+troute(server, "POST", "/loop/dispatch",       "handle_dispatch")
+troute(server, "POST", "/loop/deliberate",     "handle_deliberate")
+troute(server, "POST", "/loop/heal",           "handle_heal")
+troute(server, "POST", "/loop/optimize",       "handle_optimize")
+troute(server, "POST", "/loop/toggle",         "handle_toggle")
+troute(server, "POST", "/loop/anomaly",        "handle_anomaly")
+troute(server, "POST", "/closed_loop/tick",    "handle_tick")
+
+// ================================================================
+// Boot banner
+// ================================================================
+print("[CLOSED-LOOP] NovaX Closed-Loop Autonomous Engine v2.0 (NovaLang)")
+print("[CLOSED-LOOP] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[CLOSED-LOOP] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[CLOSED-LOOP] BLOCK=" + str(BLOCK) + " | Re=" + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT))
+print("[CLOSED-LOOP] Alpha EMA: " + str(ALPHA_EMA) + " | Trit bounds: " + str(TRIT_LOW) + "/" + str(TRIT_HIGH))
+print("[CLOSED-LOOP] Agents bootstrapped: " + str(len(keys(agents))))
+print("[CLOSED-LOOP] Flow channels: " + str(len(FLOW_CHANNELS)) + " (25-channel ternary matrix)")
+print("[CLOSED-LOOP] 6 daemon threads -> single POST /closed_loop/tick endpoint")
+print("[CLOSED-LOOP] Routes: GET /health /loop/status /loop/agents /loop/deliberations")
+print("[CLOSED-LOOP] Routes: GET /loop/tasks /loop/self-heal /loop/optimizer")
+print("[CLOSED-LOOP] Routes: POST /loop/dispatch /loop/deliberate /loop/heal")
+print("[CLOSED-LOOP] Routes: POST /loop/optimize /loop/toggle /loop/anomaly")
+print("[CLOSED-LOOP] Routes: POST /closed_loop/tick (run all 6 daemons)")
+print("[CLOSED-LOOP] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

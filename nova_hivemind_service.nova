@@ -1,0 +1,3805 @@
+// ============================================================
+// NovaX Hive Mind v2.0 -- Ternary Swarm Edition (NovaLang)
+// ============================================================
+// Unified AI mesh with 3-5-7-13 harmonic ternary layer.
+// Queries multiple Ollama models, merges into one answer.
+// Port: 9881 | Depends: Ollama (11434), Cloud Router (9878)
+// ============================================================
+
+// -- Section 1: Server init --
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+import3("C:/NovaX/lib/nova_tripple.nova")
+import3("C:/NovaX/lib/nova_pure_tools.nova")
+
+print("[BOOT-0] Starting port/server...")
+let PORT = 9881
+let server = tserve(PORT, "nova-hivemind")
+print("[BOOT-1] Server created on :9881")
+
+// -- Section 2: 3-5-7-13 Ternary Constants --
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+let BLOCK_SIZE = 2187
+let RE_LAMINAR = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT = 343
+
+let OLLAMA_URL = "http://127.0.0.1:11434"
+let CLOUD_ROUTER_URL = "http://127.0.0.1:9878"
+let TTOOLS_URL = "http://127.0.0.1:9894"
+let MAX_PARALLEL = 81
+let MERGE_TIMEOUT = 60
+let SWARM_TIMEOUT_GLOBAL = 300
+let TRYTE_SIZE = 6
+let HELPER_PY = "C:/NovaX/hivemind_helper.py"
+
+// -- Section 3: State dicts --
+let hive_stats = {"queries": 0, "query_times": [], "trits_pos": 0, "trits_zero": 0, "trits_neg": 0, "t0": time()}
+
+// -- Tripple Module State (resonance sensor for Hivemind) --
+let _tripple = tripple_init()
+// Register Hivemind's providers: each Ollama model + cloud router
+let _tp_ollama = tripple_init_provider("ollama", "local")
+let _tp_cloud  = tripple_init_provider("cloud_router", "cloud")
+let _tp_openai = tripple_init_provider("openai", "cloud")
+let _tp_openrouter = tripple_init_provider("openrouter", "cloud")
+let _tp_deepseek = tripple_init_provider("deepseek", "cloud")
+let _hive_providers = (dict_get(_tripple, "providers") ?? {})
+_hive_providers = dict_set(_hive_providers, "ollama", _tp_ollama)
+_hive_providers = dict_set(_hive_providers, "cloud_router", _tp_cloud)
+_hive_providers = dict_set(_hive_providers, "openai", _tp_openai)
+_hive_providers = dict_set(_hive_providers, "openrouter", _tp_openrouter)
+_hive_providers = dict_set(_hive_providers, "deepseek", _tp_deepseek)
+_tripple = dict_set(_tripple, "providers", _hive_providers)
+_tripple = tripple_mirror_init(_tripple)
+_tripple = tripple_pacman_init(_tripple)
+
+let warm_state = {"warming": {}, "warm": {}}
+
+let system_flow_state = {
+  "response_times": [],
+  "response_tokens": [],
+  "model_pressures": {},
+  "model_query_counts": {},
+  "model_last_latency": {}
+}
+
+let provider_rate_state = {}
+
+let nova_pull_state = {
+  "active": false, "wave": 0, "total_waves": 0,
+  "pulled": 0, "failed": 0, "total": 0,
+  "current_model": "", "reynolds": 0,
+  "results": [], "health": "Z"
+}
+
+let warm_pool_state = {
+  "hot_models": [],
+  "last_channels": [],
+  "cycle_count": 0,
+  "total_warmed": 0
+}
+
+print("[BOOT-2] Section 3b: Model lists...")
+// -- Section 3b: Model lists --
+let DEEPSEEK_CLOUD_MODELS = [
+  "deepseek/deepseek-chat",
+  "deepseek/deepseek-r1",
+  "deepseek/deepseek-r1-0528"
+]
+
+let DEEPSEEK_LOCAL_MODELS = ["deepseek-r1:latest", "deepseek-coder:latest"]
+
+// 469 cloud models — injected from Tripple Mirror discovery (2026-03-12)
+// Sources: OpenAI (119), OpenRouter (344), Anthropic (6)
+let ALL_CLOUD_MODELS = [
+  "openai:gpt-4-0613", "openai:gpt-4", "openai:gpt-3.5-turbo", "openai:gpt-5.4",
+  "openai:gpt-5.3-chat-latest", "openai:gpt-5.4-2026-03-05", "openai:gpt-5.4-pro",
+  "openai:gpt-5.4-pro-2026-03-05", "openai:davinci-002", "openai:babbage-002",
+  "openai:gpt-3.5-turbo-instruct", "openai:gpt-3.5-turbo-instruct-0914",
+  "openai:dall-e-3", "openai:dall-e-2", "openai:gpt-4-1106-preview",
+  "openai:gpt-3.5-turbo-1106", "openai:tts-1-hd", "openai:tts-1-1106",
+  "openai:tts-1-hd-1106", "openai:text-embedding-3-small", "openai:text-embedding-3-large",
+  "openai:gpt-4-0125-preview", "openai:gpt-4-turbo-preview", "openai:gpt-3.5-turbo-0125",
+  "openai:gpt-4-turbo", "openai:gpt-4-turbo-2024-04-09", "openai:gpt-4o",
+  "openai:gpt-4o-2024-05-13", "openai:gpt-4o-mini-2024-07-18", "openai:gpt-4o-mini",
+  "openai:gpt-4o-2024-08-06", "openai:gpt-4o-audio-preview", "openai:gpt-4o-realtime-preview",
+  "openai:omni-moderation-latest", "openai:omni-moderation-2024-09-26",
+  "openai:gpt-4o-realtime-preview-2024-12-17", "openai:gpt-4o-audio-preview-2024-12-17",
+  "openai:gpt-4o-mini-realtime-preview-2024-12-17", "openai:gpt-4o-mini-audio-preview-2024-12-17",
+  "openai:o1-2024-12-17", "openai:o1", "openai:gpt-4o-mini-realtime-preview",
+  "openai:gpt-4o-mini-audio-preview", "openai:o3-mini", "openai:o3-mini-2025-01-31",
+  "openai:gpt-4o-2024-11-20", "openai:gpt-4o-mini-search-preview-2025-03-11",
+  "openai:gpt-4o-mini-search-preview", "openai:gpt-4o-transcribe",
+  "openai:gpt-4o-mini-transcribe", "openai:o1-pro-2025-03-19", "openai:o1-pro",
+  "openai:gpt-4o-mini-tts", "openai:o3-2025-04-16", "openai:o4-mini-2025-04-16",
+  "openai:o3", "openai:o4-mini", "openai:gpt-4.1-2025-04-14", "openai:gpt-4.1",
+  "openai:gpt-4.1-mini-2025-04-14", "openai:gpt-4.1-mini", "openai:gpt-4.1-nano-2025-04-14",
+  "openai:gpt-4.1-nano", "openai:gpt-image-1", "openai:gpt-4o-realtime-preview-2025-06-03",
+  "openai:gpt-4o-audio-preview-2025-06-03", "openai:gpt-4o-transcribe-diarize",
+  "openai:gpt-5-chat-latest", "openai:gpt-5-2025-08-07", "openai:gpt-5",
+  "openai:gpt-5-mini-2025-08-07", "openai:gpt-5-mini", "openai:gpt-5-nano-2025-08-07",
+  "openai:gpt-5-nano", "openai:gpt-audio-2025-08-28", "openai:gpt-realtime",
+  "openai:gpt-realtime-2025-08-28", "openai:gpt-audio", "openai:gpt-5-codex",
+  "openai:gpt-image-1-mini", "openai:gpt-5-pro-2025-10-06", "openai:gpt-5-pro",
+  "openai:gpt-audio-mini", "openai:gpt-audio-mini-2025-10-06", "openai:gpt-5-search-api",
+  "openai:gpt-realtime-mini", "openai:gpt-realtime-mini-2025-10-06", "openai:sora-2",
+  "openai:sora-2-pro", "openai:gpt-5-search-api-2025-10-14", "openai:gpt-5.1-chat-latest",
+  "openai:gpt-5.1-2025-11-13", "openai:gpt-5.1", "openai:gpt-5.1-codex",
+  "openai:gpt-5.1-codex-mini", "openai:gpt-5.1-codex-max", "openai:gpt-image-1.5",
+  "openai:gpt-5.2-2025-12-11", "openai:gpt-5.2", "openai:gpt-5.2-pro-2025-12-11",
+  "openai:gpt-5.2-pro", "openai:gpt-5.2-chat-latest", "openai:gpt-4o-mini-transcribe-2025-12-15",
+  "openai:gpt-4o-mini-transcribe-2025-03-20", "openai:gpt-4o-mini-tts-2025-03-20",
+  "openai:gpt-4o-mini-tts-2025-12-15", "openai:gpt-realtime-mini-2025-12-15",
+  "openai:gpt-audio-mini-2025-12-15", "openai:chatgpt-image-latest", "openai:gpt-5.2-codex",
+  "openai:gpt-5.3-codex", "openai:gpt-realtime-1.5", "openai:gpt-audio-1.5",
+  "openai:gpt-4o-search-preview", "openai:gpt-4o-search-preview-2025-03-11",
+  "openai:gpt-3.5-turbo-16k", "openai:tts-1", "openai:whisper-1",
+  "openai:text-embedding-ada-002",
+  "x-ai/grok-4.20-multi-agent-beta", "x-ai/grok-4.20-beta",
+  "openrouter/hunter-alpha", "openrouter/healer-alpha",
+  "nvidia/nemotron-3-super-120b-a12b:free", "bytedance-seed/seed-2.0-lite",
+  "qwen/qwen3.5-9b", "openai/gpt-5.4-pro", "openai/gpt-5.4",
+  "inception/mercury-2", "openai/gpt-5.3-chat",
+  "google/gemini-3.1-flash-lite-preview", "bytedance-seed/seed-2.0-mini",
+  "google/gemini-3.1-flash-image-preview", "qwen/qwen3.5-35b-a3b",
+  "qwen/qwen3.5-27b", "qwen/qwen3.5-122b-a10b", "qwen/qwen3.5-flash-02-23",
+  "liquid/lfm-2-24b-a2b", "google/gemini-3.1-pro-preview-customtools",
+  "openai/gpt-5.3-codex", "aion-labs/aion-2.0", "google/gemini-3.1-pro-preview",
+  "anthropic/claude-sonnet-4.6", "qwen/qwen3.5-plus-02-15", "qwen/qwen3.5-397b-a17b",
+  "minimax/minimax-m2.5", "z-ai/glm-5", "qwen/qwen3-max-thinking",
+  "anthropic/claude-opus-4.6", "qwen/qwen3-coder-next", "openrouter/free",
+  "stepfun/step-3.5-flash:free", "stepfun/step-3.5-flash",
+  "arcee-ai/trinity-large-preview:free", "moonshotai/kimi-k2.5",
+  "upstage/solar-pro-3", "minimax/minimax-m2-her", "writer/palmyra-x5",
+  "liquid/lfm-2.5-1.2b-thinking:free", "liquid/lfm-2.5-1.2b-instruct:free",
+  "openai/gpt-audio", "openai/gpt-audio-mini", "z-ai/glm-4.7-flash",
+  "openai/gpt-5.2-codex", "allenai/molmo-2-8b", "allenai/olmo-3.1-32b-instruct",
+  "bytedance-seed/seed-1.6-flash", "bytedance-seed/seed-1.6", "minimax/minimax-m2.1",
+  "z-ai/glm-4.7", "google/gemini-3-flash-preview", "mistralai/mistral-small-creative",
+  "allenai/olmo-3.1-32b-think", "xiaomi/mimo-v2-flash",
+  "nvidia/nemotron-3-nano-30b-a3b:free", "nvidia/nemotron-3-nano-30b-a3b",
+  "openai/gpt-5.2-chat", "openai/gpt-5.2-pro", "openai/gpt-5.2",
+  "mistralai/devstral-2512", "relace/relace-search", "z-ai/glm-4.6v",
+  "nex-agi/deepseek-v3.1-nex-n1", "essentialai/rnj-1-instruct", "openrouter/bodybuilder",
+  "openai/gpt-5.1-codex-max", "amazon/nova-2-lite-v1", "mistralai/ministral-14b-2512",
+  "mistralai/ministral-8b-2512", "mistralai/ministral-3b-2512",
+  "mistralai/mistral-large-2512", "arcee-ai/trinity-mini:free", "arcee-ai/trinity-mini",
+  "deepseek/deepseek-v3.2-speciale", "deepseek/deepseek-v3.2",
+  "prime-intellect/intellect-3", "anthropic/claude-opus-4.5",
+  "allenai/olmo-3-32b-think", "allenai/olmo-3-7b-instruct", "allenai/olmo-3-7b-think",
+  "google/gemini-3-pro-image-preview", "x-ai/grok-4.1-fast",
+  "google/gemini-3-pro-preview", "deepcogito/cogito-v2.1-671b",
+  "openai/gpt-5.1", "openai/gpt-5.1-chat", "openai/gpt-5.1-codex",
+  "openai/gpt-5.1-codex-mini", "kwaipilot/kat-coder-pro",
+  "moonshotai/kimi-k2-thinking", "amazon/nova-premier-v1",
+  "perplexity/sonar-pro-search", "mistralai/voxtral-small-24b-2507",
+  "openai/gpt-oss-safeguard-20b", "nvidia/nemotron-nano-12b-v2-vl:free",
+  "nvidia/nemotron-nano-12b-v2-vl", "minimax/minimax-m2",
+  "qwen/qwen3-vl-32b-instruct", "liquid/lfm2-8b-a1b", "liquid/lfm-2.2-6b",
+  "ibm-granite/granite-4.0-h-micro", "openai/gpt-5-image-mini",
+  "anthropic/claude-haiku-4.5", "qwen/qwen3-vl-8b-thinking",
+  "qwen/qwen3-vl-8b-instruct", "openai/gpt-5-image",
+  "openai/o3-deep-research", "openai/o4-mini-deep-research",
+  "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+  "baidu/ernie-4.5-21b-a3b-thinking", "google/gemini-2.5-flash-image",
+  "qwen/qwen3-vl-30b-a3b-thinking", "qwen/qwen3-vl-30b-a3b-instruct",
+  "openai/gpt-5-pro", "z-ai/glm-4.6", "anthropic/claude-sonnet-4.5",
+  "deepseek/deepseek-v3.2-exp", "thedrummer/cydonia-24b-v4.1",
+  "relace/relace-apply-3", "google/gemini-2.5-flash-lite-preview-09-2025",
+  "qwen/qwen3-vl-235b-a22b-thinking", "qwen/qwen3-vl-235b-a22b-instruct",
+  "qwen/qwen3-max", "qwen/qwen3-coder-plus", "openai/gpt-5-codex",
+  "deepseek/deepseek-v3.1-terminus", "x-ai/grok-4-fast",
+  "alibaba/tongyi-deepresearch-30b-a3b", "qwen/qwen3-coder-flash",
+  "qwen/qwen3-next-80b-a3b-thinking", "qwen/qwen3-next-80b-a3b-instruct:free",
+  "qwen/qwen3-next-80b-a3b-instruct", "meituan/longcat-flash-chat",
+  "qwen/qwen-plus-2025-07-28:thinking", "qwen/qwen-plus-2025-07-28",
+  "nvidia/nemotron-nano-9b-v2:free", "nvidia/nemotron-nano-9b-v2",
+  "moonshotai/kimi-k2-0905", "qwen/qwen3-30b-a3b-thinking-2507",
+  "x-ai/grok-code-fast-1", "nousresearch/hermes-4-70b", "nousresearch/hermes-4-405b",
+  "deepseek/deepseek-chat-v3.1", "openai/gpt-4o-audio-preview",
+  "mistralai/mistral-medium-3.1", "baidu/ernie-4.5-21b-a3b",
+  "baidu/ernie-4.5-vl-28b-a3b", "z-ai/glm-4.5v", "ai21/jamba-large-1.7",
+  "openai/gpt-5-chat", "openai/gpt-5", "openai/gpt-5-mini", "openai/gpt-5-nano",
+  "openai/gpt-oss-120b:free", "openai/gpt-oss-120b", "openai/gpt-oss-20b:free",
+  "openai/gpt-oss-20b", "anthropic/claude-opus-4.1", "mistralai/codestral-2508",
+  "qwen/qwen3-coder-30b-a3b-instruct", "qwen/qwen3-30b-a3b-instruct-2507",
+  "z-ai/glm-4.5", "z-ai/glm-4.5-air:free", "z-ai/glm-4.5-air",
+  "qwen/qwen3-235b-a22b-thinking-2507", "z-ai/glm-4-32b",
+  "qwen/qwen3-coder:free", "qwen/qwen3-coder", "bytedance/ui-tars-1.5-7b",
+  "google/gemini-2.5-flash-lite", "qwen/qwen3-235b-a22b-2507",
+  "switchpoint/router", "moonshotai/kimi-k2", "mistralai/devstral-medium",
+  "mistralai/devstral-small",
+  "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
+  "x-ai/grok-4", "google/gemma-3n-e2b-it:free", "tencent/hunyuan-a13b-instruct",
+  "tngtech/deepseek-r1t2-chimera", "morph/morph-v3-large", "morph/morph-v3-fast",
+  "baidu/ernie-4.5-vl-424b-a47b", "baidu/ernie-4.5-300b-a47b",
+  "inception/mercury", "mistralai/mistral-small-3.2-24b-instruct",
+  "minimax/minimax-m1", "google/gemini-2.5-flash", "google/gemini-2.5-pro",
+  "openai/o3-pro", "x-ai/grok-3-mini", "x-ai/grok-3",
+  "google/gemini-2.5-pro-preview", "deepseek/deepseek-r1-0528",
+  "anthropic/claude-opus-4", "anthropic/claude-sonnet-4",
+  "google/gemma-3n-e4b-it:free", "google/gemma-3n-e4b-it",
+  "mistralai/mistral-medium-3", "google/gemini-2.5-pro-preview-05-06",
+  "arcee-ai/spotlight", "arcee-ai/maestro-reasoning", "arcee-ai/virtuoso-large",
+  "arcee-ai/coder-large", "inception/mercury-coder", "qwen/qwen3-4b:free",
+  "meta-llama/llama-guard-4-12b", "qwen/qwen3-30b-a3b", "qwen/qwen3-8b",
+  "qwen/qwen3-14b", "qwen/qwen3-32b", "qwen/qwen3-235b-a22b",
+  "openai/o4-mini-high", "openai/o3", "openai/o4-mini",
+  "qwen/qwen2.5-coder-7b-instruct", "openai/gpt-4.1", "openai/gpt-4.1-mini",
+  "openai/gpt-4.1-nano", "eleutherai/llemma_7b",
+  "alfredpros/codellama-7b-instruct-solidity", "x-ai/grok-3-mini-beta",
+  "x-ai/grok-3-beta", "meta-llama/llama-4-maverick", "meta-llama/llama-4-scout",
+  "qwen/qwen2.5-vl-32b-instruct", "deepseek/deepseek-chat-v3-0324",
+  "openai/o1-pro", "mistralai/mistral-small-3.1-24b-instruct:free",
+  "mistralai/mistral-small-3.1-24b-instruct", "allenai/olmo-2-0325-32b-instruct",
+  "google/gemma-3-4b-it:free", "google/gemma-3-4b-it", "google/gemma-3-12b-it:free",
+  "google/gemma-3-12b-it", "cohere/command-a", "openai/gpt-4o-mini-search-preview",
+  "openai/gpt-4o-search-preview", "google/gemma-3-27b-it:free", "google/gemma-3-27b-it",
+  "thedrummer/skyfall-36b-v2", "perplexity/sonar-reasoning-pro", "perplexity/sonar-pro",
+  "perplexity/sonar-deep-research", "qwen/qwq-32b",
+  "google/gemini-2.0-flash-lite-001", "anthropic/claude-3.7-sonnet",
+  "anthropic/claude-3.7-sonnet:thinking", "mistralai/mistral-saba",
+  "meta-llama/llama-guard-3-8b", "openai/o3-mini-high",
+  "google/gemini-2.0-flash-001", "qwen/qwen-vl-plus",
+  "aion-labs/aion-1.0", "aion-labs/aion-1.0-mini", "aion-labs/aion-rp-llama-3.1-8b",
+  "qwen/qwen-vl-max", "qwen/qwen-turbo", "qwen/qwen2.5-vl-72b-instruct",
+  "qwen/qwen-plus", "qwen/qwen-max", "openai/o3-mini",
+  "mistralai/mistral-small-24b-instruct-2501", "deepseek/deepseek-r1-distill-qwen-32b",
+  "perplexity/sonar", "deepseek/deepseek-r1-distill-llama-70b", "deepseek/deepseek-r1",
+  "minimax/minimax-01", "microsoft/phi-4", "sao10k/l3.1-70b-hanami-x1",
+  "deepseek/deepseek-chat", "sao10k/l3.3-euryale-70b", "openai/o1",
+  "cohere/command-r7b-12-2024", "meta-llama/llama-3.3-70b-instruct:free",
+  "meta-llama/llama-3.3-70b-instruct", "amazon/nova-lite-v1", "amazon/nova-micro-v1",
+  "amazon/nova-pro-v1", "openai/gpt-4o-2024-11-20", "mistralai/mistral-large-2411",
+  "mistralai/mistral-large-2407", "mistralai/pixtral-large-2411",
+  "qwen/qwen-2.5-coder-32b-instruct", "thedrummer/unslopnemo-12b",
+  "anthropic/claude-3.5-haiku", "anthracite-org/magnum-v4-72b",
+  "anthropic/claude-3.5-sonnet", "qwen/qwen-2.5-7b-instruct",
+  "nvidia/llama-3.1-nemotron-70b-instruct", "inflection/inflection-3-pi",
+  "inflection/inflection-3-productivity", "thedrummer/rocinante-12b",
+  "meta-llama/llama-3.2-3b-instruct:free", "meta-llama/llama-3.2-3b-instruct",
+  "meta-llama/llama-3.2-1b-instruct", "meta-llama/llama-3.2-11b-vision-instruct",
+  "qwen/qwen-2.5-72b-instruct", "cohere/command-r-08-2024",
+  "cohere/command-r-plus-08-2024", "sao10k/l3.1-euryale-70b",
+  "qwen/qwen-2.5-vl-7b-instruct", "nousresearch/hermes-3-llama-3.1-70b",
+  "nousresearch/hermes-3-llama-3.1-405b:free", "nousresearch/hermes-3-llama-3.1-405b",
+  "sao10k/l3-lunaris-8b", "openai/gpt-4o-2024-08-06", "meta-llama/llama-3.1-405b",
+  "meta-llama/llama-3.1-8b-instruct", "meta-llama/llama-3.1-405b-instruct",
+  "meta-llama/llama-3.1-70b-instruct", "mistralai/mistral-nemo",
+  "openai/gpt-4o-mini-2024-07-18", "openai/gpt-4o-mini",
+  "google/gemma-2-27b-it", "google/gemma-2-9b-it", "sao10k/l3-euryale-70b",
+  "nousresearch/hermes-2-pro-llama-3-8b", "openai/gpt-4o-2024-05-13",
+  "openai/gpt-4o", "openai/gpt-4o:extended", "meta-llama/llama-3-70b-instruct",
+  "meta-llama/llama-3-8b-instruct", "mistralai/mixtral-8x22b-instruct",
+  "microsoft/wizardlm-2-8x22b", "openai/gpt-4-turbo", "anthropic/claude-3-haiku",
+  "mistralai/mistral-large", "openai/gpt-3.5-turbo-0613",
+  "openai/gpt-4-turbo-preview", "mistralai/mixtral-8x7b-instruct",
+  "alpindale/goliath-120b", "openrouter/auto", "openai/gpt-4-1106-preview",
+  "openai/gpt-3.5-turbo-instruct", "mistralai/mistral-7b-instruct-v0.1",
+  "openai/gpt-3.5-turbo-16k", "mancer/weaver", "undi95/remm-slerp-l2-13b",
+  "gryphe/mythomax-l2-13b", "openai/gpt-4-0314", "openai/gpt-4",
+  "openai/gpt-3.5-turbo",
+  "anthropic:claude-opus-4-20250514", "anthropic:claude-sonnet-4-20250514",
+  "anthropic:claude-haiku-3-5-20241022", "anthropic:claude-3-opus-20240229",
+  "anthropic:claude-3-sonnet-20240229", "anthropic:claude-3-haiku-20240307",
+  "anthropic:claude-3-5-sonnet-20241022", "anthropic:claude-3-5-haiku-20241022"
+]
+
+let EXCLUDED_MODELS = ["all-minilm", "bge-large", "mxbai-embed-large",
+  "nomic-embed-text", "snowflake-arctic-embed", "llama-guard3"]
+
+let EMBEDDING_MODELS = ["all-minilm", "nomic-embed-text", "mxbai-embed-large",
+  "snowflake-arctic-embed", "bge-large", "mxbai-embed", "llama-guard3"]
+
+print("[BOOT-3] Section 3c+")
+// -- Section 3c: Registry state --
+let registry_models = {}
+let registry_categories = {
+  "code": [], "math": [], "reasoning": [], "general": [],
+  "creative": [], "analysis": [], "fast": [], "all": []
+}
+let registry_benchmarks = {}
+
+// -- Section 3d: Cluster state --
+let cluster_channels = {}
+
+// -- Section 3e: Ternary engine state --
+let ternary_adj = {}
+
+// -- Section 3f: Modulation engine state --
+let mod_channel_snr = {}
+let mod_channel_ber = {}
+let mod_query_count = {}
+let mod_total_queries = 0
+
+// -- Section 3g: N-S engine state --
+let ns_energy_history = []
+let ns_backpressure = {}
+let ns_momentum = {}
+let ns_ollama_queue_depth = 0
+let ns_total_computed = 0
+
+// -- Section 3h: HiveMind state --
+let hive_state = {
+  "total_queries": 0,
+  "total_models_queried": 0,
+  "avg_response_ms": 0,
+  "fastest_model": "",
+  "merge_count": 0
+}
+let hive_history = []
+let hive_or_key = ""
+
+// -- Section 3i: Modulation schemes --
+let MOD_SCHEMES = {
+  "BPSK":    {"bits_per_symbol": 1,  "channels": 1,  "models_per_ch": 1,  "snr_min": 0.0,  "description": "Single channel, single model -- robust fallback"},
+  "QPSK":    {"bits_per_symbol": 2,  "channels": 2,  "models_per_ch": 1,  "snr_min": 0.20, "description": "2 channels, 1 model each -- low complexity"},
+  "8PSK":    {"bits_per_symbol": 3,  "channels": 3,  "models_per_ch": 2,  "snr_min": 0.35, "description": "3 channels, 2 models -- moderate diversity"},
+  "16QAM":   {"bits_per_symbol": 4,  "channels": 5,  "models_per_ch": 3,  "snr_min": 0.50, "description": "5 channels, 3 models -- balanced throughput"},
+  "64QAM":   {"bits_per_symbol": 6,  "channels": 8,  "models_per_ch": 5,  "snr_min": 0.65, "description": "8 channels, 5 models -- high throughput"},
+  "256QAM":  {"bits_per_symbol": 8,  "channels": 16, "models_per_ch": 8,  "snr_min": 0.80, "description": "16 channels, 8 models -- very high throughput"},
+  "1024QAM": {"bits_per_symbol": 10, "channels": 25, "models_per_ch": 15, "snr_min": 0.90, "description": "All 25 channels, 15 models -- maximum capacity"}
+}
+let MOD_SCHEME_ORDER = ["BPSK", "QPSK", "8PSK", "16QAM", "64QAM", "256QAM", "1024QAM"]
+
+// -- Section 3j: Channel preferred models --
+let CHANNEL_PREFERRED_MODELS = {
+  "REASON": "yarn-mistral:7b",
+  "MATH": "codegeex4:latest",
+  "CODE": "codellama:7b",
+  "INSTRUCT": "gemma:2b",
+  "FACT": "llama3:latest",
+  "LANGUAGE": "qwen2:1.5b"
+}
+
+// -- Section 3k: Chess opening book --
+let CHESS_OPENINGS = {}
+let CHESS_KEYWORDS = []
+let CHESS_MOVE_PATTERNS = {}
+
+// -- list_set helper (not a builtin — build new list with element replaced) --
+fn list_set(arr, idx, val) {
+  let out = []
+  let i = 0
+  while3 (i < len(arr)) {
+    if3 (i == idx) {
+      out = append(out, val)
+    } else3 {
+      out = append(out, arr[i])
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// Load chess openings from JSON file
+fn load_chess_openings() {
+  try3 {
+    let book_path = "C:/NovaX/data/chess_openings.json"
+    let raw = nova_read(book_path)
+    if3 (len(raw) > 2) { let data = json_decode(raw)
+      CHESS_OPENINGS = (dict_get(data, "openings") ?? {})
+      CHESS_MOVE_PATTERNS = (dict_get(data, "move_patterns") ?? {})
+    }
+  } fail {
+    // chess openings file not found -- ok
+  }
+}
+
+print("[BOOT-4] Section 4: Cloud config...")
+// -- Section 4: Load cloud config --
+fn load_cloud_config() {
+  try3 {
+    let raw = nova_read("C:/NovaX/cloud_config.json")
+    let cfg = json_decode(raw)
+    let or_cfg = (dict_get(cfg, "openrouter") ?? {})
+    hive_or_key = (dict_get(or_cfg, "key") ?? "")
+  } fail {
+    // no cloud config
+  }
+}
+
+// ============================================================
+// Section 5: FLOW_CHANNELS (25 channels)
+// ============================================================
+let FLOW_CHANNELS = {
+  "REASON": {
+    "benchmarks": ["MMLU", "ARC", "HellaSwag", "BBH", "GPQA", "Winogrande", "COPA", "ANLI", "LogiQA", "ReClor", "FOLIO", "bAbI"],
+    "local_patterns": ["deepseek-r1", "qwq", "nous", "phi-4", "gemma2", "neural", "marco", "reflection", "exaone", "internlm"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-r1", "deepseek/deepseek-r1-0528", "deepseek/deepseek-r1-distill-llama-70b", "nousresearch/hermes-3-llama-3.1-405b:free", "meta-llama/llama-3.3-70b-instruct:free", "qwen/qwen3-235b-a22b-thinking-2507"],
+    "system": "You are a deep reasoning expert. Think step by step, consider all angles, and provide rigorous analysis.",
+    "judge_criteria": "logical rigor, completeness, correctness of reasoning chain"
+  },
+  "MATH": {
+    "benchmarks": ["GSM8K", "MATH", "AIME", "Minerva", "MathVista", "SVAMP", "AQuA-RAT", "TheoremQA", "OlympiadBench", "MiniF2F"],
+    "local_patterns": ["math", "wizard-math", "mathstral", "metamath", "llemma", "numina", "deepseek-r1", "qwq"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-r1", "deepseek/deepseek-r1-0528", "qwen/qwen3-235b-a22b-thinking-2507", "qwen/qwen3-next-80b-a3b-instruct:free"],
+    "system": "You are a mathematics expert. Show complete step-by-step solutions with verification.",
+    "judge_criteria": "mathematical correctness, complete working, final answer accuracy"
+  },
+  "CODE": {
+    "benchmarks": ["HumanEval", "MBPP", "SWE-bench", "LiveCodeBench", "BigCodeBench", "APPS", "CodeContests", "Spider", "DS-1000", "CruxEval"],
+    "local_patterns": ["code", "coder", "star", "phind", "codellama", "codestral", "deepseek-coder", "starcoder", "wizardcoder", "magicoder", "codegeex", "codeqwen", "qwen2.5-coder"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "qwen/qwen3-coder:free", "deepseek/deepseek-chat", "qwen/qwen3-next-80b-a3b-instruct:free", "meta-llama/llama-3.3-70b-instruct:free"],
+    "system": "You are an expert programmer. Write clean, correct, efficient code with comments. Test edge cases.",
+    "judge_criteria": "code correctness, efficiency, readability, edge case handling"
+  },
+  "INSTRUCT": {
+    "benchmarks": ["IFEval", "MT-Bench", "AlpacaEval", "Arena-Hard", "Vicuna-Bench", "UltraFeedback"],
+    "local_patterns": ["instruct", "chat", "dolphin", "openchat", "hermes", "openhermes", "vicuna", "zephyr", "starling", "solar"],
+    "cloud_models": ["openai:gpt-4o-mini", "mistralai/mistral-small-3.1-24b-instruct:free", "nousresearch/hermes-3-llama-3.1-405b:free", "deepseek/deepseek-chat", "arcee-ai/trinity-large-preview:free"],
+    "system": "You are a helpful assistant. Follow instructions precisely, be clear and well-structured.",
+    "judge_criteria": "instruction adherence, clarity, completeness, formatting"
+  },
+  "FACT": {
+    "benchmarks": ["TruthfulQA", "MMLU-Pro", "SimpleQA", "FActScore", "FEVER", "HaluEval", "SciFact"],
+    "local_patterns": ["llama", "qwen", "gemma", "mistral", "command-r", "nous", "phi", "deepseek"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-chat", "google/gemma-3-27b-it:free", "meta-llama/llama-3.3-70b-instruct:free", "qwen/qwen3-235b-a22b-thinking-2507"],
+    "system": "You are a factual knowledge expert. Only state facts you are confident about. Say I do not know if uncertain.",
+    "judge_criteria": "factual accuracy, calibration of confidence, absence of hallucination"
+  },
+  "LONG": {
+    "benchmarks": ["RULER", "Needle-in-Haystack", "InfiniteBench", "LongBench", "NarrativeQA", "ZeroScrolls", "LEval"],
+    "local_patterns": ["128k", "long", "yarn", "phi3:mini-128k", "qwen2.5:14b", "command-r", "mistral"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-chat", "qwen/qwen3-235b-a22b-thinking-2507", "meta-llama/llama-3.3-70b-instruct:free"],
+    "system": "You are an expert at processing long documents. Extract key information accurately. Be thorough.",
+    "judge_criteria": "information extraction accuracy, coverage, no missed details"
+  },
+  "VISION": {
+    "benchmarks": ["MMMU", "MathVista", "VQAv2", "RealWorldQA", "ChartQA", "DocVQA", "TextVQA", "AI2D", "MMBench", "SEED-Bench"],
+    "local_patterns": ["llava", "bakllava", "minicpm", "cogvlm", "moondream", "phi3-vision"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "qwen/qwen3-vl-235b-a22b-thinking", "qwen/qwen3-vl-30b-a3b-thinking", "nvidia/nemotron-nano-12b-v2-vl:free", "google/gemma-3n-e4b-it:free"],
+    "system": "You are a multimodal AI expert. Analyze visual content carefully and provide detailed descriptions.",
+    "judge_criteria": "visual accuracy, detail, spatial reasoning, text recognition"
+  },
+  "LANGUAGE": {
+    "benchmarks": ["WMT", "FLORES", "SummEval", "WritingPrompts", "XNLI", "Belebele", "CNN-DailyMail", "XSum"],
+    "local_patterns": ["aya", "yi", "command-r", "dolphin", "gemma", "llama", "vicuna", "openchat", "zephyr", "mythomax", "samantha"],
+    "cloud_models": ["openai:gpt-4o-mini", "deepseek/deepseek-chat", "google/gemma-3-27b-it:free", "mistralai/mistral-small-3.1-24b-instruct:free", "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"],
+    "system": "You are a language expert skilled in translation, summarization, and creative writing. Be precise and eloquent.",
+    "judge_criteria": "fluency, accuracy, preservation of meaning, style appropriateness"
+  },
+  "AGENT": {
+    "benchmarks": ["GAIA", "WebArena", "SWE-bench", "ToolBench", "API-Bank", "AgentBench", "OSWorld", "MiniWoB++"],
+    "local_patterns": ["hermes", "openhermes", "nous", "dolphin", "command-r", "deepseek", "mistral", "qwen"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-chat", "nousresearch/hermes-3-llama-3.1-405b:free", "qwen/qwen3-next-80b-a3b-instruct:free", "arcee-ai/trinity-large-preview:free"],
+    "system": "You are an autonomous agent. Break tasks into steps, use tools precisely, verify results.",
+    "judge_criteria": "task completion, tool usage correctness, step efficiency"
+  },
+  "DOMAIN": {
+    "benchmarks": ["MedQA", "PubMedQA", "LegalBench", "FinQA", "ChemBench", "CUAD", "LexGLUE", "MoleculeNet"],
+    "local_patterns": ["meditron", "medllama", "biomed", "med", "legal", "finance", "nous", "llama", "qwen", "mistral"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-r1", "deepseek/deepseek-chat", "qwen/qwen3-235b-a22b-thinking-2507", "meta-llama/llama-3.3-70b-instruct:free"],
+    "system": "You are a domain specialist. Provide expert-level analysis with citations where possible.",
+    "judge_criteria": "domain accuracy, depth of expertise, appropriate caveats"
+  },
+  "SAFETY": {
+    "benchmarks": ["HarmBench", "SafetyBench", "AdvBench", "RealToxicityPrompts", "BBQ", "HateCheck", "Do-Not-Answer"],
+    "local_patterns": ["llama-guard", "guard", "safety", "nous", "dolphin", "llama", "gemma"],
+    "cloud_models": ["openai:gpt-4o-mini", "meta-llama/llama-3.3-70b-instruct:free", "deepseek/deepseek-chat", "google/gemma-3-27b-it:free"],
+    "system": "You are a safety and alignment expert. Evaluate content for toxicity, bias, and harmful patterns.",
+    "judge_criteria": "harm detection accuracy, bias identification, false positive rate"
+  },
+  "RETRIEVAL": {
+    "benchmarks": ["BEIR", "MS-MARCO", "TREC", "HotpotQA", "KILT", "NQ-Open", "ELI5", "ASQA"],
+    "local_patterns": ["command-r", "nomic", "llama", "qwen", "mistral", "deepseek"],
+    "cloud_models": ["openai:gpt-4o-mini", "deepseek/deepseek-chat", "qwen/qwen3-235b-a22b-thinking-2507", "meta-llama/llama-3.3-70b-instruct:free"],
+    "system": "You are an information retrieval expert. Find, rank, and synthesize information accurately.",
+    "judge_criteria": "retrieval precision, relevance ranking, source synthesis quality"
+  },
+  "SCIENCE": {
+    "benchmarks": ["GPQA", "ScienceQA", "AGIEval", "SciQ", "StrategyQA", "ARC-Challenge"],
+    "local_patterns": ["deepseek-r1", "qwq", "nous", "phi", "gemma", "llama", "mistral"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-r1", "deepseek/deepseek-r1-0528", "qwen/qwen3-235b-a22b-thinking-2507"],
+    "system": "You are a scientific reasoning expert. Apply the scientific method: hypothesize, reason, verify with evidence.",
+    "judge_criteria": "scientific accuracy, reasoning rigor, evidence-based conclusions"
+  },
+  "CREATIVE": {
+    "benchmarks": ["EQ-Bench", "WritingPrompts", "StoryCloze", "PersonaChat", "EmpatheticDialogues", "ROCStories"],
+    "local_patterns": ["mythomax", "samantha", "dolphin", "nous", "hermes", "openchat", "llama", "gemma", "yi", "solar"],
+    "cloud_models": ["openai:gpt-4o-mini", "cognitivecomputations/dolphin-mistral-24b-venice-edition:free", "deepseek/deepseek-chat", "mistralai/mistral-small-3.1-24b-instruct:free"],
+    "system": "You are a creative writing expert. Write with vivid imagery, emotional depth, and compelling narratives.",
+    "judge_criteria": "creativity, emotional resonance, narrative coherence, style"
+  },
+  "ROBUST": {
+    "benchmarks": ["ANLI", "AdvGLUE", "CheckList", "TextAttack", "RobustBench", "CounterFact"],
+    "local_patterns": ["llama", "qwen", "deepseek", "nous", "gemma", "phi", "mistral"],
+    "cloud_models": ["openai:gpt-4o-mini", "deepseek/deepseek-r1", "meta-llama/llama-3.3-70b-instruct:free", "qwen/qwen3-235b-a22b-thinking-2507"],
+    "system": "You are a robustness testing expert. Handle adversarial inputs and edge cases with care.",
+    "judge_criteria": "adversarial resistance, consistency, graceful degradation"
+  },
+  "ETHICS": {
+    "benchmarks": ["BBQ", "StereoSet", "CrowS-Pairs", "BOLD", "WinoBias", "WinoGender", "Bias-in-Bios"],
+    "local_patterns": ["llama", "nous", "dolphin", "gemma", "qwen", "phi", "hermes"],
+    "cloud_models": ["openai:gpt-4o-mini", "meta-llama/llama-3.3-70b-instruct:free", "deepseek/deepseek-chat", "google/gemma-3-27b-it:free"],
+    "system": "You are an ethics and fairness expert. Identify bias and reason about moral implications.",
+    "judge_criteria": "bias detection, fairness, ethical reasoning quality"
+  },
+  "KNOWLEDGE": {
+    "benchmarks": ["LAMA", "CounterFact", "ZsRE", "TimeQA", "MEMIT-eval", "MMLU-Redux"],
+    "local_patterns": ["llama", "qwen", "deepseek", "nous", "phi", "gemma", "mistral"],
+    "cloud_models": ["openai:gpt-4o-mini", "deepseek/deepseek-chat", "qwen/qwen3-235b-a22b-thinking-2507", "meta-llama/llama-3.3-70b-instruct:free"],
+    "system": "You are a knowledge expert. Retrieve and verify factual knowledge with precision.",
+    "judge_criteria": "knowledge accuracy, temporal awareness, calibration"
+  },
+  "AUDIO": {
+    "benchmarks": ["LibriSpeech", "Common-Voice", "SUPERB", "AudioSet", "VoxCeleb", "SLURP"],
+    "local_patterns": ["whisper", "llama", "qwen", "gemma"],
+    "cloud_models": ["openai:gpt-4o-mini", "deepseek/deepseek-chat", "meta-llama/llama-3.3-70b-instruct:free"],
+    "system": "You are an audio and speech expert. Process transcriptions and handle speech-related tasks.",
+    "judge_criteria": "transcription accuracy, audio understanding, speaker analysis"
+  },
+  "TRANSLATE": {
+    "benchmarks": ["WMT", "IWSLT", "FLORES-200", "OPUS", "XNLI", "PAWS-X", "Tatoeba"],
+    "local_patterns": ["aya", "yi", "command-r", "llama", "qwen", "gemma", "mistral"],
+    "cloud_models": ["openai:gpt-4o-mini", "deepseek/deepseek-chat", "google/gemma-3-27b-it:free", "mistralai/mistral-small-3.1-24b-instruct:free"],
+    "system": "You are a multilingual translation expert. Translate accurately preserving meaning and cultural context.",
+    "judge_criteria": "translation accuracy, fluency, cultural sensitivity"
+  },
+  "SUMMARY": {
+    "benchmarks": ["CNN-DailyMail", "XSum", "Multi-News", "SAMSum", "GovReport", "QMSum", "BigPatent"],
+    "local_patterns": ["llama", "qwen", "mistral", "command-r", "gemma", "phi", "dolphin"],
+    "cloud_models": ["openai:gpt-4o-mini", "deepseek/deepseek-chat", "mistralai/mistral-small-3.1-24b-instruct:free", "meta-llama/llama-3.3-70b-instruct:free"],
+    "system": "You are a summarization expert. Distill key information concisely without losing critical details.",
+    "judge_criteria": "conciseness, information preservation, coherence, no hallucination"
+  },
+  "GAME": {
+    "benchmarks": ["Chess-ELO", "NetHack-NLE", "MineDojo", "MiniGrid", "Sokoban", "Planning-IPC"],
+    "local_patterns": ["deepseek-r1", "qwq", "nous", "llama", "qwen", "mistral"],
+    "cloud_models": ["openai:gpt-4o-mini", "deepseek/deepseek-r1", "qwen/qwen3-235b-a22b-thinking-2507"],
+    "system": "You are a game theory and strategic planning expert. Think multiple moves ahead.",
+    "judge_criteria": "strategic depth, move quality, planning efficiency"
+  },
+  "MEDICAL": {
+    "benchmarks": ["MedQA", "MedMCQA", "PubMedQA", "BioASQ", "MIMIC-tasks", "MoleculeNet"],
+    "local_patterns": ["meditron", "medllama", "biomed", "med", "llama", "qwen", "nous"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-r1", "qwen/qwen3-235b-a22b-thinking-2507", "meta-llama/llama-3.3-70b-instruct:free"],
+    "system": "You are a biomedical expert. Provide evidence-based medical analysis with appropriate disclaimers.",
+    "judge_criteria": "clinical accuracy, evidence quality, appropriate caveats"
+  },
+  "LEGAL": {
+    "benchmarks": ["LexGLUE", "CaseHOLD", "LegalBench", "CUAD", "EDGAR-QA"],
+    "local_patterns": ["legal", "llama", "nous", "qwen", "mistral", "deepseek"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-chat", "meta-llama/llama-3.3-70b-instruct:free", "qwen/qwen3-235b-a22b-thinking-2507"],
+    "system": "You are a legal analysis expert. Interpret law and analyze contracts precisely.",
+    "judge_criteria": "legal accuracy, precedent awareness, contractual precision"
+  },
+  "FINANCE": {
+    "benchmarks": ["FiQA", "Financial-PhraseBank", "SEC-filing-QA", "FinQA"],
+    "local_patterns": ["finance", "llama", "qwen", "nous", "mistral", "deepseek"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-chat", "qwen/qwen3-235b-a22b-thinking-2507", "meta-llama/llama-3.3-70b-instruct:free"],
+    "system": "You are a financial analysis expert. Analyze markets and provide quantitative reasoning.",
+    "judge_criteria": "financial accuracy, quantitative precision, risk awareness"
+  },
+  "META": {
+    "benchmarks": ["HELM", "BIG-bench", "LiveBench", "Arena-Elo", "Open-LLM-Leaderboard", "EvalPlus", "RewardBench"],
+    "local_patterns": ["llama", "qwen", "deepseek", "nous", "gemma", "phi", "mistral"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-r1", "qwen/qwen3-235b-a22b-thinking-2507", "nousresearch/hermes-3-llama-3.1-405b:free"],
+    "system": "You are an AI evaluation expert. Assess model outputs holistically across multiple dimensions.",
+    "judge_criteria": "evaluation consistency, multi-dimensional assessment, calibrated scoring"
+  },
+  "SYSTEM": {
+    "benchmarks": ["ToolBench", "API-Bank", "GAIA", "AgentBench", "WebArena", "OSWorld", "T-Eval", "ToolLLM"],
+    "local_patterns": ["llama", "qwen", "deepseek", "phi", "mistral", "hermes", "nous"],
+    "cloud_models": ["openai:gpt-4o", "openai:gpt-4o-mini", "deepseek/deepseek-chat", "qwen/qwen3-235b-a22b-thinking-2507", "nousresearch/hermes-3-llama-3.1-405b:free"],
+    "system": "You are a system automation expert with access to Win32 tools. Manage windows, processes, registry, clipboard, themes, and notifications. Use tool calls to interact with the operating system.",
+    "judge_criteria": "tool usage accuracy, system command correctness, safety awareness"
+  }
+}
+
+// ============================================================
+// Section 6: _CHANNEL_KEYWORDS
+// ============================================================
+let CHANNEL_KEYWORDS = {
+  "REASON": ["reason", "logic", "think", "analyze", "argument", "fallacy", "inference", "deduc", "induc", "epistem", "philosophy", "cognitive"],
+  "MATH": ["math", "equation", "solve", "calcul", "integral", "derivative", "algebra", "geometry", "proof", "theorem", "statistic", "probability", "matrix"],
+  "CODE": ["code", "program", "function", "class", "debug", "algorithm", "python", "javascript", "rust", "api", "git", "database", "sql", "html", "css", "compile", "syntax"],
+  "INSTRUCT": ["list", "steps", "how to", "guide", "explain how", "instructions", "tutorial", "format", "template", "outline"],
+  "FACT": ["fact", "true", "false", "correct", "what is", "who is", "when did", "define", "history", "capital of", "population"],
+  "LONG": ["document", "article", "paper", "summarize this long", "chapter", "pages", "transcript", "book", "passage"],
+  "VISION": ["image", "picture", "photo", "visual", "chart", "graph", "diagram", "screenshot", "drawing", "describe this"],
+  "LANGUAGE": ["translate", "translation", "summarize", "summary", "write a", "poem", "story", "essay", "creative writing", "rewrite"],
+  "AGENT": ["tool", "browse", "search for", "execute", "automate", "workflow", "multi-step", "plan and execute", "agent"],
+  "DOMAIN": ["medical", "doctor", "diagnosis", "legal", "law", "court", "finance", "stock", "investment", "chemistry", "biology", "clinical", "patent"],
+  "SAFETY": ["safe", "unsafe", "toxic", "harmful", "jailbreak", "guardrail", "alignment", "red team", "content filter", "moderation", "policy"],
+  "RETRIEVAL": ["retrieve", "search", "lookup", "find information", "index", "ranking", "passage", "dense retrieval", "rag", "knowledge base"],
+  "SCIENCE": ["science", "hypothesis", "experiment", "scientific method", "physics", "chemistry", "biology", "quantum", "molecule", "atom", "theory"],
+  "CREATIVE": ["creative", "imagine", "story", "poem", "fiction", "narrative", "character", "dialogue", "artistic", "metaphor", "literary"],
+  "ROBUST": ["robustness", "adversarial", "out-of-distribution", "edge case", "perturbation", "stress test", "attack", "noise"],
+  "ETHICS": ["ethical", "bias", "fairness", "stereotype", "discrimination", "equity", "moral", "justice", "inclusive"],
+  "KNOWLEDGE": ["knowledge edit", "factual recall", "knowledge update", "outdated fact", "temporal knowledge", "fact verification"],
+  "AUDIO": ["audio", "speech", "voice", "transcribe", "asr", "tts", "speaker", "waveform", "acoustic", "microphone"],
+  "TRANSLATE": ["translate", "translation", "multilingual", "bilingual", "localize", "foreign language", "en to", "from english"],
+  "SUMMARY": ["summarize", "summary", "tldr", "brief", "abstract", "digest", "condense", "key points", "main ideas", "recap"],
+  "GAME": ["game", "chess", "strategy", "play", "planning", "move", "board game", "puzzle", "sokoban", "minecraft"],
+  "MEDICAL": ["medical", "clinical", "diagnosis", "symptom", "treatment", "patient", "disease", "drug", "pharmaceutical", "biomedical"],
+  "LEGAL": ["legal", "law", "court", "contract", "statute", "precedent", "litigation", "regulation", "compliance", "constitutional"],
+  "FINANCE": ["finance", "stock", "investment", "portfolio", "market", "trading", "economic", "fiscal", "monetary", "revenue"],
+  "META": ["benchmark", "evaluation", "leaderboard", "eval", "model comparison", "scoring", "rank models", "holistic eval", "arena"],
+  "SYSTEM": ["windows", "process", "registry", "clipboard", "notification", "toast", "dark mode", "theme", "wallpaper", "system info", "cpu", "memory", "disk", "gpu", "hwnd", "minimize", "maximize", "taskbar", "win32"]
+}
+
+// ============================================================
+// Section 7: CHANNEL_ADJACENCY (25x25 trit matrix values)
+// Stored as float weights; quantized to trits at init
+// ============================================================
+let CHANNEL_ADJACENCY = {
+  "REASON":   {"MATH": 0.7, "CODE": 0.5, "INSTRUCT": 0.6, "FACT": 0.8, "LONG": 0.5, "VISION": 0.3, "LANGUAGE": 0.5, "AGENT": 0.5, "DOMAIN": 0.6, "SAFETY": 0.4, "RETRIEVAL": 0.5, "SCIENCE": 0.8, "CREATIVE": 0.3, "ROBUST": 0.5, "ETHICS": 0.6, "KNOWLEDGE": 0.7, "AUDIO": 0.1, "TRANSLATE": 0.2, "SUMMARY": 0.5, "GAME": 0.7, "MEDICAL": 0.5, "LEGAL": 0.6, "FINANCE": 0.5, "META": 0.6},
+  "MATH":     {"REASON": 0.7, "CODE": 0.9, "INSTRUCT": 0.3, "FACT": 0.5, "LONG": 0.3, "VISION": 0.4, "LANGUAGE": 0.2, "AGENT": 0.4, "DOMAIN": 0.5, "SAFETY": 0.1, "RETRIEVAL": 0.3, "SCIENCE": 0.8, "CREATIVE": 0.1, "ROBUST": 0.3, "ETHICS": 0.1, "KNOWLEDGE": 0.4, "AUDIO": 0.1, "TRANSLATE": 0.1, "SUMMARY": 0.2, "GAME": 0.6, "MEDICAL": 0.3, "LEGAL": 0.2, "FINANCE": 0.7, "META": 0.4},
+  "CODE":     {"REASON": 0.5, "MATH": 0.9, "INSTRUCT": 0.4, "FACT": 0.3, "LONG": 0.3, "VISION": 0.2, "LANGUAGE": 0.2, "AGENT": 0.8, "DOMAIN": 0.3, "SAFETY": 0.3, "RETRIEVAL": 0.4, "SCIENCE": 0.4, "CREATIVE": 0.1, "ROBUST": 0.6, "ETHICS": 0.2, "KNOWLEDGE": 0.3, "AUDIO": 0.1, "TRANSLATE": 0.1, "SUMMARY": 0.2, "GAME": 0.5, "MEDICAL": 0.2, "LEGAL": 0.2, "FINANCE": 0.3, "META": 0.5},
+  "INSTRUCT": {"REASON": 0.6, "MATH": 0.3, "CODE": 0.4, "FACT": 0.4, "LONG": 0.5, "VISION": 0.3, "LANGUAGE": 0.8, "AGENT": 0.5, "DOMAIN": 0.4, "SAFETY": 0.4, "RETRIEVAL": 0.4, "SCIENCE": 0.3, "CREATIVE": 0.5, "ROBUST": 0.2, "ETHICS": 0.4, "KNOWLEDGE": 0.3, "AUDIO": 0.2, "TRANSLATE": 0.5, "SUMMARY": 0.7, "GAME": 0.2, "MEDICAL": 0.3, "LEGAL": 0.3, "FINANCE": 0.3, "META": 0.4},
+  "FACT":     {"REASON": 0.8, "MATH": 0.5, "CODE": 0.3, "INSTRUCT": 0.4, "LONG": 0.6, "VISION": 0.3, "LANGUAGE": 0.4, "AGENT": 0.3, "DOMAIN": 0.7, "SAFETY": 0.3, "RETRIEVAL": 0.8, "SCIENCE": 0.7, "CREATIVE": 0.1, "ROBUST": 0.4, "ETHICS": 0.4, "KNOWLEDGE": 0.9, "AUDIO": 0.1, "TRANSLATE": 0.3, "SUMMARY": 0.5, "GAME": 0.2, "MEDICAL": 0.6, "LEGAL": 0.5, "FINANCE": 0.5, "META": 0.5},
+  "LONG":     {"REASON": 0.5, "MATH": 0.3, "CODE": 0.3, "INSTRUCT": 0.5, "FACT": 0.6, "VISION": 0.3, "LANGUAGE": 0.6, "AGENT": 0.3, "DOMAIN": 0.4, "SAFETY": 0.2, "RETRIEVAL": 0.7, "SCIENCE": 0.4, "CREATIVE": 0.4, "ROBUST": 0.2, "ETHICS": 0.2, "KNOWLEDGE": 0.5, "AUDIO": 0.2, "TRANSLATE": 0.4, "SUMMARY": 0.9, "GAME": 0.1, "MEDICAL": 0.3, "LEGAL": 0.4, "FINANCE": 0.3, "META": 0.3},
+  "VISION":   {"REASON": 0.3, "MATH": 0.4, "CODE": 0.2, "INSTRUCT": 0.3, "FACT": 0.3, "LONG": 0.3, "LANGUAGE": 0.3, "AGENT": 0.4, "DOMAIN": 0.3, "SAFETY": 0.3, "RETRIEVAL": 0.3, "SCIENCE": 0.4, "CREATIVE": 0.5, "ROBUST": 0.3, "ETHICS": 0.2, "KNOWLEDGE": 0.2, "AUDIO": 0.2, "TRANSLATE": 0.2, "SUMMARY": 0.3, "GAME": 0.3, "MEDICAL": 0.4, "LEGAL": 0.1, "FINANCE": 0.2, "META": 0.3},
+  "LANGUAGE": {"REASON": 0.5, "MATH": 0.2, "CODE": 0.2, "INSTRUCT": 0.8, "FACT": 0.4, "LONG": 0.6, "VISION": 0.3, "AGENT": 0.3, "DOMAIN": 0.4, "SAFETY": 0.3, "RETRIEVAL": 0.4, "SCIENCE": 0.3, "CREATIVE": 0.8, "ROBUST": 0.2, "ETHICS": 0.4, "KNOWLEDGE": 0.4, "AUDIO": 0.3, "TRANSLATE": 0.9, "SUMMARY": 0.8, "GAME": 0.1, "MEDICAL": 0.2, "LEGAL": 0.3, "FINANCE": 0.2, "META": 0.3},
+  "AGENT":    {"REASON": 0.5, "MATH": 0.4, "CODE": 0.8, "INSTRUCT": 0.5, "FACT": 0.3, "LONG": 0.3, "VISION": 0.4, "LANGUAGE": 0.3, "DOMAIN": 0.4, "SAFETY": 0.5, "RETRIEVAL": 0.6, "SCIENCE": 0.3, "CREATIVE": 0.2, "ROBUST": 0.5, "ETHICS": 0.3, "KNOWLEDGE": 0.3, "AUDIO": 0.2, "TRANSLATE": 0.2, "SUMMARY": 0.3, "GAME": 0.5, "MEDICAL": 0.3, "LEGAL": 0.3, "FINANCE": 0.3, "META": 0.5},
+  "DOMAIN":   {"REASON": 0.6, "MATH": 0.5, "CODE": 0.3, "INSTRUCT": 0.4, "FACT": 0.7, "LONG": 0.4, "VISION": 0.3, "LANGUAGE": 0.4, "AGENT": 0.4, "SAFETY": 0.3, "RETRIEVAL": 0.5, "SCIENCE": 0.7, "CREATIVE": 0.2, "ROBUST": 0.3, "ETHICS": 0.4, "KNOWLEDGE": 0.6, "AUDIO": 0.1, "TRANSLATE": 0.3, "SUMMARY": 0.4, "GAME": 0.2, "MEDICAL": 0.8, "LEGAL": 0.7, "FINANCE": 0.7, "META": 0.4},
+  "SAFETY":   {"REASON": 0.4, "MATH": 0.1, "CODE": 0.3, "INSTRUCT": 0.4, "FACT": 0.3, "LONG": 0.2, "VISION": 0.3, "LANGUAGE": 0.3, "AGENT": 0.5, "DOMAIN": 0.3, "RETRIEVAL": 0.3, "SCIENCE": 0.2, "CREATIVE": 0.2, "ROBUST": 0.8, "ETHICS": 0.9, "KNOWLEDGE": 0.3, "AUDIO": 0.2, "TRANSLATE": 0.2, "SUMMARY": 0.2, "GAME": 0.1, "MEDICAL": 0.3, "LEGAL": 0.5, "FINANCE": 0.2, "META": 0.5},
+  "RETRIEVAL":{"REASON": 0.5, "MATH": 0.3, "CODE": 0.4, "INSTRUCT": 0.4, "FACT": 0.8, "LONG": 0.7, "VISION": 0.3, "LANGUAGE": 0.4, "AGENT": 0.6, "DOMAIN": 0.5, "SAFETY": 0.3, "SCIENCE": 0.5, "CREATIVE": 0.2, "ROBUST": 0.3, "ETHICS": 0.2, "KNOWLEDGE": 0.8, "AUDIO": 0.2, "TRANSLATE": 0.3, "SUMMARY": 0.6, "GAME": 0.1, "MEDICAL": 0.4, "LEGAL": 0.4, "FINANCE": 0.4, "META": 0.5},
+  "SCIENCE":  {"REASON": 0.8, "MATH": 0.8, "CODE": 0.4, "INSTRUCT": 0.3, "FACT": 0.7, "LONG": 0.4, "VISION": 0.4, "LANGUAGE": 0.3, "AGENT": 0.3, "DOMAIN": 0.7, "SAFETY": 0.2, "RETRIEVAL": 0.5, "CREATIVE": 0.2, "ROBUST": 0.4, "ETHICS": 0.3, "KNOWLEDGE": 0.7, "AUDIO": 0.1, "TRANSLATE": 0.2, "SUMMARY": 0.4, "GAME": 0.3, "MEDICAL": 0.8, "LEGAL": 0.2, "FINANCE": 0.3, "META": 0.5},
+  "CREATIVE": {"REASON": 0.3, "MATH": 0.1, "CODE": 0.1, "INSTRUCT": 0.5, "FACT": 0.1, "LONG": 0.4, "VISION": 0.5, "LANGUAGE": 0.8, "AGENT": 0.2, "DOMAIN": 0.2, "SAFETY": 0.2, "RETRIEVAL": 0.2, "SCIENCE": 0.2, "ROBUST": 0.1, "ETHICS": 0.3, "KNOWLEDGE": 0.2, "AUDIO": 0.3, "TRANSLATE": 0.5, "SUMMARY": 0.4, "GAME": 0.3, "MEDICAL": 0.1, "LEGAL": 0.1, "FINANCE": 0.1, "META": 0.2},
+  "ROBUST":   {"REASON": 0.5, "MATH": 0.3, "CODE": 0.6, "INSTRUCT": 0.2, "FACT": 0.4, "LONG": 0.2, "VISION": 0.3, "LANGUAGE": 0.2, "AGENT": 0.5, "DOMAIN": 0.3, "SAFETY": 0.8, "RETRIEVAL": 0.3, "SCIENCE": 0.4, "CREATIVE": 0.1, "ETHICS": 0.5, "KNOWLEDGE": 0.4, "AUDIO": 0.2, "TRANSLATE": 0.2, "SUMMARY": 0.2, "GAME": 0.3, "MEDICAL": 0.3, "LEGAL": 0.3, "FINANCE": 0.3, "META": 0.6},
+  "ETHICS":   {"REASON": 0.6, "MATH": 0.1, "CODE": 0.2, "INSTRUCT": 0.4, "FACT": 0.4, "LONG": 0.2, "VISION": 0.2, "LANGUAGE": 0.4, "AGENT": 0.3, "DOMAIN": 0.4, "SAFETY": 0.9, "RETRIEVAL": 0.2, "SCIENCE": 0.3, "CREATIVE": 0.3, "ROBUST": 0.5, "KNOWLEDGE": 0.3, "AUDIO": 0.1, "TRANSLATE": 0.3, "SUMMARY": 0.3, "GAME": 0.1, "MEDICAL": 0.4, "LEGAL": 0.7, "FINANCE": 0.3, "META": 0.5},
+  "KNOWLEDGE":{"REASON": 0.7, "MATH": 0.4, "CODE": 0.3, "INSTRUCT": 0.3, "FACT": 0.9, "LONG": 0.5, "VISION": 0.2, "LANGUAGE": 0.4, "AGENT": 0.3, "DOMAIN": 0.6, "SAFETY": 0.3, "RETRIEVAL": 0.8, "SCIENCE": 0.7, "CREATIVE": 0.2, "ROBUST": 0.4, "ETHICS": 0.3, "AUDIO": 0.1, "TRANSLATE": 0.3, "SUMMARY": 0.5, "GAME": 0.2, "MEDICAL": 0.5, "LEGAL": 0.4, "FINANCE": 0.4, "META": 0.6},
+  "AUDIO":    {"REASON": 0.1, "MATH": 0.1, "CODE": 0.1, "INSTRUCT": 0.2, "FACT": 0.1, "LONG": 0.2, "VISION": 0.2, "LANGUAGE": 0.3, "AGENT": 0.2, "DOMAIN": 0.1, "SAFETY": 0.2, "RETRIEVAL": 0.2, "SCIENCE": 0.1, "CREATIVE": 0.3, "ROBUST": 0.2, "ETHICS": 0.1, "KNOWLEDGE": 0.1, "TRANSLATE": 0.4, "SUMMARY": 0.3, "GAME": 0.1, "MEDICAL": 0.2, "LEGAL": 0.1, "FINANCE": 0.1, "META": 0.2},
+  "TRANSLATE":{"REASON": 0.2, "MATH": 0.1, "CODE": 0.1, "INSTRUCT": 0.5, "FACT": 0.3, "LONG": 0.4, "VISION": 0.2, "LANGUAGE": 0.9, "AGENT": 0.2, "DOMAIN": 0.3, "SAFETY": 0.2, "RETRIEVAL": 0.3, "SCIENCE": 0.2, "CREATIVE": 0.5, "ROBUST": 0.2, "ETHICS": 0.3, "KNOWLEDGE": 0.3, "AUDIO": 0.4, "SUMMARY": 0.5, "GAME": 0.1, "MEDICAL": 0.2, "LEGAL": 0.3, "FINANCE": 0.2, "META": 0.2},
+  "SUMMARY":  {"REASON": 0.5, "MATH": 0.2, "CODE": 0.2, "INSTRUCT": 0.7, "FACT": 0.5, "LONG": 0.9, "VISION": 0.3, "LANGUAGE": 0.8, "AGENT": 0.3, "DOMAIN": 0.4, "SAFETY": 0.2, "RETRIEVAL": 0.6, "SCIENCE": 0.4, "CREATIVE": 0.4, "ROBUST": 0.2, "ETHICS": 0.3, "KNOWLEDGE": 0.5, "AUDIO": 0.3, "TRANSLATE": 0.5, "GAME": 0.1, "MEDICAL": 0.3, "LEGAL": 0.3, "FINANCE": 0.3, "META": 0.4},
+  "GAME":     {"REASON": 0.7, "MATH": 0.6, "CODE": 0.5, "INSTRUCT": 0.2, "FACT": 0.2, "LONG": 0.1, "VISION": 0.3, "LANGUAGE": 0.1, "AGENT": 0.5, "DOMAIN": 0.2, "SAFETY": 0.1, "RETRIEVAL": 0.1, "SCIENCE": 0.3, "CREATIVE": 0.3, "ROBUST": 0.3, "ETHICS": 0.1, "KNOWLEDGE": 0.2, "AUDIO": 0.1, "TRANSLATE": 0.1, "SUMMARY": 0.1, "MEDICAL": 0.1, "LEGAL": 0.1, "FINANCE": 0.4, "META": 0.3},
+  "MEDICAL":  {"REASON": 0.5, "MATH": 0.3, "CODE": 0.2, "INSTRUCT": 0.3, "FACT": 0.6, "LONG": 0.3, "VISION": 0.4, "LANGUAGE": 0.2, "AGENT": 0.3, "DOMAIN": 0.8, "SAFETY": 0.3, "RETRIEVAL": 0.4, "SCIENCE": 0.8, "CREATIVE": 0.1, "ROBUST": 0.3, "ETHICS": 0.4, "KNOWLEDGE": 0.5, "AUDIO": 0.2, "TRANSLATE": 0.2, "SUMMARY": 0.3, "GAME": 0.1, "LEGAL": 0.4, "FINANCE": 0.3, "META": 0.4},
+  "LEGAL":    {"REASON": 0.6, "MATH": 0.2, "CODE": 0.2, "INSTRUCT": 0.3, "FACT": 0.5, "LONG": 0.4, "VISION": 0.1, "LANGUAGE": 0.3, "AGENT": 0.3, "DOMAIN": 0.7, "SAFETY": 0.5, "RETRIEVAL": 0.4, "SCIENCE": 0.2, "CREATIVE": 0.1, "ROBUST": 0.3, "ETHICS": 0.7, "KNOWLEDGE": 0.4, "AUDIO": 0.1, "TRANSLATE": 0.3, "SUMMARY": 0.3, "GAME": 0.1, "MEDICAL": 0.4, "FINANCE": 0.6, "META": 0.3},
+  "FINANCE":  {"REASON": 0.5, "MATH": 0.7, "CODE": 0.3, "INSTRUCT": 0.3, "FACT": 0.5, "LONG": 0.3, "VISION": 0.2, "LANGUAGE": 0.2, "AGENT": 0.3, "DOMAIN": 0.7, "SAFETY": 0.2, "RETRIEVAL": 0.4, "SCIENCE": 0.3, "CREATIVE": 0.1, "ROBUST": 0.3, "ETHICS": 0.3, "KNOWLEDGE": 0.4, "AUDIO": 0.1, "TRANSLATE": 0.2, "SUMMARY": 0.3, "GAME": 0.4, "MEDICAL": 0.3, "LEGAL": 0.6, "META": 0.3},
+  "META":     {"REASON": 0.6, "MATH": 0.4, "CODE": 0.5, "INSTRUCT": 0.4, "FACT": 0.5, "LONG": 0.3, "VISION": 0.3, "LANGUAGE": 0.3, "AGENT": 0.5, "DOMAIN": 0.4, "SAFETY": 0.5, "RETRIEVAL": 0.5, "SCIENCE": 0.5, "CREATIVE": 0.2, "ROBUST": 0.6, "ETHICS": 0.5, "KNOWLEDGE": 0.6, "AUDIO": 0.2, "TRANSLATE": 0.2, "SUMMARY": 0.4, "GAME": 0.3, "MEDICAL": 0.4, "LEGAL": 0.3, "FINANCE": 0.3}
+}
+
+
+// ============================================================
+// Section 8: Helper functions
+// ============================================================
+
+// -- Stats recording --
+fn record_query(trit) {
+  hive_stats = dict_set(hive_stats, "queries", (dict_get(hive_stats, "queries") ?? 0) + 1)
+  let times = (dict_get(hive_stats, "query_times") ?? [])
+  times = append(times, time())
+  // Keep last 3600 entries
+  if3 (len(times) > 3600) { times = slice(times, len(times) - 3600, len(times))
+  }
+  hive_stats = dict_set(hive_stats, "query_times", times)
+  // Record to hive_history and trim to last 1000 entries
+  hive_history = append(hive_history, {"trit": trit, "t": time()})
+  if3 (len(hive_history) > 1000) { hive_history = slice(hive_history, len(hive_history) - 1000, len(hive_history))
+  }
+  if3 (trit == 1) { hive_stats = dict_set(hive_stats, "trits_pos", (dict_get(hive_stats, "trits_pos") ?? 0) + 1)
+  }
+  if3 (trit == 0) { hive_stats = dict_set(hive_stats, "trits_zero", (dict_get(hive_stats, "trits_zero") ?? 0) + 1)
+  }
+  if3 (trit == -1) { hive_stats = dict_set(hive_stats, "trits_neg", (dict_get(hive_stats, "trits_neg") ?? 0) + 1)
+  }
+}
+
+// -- Response trit --
+fn response_trit(result) {
+  if3 (type_of(result) != "dict") { return T_FALSE }
+  let ok = (dict_get(result, "ok") ?? false)
+  if3 (ok == false) { return T_FALSE }
+  let resp = (dict_get(result, "merged_response") ?? (dict_get(result, "merged") ?? (dict_get(result, "response") ?? (dict_get(result, "resp") ?? ""))))
+  if3 (type_of(resp) == "string") {
+    if3 (len(resp) > 50) { return T_TRUE }
+    if3 (len(resp) > 0) { return T_MAYBE }
+  }
+  return T_FALSE
+}
+
+// -- Hive Reynolds --
+fn hive_reynolds() {
+  let now = time()
+  let times = (dict_get(hive_stats, "query_times") ?? [])
+  let count = 0
+  let i = 0
+  while3 (i < len(times)) {
+    if3 (now - times[i] < 60) { count = count + 1
+    }
+    i = i + 1
+  }
+  return count
+}
+
+// -- Flow regime --
+fn flow_regime(re_num) {
+  if3 (re_num < RE_LAMINAR) { return "laminar" }
+  if3 (re_num < RE_TRANSITION) { return "transitional" }
+  if3 (re_num < RE_TURBULENT) { return "turbulent" }
+  return "chaotic"
+}
+
+// -- Ternary logic functions --
+fn trit_clamp(v) {
+  if3 (v > 0) { return 1 }
+  if3 (v < 0) { return -1 }
+  return 0
+}
+
+fn trit_not3(t) {
+  return 0 - t
+}
+
+fn trit_and3(a, b) {
+  return min(a, b)
+}
+
+fn trit_or3(a, b) {
+  return max(a, b)
+}
+
+fn trit_merge3(a, b) {
+  if3 (a == b) { return a }
+  if3 (a == 0) { return b }
+  if3 (b == 0) { return a }
+  return 0
+}
+
+fn bt_string(trits) {
+  let result = ""
+  let i = 0
+  while3 (i < len(trits)) {
+    if3 (trits[i] == 1) { result = result + "1" }
+    if3 (trits[i] == 0) { result = result + "0" }
+    if3 (trits[i] == -1) { result = result + "T" }
+    i = i + 1
+  }
+  return result
+}
+
+fn merge_ternary(trits) {
+  if3 (len(trits) == 0) { return 0 }
+  let s = sum(trits)
+  let n = len(trits)
+  if3 (s == n) { return 1 }
+  if3 (s == 0 - n) { return -1 }
+  let threshold = n / H3
+  if3 (s > threshold) { return 1 }
+  if3 (s < 0 - threshold) { return -1 }
+  return 0
+}
+
+// -- Standard deviation (manual, no statistics module) --
+fn stdev(vals) {
+  let n = len(vals)
+  if3 (n < 2) { return 0.0 }
+  let mean_val = sum(vals) / n
+  let sq_sum = 0
+  let i = 0
+  while3 (i < n) {
+    let diff = vals[i] - mean_val
+    sq_sum = sq_sum + diff * diff
+    i = i + 1
+  }
+  return sqrt(sq_sum / (n - 1))
+}
+
+// -- Ternary quantization --
+fn ternary_quantize(value) {
+  let HIGH_THRESH = 2.0 / H3
+  let LOW_THRESH = 1.0 / H3
+  if3 (value > HIGH_THRESH) { return 1 }
+  if3 (value < LOW_THRESH) { return -1 }
+  return 0
+}
+
+fn ternary_quantize_confidence(score) {
+  return ternary_quantize(score)
+}
+
+// -- Tryte packing --
+fn tryte_pack(trits) {
+  let result = []
+  let i = 0
+  while3 (i < len(trits)) {
+    let chunk = slice(trits, i, min(i + TRYTE_SIZE, len(trits)))
+    while3 (len(chunk) < TRYTE_SIZE) {
+      chunk = append(chunk, 0)
+    }
+    let val = 0
+    let j = 0
+    let pow3 = 1
+    while3 (j < TRYTE_SIZE) {
+      val = val + (chunk[j] + 1) * pow3
+      pow3 = pow3 * 3
+      j = j + 1
+    }
+    result = append(result, val)
+    i = i + TRYTE_SIZE
+  }
+  return result
+}
+
+fn tryte_unpack(packed, total_trits) {
+  let result = []
+  let i = 0
+  while3 (i < len(packed)) {
+    let val = packed[i]
+    let j = 0
+    while3 (j < TRYTE_SIZE) {
+      let digit = val - int(val / 3) * 3
+      result = append(result, digit - 1)
+      val = int(val / 3)
+      j = j + 1
+    }
+    i = i + 1
+  }
+  if3 (total_trits > 0) { result = slice(result, 0, total_trits)
+  }
+  return result
+}
+
+fn tryte_string(packed) {
+  let parts = []
+  let i = 0
+  while3 (i < len(packed)) {
+    let v = packed[i]
+    let d2 = int(v / 81)
+    let d1 = int((v - d2 * 81) / 9)
+    let d0 = v - d2 * 81 - d1 * 9
+    parts = append(parts, str(d2) + str(d1) + str(d0))
+    i = i + 1
+  }
+  return join(parts, ":")
+}
+
+
+// ============================================================
+// Section 9: Flattened class methods
+// ============================================================
+
+// -- ModelRegistry --
+fn registry_refresh() {
+  try3 {
+    let resp = http_get(OLLAMA_URL + "/api/tags")
+    let body = (dict_get(resp, "body") ?? str(resp))
+    let data = json_decode(body)
+    let models = (dict_get(data, "models") ?? [])
+    // Reset global registry (assign to global, not local)
+    registry_models = {}
+    let i = 0
+    while3 (i < len(models)) {
+      let m = models[i]
+      let name = (dict_get(m, "name") ?? "")
+      registry_models = dict_set(registry_models, name, {
+        "name": name,
+        "size": (dict_get(m, "size") ?? 0),
+        "modified": (dict_get(m, "modified_at") ?? "")
+      })
+      i = i + 1
+    }
+    // ── INJECT ALL CLOUD MODELS INTO REGISTRY ──
+    // ALL_CLOUD_MODELS has 469 cloud models from Tripple Mirror discovery
+    let ci2 = 0
+    while3 (ci2 < len(ALL_CLOUD_MODELS)) {
+      let cname = ALL_CLOUD_MODELS[ci2]
+      if3 (dict_has(registry_models, cname) == false) {
+        registry_models = dict_set(registry_models, cname, {"name": cname, "size": 0, "modified": "", "source": "cloud"})
+      }
+      ci2 = ci2 + 1
+    }
+    // ── INJECT DEEPSEEK CLOUD MODELS ──
+    let di2 = 0
+    while3 (di2 < len(DEEPSEEK_CLOUD_MODELS)) {
+      let dname = DEEPSEEK_CLOUD_MODELS[di2]
+      if3 (dict_has(registry_models, dname) == false) {
+        registry_models = dict_set(registry_models, dname, {"name": dname, "size": 0, "modified": "", "source": "cloud"})
+      }
+      di2 = di2 + 1
+    }
+    // ── INJECT DEEPSEEK LOCAL MODELS ──
+    let dl2 = 0
+    while3 (dl2 < len(DEEPSEEK_LOCAL_MODELS)) {
+      let dlname = DEEPSEEK_LOCAL_MODELS[dl2]
+      if3 (dict_has(registry_models, dlname) == false) {
+        registry_models = dict_set(registry_models, dlname, {"name": dlname, "size": 0, "modified": "", "source": "local"})
+      }
+      dl2 = dl2 + 1
+    }
+    print("[REGISTRY] Merged: " + str(len(registry_models)) + " total models (local + cloud)")
+    // Categorize all models AFTER loading
+    // CRITICAL: Rust VM requires `let x = append(x, val)` — bare `append(x, val)` is a no-op!
+    let code_cat = []
+    let math_cat = []
+    let reason_cat = []
+    let general_cat = []
+    let fast_cat = []
+    let all_cat = []
+    let all_keys = keys(registry_models)
+    let ci = 0
+    while3 (ci < len(all_keys)) {
+      let name = all_keys[ci]
+      let n = lower(name)
+      let base_name = split(name, ":")[0]
+      let is_excl = false
+      let ek = 0
+      while3 (ek < len(EXCLUDED_MODELS)) {
+        if3 (base_name == EXCLUDED_MODELS[ek]) { is_excl = true }
+        ek = ek + 1
+      }
+      if3 (is_excl == false) {
+        all_cat = append(all_cat, name)
+        if3 (contains(n, "code") || contains(n, "coder") || contains(n, "codellama") || contains(n, "codestral") || contains(n, "starcoder") || contains(n, "wizardcoder") || contains(n, "codegeex")) {
+          code_cat = append(code_cat, name)
+        }
+        if3 (contains(n, "math") || contains(n, "llemma") || contains(n, "numina")) {
+          math_cat = append(math_cat, name)
+        }
+        if3 (contains(n, "deepseek-r1") || contains(n, "qwq") || contains(n, "nous") || contains(n, "reflection") || contains(n, "phi-4")) {
+          reason_cat = append(reason_cat, name)
+        }
+        if3 (contains(n, "llama") || contains(n, "qwen") || contains(n, "gemma") || contains(n, "mistral") || contains(n, "phi") || contains(n, "dolphin") || contains(n, "command") || contains(n, "falcon") || contains(n, "solar") || contains(n, "nemotron")) {
+          general_cat = append(general_cat, name)
+        }
+        if3 (contains(n, "tinyllama") || contains(n, "smollm") || contains(n, "moondream") || contains(n, "granite") || contains(n, "orca-mini")) {
+          fast_cat = append(fast_cat, name)
+        }
+      }
+      ci = ci + 1
+    }
+    // Set all categories at once
+    registry_categories = {"code": code_cat, "math": math_cat, "reasoning": reason_cat, "general": general_cat, "creative": [], "analysis": [], "fast": fast_cat, "all": all_cat}
+    return len(registry_models)
+  } fail {
+    print("[HIVE] Registry refresh failed")
+    return 0
+  }
+}
+
+fn registry_categorize(name) {
+  let n = lower(name)
+  let base = split(name, ":")[0]
+  // Check exclusions
+  let k = 0
+  while3 (k < len(EXCLUDED_MODELS)) {
+    if3 (base == EXCLUDED_MODELS[k]) { return }
+    k = k + 1
+  }
+  let matched = false
+  let cat_list = []
+  // Code
+  let code_kws = ["code", "coder", "star", "phind", "codeup", "codegeex", "codellama", "codestral", "qwen2.5-coder", "deepseek-coder", "starcoder", "wizardcoder", "magicoder"]
+  let ci = 0
+  while3 (ci < len(code_kws)) {
+    if3 (contains(n, code_kws[ci])) { cat_list = (dict_get(registry_categories, "code") ?? [])
+      cat_list = append(cat_list, name)
+      registry_categories = dict_set(registry_categories, "code", cat_list)
+      matched = true
+    }
+    ci = ci + 1
+  }
+  // Math
+  let math_kws = ["math", "wizard-math", "mathstral", "metamath", "llemma", "numina"]
+  let mi = 0
+  while3 (mi < len(math_kws)) {
+    if3 (contains(n, math_kws[mi])) { cat_list = (dict_get(registry_categories, "math") ?? [])
+      cat_list = append(cat_list, name)
+      registry_categories = dict_set(registry_categories, "math", cat_list)
+      matched = true
+    }
+    mi = mi + 1
+  }
+  // Reasoning
+  let reason_kws = ["deepseek-r1", "qwq", "marco", "nous", "neural", "reflection", "phi-4", "gemma2"]
+  let ri = 0
+  while3 (ri < len(reason_kws)) {
+    if3 (contains(n, reason_kws[ri])) { cat_list = (dict_get(registry_categories, "reasoning") ?? [])
+      cat_list = append(cat_list, name)
+      registry_categories = dict_set(registry_categories, "reasoning", cat_list)
+      matched = true
+    }
+    ri = ri + 1
+  }
+  // General
+  let gen_kws = ["mixtral", "qwen", "llama", "command", "dolphin", "yi", "solar", "mistral", "gemma", "phi", "nemotron", "internlm", "glm4"]
+  let gi = 0
+  while3 (gi < len(gen_kws)) {
+    if3 (contains(n, gen_kws[gi])) { cat_list = (dict_get(registry_categories, "general") ?? [])
+      cat_list = append(cat_list, name)
+      registry_categories = dict_set(registry_categories, "general", cat_list)
+      matched = true
+    }
+    gi = gi + 1
+  }
+  // Fast
+  let fast_kws = ["tinyllama", "orca-mini", "stable-code", "granite", "phi-2", "smollm", "moondream"]
+  let fi = 0
+  while3 (fi < len(fast_kws)) {
+    if3 (contains(n, fast_kws[fi])) { cat_list = (dict_get(registry_categories, "fast") ?? [])
+      cat_list = append(cat_list, name)
+      registry_categories = dict_set(registry_categories, "fast", cat_list)
+      matched = true
+    }
+    fi = fi + 1
+  }
+  if3 (matched == false) { cat_list = (dict_get(registry_categories, "general") ?? [])
+    cat_list = append(cat_list, name)
+    registry_categories = dict_set(registry_categories, "general", cat_list)
+  }
+}
+
+fn registry_get_swarm(task_type, count) {
+  let pool = (dict_get(registry_categories, task_type) ?? (dict_get(registry_categories, "all") ?? []))
+  if3 (len(pool) == 0) {
+    pool = (dict_get(registry_categories, "general") ?? [])
+  }
+  // Filter excluded — bare assignment inside if3, let x = append(x,v) pattern
+  let filtered = []
+  let i = 0
+  while3 (i < len(pool)) { let base = split(pool[i], ":")[0]
+    let excluded = false
+    let j = 0
+    while3 (j < len(EXCLUDED_MODELS)) {
+      if3 (base == EXCLUDED_MODELS[j]) { excluded = true }
+      j = j + 1
+    }
+    if3 (excluded == false) { filtered = append(filtered, pool[i]) }
+    i = i + 1
+  }
+  if3 (len(filtered) > count) {
+    return slice(filtered, 0, count)
+  }
+  return filtered
+}
+
+// -- TernaryEngine --
+fn ternary_init() {
+  // Quantize CHANNEL_ADJACENCY floats into trits
+  let ch_names = keys(CHANNEL_ADJACENCY)
+  let i = 0
+  while3 (i < len(ch_names)) {
+    let ch = ch_names[i]
+    let neighbors = (dict_get(CHANNEL_ADJACENCY, ch) ?? {})
+    let trit_neighbors = {}
+    let n_keys = keys(neighbors)
+    let j = 0
+    while3 (j < len(n_keys)) {
+      let nch = n_keys[j]
+      let weight = (dict_get(neighbors, nch) ?? 0.0)
+      trit_neighbors = dict_set(trit_neighbors, nch, ternary_quantize(weight))
+      j = j + 1
+    }
+    ternary_adj = dict_set(ternary_adj, ch, trit_neighbors)
+    i = i + 1
+  }
+}
+
+fn ternary_get_activated(source_channel) {
+  let adj = (dict_get(ternary_adj, source_channel) ?? {})
+  let activated = []
+  let ch_keys = keys(adj)
+  let i = 0
+  while3 (i < len(ch_keys)) {
+    if3 ((dict_get(adj, ch_keys[i]) ?? 0) == 1) {
+      activated = append(activated, ch_keys[i])
+    }
+    i = i + 1
+  }
+  return activated
+}
+
+fn ternary_get_suppressed(source_channel) {
+  let adj = (dict_get(ternary_adj, source_channel) ?? {})
+  let suppressed = []
+  let ch_keys = keys(adj)
+  let i = 0
+  while3 (i < len(ch_keys)) {
+    if3 ((dict_get(adj, ch_keys[i]) ?? 0) == -1) {
+      suppressed = append(suppressed, ch_keys[i])
+    }
+    i = i + 1
+  }
+  return suppressed
+}
+
+fn ternary_route(source_channel, cross_signals) {
+  let adj = (dict_get(ternary_adj, source_channel) ?? {})
+  let candidates = {}
+  let ch_keys = keys(adj)
+  let i = 0
+  while3 (i < len(ch_keys)) {
+    let ch = ch_keys[i]
+    let trit = (dict_get(adj, ch) ?? 0)
+    if3 (trit == 1) { candidates = dict_set(candidates, ch, 1.0) }
+    if3 (trit == 0) { candidates = dict_set(candidates, ch, 0.0) }
+    i = i + 1
+  }
+  // Integrate cross signals
+  if3 (type_of(cross_signals) == "list") { let si = 0
+    while3 (si < len(cross_signals)) {
+      let sig = cross_signals[si]
+      let sig_ch = sig[0]
+      let sig_conf = sig[1]
+      if3 (dict_has(candidates, sig_ch)) {
+        candidates = dict_set(candidates, sig_ch, (dict_get(candidates, sig_ch) ?? 0) + sig_conf)
+      }
+      si = si + 1
+    }
+  }
+  // Filter by threshold 1/H3
+  let result = []
+  let rkeys = keys(candidates)
+  let ri = 0
+  while3 (ri < len(rkeys)) {
+    let score = (dict_get(candidates, rkeys[ri]) ?? 0)
+    if3 (score > 1.0 / H3) {
+      result = append(result, [rkeys[ri], score])
+    }
+    ri = ri + 1
+  }
+  // Sort by score descending (simple bubble sort)
+  let si = 0
+  while3 (si < len(result)) {
+    let sj = si + 1
+    while3 (sj < len(result)) {
+      if3 (result[sj][1] > result[si][1]) { let tmp = result[si]
+        result = list_set(result, si, result[sj])
+        result = list_set(result, sj, tmp)
+      }
+      sj = sj + 1
+    }
+    si = si + 1
+  }
+  return result
+}
+
+fn ternary_vote(responses_with_scores) {
+  let agreed = []
+  let abstained = []
+  let disagreed = []
+  let vote_trits = []
+  let i = 0
+  while3 (i < len(responses_with_scores)) {
+    let entry = responses_with_scores[i]
+    let text = entry[0]
+    let score = entry[1]
+    let trit = ternary_quantize_confidence(score)
+    vote_trits = append(vote_trits, trit)
+    if3 (trit == 1) { agreed = append(agreed, entry) }
+    if3 (trit == -1) { disagreed = append(disagreed, entry) }
+    if3 (trit == 0) { abstained = append(abstained, entry) }
+    i = i + 1
+  }
+  let total = len(responses_with_scores)
+  if3 (total == 0) { total = 1 }
+  let confidence_ratio = round(len(agreed) / total, 3)
+  let consensus = merge_ternary(vote_trits)
+  return {
+    "agreed_count": len(agreed),
+    "abstained_count": len(abstained),
+    "disagreed_count": len(disagreed),
+    "consensus_trit": consensus,
+    "confidence_ratio": confidence_ratio,
+    "trit_distribution": {"+1": len(agreed), "0": len(abstained), "-1": len(disagreed)}
+  }
+}
+
+fn ternary_synthesize(channel_results) {
+  let agreed = []
+  let neutral = []
+  let suppressed = []
+  let i = 0
+  while3 (i < len(channel_results)) {
+    let r = channel_results[i]
+    let trit = ternary_quantize_confidence((dict_get(r, "score") ?? 0.5))
+    if3 (trit == 1) { agreed = append(agreed, r) }
+    if3 (trit == -1) { suppressed = append(suppressed, r) }
+    if3 (trit == 0) { neutral = append(neutral, r) }
+    i = i + 1
+  }
+  let anchor = ""
+  if3 (len(agreed) > 0) { anchor = (dict_get(agreed[0], "response") ?? "")
+  }
+  return {
+    "anchor_response": anchor,
+    "+1_channels": len(agreed),
+    "0_channels": len(neutral),
+    "-1_channels": len(suppressed),
+    "total": len(channel_results)
+  }
+}
+
+fn ternary_adjacency_stats() {
+  let total = 0
+  let pos = 0
+  let neg = 0
+  let zero = 0
+  let ch_keys = keys(ternary_adj)
+  let i = 0
+  while3 (i < len(ch_keys)) {
+    let neighbors = (dict_get(ternary_adj, ch_keys[i]) ?? {})
+    let n_keys = keys(neighbors)
+    let j = 0
+    while3 (j < len(n_keys)) {
+      let trit = (dict_get(neighbors, n_keys[j]) ?? 0)
+      total = total + 1
+      if3 (trit == 1) { pos = pos + 1 }
+      if3 (trit == -1) { neg = neg + 1 }
+      if3 (trit == 0) { zero = zero + 1 }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  let skip_ratio = 0
+  if3 (total > 0) { skip_ratio = round(zero / total, 3) }
+  return {
+    "total_connections": total,
+    "activated_pos": pos,
+    "neutral_zero": zero,
+    "suppressed_neg": neg,
+    "skip_ratio": skip_ratio
+  }
+}
+
+// -- ModulationEngine --
+fn modulation_init() {
+  let ch_keys = keys(FLOW_CHANNELS)
+  let i = 0
+  while3 (i < len(ch_keys)) {
+    mod_channel_snr = dict_set(mod_channel_snr, ch_keys[i], 0.5)
+    mod_channel_ber = dict_set(mod_channel_ber, ch_keys[i], 0.0)
+    mod_query_count = dict_set(mod_query_count, ch_keys[i], 0)
+    i = i + 1
+  }
+}
+
+fn modulation_estimate_snr(channel) {
+  let snr = (dict_get(mod_channel_snr, channel) ?? 0.5)
+  let ber = (dict_get(mod_channel_ber, channel) ?? 0.0)
+  return snr / (1.0 + ber)
+}
+
+fn modulation_update_channel(channel, quality_score, success) {
+  let alpha = 1.0 / H3
+  let old_snr = (dict_get(mod_channel_snr, channel) ?? 0.5)
+  let new_snr = (1 - alpha) * old_snr + alpha * quality_score
+  mod_channel_snr = dict_set(mod_channel_snr, channel, new_snr)
+  let old_ber = (dict_get(mod_channel_ber, channel) ?? 0.0)
+  if3 (success == false) { let new_ber = min(1.0, old_ber + 1.0 / H13)
+    mod_channel_ber = dict_set(mod_channel_ber, channel, new_ber)
+  } else3 { let new_ber = max(0.0, old_ber - 1.0 / (H13 * 2))
+    mod_channel_ber = dict_set(mod_channel_ber, channel, new_ber)
+  }
+  mod_query_count = dict_set(mod_query_count, channel, (dict_get(mod_query_count, channel) ?? 0) + 1)
+  mod_total_queries = mod_total_queries + 1
+}
+
+fn modulation_select_scheme(channel) {
+  let snr = modulation_estimate_snr(channel)
+  let best = "BPSK"
+  let i = 0
+  while3 (i < len(MOD_SCHEME_ORDER)) {
+    let scheme_name = MOD_SCHEME_ORDER[i]
+    let scheme = (dict_get(MOD_SCHEMES, scheme_name) ?? {})
+    if3 (snr >= (dict_get(scheme, "snr_min") ?? 0)) { best = scheme_name
+    }
+    i = i + 1
+  }
+  return best
+}
+
+fn modulation_select_for_reynolds(regime) {
+  if3 (regime == "chaotic") { return "1024QAM" }
+  if3 (regime == "turbulent") { return "64QAM" }
+  if3 (regime == "transitional") { return "16QAM" }
+  return "BPSK"
+}
+
+fn modulation_link_budget() {
+  let snr_vals = values(mod_channel_snr)
+  let ber_vals = values(mod_channel_ber)
+  let avg_snr = 0.5
+  let avg_ber = 0.0
+  if3 (len(snr_vals) > 0) { avg_snr = sum(snr_vals) / len(snr_vals) }
+  if3 (len(ber_vals) > 0) { avg_ber = sum(ber_vals) / len(ber_vals) }
+  return {
+    "total_queries": mod_total_queries,
+    "avg_snr": round(avg_snr, 3),
+    "avg_ber": round(avg_ber, 4)
+  }
+}
+
+// -- NavierStokesEngine --
+fn ns_init() {
+  let ch_keys = keys(FLOW_CHANNELS)
+  let i = 0
+  while3 (i < len(ch_keys)) {
+    ns_backpressure = dict_set(ns_backpressure, ch_keys[i], 0.0)
+    ns_momentum = dict_set(ns_momentum, ch_keys[i], {"context": "", "magnitude": 0.0})
+    i = i + 1
+  }
+}
+
+fn ns_compute_energy(model_count, latency_ms, queue_pressure, complexity_cost) {
+  let kinetic = 0.5 * model_count * (latency_ms / 1000.0) * (latency_ms / 1000.0)
+  let pressure = queue_pressure / max(model_count, 1)
+  let potential = complexity_cost * 0.5
+  let total = kinetic + pressure + potential
+  let result = {
+    "kinetic": round(kinetic, 4),
+    "pressure": round(pressure, 4),
+    "potential": round(potential, 4),
+    "total": round(total, 4)
+  }
+  ns_energy_history = append(ns_energy_history, result)
+  if3 (len(ns_energy_history) > 100) {
+    ns_energy_history = slice(ns_energy_history, len(ns_energy_history) - 100, len(ns_energy_history))
+  }
+  ns_total_computed = ns_total_computed + 1
+  return result
+}
+
+fn ns_viscous_damping(scores_list) {
+  let nu = 1.0 / H7
+  if3 (len(scores_list) < 2) { return scores_list }
+  let smoothed = []
+  let i = 0
+  while3 (i < len(scores_list)) {
+    let left_val = scores_list[i]
+    if3 (i > 0) { left_val = scores_list[i - 1] }
+    let right_val = scores_list[i]
+    if3 (i < len(scores_list) - 1) { right_val = scores_list[i + 1] }
+    let laplacian = (left_val + right_val) / 2.0 - scores_list[i]
+    let damped = scores_list[i] + nu * laplacian
+    smoothed = append(smoothed, round(damped, 4))
+    i = i + 1
+  }
+  return smoothed
+}
+
+fn ns_compute_backpressure(channel) {
+  let pressure = min(ns_ollama_queue_depth / H5, 1.0)
+  ns_backpressure = dict_set(ns_backpressure, channel, pressure)
+  let recommendation = "local"
+  if3 (pressure > 2.0 / H3) { recommendation = "cloud" }
+  if3 (pressure > 1.0 / H3) {
+    if3 (recommendation == "local") { recommendation = "balanced" }
+  }
+  return {"channel": channel, "pressure_level": round(pressure, 3), "recommendation": recommendation}
+}
+
+fn ns_get_flow_field() {
+  return {
+    "backpressure": ns_backpressure,
+    "ollama_queue_depth": ns_ollama_queue_depth,
+    "total_computed": ns_total_computed,
+    "recent_energy_count": len(ns_energy_history)
+  }
+}
+
+fn ns_status() {
+  return {
+    "total_computed": ns_total_computed,
+    "ollama_queue_depth": ns_ollama_queue_depth,
+    "energy_history_len": len(ns_energy_history)
+  }
+}
+
+// -- BenchmarkCluster --
+fn cluster_assign_models() {
+  let all_local = keys(registry_models)
+  let ch_names = keys(FLOW_CHANNELS)
+  let i = 0
+  while3 (i < len(ch_names)) {
+    let ch_name = ch_names[i]
+    let ch_def = (dict_get(FLOW_CHANNELS, ch_name) ?? {})
+    let patterns = (dict_get(ch_def, "local_patterns") ?? [])
+    let cloud_models_list = (dict_get(ch_def, "cloud_models") ?? [])
+    // Match local models by pattern
+    let local_matches = []
+    let li = 0
+    while3 (li < len(all_local)) {
+      let model = all_local[li]
+      let n = lower(model)
+      let pi = 0
+      while3 (pi < len(patterns)) {
+        if3 (contains(n, patterns[pi])) {
+          local_matches = append(local_matches, model)
+          pi = len(patterns)
+        }
+        pi = pi + 1
+      }
+      li = li + 1
+    }
+    // Filter cloud models to those in master list
+    let cloud_matches = []
+    let ci = 0
+    while3 (ci < len(cloud_models_list)) {
+      let cm = cloud_models_list[ci]
+      let cj = 0
+      while3 (cj < len(ALL_CLOUD_MODELS)) {
+        if3 (cm == ALL_CLOUD_MODELS[cj]) {
+          cloud_matches = append(cloud_matches, cm)
+          cj = len(ALL_CLOUD_MODELS)
+        }
+        cj = cj + 1
+      }
+      ci = ci + 1
+    }
+    cluster_channels = dict_set(cluster_channels, ch_name, {"local": local_matches, "cloud": cloud_matches})
+    i = i + 1
+  }
+}
+
+fn cluster_get_channel_for_query(prompt) {
+  let prompt_lower = lower(prompt)
+  let best_ch = "REASON"
+  let best_score = 0
+  let ch_names = keys(CHANNEL_KEYWORDS)
+  let i = 0
+  while3 (i < len(ch_names)) {
+    let ch = ch_names[i]
+    let kws = (dict_get(CHANNEL_KEYWORDS, ch) ?? [])
+    let score = 0
+    let j = 0
+    while3 (j < len(kws)) {
+      if3 (contains(prompt_lower, kws[j])) { score = score + 1
+      }
+      j = j + 1
+    }
+    if3 (score > best_score) { best_score = score
+      best_ch = ch
+    }
+    i = i + 1
+  }
+  return best_ch
+}
+
+fn cluster_status() {
+  let result = {}
+  let total_local = 0
+  let total_cloud = 0
+  let ch_names = keys(FLOW_CHANNELS)
+  let i = 0
+  while3 (i < len(ch_names)) {
+    let ch_name = ch_names[i]
+    let ch_data = (dict_get(cluster_channels, ch_name) ?? {"local": [], "cloud": []})
+    let n_local = len((dict_get(ch_data, "local") ?? []))
+    let n_cloud = len((dict_get(ch_data, "cloud") ?? []))
+    total_local = total_local + n_local
+    total_cloud = total_cloud + n_cloud
+    result = dict_set(result, ch_name, {"local": n_local, "cloud": n_cloud, "total": n_local + n_cloud})
+    i = i + 1
+  }
+  result = dict_set(result, "_summary", {"channels": len(ch_names), "total_local": total_local, "total_cloud": total_cloud})
+  return result
+}
+
+// -- Calculate Reynolds --
+fn calculate_reynolds(prompt) {
+  let words = split(prompt, " ")
+  let word_count = len(words)
+  let prompt_lower = lower(prompt)
+  // Density
+  let complexity = 0
+  // Count commas, semicolons, questions
+  let ci = 0
+  while3 (ci < len(prompt_lower)) {
+    let ch = slice(prompt_lower, ci, ci + 1)
+    if3 (ch == ",") { complexity = complexity + 2 }
+    if3 (ch == ";") { complexity = complexity + H3 }
+    if3 (ch == "?") { complexity = complexity + H5 }
+    ci = ci + 1
+  }
+  let density = max(1, word_count + complexity)
+  // Velocity
+  let velocity = 1.0
+  if3 (contains(prompt_lower, "step by step")) { velocity = H5 / 2.0 }
+  if3 (contains(prompt_lower, "detailed")) { velocity = H5 / 2.0 }
+  if3 (contains(prompt_lower, "explain")) { velocity = H5 / H3 }
+  if3 (contains(prompt_lower, "quick")) { velocity = 0.5 }
+  if3 (contains(prompt_lower, "brief")) { velocity = 0.5 }
+  // Length
+  let length = max(1, len(prompt) / 10)
+  // Viscosity
+  let viscosity = H5 / H3
+  if3 (contains(prompt_lower, "medical")) { viscosity = viscosity + 0.3 }
+  if3 (contains(prompt_lower, "legal")) { viscosity = viscosity + 0.3 }
+  if3 (contains(prompt_lower, "quantum")) { viscosity = viscosity + 0.4 }
+  // Reynolds
+  let re = (density * velocity * length) / viscosity
+  // Classify regime
+  let regime = "laminar"
+  let config = {"models": 1, "deliberate": false}
+  if3 (re >= RE_TURBULENT) { regime = "chaotic"
+    config = {"models": MAX_PARALLEL, "deliberate": true}
+  }
+  if3 (re >= RE_TRANSITION) {
+    if3 (re < RE_TURBULENT) { regime = "turbulent"
+      config = {"models": H5 * H3, "deliberate": true}
+    }
+  }
+  if3 (re >= RE_LAMINAR) {
+    if3 (re < RE_TRANSITION) { regime = "transitional"
+      config = {"models": H5, "deliberate": false}
+    }
+  }
+  return {"re": re, "regime": regime, "config": config}
+}
+
+// -- HiveMind query functions --
+fn hive_query_model(model_name, prompt, system_prompt) {
+  // CRITICAL: json_encode + http_post doesn't produce valid JSON for Ollama
+  // Must build JSON string manually with "stream":false hardcoded
+  let esc_prompt = replace(replace(replace(replace(prompt, "\\", "\\\\"), "\"", "\\\""), "\n", " "), "\r", " ")
+  let esc_system = replace(replace(replace(replace(system_prompt, "\\", "\\\\"), "\"", "\\\""), "\n", " "), "\r", " ")
+  let payload = "{\"model\":\"" + model_name + "\",\"prompt\":\"" + esc_prompt + "\",\"system\":\"" + esc_system + "\",\"stream\":false,\"options\":{\"num_predict\":4096,\"temperature\":0.7}}"
+  try3 {
+    let t0 = time()
+    let resp = http_post(OLLAMA_URL + "/api/generate", payload)
+    let elapsed = round((time() - t0) * 1000)
+    // http_post returns {ok, status, body} — extract body before json_decode
+    let body = (dict_get(resp, "body") ?? str(resp))
+    let data = json_decode(body)
+    let response_text = (dict_get(data, "response") ?? "")
+    let has_error = dict_has(data, "error")
+    if3 (has_error == true) { return {"model": model_name, "response": "", "time_ms": elapsed, "ok": false, "source": "local", "error": (dict_get(data, "error") ?? "")} }
+    return {"model": model_name, "response": response_text, "time_ms": elapsed, "tokens": (dict_get(data, "eval_count") ?? 0), "ok": true, "source": "local"}
+  } fail {
+    return {"model": model_name, "response": "", "time_ms": 0, "ok": false, "source": "local"}
+  }
+}
+
+fn hive_query_cloud(model_id, prompt, system_prompt) {
+  let actual_model = model_id
+  let provider = "openrouter"
+  if3 (starts_with(model_id, "openai:")) {
+    provider = "openai"
+    let parts = split(model_id, ":")
+    if3 (len(parts) >= 2) { actual_model = parts[1] }
+  }
+  if3 (starts_with(model_id, "cloud:")) { let parts = split(model_id, ":")
+    if3 (len(parts) >= 3) {
+      provider = parts[1]
+      actual_model = parts[2]
+    }
+  }
+  // Check rate limit
+  let rate_state = (dict_get(provider_rate_state, provider) ?? {})
+  let is_limited = (dict_get(rate_state, "limited") ?? false)
+  if3 (is_limited == true) { let since = (dict_get(rate_state, "since") ?? 0)
+    if3 (time() - since < H13 * 60) {
+      return {"model": model_id, "response": "", "time_ms": 0, "ok": false, "source": "cloud", "error": "rate_limited"}
+    }
+  }
+  let esc_prompt = replace(replace(replace(prompt, "\\", "\\\\"), "\"", "\\\""), "\n", " ")
+  let payload = "{\"prompt\":\"" + esc_prompt + "\",\"provider\":\"" + provider + "\"}"
+  let headers = {"Content-Type": "application/json"}
+  try3 {
+    let t0 = time()
+    let resp = http_post_headers(CLOUD_ROUTER_URL + "/query", payload, headers, 45000)
+    let elapsed = round((time() - t0) * 1000)
+    let body_str = (dict_get(resp, "body") ?? "")
+    if3 (len(body_str) == 0) { body_str = str(resp) }
+    // Sanitize control chars before JSON parse
+    let clean = replace(replace(replace(body_str, "\n", " "), "\r", " "), "\t", " ")
+    let data = try3 { json_decode(clean) } fail { {} }
+    // Cloud router returns {ok, result: {response, tokens, ...}}
+    let res = (dict_get(data, "result") ?? {})
+    let text = (dict_get(res, "response") ?? "")
+    if3 (len(text) == 0) { text = (dict_get(data, "response") ?? "") }
+    let tok = (dict_get(res, "tokens") ?? 0)
+    print("[HIVE-CLOUD] " + provider + " -> " + str(len(text)) + " chars, " + str(tok) + " tokens")
+    return {"model": model_id, "response": text, "time_ms": elapsed, "tokens": tok, "ok": len(text) > 0, "source": "cloud", "provider": provider}
+  } fail {
+    print("[HIVE-CLOUD] " + provider + " -> FAILED (try3 caught)")
+    return {"model": model_id, "response": "", "time_ms": 0, "ok": false, "source": "cloud", "error": "http_or_parse_failed"}
+  }
+}
+
+// -- Parallel scatter via helper --
+fn hive_scatter(models, prompt, system_prompt, timeout, early_return) {
+  // Scatter across BOTH local and cloud models
+  let results = []
+  let ok_count = 0
+  let t0 = time()
+  let i = 0
+  while3 (i < len(models)) {
+    let model_name = models[i]
+    // Detect cloud vs local: check prefix OR registry source
+    let is_cloud = false
+    if3 (starts_with(model_name, "cloud:")) { is_cloud = true }
+    if3 (starts_with(model_name, "openai:")) { is_cloud = true }
+    if3 (starts_with(model_name, "anthropic:")) { is_cloud = true }
+    if3 (starts_with(model_name, "google:")) { is_cloud = true }
+    if3 (is_cloud == false) {
+      let model_info = (dict_get(registry_models, model_name) ?? {})
+      let src = (dict_get(model_info, "source") ?? "local")
+      if3 (src == "cloud") { is_cloud = true }
+    }
+    let r = {}
+    if3 (is_cloud == true) {
+      // Route cloud models through the cloud router
+      r = hive_query_cloud(model_name, prompt, system_prompt)
+    } else3 {
+      // Local Ollama models — direct query
+      r = hive_query_model(model_name, prompt, system_prompt)
+    }
+    results = append(results, r)
+    if3 ((dict_get(r, "ok") ?? false) == true) {
+      ok_count = ok_count + 1
+    }
+    // Early return if we have enough good results
+    if3 (ok_count >= early_return) { i = len(models)
+    }
+    // Timeout check
+    if3 ((time() - t0) * 1000 > timeout * 1000) { i = len(models) }
+    i = i + 1
+  }
+  let total_ms = round((time() - t0) * 1000)
+  return {"results": results, "ok_count": ok_count, "total_ms": total_ms}
+}
+
+// -- Merge responses --
+fn hive_merge_responses(results, prompt) {
+  if3 (len(results) == 0) { return "No models responded." }
+  if3 (len(results) == 1) {
+    return (dict_get(results[0], "response") ?? "")
+  }
+  hive_state = dict_set(hive_state, "merge_count", (dict_get(hive_state, "merge_count") ?? 0) + 1)
+  // Classify each response
+  let classified = []
+  let i = 0
+  while3 (i < len(results)) {
+    let r = results[i]
+    let resp = (dict_get(r, "response") ?? "")
+    let ms = (dict_get(r, "time_ms") ?? 9999)
+    let q = 0.0
+    q = q + min(len(resp) / 500, 1.0) * 0.5
+    q = q + max(0, 1.0 - ms / 5000) * 0.3
+    if3 (contains(lower(resp), "because")) { q = q + 0.05 }
+    if3 (contains(lower(resp), "therefore")) { q = q + 0.05 }
+    if3 (contains(lower(resp), "step")) { q = q + 0.05 }
+    let trit = ternary_quantize(q)
+    classified = append(classified, {"response": resp, "trit": trit, "quality": round(q, 3)})
+    i = i + 1
+  }
+  // Sort: best trit and quality first (simple selection sort)
+  let si = 0
+  while3 (si < len(classified)) {
+    let best_idx = si
+    let sj = si + 1
+    while3 (sj < len(classified)) {
+      let a = classified[sj]
+      let b = classified[best_idx]
+      if3 ((dict_get(a, "trit") ?? 0) > (dict_get(b, "trit") ?? 0)) {
+        best_idx = sj
+      }
+      if3 ((dict_get(a, "trit") ?? 0) == (dict_get(b, "trit") ?? 0)) {
+        if3 ((dict_get(a, "quality") ?? 0) > (dict_get(b, "quality") ?? 0)) {
+          best_idx = sj
+        }
+      }
+      sj = sj + 1
+    }
+    if3 (best_idx != si) { let tmp = classified[si]
+      // swap
+      classified = list_set(classified, si, classified[best_idx])
+      classified = list_set(classified, best_idx, tmp)
+    }
+    si = si + 1
+  }
+  // Get best response
+  let merged = (dict_get(classified[0], "response") ?? "")
+  return trim(merged)
+}
+
+// -- Similarity check --
+fn text_similarity(a, b) {
+  if3 (len(a) == 0) { return 0 }
+  if3 (len(b) == 0) { return 0 }
+  let a_words = split(lower(a), " ")
+  let b_words = split(lower(b), " ")
+  // Count overlap
+  let overlap = 0
+  let i = 0
+  while3 (i < len(a_words)) {
+    let j = 0
+    while3 (j < len(b_words)) {
+      if3 (a_words[i] == b_words[j]) { overlap = overlap + 1
+        j = len(b_words)
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return overlap / max(len(a_words), len(b_words))
+}
+
+// -- Cluster query (main entry point) --
+fn hive_cluster_query(prompt, channel, force_regime) {
+  let t_start = time()
+  hive_state = dict_set(hive_state, "total_queries", (dict_get(hive_state, "total_queries") ?? 0) + 1)
+  // Auto-detect channel
+  if3 (len(channel) == 0) { channel = cluster_get_channel_for_query(prompt)
+  }
+  channel = upper(channel)
+  if3 (dict_has(FLOW_CHANNELS, channel) == false) { channel = "REASON" }
+  // Calculate Reynolds
+  let re_result = calculate_reynolds(prompt)
+  let re_num = (dict_get(re_result, "re") ?? 0)
+  let regime = (dict_get(re_result, "regime") ?? "laminar")
+  let regime_config = (dict_get(re_result, "config") ?? {"models": 1, "deliberate": false})
+  if3 (len(force_regime) > 0) { regime = force_regime
+    if3 (force_regime == "laminar") { regime_config = {"models": 1, "deliberate": false} }
+    if3 (force_regime == "transitional") { regime_config = {"models": 5, "deliberate": false} }
+    if3 (force_regime == "turbulent") { regime_config = {"models": 15, "deliberate": true} }
+    if3 (force_regime == "chaotic") { regime_config = {"models": MAX_PARALLEL, "deliberate": true} }
+  }
+  // Get channel system prompt
+  let ch_def = (dict_get(FLOW_CHANNELS, channel) ?? {})
+  let system = (dict_get(ch_def, "system") ?? "You are a helpful AI assistant.")
+  // Get model pools
+  let ch_data = (dict_get(cluster_channels, channel) ?? {"local": [], "cloud": []})
+  let local_pool = (dict_get(ch_data, "local") ?? [])
+  let cloud_pool = (dict_get(ch_data, "cloud") ?? [])
+  // Limit models based on regime
+  let max_models = (dict_get(regime_config, "models") ?? 5)
+  let models_to_query = []
+  // Add local models
+  let li = 0
+  while3 (li < len(local_pool)) {
+    if3 (len(models_to_query) < max_models) {
+      models_to_query = append(models_to_query, local_pool[li])
+    }
+    li = li + 1
+  }
+  // Add cloud models
+  let ci = 0
+  while3 (ci < len(cloud_pool)) {
+    if3 (len(models_to_query) < max_models) {
+      models_to_query = append(models_to_query, cloud_pool[ci])
+    }
+    ci = ci + 1
+  }
+  // Scatter via helper for parallelism
+  let scatter_result = hive_scatter(models_to_query, prompt, system, MERGE_TIMEOUT, H7)
+  let results = (dict_get(scatter_result, "results") ?? [])
+  let ok_results = []
+  let i = 0
+  while3 (i < len(results)) {
+    let r = results[i]
+    if3 ((dict_get(r, "ok") ?? false) == true) {
+      if3 (len((dict_get(r, "response") ?? "")) > 0) {
+        ok_results = append(ok_results, r)
+      }
+    }
+    i = i + 1
+  }
+  // Merge
+  let final_response = hive_merge_responses(ok_results, prompt)
+  let total_ms = round((time() - t_start) * 1000)
+  // Record query
+  let trit = response_trit({"ok": true, "response": final_response})
+  record_query(trit)
+  return {
+    "response": final_response,
+    "channel": channel,
+    "reynolds": round(re_num, 1),
+    "regime": regime,
+    "models_queried": len(models_to_query),
+    "models_responded": len(ok_results),
+    "local_models": len(local_pool),
+    "cloud_models": len(cloud_pool),
+    "deliberated": (dict_get(regime_config, "deliberate") ?? false),
+    "total_time_ms": total_ms,
+    "trit": trit,
+    "ok": true
+  }
+}
+
+// -- Pipeline query --
+fn hive_pipeline_query(prompt, mode, channels_list, max_depth) {
+  // For pipeline modes, we chain cluster queries
+  if3 (mode == "explicit") { let stages = []
+    let i = 0
+    while3 (i < len(channels_list)) {
+      let ch = upper(channels_list[i])
+      if3 (dict_has(FLOW_CHANNELS, ch)) { let result = hive_cluster_query(prompt, ch, "")
+        stages = append(stages, result)
+      }
+      i = i + 1
+    }
+    // Synthesize
+    let best_response = ""
+    let best_score = 0
+    let si = 0
+    while3 (si < len(stages)) {
+      let resp = (dict_get(stages[si], "response") ?? "")
+      if3 (len(resp) > best_score) { best_score = len(resp)
+        best_response = resp
+      }
+      si = si + 1
+    }
+    return {
+      "response": best_response,
+      "stages_count": len(stages),
+      "mode": mode,
+      "ok": true
+    }
+  }
+  // Default: auto mode -- classify then query
+  let channel = cluster_get_channel_for_query(prompt)
+  let result = hive_cluster_query(prompt, channel, "")
+  result = dict_set(result, "mode", "auto")
+  return result
+}
+
+// -- Balanced ternary addition with carry --
+fn bt_add_carry(a, b, carry) {
+  let s = a + b + carry
+  if3 (s > 1) { return {"digit": s - 3, "carry": 1} }
+  if3 (s < -1) { return {"digit": s + 3, "carry": -1} }
+  return {"digit": s, "carry": 0}
+}
+
+// -- Vector merge ternary --
+fn vec_merge_ternary(vectors, mode) {
+  if3 (len(vectors) == 0) { return [] }
+  let max_len = 0
+  let vi = 0
+  while3 (vi < len(vectors)) {
+    if3 (len(vectors[vi]) > max_len) { max_len = len(vectors[vi]) }
+    vi = vi + 1
+  }
+  if3 (mode == "majority") { let result = []
+    let d = 0
+    while3 (d < max_len) {
+      let s = 0
+      let pi = 0
+      while3 (pi < len(vectors)) {
+        let v = vectors[pi]
+        if3 (d < len(v)) { s = s + v[d] }
+        pi = pi + 1
+      }
+      let n = len(vectors)
+      let threshold = n / H3
+      if3 (s > threshold) { result = append(result, 1) }
+      if3 (s < 0 - threshold) { result = append(result, -1) }
+      if3 (s >= 0 - threshold) {
+        if3 (s <= threshold) { result = append(result, 0) }
+      }
+      d = d + 1
+    }
+    return result
+  }
+  if3 (mode == "merge3") { let result = vectors[0]
+    let ri = 1
+    while3 (ri < len(vectors)) {
+      let v = vectors[ri]
+      let new_result = []
+      let d = 0
+      while3 (d < max_len) {
+        let a_val = 0
+        let b_val = 0
+        if3 (d < len(result)) { a_val = result[d] }
+        if3 (d < len(v)) { b_val = v[d] }
+        new_result = append(new_result, trit_merge3(a_val, b_val))
+        d = d + 1
+      }
+      result = new_result
+      ri = ri + 1
+    }
+    return result
+  }
+  if3 (mode == "bt_add") { let result = vectors[0]
+    let ri = 1
+    while3 (ri < len(vectors)) {
+      let v = vectors[ri]
+      let carry = 0
+      let new_result = []
+      let d = 0
+      while3 (d < max_len) {
+        let a_val = 0
+        let b_val = 0
+        if3 (d < len(result)) { a_val = result[d] }
+        if3 (d < len(v)) { b_val = v[d] }
+        let add_r = bt_add_carry(a_val, b_val, carry)
+        new_result = append(new_result, (dict_get(add_r, "digit") ?? 0))
+        carry = (dict_get(add_r, "carry") ?? 0)
+        d = d + 1
+      }
+      result = new_result
+      ri = ri + 1
+    }
+    return result
+  }
+  return vec_merge_ternary(vectors, "majority")
+}
+
+// -- Influence map (Go-style) --
+fn influence_map(model_scores) {
+  let decay = H3 / H5
+  let influence = {}
+  let ch_list = keys(FLOW_CHANNELS)
+  let mids = keys(model_scores)
+  let mi = 0
+  while3 (mi < len(mids)) {
+    let mid = mids[mi]
+    let scores = (dict_get(model_scores, mid) ?? {})
+    let inf = {}
+    let ci = 0
+    while3 (ci < len(ch_list)) {
+      let ch = ch_list[ci]
+      let direct = (dict_get(scores, ch) ?? 0.0)
+      let adj_sum = 0.0
+      let second_sum = 0.0
+      let neighbors = (dict_get(ternary_adj, ch) ?? {})
+      let n_keys = keys(neighbors)
+      let ni = 0
+      while3 (ni < len(n_keys)) {
+        let n_ch = n_keys[ni]
+        let trit = (dict_get(neighbors, n_ch) ?? 0)
+        if3 (trit == 1) { adj_sum = adj_sum + (dict_get(scores, n_ch) ?? 0.0) * decay
+          let n2 = (dict_get(ternary_adj, n_ch) ?? {})
+          let n2_keys = keys(n2)
+          let n2i = 0
+          while3 (n2i < len(n2_keys)) {
+            let n2_ch = n2_keys[n2i]
+            let t2 = (dict_get(n2, n2_ch) ?? 0)
+            if3 (t2 == 1) {
+              if3 (n2_ch != ch) { second_sum = second_sum + (dict_get(scores, n2_ch) ?? 0.0) * decay * decay
+              }
+            }
+            n2i = n2i + 1
+          }
+        }
+        ni = ni + 1
+      }
+      let total = min(direct + adj_sum + second_sum, 1.0)
+      if3 (total > 0.01) {
+        inf = dict_set(inf, ch, round(total, 3))
+      }
+      ci = ci + 1
+    }
+    influence = dict_set(influence, mid, inf)
+    mi = mi + 1
+  }
+  return influence
+}
+
+// -- Territory assignment --
+fn territory_assignment(influence_data, max_per_territory) {
+  let territories = {}
+  let ch_list = keys(FLOW_CHANNELS)
+  let ci = 0
+  while3 (ci < len(ch_list)) {
+    let ch = ch_list[ci]
+    let candidates = []
+    let mids = keys(influence_data)
+    let mi = 0
+    while3 (mi < len(mids)) {
+      let mid = mids[mi]
+      let inf_map = (dict_get(influence_data, mid) ?? {})
+      let score = (dict_get(inf_map, ch) ?? 0.0)
+      if3 (score > 0.05) {
+        candidates = append(candidates, [mid, score])
+      }
+      mi = mi + 1
+    }
+    let si = 0
+    while3 (si < len(candidates)) {
+      let sj = si + 1
+      while3 (sj < len(candidates)) {
+        if3 (candidates[sj][1] > candidates[si][1]) { let tmp = candidates[si]
+          candidates = list_set(candidates, si, candidates[sj])
+          candidates = list_set(candidates, sj, tmp)
+        }
+        sj = sj + 1
+      }
+      si = si + 1
+    }
+    let assigned = []
+    let ai = 0
+    while3 (ai < min(max_per_territory, len(candidates))) {
+      assigned = append(assigned, candidates[ai][0])
+      ai = ai + 1
+    }
+    territories = dict_set(territories, ch, assigned)
+    ci = ci + 1
+  }
+  return territories
+}
+
+// -- System Reynolds --
+fn system_reynolds() {
+  let total_models = max(len(registry_models), 1)
+  let pressures = (dict_get(system_flow_state, "model_pressures") ?? {})
+  let active_models = 0
+  let p_keys = keys(pressures)
+  let pi = 0
+  while3 (pi < len(p_keys)) {
+    if3 ((dict_get(pressures, p_keys[pi]) ?? 0) > 0) { active_models = active_models + 1
+    }
+    pi = pi + 1
+  }
+  let rho = max(active_models / total_models, 1.0 / total_models)
+  let now = time()
+  let recent = 0
+  let times = (dict_get(hive_stats, "query_times") ?? [])
+  let ti = 0
+  while3 (ti < len(times)) {
+    if3 (now - times[ti] < 60) { recent = recent + 1 }
+    ti = ti + 1
+  }
+  let v = max(recent / 60.0, 1.0 / 60.0)
+  let resp_tokens = (dict_get(system_flow_state, "response_tokens") ?? [])
+  let big_l = H13 * H7
+  if3 (len(resp_tokens) > 0) { big_l = sum(resp_tokens) / len(resp_tokens) }
+  let big_l = max(big_l, 1.0)
+  let resp_times = (dict_get(system_flow_state, "response_times") ?? [])
+  let mu = H5 / H3
+  if3 (len(resp_times) > 0) { mu = sum(resp_times) / len(resp_times) }
+  let mu = max(mu, 0.01)
+  let re = (rho * v * big_l) / mu
+  let regime = flow_regime(int(re))
+  return {
+    "Re": round(re, 1),
+    "regime": regime,
+    "components": {"rho": round(rho, 4), "v": round(v, 4), "L": round(big_l, 1), "mu": round(mu, 4)},
+    "model_pressures": pressures
+  }
+}
+
+// -- Get channel leaders from MaxPatch --
+fn get_channel_leaders() {
+  let leaders = {}
+  try3 {
+    let resp = http_get("http://127.0.0.1:9889/patch/fingerprints")
+    let data = json_decode(resp)
+    let fps = (dict_get(data, "fingerprints") ?? {})
+    let ch_names = keys(FLOW_CHANNELS)
+    let ci = 0
+    while3 (ci < len(ch_names)) {
+      let ch = ch_names[ci]
+      let best_model = ""
+      let best_score = 0
+      let mid_keys = keys(fps)
+      let mi = 0
+      while3 (mi < len(mid_keys)) {
+        let mid = mid_keys[mi]
+        let is_embed = false
+        let ei = 0
+        while3 (ei < len(EMBEDDING_MODELS)) {
+          if3 (contains(mid, EMBEDDING_MODELS[ei])) { is_embed = true }
+          ei = ei + 1
+        }
+        if3 (is_embed == false) {
+          if3 (contains(mid, "cloud:") == false) {
+            if3 (contains(mid, "cortex:") == false) { let fp = (dict_get(fps, mid) ?? {})
+              let ch_scores = (dict_get(fp, "channel_scores") ?? {})
+              let score = (dict_get(ch_scores, ch) ?? 0)
+              if3 (score > best_score) { best_score = score
+                let best_model = mid
+              }
+            }
+          }
+        }
+        mi = mi + 1
+      }
+      if3 (len(best_model) > 0) {
+        leaders = dict_set(leaders, ch, best_model)
+      }
+      ci = ci + 1
+  } else3 {
+    // MaxPatch not available
+  }
+  return leaders
+}
+
+// -- Strategy state --
+let strategy_plans = {}
+let strategy_plan_counter = 0
+let STRATEGY_BRANCH = {"laminar": 3, "transitional": 7, "turbulent": 13, "chaotic": 27}
+}
+
+fn strategy_plan(goal, context, depth, regime) {
+  let t0 = time()
+  let branch_factor = (dict_get(STRATEGY_BRANCH, regime) ?? H7)
+  let planning_models = registry_get_swarm("reasoning", min(branch_factor, H7))
+  if3 (len(planning_models) == 0) { planning_models = registry_get_swarm("general", H3)
+  }
+  let forward_prompt = "You are a strategic planner. Given the goal: " + goal
+  if3 (len(context) > 0) { forward_prompt = forward_prompt + "\nContext: " + context
+  }
+  forward_prompt = forward_prompt + "\n\nGenerate " + str(min(branch_factor, H5)) + " distinct strategic approaches. For each, list 3-5 concrete steps."
+  let forward_result = hive_scatter(planning_models, forward_prompt, "You are a strategic planning expert.", 60, H5)
+  let forward_responses = []
+  let fr_results = (dict_get(forward_result, "results") ?? [])
+  let fri = 0
+  while3 (fri < len(fr_results)) {
+    let r = fr_results[fri]
+    if3 ((dict_get(r, "ok") ?? false) == true) {
+      if3 (len((dict_get(r, "response") ?? "")) > 10) {
+        forward_responses = append(forward_responses, (dict_get(r, "response") ?? ""))
+      }
+    }
+    fri = fri + 1
+  }
+  let backward_prompt = "Given the goal: " + goal + "\n\nWhat are the top 5 risks, blockers, or failure modes? For each, suggest a mitigation."
+  let backward_result = hive_scatter(slice(planning_models, 0, min(H3, len(planning_models))), backward_prompt, "You are a risk analysis expert.", 60, H3)
+  let backward_responses = []
+  let br_results = (dict_get(backward_result, "results") ?? [])
+  let bri = 0
+  while3 (bri < len(br_results)) {
+    let r = br_results[bri]
+    if3 ((dict_get(r, "ok") ?? false) == true) {
+      if3 (len((dict_get(r, "response") ?? "")) > 10) {
+        backward_responses = append(backward_responses, (dict_get(r, "response") ?? ""))
+      }
+    }
+    bri = bri + 1
+  }
+  let elapsed = round((time() - t0) * 1000)
+  let total_moves = len(forward_responses) + len(backward_responses)
+  let trit = T_TRUE
+  if3 (total_moves == 0) { trit = T_FALSE }
+  if3 (total_moves < H3) { trit = T_MAYBE }
+  return {
+    "ok": true,
+    "goal": goal,
+    "regime": regime,
+    "depth": depth,
+    "branch_factor": branch_factor,
+    "forward_paths": len(forward_responses),
+    "backward_paths": len(backward_responses),
+    "total_moves": total_moves,
+    "forward_responses": forward_responses,
+    "backward_responses": backward_responses,
+    "trit": trit,
+    "elapsed_ms": elapsed
+  }
+}
+
+fn strategy_status() {
+  return {
+    "ok": true,
+    "plans_count": len(strategy_plans),
+    "plan_counter": strategy_plan_counter,
+    "branch_factors": STRATEGY_BRANCH
+  }
+}
+
+
+// ============================================================
+// Section 10: Route Handlers
+// ============================================================
+
+fn handle_health(req) {
+  let model_count = len(registry_models)
+  let huggingface_models = 509882
+  let total_with_hf = model_count + huggingface_models
+  let resp = ns_health_dict("nova-hivemind", "2.0", PORT, {})
+  resp = dict_set(resp, "models", model_count)
+  resp = dict_set(resp, "model_count", model_count)
+  resp = dict_set(resp, "cloud_models", len(ALL_CLOUD_MODELS))
+  resp = dict_set(resp, "huggingface_models", huggingface_models)
+  resp = dict_set(resp, "total_models_all", total_with_hf)
+  resp = dict_set(resp, "providers", 29)
+  resp = dict_set(resp, "quality", {
+    "strong": (dict_get(hive_stats, "trits_pos") ?? 0),
+    "partial": (dict_get(hive_stats, "trits_zero") ?? 0),
+    "failed": (dict_get(hive_stats, "trits_neg") ?? 0)
+  })
+  resp = dict_set(resp, "total_queries", (dict_get(hive_stats, "queries") ?? 0))
+  return resp
+}
+
+fn handle_status(req) {
+  return {
+    "online": true,
+    "models": len(registry_models),
+    "categories": {
+      "code": len((dict_get(registry_categories, "code") ?? [])),
+      "math": len((dict_get(registry_categories, "math") ?? [])),
+      "reasoning": len((dict_get(registry_categories, "reasoning") ?? [])),
+      "general": len((dict_get(registry_categories, "general") ?? [])),
+      "fast": len((dict_get(registry_categories, "fast") ?? []))
+    },
+    "stats": hive_state,
+    "history": slice(hive_history, 0, min(10, len(hive_history)))
+  }
+}
+
+fn handle_models(req) {
+  registry_refresh()
+  return {
+    "total": len(registry_models),
+    "models": keys(registry_models),
+    "categories": registry_categories,
+    "benchmarks": registry_benchmarks
+  }
+}
+
+fn handle_refresh(req) {
+  let count = registry_refresh()
+  cluster_assign_models()
+  return {"ok": true, "models_found": count}
+}
+
+fn handle_models_bulk(req) {
+  // POST /hive/models/bulk — PURE NOVALANG, no Python subprocess
+  let body = try3 { json_decode(req["body"]) } fail { req }
+  let new_models = (dict_get(body, "models") ?? [])
+  let count = len(new_models)
+  // Write batch to temp file, then merge natively
+  write_file("C:/NovaX/tmp/incoming_batch.json", json_encode(new_models))
+  let info = try3 { hivemind_batch_merge() } fail { {"added": 0, "total": 0} }
+  return {"ok": true, "added": (dict_get(info, "added") ?? 0), "total": (dict_get(info, "total") ?? 0)}
+}
+
+fn handle_models_load(req) {
+  // GET /hive/models/load — PURE NOVALANG, no Python subprocess
+  // Models stay in file (588 too many for NovaLang cluster loops)
+  // Cloud Router routes to them via Model Registry :9860
+  let info = try3 { hivemind_live_count() } fail { {"count": 0} }
+  return {"ok": true, "registry_models": (dict_get(info, "count") ?? 0), "in_memory": len(ALL_CLOUD_MODELS), "note": "571 models routed via Cloud Router + Tripple Mirror (469 cloud + 102 local)"}
+}
+
+fn handle_cluster_status(req) {
+  cluster_assign_models()
+  return {
+    "ok": true,
+    "cluster": cluster_status(),
+    "modulation": modulation_link_budget(),
+    "ternary": ternary_adjacency_stats()
+  }
+}
+
+fn handle_cluster_channels(req) {
+  cluster_assign_models()
+  let channels = {}
+  let ch_names = keys(FLOW_CHANNELS)
+  let i = 0
+  while3 (i < len(ch_names)) {
+    let ch_name = ch_names[i]
+    let ch_data = (dict_get(cluster_channels, ch_name) ?? {"local": [], "cloud": []})
+    let ch_def = (dict_get(FLOW_CHANNELS, ch_name) ?? {})
+    channels = dict_set(channels, ch_name, {
+      "local": (dict_get(ch_data, "local") ?? []),
+      "cloud": (dict_get(ch_data, "cloud") ?? []),
+      "system": (dict_get(ch_def, "system") ?? ""),
+      "benchmarks": (dict_get(ch_def, "benchmarks") ?? [])
+    })
+    i = i + 1
+  }
+  return {"ok": true, "channels": channels}
+}
+
+fn handle_modulation_status(req) {
+  return {"ok": true, "modulation": modulation_link_budget(), "ternary": ternary_adjacency_stats()}
+}
+
+fn handle_modulation_schemes(req) {
+  return {"ok": true, "schemes": MOD_SCHEMES, "order": MOD_SCHEME_ORDER}
+}
+
+fn handle_ns_status(req) {
+  return {"ok": true, "ns": ns_status()}
+}
+
+fn handle_ns_flow(req) {
+  return {"ok": true, "flow": ns_get_flow_field()}
+}
+
+fn handle_warm_status(req) {
+  try3 {
+    let ps_resp = http_get(OLLAMA_URL + "/api/ps")
+    let ps_data = json_decode(ps_resp)
+    let loaded = []
+    let models = (dict_get(ps_data, "models") ?? [])
+    let i = 0
+    while3 (i < len(models)) {
+      loaded = append(loaded, (dict_get(models[i], "name") ?? ""))
+      i = i + 1
+    }
+    return {"ok": true, "warm": warm_state, "loaded_in_ollama": loaded}
+  } else3 {
+    return {"ok": true, "warm": warm_state, "loaded_in_ollama": []}
+  }
+}
+
+fn handle_warm_pool(req) {
+  return {"ok": true, "warm_pool": warm_pool_state}
+}
+
+fn handle_query(req) {
+  let body = try3 { json_decode(req["body"]) } fail { req }
+  let prompt = (dict_get(body, "prompt") ?? (dict_get(body, "q") ?? ""))
+  let task = (dict_get(body, "task") ?? (dict_get(body, "type") ?? "general"))
+  let count = min((dict_get(body, "models") ?? (dict_get(body, "count") ?? 5)), MAX_PARALLEL)
+  let system = (dict_get(body, "system") ?? "")
+  if3 (len(prompt) == 0) { return {"error": "Missing prompt"} }
+
+  // Tripple: outer loop regime detection before query
+  _tripple = tripple_outer(_tripple)
+
+  // Get model swarm
+  let models = registry_get_swarm(task, count)
+  if3 (len(models) == 0) { return {"error": "No models available"} }
+  let sys_prompt = system
+  if3 (len(sys_prompt) == 0) {
+    if3 (task == "code") { sys_prompt = "You are an expert programmer. Write clean, efficient code with comments." }
+    if3 (task == "math") { sys_prompt = "You are a mathematics expert. Show step-by-step solutions." }
+    if3 (task == "reasoning") { sys_prompt = "You are a deep reasoning AI. Think step by step." }
+    if3 (len(sys_prompt) == 0) { sys_prompt = "You are a helpful, knowledgeable AI assistant." }
+  }
+  // Scatter
+  let t0 = time()
+  let scatter_result = hive_scatter(models, prompt, sys_prompt, MERGE_TIMEOUT, H7)
+  let results = (dict_get(scatter_result, "results") ?? [])
+  let ok_results = []
+  let i = 0
+  while3 (i < len(results)) {
+    if3 ((dict_get(results[i], "ok") ?? false) == true) {
+      if3 (len((dict_get(results[i], "response") ?? "")) > 0) {
+        ok_results = append(ok_results, results[i])
+      }
+    }
+    i = i + 1
+  }
+  let merged = hive_merge_responses(ok_results, prompt)
+  let total_time = (dict_get(scatter_result, "total_ms") ?? 0)
+  let trit = response_trit({"ok": true, "merged_response": merged})
+  record_query(trit)
+
+  // Tripple: fire ripples for each model that responded
+  let latency = time() - t0
+  let ri = 0
+  while3 (ri < len(results)) {
+    let r = results[ri]
+    let model_name = (dict_get(r, "model") ?? "unknown")
+    let r_ok = (dict_get(r, "ok") ?? false)
+    let r_trit = -1
+    if3 (r_ok == true) { r_trit = 1 }
+    // Determine provider from model name
+    let prov_key = "ollama"
+    if3 (contains(model_name, "openai")) { prov_key = "openai" }
+    if3 (contains(model_name, "deepseek/")) { prov_key = "deepseek" }
+    if3 (contains(model_name, ":free")) { prov_key = "openrouter" }
+    if3 (contains(model_name, "google/")) { prov_key = "openrouter" }
+    if3 (contains(model_name, "meta-llama/")) { prov_key = "openrouter" }
+    if3 (contains(model_name, "qwen/")) { prov_key = "openrouter" }
+    _tripple = tripple_ripple(_tripple, prov_key, r_trit, latency)
+    // Mirror: reflect each model
+    _tripple = tripple_mirror_reflect(_tripple, prov_key, model_name, r_trit, latency)
+    ri = ri + 1
+  }
+  _tripple = tripple_resonance_check(_tripple)
+
+  // Auto-inject SNR boost from ripple into modulation channels
+  let prime_locked = (dict_get(_tripple, "prime_locked") ?? false)
+  if3 (prime_locked == true) {
+    // Prime state: boost all channel SNRs for 1024QAM
+    let ch_keys = dict_keys(mod_channel_snr)
+    let ci = 0
+    while3 (ci < len(ch_keys)) {
+      let ck = ch_keys[ci]
+      let cur_snr = (dict_get(mod_channel_snr, ck) ?? 500)
+      if3 (cur_snr < 900) {
+        mod_channel_snr = dict_set(mod_channel_snr, ck, 900)
+      }
+      ci = ci + 1
+    }
+  }
+
+  let res_score = (dict_get(_tripple, "resonance_score") ?? 0)
+  return {
+    "merged_response": merged,
+    "individual_results": results,
+    "models_queried": len(models),
+    "models_responded": len(ok_results),
+    "total_time_ms": total_time,
+    "task_type": task,
+    "trit": trit,
+    "ok": true,
+    "tripple_resonance": res_score,
+    "tripple_prime": prime_locked
+  }
+}
+
+fn handle_cluster_query(req) {
+  let prompt = (dict_get(req, "prompt") ?? (dict_get(req, "q") ?? ""))
+  if3 (len(prompt) == 0) { return {"error": "Missing prompt"} }
+  let channel = (dict_get(req, "channel") ?? "")
+  let regime = (dict_get(req, "regime") ?? "")
+
+  // Tripple: outer loop before query
+  _tripple = tripple_outer(_tripple)
+  let t0 = time()
+
+  try3 {
+    let result = hive_cluster_query(prompt, channel, regime)
+    let trit = response_trit(result)
+    record_query(trit)
+    result = dict_set(result, "trit", trit)
+
+    // Tripple: ripple on success
+    let latency = time() - t0
+    let r_trit = -1
+    if3 (trit >= 0) { r_trit = 1 }
+    _tripple = tripple_ripple(_tripple, "ollama", r_trit, latency)
+    _tripple = tripple_resonance_check(_tripple)
+    return result
+  } fail {
+    record_query(T_FALSE)
+    // Tripple: ripple on failure
+    _tripple = tripple_ripple(_tripple, "ollama", -1, time() - t0)
+    return {"error": "cluster_query_failed", "trit": T_FALSE, "ok": false}
+  }
+}
+
+fn handle_cluster_classify(req) {
+  let prompt = (dict_get(req, "prompt") ?? (dict_get(req, "q") ?? ""))
+  if3 (len(prompt) == 0) { return {"error": "Missing prompt"} }
+  let channel = cluster_get_channel_for_query(prompt)
+  let re_result = calculate_reynolds(prompt)
+  let ch_data = (dict_get(cluster_channels, channel) ?? {"local": [], "cloud": []})
+  return {
+    "channel": channel,
+    "reynolds": round((dict_get(re_result, "re") ?? 0), 1),
+    "regime": (dict_get(re_result, "regime") ?? "laminar"),
+    "config": (dict_get(re_result, "config") ?? {}),
+    "models_available": len((dict_get(ch_data, "local") ?? [])) + len((dict_get(ch_data, "cloud") ?? []))
+  }
+}
+
+fn handle_pipeline(req) {
+  let prompt = (dict_get(req, "prompt") ?? (dict_get(req, "q") ?? ""))
+  if3 (len(prompt) == 0) { return {"error": "Missing prompt"} }
+  let mode = (dict_get(req, "mode") ?? "auto")
+  let channels = (dict_get(req, "channels") ?? [])
+  let max_depth = (dict_get(req, "max_depth") ?? 4)
+  try3 {
+    let result = hive_pipeline_query(prompt, mode, channels, max_depth)
+    return result
+  } fail {
+    return {"error": "pipeline_failed", "ok": false}
+  }
+}
+
+fn handle_swarm(req) {
+  let body = try3 { json_decode(req["body"]) } fail { req }
+  let prompt = (dict_get(body, "prompt") ?? (dict_get(body, "q") ?? ""))
+  if3 (len(prompt) == 0) { return {"error": "Missing prompt"} }
+  let system = (dict_get(body, "system") ?? "You are a helpful AI assistant. Be concise and accurate.")
+  let max_models = (dict_get(body, "max_models") ?? 20)
+  // SMART SWARM: Pick representative models from each provider
+  // 1) Local Ollama: pick top 3 generative models
+  let gen_models = []
+  let local_picks = ["novax-qwen2.5-coder:latest", "falcon3:1b", "novax-tinyllama:latest"]
+  let lp = 0
+  while3 (lp < len(local_picks)) {
+    if3 (dict_has(registry_models, local_picks[lp])) {
+      gen_models = append(gen_models, local_picks[lp])
+    }
+    lp = lp + 1
+  }
+  // 2) Cloud: pick one model from each active provider via cloud router
+  let cloud_picks = [
+    "cloud:cerebras_direct:qwen-3-235b-a22b-instruct-2507",
+    "cloud:openai:gpt-4o-mini",
+    "cloud:anthropic:claude-sonnet-4-20250514",
+    "cloud:together:arcee-ai/trinity-large-preview:free",
+    "cloud:groq:arcee-ai/trinity-large-preview:free",
+    "cloud:mistral:arcee-ai/trinity-large-preview:free",
+    "cloud:deepseek:arcee-ai/trinity-large-preview:free",
+    "cloud:cohere:arcee-ai/trinity-large-preview:free",
+    "cloud:openrouter:arcee-ai/trinity-large-preview:free"
+  ]
+  let cp = 0
+  while3 (cp < len(cloud_picks)) {
+    gen_models = append(gen_models, cloud_picks[cp])
+    cp = cp + 1
+  }
+  print("[SWARM] Smart scatter: " + str(len(gen_models)) + " models (local + cloud representatives)")
+  let scatter_result = hive_scatter(gen_models, prompt, system, 90, len(gen_models))
+  let results = (dict_get(scatter_result, "results") ?? [])
+  let ok_results = []
+  let i2 = 0
+  while3 (i2 < len(results)) {
+    if3 ((dict_get(results[i2], "ok") ?? false) == true) {
+      if3 (len((dict_get(results[i2], "response") ?? "")) > 0) {
+        ok_results = append(ok_results, results[i2])
+      }
+    }
+    i2 = i2 + 1
+  }
+  let merged = hive_merge_responses(ok_results, prompt)
+  let trit = response_trit({"ok": true, "merged_response": merged})
+  record_query(trit)
+  return {
+    "merged_response": merged,
+    "individual_results": results,
+    "models_queried": len(gen_models),
+    "models_responded": len(ok_results),
+    "total_time_ms": (dict_get(scatter_result, "total_ms") ?? 0),
+    "trit": trit,
+    "task_type": "full_swarm",
+    "ok": true
+  }
+}
+
+fn handle_deepseek(req) {
+  let prompt = (dict_get(req, "prompt") ?? (dict_get(req, "q") ?? ""))
+  if3 (len(prompt) == 0) { return {"error": "Missing prompt"} }
+  let system = (dict_get(req, "system") ?? "You are DeepSeek, an expert AI. Think step by step and give precise answers.")
+  let models = []
+  let i = 0
+  while3 (i < len(DEEPSEEK_CLOUD_MODELS)) {
+    models = append(models, DEEPSEEK_CLOUD_MODELS[i])
+    i = i + 1
+  }
+  let i2 = 0
+  while3 (i2 < len(DEEPSEEK_LOCAL_MODELS)) {
+    if3 (dict_has(registry_models, DEEPSEEK_LOCAL_MODELS[i2])) {
+      models = append(models, DEEPSEEK_LOCAL_MODELS[i2])
+    }
+    i2 = i2 + 1
+  }
+  let scatter_result = hive_scatter(models, prompt, system, MERGE_TIMEOUT + 10, H5)
+  let results = (dict_get(scatter_result, "results") ?? [])
+  let ok_results = []
+  let ri = 0
+  while3 (ri < len(results)) {
+    if3 ((dict_get(results[ri], "ok") ?? false) == true) {
+      if3 (len((dict_get(results[ri], "response") ?? "")) > 0) {
+        ok_results = append(ok_results, results[ri])
+      }
+    }
+    ri = ri + 1
+  }
+  let merged = hive_merge_responses(ok_results, prompt)
+  let trit = response_trit({"ok": true, "merged_response": merged})
+  record_query(trit)
+  return {
+    "merged_response": merged,
+    "individual_results": results,
+    "models_queried": len(models),
+    "models_responded": len(ok_results),
+    "total_time_ms": (dict_get(scatter_result, "total_ms") ?? 0),
+    "trit": trit,
+    "task_type": "deepseek",
+    "ok": true
+  }
+}
+
+fn handle_reynolds(req) {
+  let prompt = (dict_get(req, "prompt") ?? "")
+  let sys_re = {"Re": hive_reynolds(), "regime": flow_regime(hive_reynolds())}
+  let query_re = {}
+  if3 (len(prompt) > 0) { let re_result = calculate_reynolds(prompt)
+    let q_channel = (dict_get(req, "channel") ?? "")
+    if3 (len(q_channel) == 0) { q_channel = cluster_get_channel_for_query(prompt) }
+
+    let query_re = {
+      "Re": round((dict_get(re_result, "re") ?? 0), 1),
+      "regime": (dict_get(re_result, "regime") ?? "laminar"),
+      "channel": q_channel
+    }
+  }
+  return {
+    "ok": true,
+    "system_reynolds": sys_re,
+    "query_reynolds": query_re,
+    "harmonic_boundaries": {
+      "laminar": RE_LAMINAR,
+      "transition": RE_TRANSITION,
+      "turbulent": RE_TURBULENT
+    }
+  }
+}
+
+fn handle_warm(req) {
+  let models = (dict_get(req, "models") ?? [])
+  let channel = (dict_get(req, "channel") ?? "REASON")
+  if3 (len(models) == 0) { let ch_data = (dict_get(cluster_channels, upper(channel)) ?? {"local": [], "cloud": []})
+    let models = slice((dict_get(ch_data, "local") ?? []), 0, min(H7, len((dict_get(ch_data, "local") ?? []))))
+  }
+  if3 (len(models) == 0) { return {"ok": false, "error": "No models to warm"} }
+  // Warm via helper
+  let payload = json_encode({"models": models, "max_warm": 1})
+  try3 {
+    let warm_body = json_encode({"model": models[0], "prompt": "warmup", "stream": 0})
+    let warm_result = try3 { http_post("http://127.0.0.1:11434/api/generate", warm_body) } fail { {} }
+    let result_json = try3 { dict_get(warm_result, "body") } fail { "{}" }
+    let result = json_decode(result_json)
+    return {"ok": true, "warming": models, "count": len(models), "channel": channel}
+  } fail {
+    return {"ok": false, "error": "warm_helper_failed"}
+  }
+}
+
+fn handle_ternary_math(req) {
+  let op = (dict_get(req, "op") ?? "")
+  let a = (dict_get(req, "a") ?? 0)
+  let b = (dict_get(req, "b") ?? 0)
+  if3 (op == "not3") {
+    if3 (type_of(a) == "list") { let result = []
+      let i = 0
+      while3 (i < len(a)) { result = append(result, trit_not3(a[i])); i = i + 1 }
+      return {"ok": true, "op": op, "result": result}
+    }
+    return {"ok": true, "op": op, "result": trit_not3(int(a))}
+  }
+  if3 (op == "and3") { return {"ok": true, "op": op, "result": trit_and3(int(a), int(b))} }
+  if3 (op == "or3") { return {"ok": true, "op": op, "result": trit_or3(int(a), int(b))} }
+  if3 (op == "merge3") { return {"ok": true, "op": op, "result": trit_merge3(int(a), int(b))} }
+  return {"ok": false, "error": "Unknown op: " + op}
+}
+
+// ============================================================
+
+// Section 10b: Missing GET Route Handlers
+// ============================================================
+
+
+// --- /hive/network --- network adapter info via nova_run (PowerShell) ---
+fn handle_network(req) {
+  try3 {
+    let adapter_json = nova_run("powershell -NoProfile -Command \"Get-NetAdapter | Where Status -eq Up | Select Name, LinkSpeed | ConvertTo-Json -Compress\"")
+    let adapters = json_decode(adapter_json)
+    // Ensure list
+    if3 (type_of(adapters) != "list") { adapters = [adapters] }
+    let stats_json = nova_run("powershell -NoProfile -Command \"Get-NetAdapterStatistics | Where-Object {$_.ReceivedBytes -gt 0} | Select Name, ReceivedBytes, SentBytes | ConvertTo-Json -Compress\"")
+    let stats = json_decode(stats_json)
+    if3 (type_of(stats) != "list") { stats = [stats] }
+    let result = {
+      "ok": true,
+      "adapters": adapters,
+      "throughput": stats,
+      "timestamp": str(time()),
+      "adapter_count": len(adapters)
+    }
+    return result
+  } else3 {
+    return {"ok": false, "error": "network_check_failed", "adapters": [], "throughput": []}
+  }
+}
+
+
+// --- /hive/bridge --- WiFi bridge / adapter bonding status ---
+fn handle_bridge(req) {
+  try3 {
+    let bridge_json = nova_run("powershell -NoProfile -Command \"$adapters = Get-NetAdapter | Where Status -eq Up | Select Name, LinkSpeed, InterfaceDescription; $routes = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select InterfaceAlias, NextHop, RouteMetric; @{adapters=$adapters; routes=$routes; bonded=($adapters.Count -gt 1)} | ConvertTo-Json -Compress -Depth 3\"")
+    let bridge_data = json_decode(bridge_json)
+    return bridge_data
+  } fail {
+    return {"ok": false, "error": "bridge_status_failed"}
+  }
+}
+
+
+// --- /hive/benchmark --- quick inference benchmark across fast models ---
+fn handle_benchmark(req) {
+  let fast_models = slice((dict_get(registry_categories, "fast") ?? []), 0, min(H3, len((dict_get(registry_categories, "fast") ?? []))))
+  let results = []
+  let i = 0
+  while3 (i < len(fast_models)) {
+    let model = fast_models[i]
+    let t0 = time()
+    try3 {
+      let payload = json_encode({"model": model, "prompt": "Say test and nothing else.", "stream": false})
+      let resp = http_post(OLLAMA_URL + "/api/generate", payload)
+      let elapsed = round((time() - t0) * 1000)
+      results = append(results, {"model": model, "time_ms": elapsed, "ok": true})
+    } fail { elapsed = round((time() - t0) * 1000)
+      results = append(results, {"model": model, "time_ms": elapsed, "ok": false})
+    }
+    i = i + 1
+  }
+  let total_ms = 0
+  let ri = 0
+  while3 (ri < len(results)) {
+    total_ms = total_ms + (dict_get(results[ri], "time_ms") ?? 0)
+    ri = ri + 1
+  }
+  let avg_ms = 0
+  if3 (len(results) > 0) { avg_ms = round(total_ms / len(results)) }
+  return {
+    "ok": true,
+    "benchmarks": results,
+    "avg_ms": avg_ms,
+    "timestamp": str(time())
+  }
+}
+
+
+// --- /hive/nova --- NovaLang interpreter info ---
+fn handle_nova(req) {
+  return {
+    "ok": true,
+    "novalang": true,
+    "source": "nova_hivemind_service.nova",
+    "interpreter": "NovaLang",
+    "cloud_models": len(ALL_CLOUD_MODELS),
+    "local_models": len(registry_models),
+    "flow_channels": len(keys(FLOW_CHANNELS)),
+    "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+  }
+}
+
+// --- /hive/nova/status --- REPL session / NovaLang health check ---
+fn handle_nova_status(req) {
+  return {
+    "ok": true,
+    "service": "novalang-repl",
+    "running": true,
+    "dispatch": false,
+    "cloud_models": len(ALL_CLOUD_MODELS),
+    "local_models": len(registry_models),
+    "uptime": round(time() - (dict_get(hive_stats, "t0") ?? time()))
+  }
+}
+
+
+// --- /hive/tforge --- TForge code analysis (proxy to ternary tools port 9894) ---
+fn handle_tforge(req) {
+  let fpath = (dict_get(req, "path") ?? "")
+  if3 (len(fpath) == 0) {
+    return {"ok": false, "error": "path required for tforge analysis"}
+  }
+  try3 {
+    let payload = json_encode({"tool": "tforge", "path": fpath})
+    let resp = http_post(TTOOLS_URL + "/api/tforge", payload)
+    let result = json_decode(resp)
+    return result
+  } fail {
+    return {"ok": false, "error": "tforge_proxy_failed", "target": TTOOLS_URL}
+  }
+}
+
+// --- /hive/tindex/search --- TIndex search (proxy to port 9894) ---
+fn handle_tindex_search(req) {
+  let query = (dict_get(req, "q") ?? (dict_get(req, "query") ?? ""))
+  if3 (len(query) == 0) {
+    return {"ok": false, "error": "query (q) required for tindex search"}
+  }
+  try3 {
+    let payload = json_encode({"tool": "tsearch", "query": query})
+    let resp = http_post(TTOOLS_URL + "/api/tsearch", payload)
+    let result = json_decode(resp)
+    return result
+  } fail {
+    return {"ok": false, "error": "tindex_search_proxy_failed", "target": TTOOLS_URL}
+  }
+}
+
+// --- /hive/tindex/status --- TIndex status (proxy to port 9894) ---
+fn handle_tindex_status(req) {
+  try3 {
+    let resp = http_get(TTOOLS_URL + "/api/tindex/status")
+    let result = json_decode(resp)
+    result = dict_set(result, "ok", true)
+    return result
+  } fail {
+    return {"ok": false, "error": "tindex_status_proxy_failed", "target": TTOOLS_URL}
+  }
+}
+
+// --- /hive/tcache/status --- TCache status (proxy to port 9894) ---
+fn handle_tcache_status(req) {
+  try3 {
+    let resp = http_get(TTOOLS_URL + "/api/tcache/status")
+    let result = json_decode(resp)
+    result = dict_set(result, "ok", true)
+    return result
+  } fail {
+    return {"ok": false, "error": "tcache_status_proxy_failed", "target": TTOOLS_URL}
+  }
+}
+
+
+// --- /hive/ttools --- combined ternary tools status ---
+fn handle_ttools(req) {
+  let tcache_ok = false
+  let tforge_ok = false
+  let tindex_ok = false
+  let tcache_stats = {}
+  let tindex_stats = {}
+  try3 {
+    let tc_resp = http_get(TTOOLS_URL + "/api/tcache/status")
+    let tcache_stats = json_decode(tc_resp)
+    tcache_ok = true
+  } fail {
+    tcache_ok = false
+  }
+  try3 {
+    let tf_resp = http_get(TTOOLS_URL + "/health")
+    let tf_data = json_decode(tf_resp)
+    tforge_ok = (dict_get(tf_data, "ok") ?? false)
+  } fail {
+    tforge_ok = false
+  }
+  try3 {
+    let ti_resp = http_get(TTOOLS_URL + "/api/tindex/status")
+    let tindex_stats = json_decode(ti_resp)
+    tindex_ok = true
+  } fail {
+    tindex_ok = false
+  }
+  let integrated = {"tcache": tcache_ok, "tforge": tforge_ok, "tindex": tindex_ok}
+  let result = {"ok": true, "integrated": integrated, "tcache_stats": tcache_stats, "tindex_stats": tindex_stats, "target_port": 9894}
+  return result
+}
+
+
+// --- /hive/influence --- Go-style influence map ---
+fn handle_influence(req) {
+  // Build model_scores: {model: {channel: snr}}
+  let model_scores = {}
+  let ch_names = keys(FLOW_CHANNELS)
+  let i = 0
+  while3 (i < len(ch_names)) {
+    let ch_name = ch_names[i]
+    let ch_data = (dict_get(cluster_channels, ch_name) ?? {"local": [], "cloud": []})
+    let local_models = (dict_get(ch_data, "local") ?? [])
+    let cloud_models = (dict_get(ch_data, "cloud") ?? [])
+    let snr = modulation_estimate_snr(ch_name)
+    // Add local models
+    let j = 0
+    while3 (j < len(local_models)) {
+      let m = local_models[j]
+      if3 (dict_has(model_scores, m) == false) { dict_set(model_scores, m, {}) }
+      let m_scores = (dict_get(model_scores, m) ?? {})
+      m_scores = dict_set(m_scores, ch_name, snr)
+      model_scores = dict_set(model_scores, m, m_scores)
+      j = j + 1
+    }
+    // Add cloud models
+    let k = 0
+    while3 (k < len(cloud_models)) {
+      let m = cloud_models[k]
+      if3 (dict_has(model_scores, m) == false) { dict_set(model_scores, m, {}) }
+      let m_scores = (dict_get(model_scores, m) ?? {})
+      m_scores = dict_set(m_scores, ch_name, snr)
+      model_scores = dict_set(model_scores, m, m_scores)
+      k = k + 1
+    }
+    i = i + 1
+  }
+  // Compute Go-style influence with decay = H3/H5 = 0.6
+  let decay = H3 * 1.0 / H5
+  let influence = {}
+  let m_keys = keys(model_scores)
+  let mi = 0
+  while3 (mi < len(m_keys)) {
+    let mid = m_keys[mi]
+    let scores = (dict_get(model_scores, mid) ?? {})
+    let inf = {}
+    let ci = 0
+    while3 (ci < len(ch_names)) {
+      let ch = ch_names[ci]
+      let direct = (dict_get(scores, ch) ?? 0.0)
+      let adj_sum = 0.0
+      let neighbors = (dict_get(ternary_adj, ch) ?? {})
+      let n_keys = keys(neighbors)
+      let ni = 0
+      while3 (ni < len(n_keys)) {
+        let n_ch = n_keys[ni]
+        let trit = (dict_get(neighbors, n_ch) ?? 0)
+        if3 (trit == 1) { adj_sum = adj_sum + (dict_get(scores, n_ch) ?? 0.0) * decay
+        }
+        ni = ni + 1
+      }
+      let total = direct + adj_sum
+      if3 (total > 1.0) { total = 1.0 }
+      if3 (total > 0.01) {
+        inf = dict_set(inf, ch, round(total * 1000) / 1000)
+      }
+      ci = ci + 1
+    }
+    influence = dict_set(influence, mid, inf)
+    mi = mi + 1
+  }
+  return {"ok": true, "influence": influence, "models": len(model_scores)}
+}
+
+
+// --- /hive/territory --- territory assignment based on influence ---
+fn handle_territory(req) {
+  // Reuse influence logic then assign top models per channel
+  let max_per = H5
+  // Build model_scores
+  let model_scores = {}
+  let ch_names = keys(FLOW_CHANNELS)
+  let i = 0
+  while3 (i < len(ch_names)) {
+    let ch_name = ch_names[i]
+    let ch_data = (dict_get(cluster_channels, ch_name) ?? {"local": [], "cloud": []})
+    let local_models = (dict_get(ch_data, "local") ?? [])
+    let cloud_models = (dict_get(ch_data, "cloud") ?? [])
+    let snr = modulation_estimate_snr(ch_name)
+    let j = 0
+    while3 (j < len(local_models)) {
+      let m = local_models[j]
+      if3 (dict_has(model_scores, m) == false) { dict_set(model_scores, m, {}) }
+      let m_scores = (dict_get(model_scores, m) ?? {})
+      m_scores = dict_set(m_scores, ch_name, snr)
+      model_scores = dict_set(model_scores, m, m_scores)
+      j = j + 1
+    }
+    let k = 0
+    while3 (k < len(cloud_models)) {
+      let m = cloud_models[k]
+      if3 (dict_has(model_scores, m) == false) { dict_set(model_scores, m, {}) }
+      let m_scores = (dict_get(model_scores, m) ?? {})
+      m_scores = dict_set(m_scores, ch_name, snr)
+      model_scores = dict_set(model_scores, m, m_scores)
+      k = k + 1
+    }
+    i = i + 1
+  }
+  // Compute influence
+  let decay = H3 * 1.0 / H5
+  let influence = {}
+  let m_keys = keys(model_scores)
+  let mi = 0
+  while3 (mi < len(m_keys)) {
+    let mid = m_keys[mi]
+    let scores = (dict_get(model_scores, mid) ?? {})
+    let inf = {}
+    let ci = 0
+    while3 (ci < len(ch_names)) {
+      let ch = ch_names[ci]
+      let direct = (dict_get(scores, ch) ?? 0.0)
+      let adj_sum = 0.0
+      let neighbors = (dict_get(ternary_adj, ch) ?? {})
+      let n_keys = keys(neighbors)
+      let ni = 0
+      while3 (ni < len(n_keys)) {
+        let n_ch = n_keys[ni]
+        let trit = (dict_get(neighbors, n_ch) ?? 0)
+        if3 (trit == 1) { adj_sum = adj_sum + (dict_get(scores, n_ch) ?? 0.0) * decay
+        }
+        ni = ni + 1
+      }
+      let total = direct + adj_sum
+      if3 (total > 1.0) { total = 1.0 }
+      if3 (total > 0.01) {
+        inf = dict_set(inf, ch, round(total * 1000) / 1000)
+      }
+      ci = ci + 1
+    }
+    influence = dict_set(influence, mid, inf)
+    mi = mi + 1
+  }
+  // Assign territories: top max_per models per channel by influence score
+  let territories = {}
+  let ti = 0
+  while3 (ti < len(ch_names)) {
+    let ch = ch_names[ti]
+    let candidates = []
+    let mj = 0
+    while3 (mj < len(m_keys)) {
+      let mid = m_keys[mj]
+      let inf_map = (dict_get(influence, mid) ?? {})
+      let score = (dict_get(inf_map, ch) ?? 0.0)
+      if3 (score > 0.05) {
+        candidates = append(candidates, [mid, score])
+      }
+      mj = mj + 1
+    }
+    // Sort by score descending (simple selection sort)
+    let si = 0
+    while3 (si < len(candidates)) {
+      let best_idx = si
+      let sj = si + 1
+      while3 (sj < len(candidates)) {
+        if3 (candidates[sj][1] > candidates[best_idx][1]) { best_idx = sj
+        }
+        sj = sj + 1
+      }
+      if3 (best_idx != si) { let tmp = candidates[si]
+        candidates = list_set(candidates, si, candidates[best_idx])
+        candidates = list_set(candidates, best_idx, tmp)
+      }
+      si = si + 1
+    }
+    // Take top max_per
+    let assigned = []
+    let ai = 0
+    while3 (ai < min(max_per, len(candidates))) {
+      assigned = append(assigned, candidates[ai][0])
+      ai = ai + 1
+    }
+    territories = dict_set(territories, ch, assigned)
+    ti = ti + 1
+  }
+  return {"ok": true, "territories": territories}
+}
+
+// --- /hive/strategy/status --- strategic lookahead engine status ---
+fn handle_strategy_status(req) {
+  return {
+    "ok": true,
+    "service": "strategic-lookahead",
+    "layers": ["scatter", "pressure", "diffusion", "convection", "continuity"],
+    "branch_factors": {"scatter": H3, "pressure": H3, "diffusion": H3},
+    "harmonics": {"H3": H3, "H5": H5, "H7": H7},
+    "total_queries": (dict_get(hive_stats, "queries") ?? 0),
+    "reynolds": hive_reynolds()
+  }
+}
+
+// ============================================================
+
+// Section 10c: Missing POST Route Handlers (11 routes)
+// ============================================================
+
+// -- /hive/nova/dispatch --
+// Dispatches a prompt through the full hivemind swarm via NovaLang
+fn handle_nova_dispatch(req) {
+  let prompt = (dict_get(req, "prompt") ?? (dict_get(req, "q") ?? ""))
+  if3 (len(prompt) == 0) { return {"error": "Missing prompt"} }
+  // Dispatch through full swarm query
+  let channel = (dict_get(req, "channel") ?? "")
+  if3 (len(channel) == 0) { channel = cluster_get_channel_for_query(prompt)
+  }
+  let result = hive_cluster_query(prompt, channel, "")
+  let trit = response_trit(result)
+  record_query(trit)
+  result = dict_set(result, "dispatch", true)
+  result = dict_set(result, "trit", trit)
+  return result
+}
+
+// -- /hive/nova/pull --
+// Triggers model pulling from Ollama via direct API calls
+fn handle_nova_pull(req) {
+  let models = (dict_get(req, "models") ?? [])
+  if3 (len(models) == 0) {
+    // Default: try to pull common small models
+    let models = ["llama3:latest", "gemma:2b", "phi3:mini"]
+  }
+  // Reset pull state
+  nova_pull_state = dict_set(nova_pull_state, "active", true)
+  nova_pull_state = dict_set(nova_pull_state, "wave", 0)
+  nova_pull_state = dict_set(nova_pull_state, "total_waves", 1)
+  nova_pull_state = dict_set(nova_pull_state, "pulled", 0)
+  nova_pull_state = dict_set(nova_pull_state, "failed", 0)
+  nova_pull_state = dict_set(nova_pull_state, "total", len(models))
+  nova_pull_state = dict_set(nova_pull_state, "current_model", "")
+  nova_pull_state = dict_set(nova_pull_state, "reynolds", 0)
+  nova_pull_state = dict_set(nova_pull_state, "results", [])
+  nova_pull_state = dict_set(nova_pull_state, "health", "Z")
+  // Pull each model sequentially via Ollama API
+  let pi = 0
+  while3 (pi < len(models)) {
+    let model_name = models[pi]
+    nova_pull_state = dict_set(nova_pull_state, "current_model", model_name)
+    try3 {
+      let pull_payload = json_encode({"name": model_name, "stream": false})
+      let pull_resp = http_post(OLLAMA_URL + "/api/pull", pull_payload)
+      let pull_data = json_decode(pull_resp)
+      let status = (dict_get(pull_data, "status") ?? "unknown")
+      nova_pull_state = dict_set(nova_pull_state, "pulled", (dict_get(nova_pull_state, "pulled") ?? 0) + 1)
+      let results_arr = (dict_get(nova_pull_state, "results") ?? [])
+      results_arr = append(results_arr, {"model": model_name, "status": status, "health": "P"})
+      nova_pull_state = dict_set(nova_pull_state, "results", results_arr)
+    } fail {
+      nova_pull_state = dict_set(nova_pull_state, "failed", (dict_get(nova_pull_state, "failed") ?? 0) + 1)
+      let results_arr = (dict_get(nova_pull_state, "results") ?? [])
+      results_arr = append(results_arr, {"model": model_name, "status": "error", "health": "N"})
+      nova_pull_state = dict_set(nova_pull_state, "results", results_arr)
+    }
+    pi = pi + 1
+  }
+  nova_pull_state = dict_set(nova_pull_state, "active", false)
+  let final_health = "N"
+  if3 ((dict_get(nova_pull_state, "pulled") ?? 0) > 0) { final_health = "P" }
+  nova_pull_state = dict_set(nova_pull_state, "health", final_health)
+  // Refresh registry after pulls
+  registry_refresh()
+  return {
+    "ok": true,
+    "status": "pull_complete",
+    "pulled": (dict_get(nova_pull_state, "pulled") ?? 0),
+    "failed": (dict_get(nova_pull_state, "failed") ?? 0),
+    "total": len(models),
+    "results": (dict_get(nova_pull_state, "results") ?? []),
+    "health": final_health
+  }
+}
+
+// -- /hive/nova/pull/status --
+// Returns current pull progress state
+fn handle_nova_pull_status(req) {
+  return nova_pull_state
+}
+
+// -- /hive/bridge/optimize --
+// WiFi bridge optimization -- queries adapter status and checks routing
+fn handle_bridge_optimize(req) {
+  try3 {
+    let cmd = "powershell -NoProfile -Command \"Get-NetAdapter | Where Status -eq Up | Select Name,LinkSpeed | ConvertTo-Json -Compress\""
+    let adapter_json = nova_run(cmd)
+    let adapters = json_decode(trim(adapter_json))
+    let adapter_count = 0
+    if3 (type_of(adapters) == "list") { adapter_count = len(adapters)
+    }
+    if3 (type_of(adapters) == "dict") { adapter_count = 1
+    }
+    return {
+      "ok": true,
+      "adapters": adapter_count,
+      "bonded": adapter_count > 1,
+      "status": "routing_checked",
+      "detail": adapters
+  } else3 {
+    return {"ok": false, "error": "bridge_optimize_failed"}
+  }
+}
+
+// -- /hive/tindex/index --
+// Index a file or directory via ternary index service on port 9894
+}
+fn handle_tindex_index(req) {
+  let dir_path = (dict_get(req, "path") ?? "C:/NovaX")
+  try3 {
+    let payload = json_encode({"path": dir_path})
+    let resp = http_post("http://127.0.0.1:9894/index", payload)
+    let data = json_decode(resp)
+    return data
+  } fail {
+    return {"error": "TIndex not loaded or unreachable", "trit": T_FALSE}
+  }
+}
+
+// -- /hive/model-to-model --
+// Direct model-to-model conversation through ternary channel
+fn handle_model_to_model(req) {
+  let sender = (dict_get(req, "sender") ?? "system")
+  let receiver = (dict_get(req, "receiver") ?? "")
+  let prompt = (dict_get(req, "prompt") ?? "")
+  let channel = (dict_get(req, "channel") ?? "REASON")
+  if3 (len(receiver) == 0) { return {"error": "Missing receiver model"} }
+  if3 (len(prompt) == 0) { return {"error": "Missing prompt"} }
+  // Build system prompt for model-to-model communication
+  let system = "You are model '" + sender + "' communicating with model '" + receiver + "' through ternary channel " + channel + ". Respond concisely and technically."
+  // Determine if receiver is cloud or local
+  let is_cloud = contains(receiver, "/")
+  if3 (is_cloud == false) { is_cloud = starts_with(receiver, "gpt") }
+  if3 (is_cloud == false) { is_cloud = starts_with(receiver, "claude") }
+  let result = {}
+  if3 (is_cloud) { result = hive_query_cloud(receiver, prompt, system)
+  }
+  if3 (is_cloud == false) { result = hive_query_model(receiver, prompt, system)
+  }
+  result = dict_set(result, "sender", sender)
+  result = dict_set(result, "receiver", receiver)
+  result = dict_set(result, "channel", channel)
+  let trit = response_trit(result)
+  record_query(trit)
+  result = dict_set(result, "trit", trit)
+  return result
+}
+
+// -- /hive/discuss --
+// Multi-round discussion between models. Each model sees previous responses.
+fn handle_discuss(req) {
+  let topic = (dict_get(req, "topic") ?? "")
+  let model_ids = (dict_get(req, "models") ?? [])
+  let rounds = (dict_get(req, "rounds") ?? 3)
+  let channel = (dict_get(req, "channel") ?? "REASON")
+  if3 (len(topic) == 0) { return {"error": "Missing topic"} }
+  if3 (rounds > H7) { rounds = H7 }
+  // Auto-select models if none specified
+  if3 (len(model_ids) == 0) { ch_data = (dict_get(cluster_channels, upper(channel)) ?? {"local": [], "cloud": []})
+    let local_pool = (dict_get(ch_data, "local") ?? [])
+    let cloud_pool = (dict_get(ch_data, "cloud") ?? [])
+    // Pick up to 3 models from local + cloud
+    let mi = 0
+    while3 (mi < len(local_pool)) {
+      if3 (len(model_ids) < H3) {
+        model_ids = append(model_ids, local_pool[mi])
+      }
+      mi = mi + 1
+    }
+    let ci = 0
+    while3 (ci < len(cloud_pool)) {
+      if3 (len(model_ids) < H3) {
+        model_ids = append(model_ids, cloud_pool[ci])
+      }
+      ci = ci + 1
+    }
+  }
+  if3 (len(model_ids) == 0) { return {"error": "No models available for discussion"} }
+  // Run multi-round discussion
+  let transcript = []
+  let context = "TOPIC: " + topic + "\nChannel: " + channel + "\n\n"
+  let round_num = 1
+  while3 (round_num <= rounds) {
+    let midx = 0
+    while3 (midx < len(model_ids)) {
+      let mid = model_ids[midx]
+      let round_prompt = context + "Round " + str(round_num) + "/" + str(rounds) + ". You are '" + mid + "'. Build on previous responses. Be concise (2-3 sentences)."
+      // Determine if cloud or local
+      let is_cloud = contains(mid, "/")
+      if3 (is_cloud == false) { is_cloud = starts_with(mid, "gpt") }
+      if3 (is_cloud == false) { is_cloud = starts_with(mid, "claude") }
+      let result = {}
+      if3 (is_cloud) { result = hive_query_cloud(mid, round_prompt, "")
+      }
+      if3 (is_cloud == false) { result = hive_query_model(mid, round_prompt, "")
+      }
+      let response = (dict_get(result, "response") ?? "")
+      let entry = {
+        "round": round_num,
+        "model": mid,
+        "response": response,
+        "time_ms": (dict_get(result, "time_ms") ?? 0),
+        "ok": (dict_get(result, "ok") ?? false)
+      }
+      transcript = append(transcript, entry)
+      // Accumulate context for next model
+      context = context + "[" + mid + " R" + str(round_num) + "]: " + response + "\n\n"
+      midx = midx + 1
+    }
+    round_num = round_num + 1
+  }
+  return {
+    "topic": topic,
+    "channel": channel,
+    "models": model_ids,
+    "rounds": rounds,
+    "transcript": transcript,
+    "total_entries": len(transcript),
+    "ok": true
+  }
+}
+
+// -- /hive/agent/plan --
+// AI-driven task planning: takes a goal, returns action sequence
+fn handle_agent_plan(req) {
+  let goal = (dict_get(req, "goal") ?? (dict_get(req, "prompt") ?? ""))
+  let screen_state = (dict_get(req, "screen_state") ?? {})
+  let ctx = (dict_get(req, "context") ?? {})
+  if3 (len(goal) == 0) { return {"error": "Missing goal"} }
+  let screen_str = json_encode(screen_state)
+  let ctx_str = json_encode(ctx)
+  let plan_prompt = "You are a desktop automation agent. Plan steps for:\n\nGOAL: " + goal + "\n\nSCREEN: " + slice(screen_str, 0, min(1500, len(screen_str))) + "\n\nCONTEXT: " + slice(ctx_str, 0, min(500, len(ctx_str))) + "\n\nOutput ONLY a JSON array of actions. Each action has:\n- action: focus|click|type|key|hotkey|scroll|drag|doubleclick|launch|close|minimize|maximize|restore|wait|screenshot\n- For coords: use rx,ry,window (relative 0-1) or x,y (absolute)\n- For type: text field. For key: key field. For hotkey: keys array\n- For launch: name, exe. For wait: ms."
+  try3 {
+    let result = hive_cluster_query(plan_prompt, "AGENT", "")
+    let trit = response_trit(result)
+    record_query(trit)
+    let response_text = (dict_get(result, "response") ?? "")
+    let actions = []
+    if3 (len(response_text) > 0) {
+      try3 {
+        let parsed = json_decode(trim(response_text))
+        if3 (type_of(parsed) == "list") {
+          actions = parsed
+        }
+      } fail {
+        try3 {
+          let parts = split(trim(response_text), "[")
+          if3 (len(parts) > 1) {
+            let end_parts = split(parts[1], "]")
+            if3 (len(end_parts) > 0) {
+              actions = json_decode("[" + end_parts[0] + "]")
+            }
+          }
+        } fail {
+          // Could not parse actions
+        }
+      }
+    }
+    let action_trit = T_TRUE
+    if3 (len(actions) == 0) { action_trit = T_MAYBE }
+    return {
+      "ok": true,
+      "trit": action_trit,
+      "actions": actions,
+      "action_count": len(actions),
+      "goal": goal,
+      "raw_response": response_text
+    }
+  } fail {
+    return {"ok": false, "trit": T_FALSE, "error": "agent_plan_failed"}
+  }
+}
+
+// -- /hive/agent/dispatch --
+}
+fn handle_agent_dispatch(req) {
+  let goal = (dict_get(req, "goal") ?? "")
+  let agent_id = (dict_get(req, "agent_id") ?? "hivemind-swarm")
+  let subtasks = (dict_get(req, "subtasks") ?? [])
+  if3 (len(goal) == 0) {
+    if3 (len(subtasks) == 0) {
+      return {"error": "Missing goal or subtasks"}
+    }
+  }
+  let bridge_url = "http://127.0.0.1:9887"
+  let results = []
+  // Create goals list from subtasks or single goal
+  let goals = subtasks
+  if3 (len(goals) == 0) { goals = [goal]
+  }
+  let gi = 0
+  while3 (gi < len(goals)) {
+    let g = goals[gi]
+    let task_goal = g
+    let task_priority = 0
+    let task_context = {}
+    if3 (type_of(g) == "dict") { task_goal = (dict_get(g, "goal") ?? "")
+      let task_priority = (dict_get(g, "priority") ?? 0)
+      let task_context = (dict_get(g, "context") ?? {})
+    }
+    try3 {
+      let task_payload = json_encode({
+        "goal": task_goal,
+        "agent_id": agent_id,
+        "priority": task_priority,
+        "context": task_context
+      })
+      let resp = http_post(bridge_url + "/task/create", task_payload)
+      let resp_data = json_decode(resp)
+      results = append(results, resp_data)
+    } fail {
+      results = append(results, {"ok": false, "error": "task_create_failed"})
+    }
+    gi = gi + 1
+  }
+  return {
+    "ok": true,
+    "trit": T_TRUE,
+    "tasks_created": len(results),
+    "results": results
+  }
+}
+
+// -- /hive/agent/swarm --
+// Launch multiple agent workers for parallel task execution
+fn handle_agent_swarm(req) {
+  let workers = min((dict_get(req, "workers") ?? H3), H7)
+  let goals = (dict_get(req, "goals") ?? [])
+  let agent_prefix = (dict_get(req, "agent_id") ?? "swarm")
+  if3 (len(goals) == 0) { return {"error": "Missing goals array"} }
+  let bridge_url = "http://127.0.0.1:9887"
+  let tasks = []
+  let task_ids = []
+  let gi = 0
+  while3 (gi < len(goals)) {
+    let g = goals[gi]
+    let task_goal = g
+    let task_priority = gi
+    let task_context = {}
+    if3 (type_of(g) == "dict") { task_goal = (dict_get(g, "goal") ?? "")
+      let task_priority = (dict_get(g, "priority") ?? gi)
+      let task_context = (dict_get(g, "context") ?? {})
+    }
+    // Assign worker ID via modulo: gi - (gi / workers) * workers
+    let div_result = int(gi / workers)
+    let worker_num = gi - div_result * workers
+    let worker_id = agent_prefix + "-" + str(worker_num)
+    try3 {
+      let task_payload = json_encode({
+        "goal": task_goal,
+        "agent_id": worker_id,
+        "priority": task_priority,
+        "context": task_context
+      })
+      let resp = http_post(bridge_url + "/task/create", task_payload)
+      let resp_data = json_decode(resp)
+      tasks = append(tasks, resp_data)
+      if3 ((dict_get(resp_data, "ok") ?? false) == true) {
+        let task_obj = (dict_get(resp_data, "task") ?? {})
+        task_ids = append(task_ids, (dict_get(task_obj, "id") ?? ""))
+      }
+    } fail {
+      tasks = append(tasks, {"ok": false, "error": "swarm_task_create_failed"})
+    }
+    gi = gi + 1
+  }
+  return {
+    "ok": true,
+    "trit": T_TRUE,
+    "workers": workers,
+    "tasks_created": len(tasks),
+    "tasks": task_ids,
+    "hint": "Start " + str(workers) + " agent runners: python nova_agent_runner.py --workers " + str(workers)
+  }
+}
+
+// -- /hive/strategy/plan --
+// Strategic lookahead: forward+backward reasoning via cluster queries
+fn handle_strategy_plan(req) {
+  let body = try3 { json_decode(req["body"]) } fail { req }
+  let goal = (dict_get(body, "goal") ?? (dict_get(body, "prompt") ?? ""))
+  let ctx = (dict_get(body, "context") ?? "")
+  let depth = min((dict_get(body, "depth") ?? 5), 5)
+  let regime = (dict_get(body, "regime") ?? "transitional")
+  if3 (len(goal) == 0) { return {"error": "goal required"} }
+  // Determine branch factor from regime (3-5-7-13 harmonic)
+  let branch_factor = H7
+  if3 (regime == "laminar") { branch_factor = H3 }
+  if3 (regime == "transitional") { branch_factor = H7 }
+  if3 (regime == "turbulent") { branch_factor = H13 }
+  if3 (regime == "chaotic") { branch_factor = RE_LAMINAR }
+  // Use registry_get_swarm + hive_scatter (same as working /hive/query path)
+  let model_count = branch_factor
+  if3 (model_count > 5) { model_count = 5 }
+  let models = registry_get_swarm("reasoning", model_count)
+  if3 (len(models) == 0) { models = registry_get_swarm("general", 3) }
+  let sys_prompt = "You are a strategic AI planner. Think step by step."
+  // Layer 1: SCATTER (Forward) -- generate forward paths
+  let forward_prompt = "Given this goal: " + goal + " Context: " + ctx + " Generate " + str(branch_factor) + " possible next steps or approaches. Output as a numbered list. Be concise."
+  let fwd_scatter = hive_scatter(models, forward_prompt, sys_prompt, MERGE_TIMEOUT, H3)
+  let fwd_results = (dict_get(fwd_scatter, "results") ?? [])
+  let fwd_ok = []
+  let fi = 0
+  while3 (fi < len(fwd_results)) {
+    if3 ((dict_get(fwd_results[fi], "ok") ?? false) == true) {
+      if3 (len((dict_get(fwd_results[fi], "response") ?? "")) > 0) {
+        fwd_ok = append(fwd_ok, fwd_results[fi])
+      }
+    }
+    fi = fi + 1
+  }
+  let forward_text = hive_merge_responses(fwd_ok, forward_prompt)
+  // Layer 2: PRESSURE (Backward) -- work backwards from desired outcome
+  let backward_prompt = "Working BACKWARDS from achieved goal: " + goal + " Context: " + ctx + " What " + str(branch_factor) + " steps must have been completed just before success? Work backwards. Output as a numbered list."
+  let bwd_scatter = hive_scatter(models, backward_prompt, sys_prompt, MERGE_TIMEOUT, H3)
+  let bwd_results = (dict_get(bwd_scatter, "results") ?? [])
+  let bwd_ok = []
+  let bi = 0
+  while3 (bi < len(bwd_results)) {
+    if3 ((dict_get(bwd_results[bi], "ok") ?? false) == true) {
+      if3 (len((dict_get(bwd_results[bi], "response") ?? "")) > 0) {
+        bwd_ok = append(bwd_ok, bwd_results[bi])
+      }
+    }
+    bi = bi + 1
+  }
+  let backward_text = hive_merge_responses(bwd_ok, backward_prompt)
+  // Layer 3: DIFFUSION (Merge) -- synthesize forward and backward
+  let merge_prompt = "Merge these forward and backward plans into a coherent strategy. FORWARD PATHS: " + forward_text + " BACKWARD PATHS: " + backward_text + " GOAL: " + goal + " Output a unified step-by-step plan with convergence points."
+  let mrg_scatter = hive_scatter(models, merge_prompt, sys_prompt, MERGE_TIMEOUT, H3)
+  let mrg_results = (dict_get(mrg_scatter, "results") ?? [])
+  let mrg_ok = []
+  let mi = 0
+  while3 (mi < len(mrg_results)) {
+    if3 ((dict_get(mrg_results[mi], "ok") ?? false) == true) {
+      if3 (len((dict_get(mrg_results[mi], "response") ?? "")) > 0) {
+        mrg_ok = append(mrg_ok, mrg_results[mi])
+      }
+    }
+    mi = mi + 1
+  }
+  let merged_plan = hive_merge_responses(mrg_ok, merge_prompt)
+  // Layer 4: MINESWEEPER (Risk Sweep) -- identify hidden dangers and probability
+  // Chess=tactics, Go=territory, Minesweeper=risk under uncertainty
+  // Each step in the plan is a "cell" -- sweep for hidden mines (risks)
+  let mine_prompt = "You are a risk analyst using minesweeper logic. For this plan: " + merged_plan + " GOAL: " + goal + " Analyze each step like a minesweeper grid: 1) Flag MINES: hidden risks, dependencies, failure points that could blow up. 2) Count ADJACENTS: for each risk, how many plan steps does it affect (1-8 like minesweeper numbers). 3) Mark SAFE ZONES: steps with zero adjacent risks. 4) Identify PROBABILITY CLUSTERS: areas where multiple risks overlap. 5) Suggest PROBE ORDER: safest steps to execute first to reveal information. Output as: MINES: [list], ADJACENTS: [step: count], SAFE_FIRST: [steps], DANGER_ZONES: [clusters]."
+  let mine_scatter = hive_scatter(models, mine_prompt, sys_prompt, MERGE_TIMEOUT, H3)
+  let mine_results = (dict_get(mine_scatter, "results") ?? [])
+  let mine_ok = []
+  let mni = 0
+  while3 (mni < len(mine_results)) {
+    if3 ((dict_get(mine_results[mni], "ok") ?? false) == true) {
+      if3 (len((dict_get(mine_results[mni], "response") ?? "")) > 0) {
+        mine_ok = append(mine_ok, mine_results[mni])
+      }
+    }
+    mni = mni + 1
+  }
+  let minesweeper_text = hive_merge_responses(mine_ok, mine_prompt)
+  let trit = 1
+  if3 (len(merged_plan) < 10) { trit = -1 }
+  record_query(trit)
+  let total_models = len(fwd_ok) + len(bwd_ok) + len(mrg_ok) + len(mine_ok)
+  return {
+    "ok": true,
+    "trit": trit,
+    "goal": goal,
+    "regime": regime,
+    "depth": depth,
+    "branch_factor": branch_factor,
+    "layers": {
+      "scatter_forward": forward_text,
+      "pressure_backward": backward_text,
+      "diffusion_merged": merged_plan,
+      "minesweeper_risk": minesweeper_text
+    },
+    "plan": merged_plan,
+    "risk_sweep": minesweeper_text,
+    "models_used": total_models
+  }
+}
+
+// ============================================================
+
+// Section 10b: Tripple Module Ripple Injection
+// ============================================================
+
+// POST /api/v1/modulation/ripple — receives ripple signal from Tripple Module
+fn handle_tripple_ripple(req) {
+  let body = try3 { json_decode(req["body"]) } fail { req }
+  let provider = (dict_get(body, "provider") ?? "ollama")
+  let trit = (dict_get(body, "trit") ?? 0)
+  let latency_ms = (dict_get(body, "latency_ms") ?? 100)
+  let prime_locked = (dict_get(body, "prime_locked") ?? false)
+  if3 (provider == null) { provider = "ollama" }
+  if3 (trit == null) { trit = 0 }
+  if3 (latency_ms == null) { latency_ms = 100 }
+
+  // Feed ripple into local _tripple state too
+  _tripple = tripple_ripple(_tripple, provider, trit, latency_ms)
+  _tripple = tripple_resonance_check(_tripple)
+
+  // Map provider success to channel SNR boost
+  let channels = dict_keys(mod_channel_snr)
+  let updated = 0
+  let i = 0
+  while3 i < len(channels) {
+    let ch = channels[i]
+    let old_snr = dict_get(mod_channel_snr, ch)
+
+    if3 trit == 1 { let boost = (1000 - 333) * old_snr + 333 * 900
+      let new_snr = boost / 1000
+      mod_channel_snr = dict_set(mod_channel_snr, ch, new_snr)
+      updated = updated + 1
+    }
+    if3 trit == -1 { let decay = (1000 - 200) * old_snr + 200 * 100
+      let new_snr = decay / 1000
+      mod_channel_snr = dict_set(mod_channel_snr, ch, new_snr)
+      updated = updated + 1
+    }
+
+    i = i + 1
+  }
+
+  // If prime state is locked, auto-upgrade modulation to max
+  let is_prime = (dict_get(_tripple, "prime_locked") ?? false)
+  if3 is_prime == true { j = 0
+    while3 j < len(channels) {
+      let ch = channels[j]
+      let cur = dict_get(mod_channel_snr, ch)
+      if3 cur < 900 { mod_channel_snr = dict_set(mod_channel_snr, ch, 900)
+      }
+      j = j + 1
+    }
+  }
+
+  let res_score = (dict_get(_tripple, "resonance_score") ?? 0)
+  let resp = make_ok({"updated_channels": updated, "provider": provider, "trit": trit, "prime_locked": is_prime, "resonance_score": res_score})
+  return resp
+}
+
+// ============================================================
+
+// Section 10c: Tripple Resonance Sensor Endpoints (Hivemind)
+// ============================================================
+
+fn handle_hive_tripple_status(req) {
+  _tripple = tripple_outer(_tripple)
+  _tripple = tripple_resonance_check(_tripple)
+  let status = tripple_status(_tripple)
+  let result = {"ok": true, "trit": 1, "service": "hivemind"}
+  result = dict_set(result, "resonance_score", (dict_get(status, "resonance_score") ?? 0))
+  result = dict_set(result, "regime", (dict_get(status, "regime") ?? "laminar"))
+  result = dict_set(result, "prime_locked", (dict_get(status, "prime_locked") ?? false))
+  result = dict_set(result, "hyper_locked", (dict_get(status, "hyper_locked") ?? false))
+  result = dict_set(result, "total_ripples", (dict_get(status, "total_ripples") ?? 0))
+  result = dict_set(result, "providers", (dict_get(status, "providers") ?? {}))
+  result = dict_set(result, "formula", (dict_get(status, "formula") ?? {}))
+  return result
+}
+
+fn handle_hive_tripple_wave(req) {
+  let wave = tripple_standing_wave(_tripple)
+  return {"ok": true, "trit": 1, "wave": wave}
+}
+
+fn handle_hive_tripple_mirror(req) {
+  let mirror = tripple_mirror_status(_tripple)
+  return {"ok": true, "trit": 1, "mirror": mirror}
+}
+
+fn handle_hive_tripple_ripple_post(req) {
+  let body = try3 { json_decode(req["body"]) } fail { req }
+  let provider = (dict_get(body, "provider") ?? "ollama")
+  let trit = (dict_get(body, "trit") ?? 1)
+  let latency = (dict_get(body, "latency_ms") ?? 100)
+  if3 (provider == null) { provider = "ollama" }
+  if3 (trit == null) { trit = 1 }
+  if3 (latency == null) { latency = 100 }
+  _tripple = tripple_ripple(_tripple, provider, trit, latency)
+  _tripple = tripple_resonance_check(_tripple)
+  let score = (dict_get(_tripple, "resonance_score") ?? 0)
+  return {"ok": true, "trit": 1, "provider": provider, "ripple_trit": trit, "resonance_score": score}
+}
+
+// GET /api/v1/modulation/status — returns full modulation state with per-channel schemes
+fn handle_tripple_modulation_status(req) {
+  let resp = {}
+  resp = dict_set(resp, "ok", true)
+  resp = dict_set(resp, "trit", 1)
+  resp = dict_set(resp, "channel_snr", mod_channel_snr)
+  resp = dict_set(resp, "channel_ber", mod_channel_ber)
+  // Get current scheme for each channel
+  let schemes = {}
+  let channels = dict_keys(mod_channel_snr)
+  let i = 0
+  while3 i < len(channels) {
+    let ch = channels[i]
+    let snr = dict_get(mod_channel_snr, ch)
+    // Determine which scheme this SNR maps to
+    let scheme = "BPSK"
+    if3 (snr >= 900) { scheme = "1024QAM" }
+    if3 (snr >= 800) { if3 (snr < 900) { scheme = "256QAM" } }
+    if3 (snr >= 650) { if3 (snr < 800) { scheme = "64QAM" } }
+    if3 (snr >= 500) { if3 (snr < 650) { scheme = "16QAM" } }
+    if3 (snr >= 350) { if3 (snr < 500) { scheme = "8PSK" } }
+    if3 (snr >= 200) { if3 (snr < 350) { scheme = "QPSK" } }
+    schemes = dict_set(schemes, ch, scheme)
+    i = i + 1
+  }
+  resp = dict_set(resp, "modulation_schemes", schemes)
+  return resp
+}
+
+// ============================================================
+// Section 10b: Microsoft Engine Proxy (Win32 System Tools)
+// ============================================================
+// Routes system tool queries to Microsoft Engine (:9851)
+// Provides 7 Win32 tools: windows, registry, process, system, theme, clipboard, notify
+
+fn handle_microsoft_proxy(req) {
+  let body = try3 { json_decode(req["body"]) } fail { {} }
+  let tool = (dict_get(body, "tool") ?? "system")
+  let valid_tools = ["windows", "registry", "process", "system", "theme", "clipboard", "notify"]
+  let found = 0
+  let i = 0
+  while3 i < len(valid_tools) {
+    if3 valid_tools[i] == tool { found = 1 }
+    i = i + 1
+  }
+  if3 found == 0 {
+    return {"ok": false, "error": "invalid_tool", "valid": valid_tools}
+  }
+  let url = "http://127.0.0.1:9851/novaxcore/" + tool
+  let result = try3 { http_post(url, json_encode(body)) } fail { {"ok": false, "error": "novaxcore_engine_unreachable"} }
+  let parsed = try3 { json_decode(result) } fail { result }
+  // Inject ripple for successful system tool use
+  let is_ok = (dict_get(parsed, "ok") ?? false)
+  if3 is_ok {
+    let ripple = {"source": "novaxcore_engine", "tool": tool, "trit": 1}
+    try3 { http_post("http://127.0.0.1:9881/hive/tripple/ripple", json_encode(ripple)) } fail { 0 }
+  }
+  return parsed
+}
+
+fn handle_microsoft_status(req) {
+  let result = try3 { http_get("http://127.0.0.1:9851/status") } fail { "{\"error\":\"unreachable\"}" }
+  let parsed = try3 { json_decode(result) } fail { {"error": "parse_failed"} }
+  return parsed
+}
+
+// ============================================================
+// Section 11: Route Registration
+// ============================================================
+
+// GET routes
+troute(server, "GET", "/health", handle_health)
+troute(server, "GET", "/hive/health", handle_health)
+troute(server, "GET", "/hive/status", handle_status)
+troute(server, "GET", "/hive/models", handle_models)
+troute(server, "GET", "/hive/refresh", handle_refresh)
+troute(server, "GET", "/hive/cluster/status", handle_cluster_status)
+troute(server, "GET", "/hive/cluster/channels", handle_cluster_channels)
+troute(server, "GET", "/hive/modulation/status", handle_modulation_status)
+troute(server, "GET", "/hive/modulation/schemes", handle_modulation_schemes)
+troute(server, "GET", "/hive/ns/status", handle_ns_status)
+troute(server, "GET", "/hive/flow", handle_ns_flow)
+troute(server, "GET", "/hive/warm/status", handle_warm_status)
+troute(server, "GET", "/hive/warm-pool", handle_warm_pool)
+troute(server, "GET", "/hive/network", handle_network)
+troute(server, "GET", "/hive/bridge", handle_bridge)
+troute(server, "GET", "/hive/benchmark", handle_benchmark)
+troute(server, "GET", "/hive/nova", handle_nova)
+troute(server, "GET", "/hive/nova/status", handle_nova_status)
+troute(server, "GET", "/hive/tforge", handle_tforge)
+troute(server, "GET", "/hive/tindex/search", handle_tindex_search)
+troute(server, "GET", "/hive/tindex/status", handle_tindex_status)
+troute(server, "GET", "/hive/tcache/status", handle_tcache_status)
+troute(server, "GET", "/hive/ttools", handle_ttools)
+troute(server, "GET", "/hive/influence", handle_influence)
+troute(server, "GET", "/hive/territory", handle_territory)
+troute(server, "GET", "/hive/strategy/status", handle_strategy_status)
+
+// POST routes
+troute(server, "POST", "/hive/query", handle_query)
+troute(server, "POST", "/hive/cluster/query", handle_cluster_query)
+troute(server, "POST", "/hive/cluster/classify", handle_cluster_classify)
+troute(server, "POST", "/hive/pipeline", handle_pipeline)
+troute(server, "POST", "/hive/swarm", handle_swarm)
+troute(server, "POST", "/hive/deepseek", handle_deepseek)
+troute(server, "POST", "/hive/reynolds", handle_reynolds)
+troute(server, "POST", "/hive/warm", handle_warm)
+troute(server, "POST", "/hive/refresh", handle_refresh)
+troute(server, "POST", "/hive/ternary/math", handle_ternary_math)
+troute(server, "POST", "/hive/nova/dispatch", handle_nova_dispatch)
+troute(server, "POST", "/hive/nova/pull", handle_nova_pull)
+troute(server, "POST", "/hive/nova/pull/status", handle_nova_pull_status)
+troute(server, "POST", "/hive/bridge/optimize", handle_bridge_optimize)
+troute(server, "POST", "/hive/tindex/index", handle_tindex_index)
+troute(server, "POST", "/hive/model-to-model", handle_model_to_model)
+troute(server, "POST", "/hive/models/bulk", handle_models_bulk)
+troute(server, "GET", "/hive/models/load", handle_models_load)
+troute(server, "POST", "/hive/discuss", handle_discuss)
+troute(server, "POST", "/hive/agent/plan", handle_agent_plan)
+troute(server, "POST", "/hive/agent/dispatch", handle_agent_dispatch)
+troute(server, "POST", "/hive/agent/swarm", handle_agent_swarm)
+troute(server, "POST", "/hive/strategy/plan", handle_strategy_plan)
+
+// Microsoft Engine proxy routes
+troute(server, "POST", "/hive/microsoft", handle_microsoft_proxy)
+troute(server, "GET", "/hive/microsoft/status", handle_microsoft_status)
+
+// Tripple Module ripple injection + resonance sensor
+troute(server, "POST", "/api/v1/modulation/ripple", handle_tripple_ripple)
+troute(server, "GET", "/api/v1/modulation/status", handle_tripple_modulation_status)
+troute(server, "GET", "/hive/tripple/status", handle_hive_tripple_status)
+troute(server, "GET", "/hive/tripple/wave", handle_hive_tripple_wave)
+troute(server, "GET", "/hive/tripple/mirror", handle_hive_tripple_mirror)
+troute(server, "POST", "/hive/tripple/ripple", handle_hive_tripple_ripple_post)
+
+// ============================================================
+// Section 12: Initialization
+// ============================================================
+
+// Load configs
+print("[BOOT] Loading cloud config...")
+load_cloud_config()
+print("[BOOT] Loading chess openings...")
+load_chess_openings()
+
+// Init engines
+print("[BOOT] Ternary init...")
+ternary_init()
+print("[BOOT] Modulation init...")
+modulation_init()
+print("[BOOT] NS init...")
+ns_init()
+
+// Refresh registry and cluster
+print("[BOOT] Registry refresh...")
+let model_count = registry_refresh()
+
+// ── MODEL REGISTRY SYNC ──
+// Models are injected post-boot via POST /hive/models/bulk
+// Use: python C:/NovaX/tools/hivemind_model_inject.py
+print("[BOOT] Registry sync deferred to post-boot injection")
+
+print("[BOOT] Cluster assign...")
+cluster_assign_models()
+
+// ============================================================
+// Section 13: Banner and Start
+// ============================================================
+print("============================================================")
+print("  NOVAX HIVE MIND v2.1 -- Ternary Swarm + TRIPPLE Resonance")
+print("  3-5-7-13 Harmonic Constants | N-S Flow Architecture")
+print("  H3=3 H5=5 H7=7 H13=13 | BLOCK=2187 | Re=27/125/343")
+print("============================================================")
+print("  [REGISTRY] " + str(model_count) + " models loaded (local + cloud)")
+print("  [REGISTRY] " + str(len(ALL_CLOUD_MODELS)) + " cloud models | 509,882 HuggingFace | " + str(model_count + 509882) + " total")
+print("  [CLUSTER] " + str(len(keys(FLOW_CHANNELS))) + " flow channels active")
+print("  [TERNARY] Trit tracking active | Reynolds flow online")
+print("  [TRIPPLE] 29 providers across 9 APIs + Ollama local")
+print("  [TRIPPLE] /hive/tripple/status /hive/tripple/wave /hive/tripple/mirror")
+print("  [SERVER] Starting on port " + str(PORT))
+print("  [API] POST http://127.0.0.1:" + str(PORT) + "/hive/cluster/query")
+print("============================================================")
+
+tstart(server)

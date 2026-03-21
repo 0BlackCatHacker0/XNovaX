@@ -1,0 +1,547 @@
+// ============================================================================
+// TSpin — The Spinning Top
+// NovaX Zombie Killer + Permanent Prevention Layer
+// Port 9970 | Ternary Micro-Tool | 3-5-7-13 Harmonics
+// ============================================================================
+// A spinning top stays upright through angular momentum.
+// TSpin maintains continuous spin state across the fleet:
+//   +1 = spinning (stable, fleet clean)
+//    0 = wobbling (anomaly detected, correcting)
+//   -1 = fallen (emergency kill mode)
+//
+// TSpin is the FIRST service to boot and the LAST to die.
+// It prevents zombie spawn loops by:
+//   1. Counting processes every H3 seconds (3s)
+//   2. Killing anything over the threshold
+//   3. Gating all launches through /spin/gate
+//   4. Maintaining a process registry of approved PIDs
+// ============================================================================
+
+let VERSION = "1.0"
+let PORT = 9970
+let server = tserve(PORT, "tspin")
+let SERVICE = "nova-tspin"
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK_SIZE = 2187
+
+// -- Ternary States --
+let T_TRUE = 1
+let T_FALSE = -1
+let T_MAYBE = 0
+
+// -- Spin States --
+let SPINNING = 1
+let WOBBLING = 0
+let FALLEN = -1
+
+// -- Thresholds (3-5-7-13 aligned) --
+let MAX_PYTHON_PROCS = H13          // 13 python processes max
+let MAX_PYTHONW_PROCS = H7          // 7 pythonw processes max
+let MAX_TOTAL_PROCS = H13 + H7     // 20 total python+pythonw
+let MAX_PROC_MB = H5 * 100         // 500MB per process max
+let SPIN_INTERVAL_S = H3            // 3 second spin cycle
+let DEEP_SCAN_EVERY = H7            // deep scan every 7th spin
+let EMERGENCY_MB = H13 * 100       // 1300MB total python RAM = emergency
+
+// -- State --
+let _spin_state = SPINNING
+let _spin_count = 0
+let _zombies_killed = 0
+let _launches_gated = 0
+let _launches_blocked = 0
+let _last_scan = {}
+let _registry = []
+let _kill_log = []
+let _t0 = time()
+
+// -- Protected processes (never kill) --
+// MCP servers, this service itself
+let PROTECTED_NAMES = ["nova_mcp_server", "nova_tspin"]
+
+// ============================================================================
+// CORE: Process Scanner
+// ============================================================================
+
+fn scan_processes() {
+    // Get all python/pythonw processes with PID, name, memory
+    let cmd = "python -c \""
+    let cmd = cmd + "import json,subprocess;"
+    let cmd = cmd + "r=subprocess.run(['tasklist','/fo','csv','/nh'],capture_output=True,text=True);"
+    let cmd = cmd + "lines=[l.strip() for l in r.stdout.strip().split(chr(10)) if l.strip()];"
+    let cmd = cmd + "procs=[];"
+    let cmd = cmd + "[procs.append({'name':p[0].strip(chr(34)),'pid':int(p[1].strip(chr(34))),'mb':int(p[4].strip(chr(34)).replace(',','').replace(' K',''))//1024}) for p in [l.split(chr(44)) for l in lines] if len(p)>=5 and ('python' in p[0].lower())];"
+    let cmd = cmd + "print(json.dumps(procs))"
+    let cmd = cmd + "\""
+    let raw = nova_run(cmd)
+    let result = json_decode(trim(raw))
+    if result == null {
+        return []
+    }
+    return result
+}
+
+fn get_process_cmdline(pid) {
+    let cmd = "python -c \"import json,subprocess;r=subprocess.run(['wmic','process','where','ProcessId=" + str(pid) + "','get','CommandLine','/value'],capture_output=True,text=True);lines=[l.strip() for l in r.stdout.split(chr(10)) if 'CommandLine=' in l];print(lines[0].replace('CommandLine=','') if lines else 'unknown')\""
+    let raw = nova_run(cmd)
+    return trim(raw)
+}
+
+// ============================================================================
+// CORE: Zombie Detection
+// ============================================================================
+
+fn detect_zombies(procs) {
+    let zombies = []
+    let total_mb = 0
+    let python_count = 0
+    let pythonw_count = 0
+
+    // Count by type
+    let i = 0
+    while i < len(procs) {
+        let p = procs[i]
+        let name = dict_get(p, "name", "")
+        let mb = dict_get(p, "mb", 0)
+        let total_mb = total_mb + mb
+        if name == "python.exe" {
+            let python_count = python_count + 1
+        }
+        if name == "pythonw.exe" {
+            let pythonw_count = pythonw_count + 1
+        }
+        let i = i + 1
+    }
+
+    // Rule 1: Too many python.exe processes
+    if python_count > MAX_PYTHON_PROCS {
+        // Kill newest (highest PID) python.exe processes first
+        let py_procs = []
+        let j = 0
+        while j < len(procs) {
+            let p = procs[j]
+            if dict_get(p, "name", "") == "python.exe" {
+                append(py_procs, p)
+            }
+            let j = j + 1
+        }
+        // Sort by PID descending (newest first) - kill excess
+        let excess = python_count - MAX_PYTHON_PROCS
+        let killed = 0
+        let k = len(py_procs) - 1
+        while k >= 0 {
+            if killed >= excess {
+                break
+            }
+            let p = py_procs[k]
+            let pid = dict_get(p, "pid", 0)
+            if is_protected(pid) == false {
+                append(zombies, p)
+                let killed = killed + 1
+            }
+            let k = k - 1
+        }
+    }
+
+    // Rule 2: Too many pythonw.exe processes
+    if pythonw_count > MAX_PYTHONW_PROCS {
+        let pw_procs = []
+        let j = 0
+        while j < len(procs) {
+            let p = procs[j]
+            if dict_get(p, "name", "") == "pythonw.exe" {
+                append(pw_procs, p)
+            }
+            let j = j + 1
+        }
+        let excess = pythonw_count - MAX_PYTHONW_PROCS
+        let killed = 0
+        let k = len(pw_procs) - 1
+        while k >= 0 {
+            if killed >= excess {
+                break
+            }
+            let p = pw_procs[k]
+            let pid = dict_get(p, "pid", 0)
+            if is_protected(pid) == false {
+                append(zombies, p)
+                let killed = killed + 1
+            }
+            let k = k - 1
+        }
+    }
+
+    // Rule 3: Any single process using > MAX_PROC_MB
+    let j = 0
+    while j < len(procs) {
+        let p = procs[j]
+        let mb = dict_get(p, "mb", 0)
+        let pid = dict_get(p, "pid", 0)
+        if mb > MAX_PROC_MB {
+            if is_protected(pid) == false {
+                // Check if already in zombies list
+                let already = false
+                let z = 0
+                while z < len(zombies) {
+                    if dict_get(zombies[z], "pid", 0) == pid {
+                        let already = true
+                    }
+                    let z = z + 1
+                }
+                if already == false {
+                    append(zombies, p)
+                }
+            }
+        }
+        let j = j + 1
+    }
+
+    // Rule 4: EMERGENCY - total RAM exceeds threshold
+    if total_mb > EMERGENCY_MB {
+        // Kill ALL pythonw.exe (they are the zombie spawners)
+        let j = 0
+        while j < len(procs) {
+            let p = procs[j]
+            if dict_get(p, "name", "") == "pythonw.exe" {
+                let pid = dict_get(p, "pid", 0)
+                if is_protected(pid) == false {
+                    let already = false
+                    let z = 0
+                    while z < len(zombies) {
+                        if dict_get(zombies[z], "pid", 0) == pid {
+                            let already = true
+                        }
+                        let z = z + 1
+                    }
+                    if already == false {
+                        append(zombies, p)
+                    }
+                }
+            }
+            let j = j + 1
+        }
+    }
+
+    return {
+        "zombies": zombies,
+        "python_count": python_count,
+        "pythonw_count": pythonw_count,
+        "total_procs": python_count + pythonw_count,
+        "total_mb": total_mb,
+        "emergency": total_mb > EMERGENCY_MB
+    }
+}
+
+fn is_protected(pid) {
+    // Check registry
+    let i = 0
+    while i < len(_registry) {
+        let entry = _registry[i]
+        if dict_get(entry, "pid", 0) == pid {
+            if dict_get(entry, "protected", false) == true {
+                return true
+            }
+        }
+        let i = i + 1
+    }
+    return false
+}
+
+// ============================================================================
+// CORE: Zombie Killer
+// ============================================================================
+
+fn kill_zombies(zombies) {
+    let killed = 0
+    let i = 0
+    while i < len(zombies) {
+        let z = zombies[i]
+        let pid = dict_get(z, "pid", 0)
+        let name = dict_get(z, "name", "unknown")
+        let mb = dict_get(z, "mb", 0)
+        // Kill it
+        let cmd = "taskkill /f /pid " + str(pid) + " 2>&1"
+        let result = nova_run(cmd)
+        let killed = killed + 1
+        let _zombies_killed = _zombies_killed + 1
+        // Log the kill
+        let entry = {
+            "pid": pid, "name": name, "mb": mb,
+            "time": time(), "spin": _spin_count
+        }
+        append(_kill_log, entry)
+        // Keep log trimmed
+        if len(_kill_log) > 100 {
+            let _kill_log = slice(_kill_log, len(_kill_log) - 100, len(_kill_log))
+        }
+        let i = i + 1
+    }
+    return killed
+}
+
+// ============================================================================
+// CORE: The Spin Cycle (background thread)
+// ============================================================================
+
+fn spin_cycle() {
+    sleep(H5)  // 5s warmup — let boot finish
+    while true {
+        let _spin_count = _spin_count + 1
+
+        // Scan
+        let procs = scan_processes()
+        let scan = detect_zombies(procs)
+        let _last_scan = scan
+
+        let zombie_list = dict_get(scan, "zombies", [])
+        let zombie_count = len(zombie_list)
+        let is_emergency = dict_get(scan, "emergency", false)
+
+        // Decide spin state
+        if zombie_count == 0 {
+            let _spin_state = SPINNING
+        }
+        if zombie_count > 0 {
+            if is_emergency == true {
+                let _spin_state = FALLEN
+            } else {
+                let _spin_state = WOBBLING
+            }
+        }
+
+        // Kill zombies
+        if zombie_count > 0 {
+            let killed = kill_zombies(zombie_list)
+        }
+
+        // Sleep until next spin
+        sleep(SPIN_INTERVAL_S)
+    }
+}
+
+// ============================================================================
+// LAUNCH GATE — The Permanent Zombie Patch
+// ============================================================================
+// Before launching ANY service, the orchestrator calls POST /spin/gate
+// TSpin checks: can we afford another process? Is RAM OK?
+// Returns +1 (go), 0 (wait), -1 (denied)
+
+fn handle_gate(body) {
+    let service_name = dict_get(body, "name", "unknown")
+    let service_port = dict_get(body, "port", 0)
+
+    let _launches_gated = _launches_gated + 1
+
+    // Quick scan
+    let procs = scan_processes()
+    let scan = detect_zombies(procs)
+    let total = dict_get(scan, "total_procs", 0)
+    let total_mb = dict_get(scan, "total_mb", 0)
+
+    // Gate logic
+    let verdict = T_TRUE
+    let reason = "clear"
+
+    // Check 1: Too many processes already
+    if total >= MAX_TOTAL_PROCS {
+        let verdict = T_FALSE
+        let reason = "max_procs_reached: " + str(total) + "/" + str(MAX_TOTAL_PROCS)
+        let _launches_blocked = _launches_blocked + 1
+    }
+
+    // Check 2: RAM too high
+    if total_mb > EMERGENCY_MB {
+        let verdict = T_FALSE
+        let reason = "emergency_ram: " + str(total_mb) + "MB"
+        let _launches_blocked = _launches_blocked + 1
+    }
+
+    // Check 3: Approaching limits — wobble (wait)
+    if verdict == T_TRUE {
+        if total >= MAX_TOTAL_PROCS - H3 {
+            let verdict = T_MAYBE
+            let reason = "approaching_limit: " + str(total) + "/" + str(MAX_TOTAL_PROCS)
+        }
+    }
+
+    // Register if approved
+    if verdict == T_TRUE {
+        let entry = {
+            "name": service_name, "port": service_port,
+            "approved_at": time(), "pid": 0, "protected": false
+        }
+        append(_registry, entry)
+    }
+
+    return {
+        "ok": verdict >= 0,
+        "trit": verdict,
+        "char": trit_char(verdict),
+        "reason": reason,
+        "name": service_name,
+        "fleet": {"procs": total, "mb": total_mb, "max_procs": MAX_TOTAL_PROCS, "max_mb": EMERGENCY_MB}
+    }
+}
+
+// ============================================================================
+// REGISTER — Orchestrator reports PID after successful launch
+// ============================================================================
+
+fn handle_register(body) {
+    let pid = dict_get(body, "pid", 0)
+    let name = dict_get(body, "name", "unknown")
+    let port = dict_get(body, "port", 0)
+    let protected = dict_get(body, "protected", false)
+
+    let entry = {
+        "name": name, "port": port, "pid": pid,
+        "protected": protected, "registered_at": time()
+    }
+    append(_registry, entry)
+
+    // Trim old entries (keep last 50)
+    if len(_registry) > 50 {
+        let _registry = slice(_registry, len(_registry) - 50, len(_registry))
+    }
+
+    return {"ok": true, "trit": T_TRUE, "registered": name, "pid": pid}
+}
+
+// ============================================================================
+// FORCE KILL — Emergency endpoint
+// ============================================================================
+
+fn handle_emergency_kill(body) {
+    let target = dict_get(body, "target", "pythonw")
+    let cmd = "taskkill /f /im " + target + ".exe 2>&1"
+    let result = nova_run(cmd)
+    return {"ok": true, "trit": T_TRUE, "killed": target, "output": result}
+}
+
+// ============================================================================
+// TRIT HELPERS
+// ============================================================================
+
+fn trit_char(t) {
+    if t == 1 {
+        return "1"
+    }
+    if t == 0 {
+        return "0"
+    }
+    return "T"
+}
+
+fn spin_label(s) {
+    if s == 1 {
+        return "SPINNING"
+    }
+    if s == 0 {
+        return "WOBBLING"
+    }
+    return "FALLEN"
+}
+
+// ============================================================================
+// HTTP HANDLERS
+// ============================================================================
+
+fn handle_health() {
+    let uptime = round(time() - _t0, 0)
+    return {
+        "ok": true, "service": SERVICE, "port": PORT,
+        "version": VERSION, "ternary": true,
+        "runtime": "novalang",
+        "spin_state": _spin_state,
+        "spin_label": spin_label(_spin_state),
+        "self_trit": _spin_state, "char": trit_char(_spin_state),
+        "spins": _spin_count,
+        "zombies_killed": _zombies_killed,
+        "launches_gated": _launches_gated,
+        "launches_blocked": _launches_blocked,
+        "uptime": int(uptime),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "thresholds": {
+            "max_python": MAX_PYTHON_PROCS,
+            "max_pythonw": MAX_PYTHONW_PROCS,
+            "max_total": MAX_TOTAL_PROCS,
+            "max_mb_per_proc": MAX_PROC_MB,
+            "emergency_mb": EMERGENCY_MB
+        }
+    }
+}
+
+fn handle_status() {
+    return {
+        "spin_state": spin_label(_spin_state),
+        "trit": _spin_state,
+        "spins": _spin_count,
+        "zombies_killed": _zombies_killed,
+        "last_scan": _last_scan,
+        "registry_size": len(_registry),
+        "kill_log_size": len(_kill_log)
+    }
+}
+
+fn handle_scan() {
+    // Manual scan trigger
+    let procs = scan_processes()
+    let scan = detect_zombies(procs)
+    return {
+        "ok": true,
+        "scan": scan,
+        "processes": procs,
+        "spin_state": spin_label(_spin_state)
+    }
+}
+
+fn handle_kill_log() {
+    return {
+        "ok": true,
+        "total_killed": _zombies_killed,
+        "recent": _kill_log
+    }
+}
+
+fn handle_registry() {
+    return {
+        "ok": true,
+        "entries": _registry,
+        "count": len(_registry)
+    }
+}
+
+// ============================================================================
+// ROUTE REGISTRATION
+// ============================================================================
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/spin/status", "handle_status")
+troute(server, "GET", "/spin/scan", "handle_scan")
+troute(server, "GET", "/spin/kills", "handle_kill_log")
+troute(server, "GET", "/spin/registry", "handle_registry")
+troute(server, "POST", "/spin/gate", "handle_gate")
+troute(server, "POST", "/spin/register", "handle_register")
+troute(server, "POST", "/spin/kill", "handle_emergency_kill")
+
+// ============================================================================
+// START SPIN THREAD + SERVER
+// ============================================================================
+
+print("[TSpin] The Spinning Top v" + VERSION + " -- Port " + str(PORT))
+print("[TSpin] Spin state: +1=SPINNING  0=WOBBLING  -1=FALLEN")
+print("[TSpin] Thresholds: python<=" + str(MAX_PYTHON_PROCS) + " pythonw<=" + str(MAX_PYTHONW_PROCS) + " total<=" + str(MAX_TOTAL_PROCS))
+print("[TSpin] Max per-proc: " + str(MAX_PROC_MB) + "MB | Emergency: " + str(EMERGENCY_MB) + "MB total")
+print("[TSpin] Spin interval: " + str(SPIN_INTERVAL_S) + "s | Deep scan: every " + str(DEEP_SCAN_EVERY) + " spins")
+print("[TSpin] Launch gate: POST /spin/gate (orchestrator must call before any launch)")
+print("[TSpin] Endpoints: /health /spin/status /spin/scan /spin/kills /spin/registry")
+print("[TSpin] POST: /spin/gate /spin/register /spin/kill")
+print("[TSpin] Harmonics: 3-5-7-13 | The top is spinning...")
+
+// Start spin thread
+thread(spin_cycle)
+tstart(server)

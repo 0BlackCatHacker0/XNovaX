@@ -1,0 +1,842 @@
+// nova_tmatrix_service.nova -- NovaX Ternary Model Performance Matrix (port 9967)
+// Pure NovaLang port of nova_tmatrix.py
+//
+// Every query to every model is a data point. Over time, the matrix reveals truth:
+// which model excels at which task. Not opinions -- measured performance encoded
+// in ternary flow.
+//
+// Score formula (per model per channel):
+//   score = (quality_avg * 0.6) + (speed_score * 0.3) + (reliability * 0.1)
+//   quality_avg  = mean of quality_trits mapped to 0-1 (FALSE=-1->0, MAYBE=0->0.5, TRUE=1->1)
+//   speed_score  = 1.0 - (avg_latency / MAX_LATENCY), clamped [0, 1]
+//   reliability  = successful_queries / total_queries
+//
+// Port: 9967 | Harmonics: 3-5-7-13
+// N-S Mapping:
+//   model_flow    = velocity_field (queries through channels)
+//   quality_trit  = pressure_gradient (output quality signal)
+//   latency       = viscosity (resistance of model to query)
+//   reliability   = Reynolds damping (laminar = reliable, turbulent = failing)
+
+let PORT = 9967
+let server = tserve(PORT, "TMatrix v1.0 - Ternary Model Performance Matrix")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3   = 3
+let H5   = 5
+let H7   = 7
+let H13  = 13
+let BLOCK = 2187      // 3^7 = H3^H7 harmonic block
+
+// -- Reynolds Boundaries --
+let RE_LAMINAR      = 27    // H3^3
+let RE_TRANSITIONAL = 125   // H5^3
+let RE_TURBULENT    = 343   // H7^3
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Service Constants --
+let VERSION      = "1.0.0"
+let SERVICE      = "nova-tmatrix"
+let MAX_MODELS   = 91       // H13 * H7 = 13 * 7 -- harmonic cap on tracked models
+let MAX_LATENCY  = 30000    // 30s worst-case ceiling for speed_score
+let SAVE_INTERVAL = 13      // save every 13th record (H13 harmonic)
+let DATA_FILE    = "data/tmatrix.json"
+
+// -- Valid Channel Names --
+let CHANNELS = [
+    "REASON", "MATH", "CODE", "INSTRUCT", "FACT", "LONG", "VISION",
+    "LANGUAGE", "AGENT", "DOMAIN", "CREATIVE", "ANALYSIS", "TRANSLATE",
+    "DEBUG", "SECURITY", "MEDICAL", "LEGAL", "SCIENCE", "EDUCATION",
+    "FINANCE", "GAMING", "MUSIC", "ART", "PHILOSOPHY", "META"
+]
+
+// -- Runtime State --
+// matrix: model_name -> channel_name -> stats_dict
+//   stats_dict keys: queries, total_latency, quality_sum, quality_count,
+//                    failures, tokens_in_total, tokens_out_total, last_seen
+let matrix       = {}
+let total_queries = 0
+let record_count  = 0
+
+// -- Helpers --
+
+// Check if a channel name is valid (linear scan of CHANNELS list)
+fn is_valid_channel(ch) {
+    let i = 0
+    while3 i < len(CHANNELS) {
+        let c = dict_get(CHANNELS, i)
+        if3 c == ch {
+            return T_TRUE
+        }
+        let i = i + 1
+    }
+    return T_FALSE
+}
+
+// Map quality trit to [0, 1] score:
+//   +1 (TRUE)  -> 1.0
+//    0 (MAYBE) -> 0.5
+//   -1 (FALSE) -> 0.0
+fn quality_trit_to_score(qt) {
+    if3 qt >= 1 {
+        return 1.0
+    }
+    if3 qt <= -1 {
+        return 0.0
+    }
+    return 0.5
+}
+
+// Return a fresh empty channel stats dict
+fn empty_stats() {
+    return {
+        "queries": 0,
+        "total_latency": 0.0,
+        "quality_sum": 0.0,
+        "quality_count": 0,
+        "failures": 0,
+        "tokens_in_total": 0,
+        "tokens_out_total": 0,
+        "last_seen": 0.0
+    }
+}
+
+// Compute composite score for a stats dict
+// score = (quality_avg * 0.6) + (speed_score * 0.3) + (reliability * 0.1)
+fn compute_score(stats) {
+    let q = dict_get(stats, "queries", 0)
+    if3 q == 0 {
+        return 0.0
+    }
+    let qcount = dict_get(stats, "quality_count", 0)
+    let qsum   = dict_get(stats, "quality_sum", 0.0)
+    let quality_avg = 0.5
+    if3 qcount > 0 {
+        let quality_avg = qsum / qcount
+    }
+    let tot_lat = dict_get(stats, "total_latency", 0.0)
+    let avg_lat = tot_lat / q
+    let speed_score = 1.0 - (avg_lat / MAX_LATENCY)
+    if3 speed_score < 0.0 {
+        let speed_score = 0.0
+    }
+    if3 speed_score > 1.0 {
+        let speed_score = 1.0
+    }
+    let failures = dict_get(stats, "failures", 0)
+    let successful = q - failures
+    let reliability = successful / q
+    let score = (quality_avg * 0.6) + (speed_score * 0.3) + (reliability * 0.1)
+    return round(score, 4)
+}
+
+// Map a score to a trit char: >0.5 = "1", ~0.5 = "0", <0.5 = "T"
+fn score_to_trit(score) {
+    if3 score > 0.5 {
+        return T_TRUE
+    }
+    if3 score < 0.5 {
+        return T_FALSE
+    }
+    return T_MAYBE
+}
+
+fn trit_to_char(t) {
+    if3 t == 1 {
+        return "1"
+    }
+    if3 t == 0 {
+        return "0"
+    }
+    return "T"
+}
+
+// Build a detail dict for a single model-channel stats block
+// Returns {} if queries == 0
+fn build_channel_detail(stats) {
+    let q = dict_get(stats, "queries", 0)
+    if3 q == 0 {
+        return {}
+    }
+    let tot_lat = dict_get(stats, "total_latency", 0.0)
+    let avg_lat = round(tot_lat / q, 1)
+    let qcount  = dict_get(stats, "quality_count", 0)
+    let qsum    = dict_get(stats, "quality_sum", 0.0)
+    let quality_avg = 0.5
+    if3 qcount > 0 {
+        let quality_avg = round(qsum / qcount, 4)
+    }
+    let failures    = dict_get(stats, "failures", 0)
+    let successful  = q - failures
+    let reliability = round(successful / q, 4)
+    let score       = compute_score(stats)
+    let t           = score_to_trit(score)
+    return {
+        "queries": q,
+        "avg_latency_ms": avg_lat,
+        "quality_avg": quality_avg,
+        "reliability": reliability,
+        "score": score,
+        "trit": t,
+        "char": trit_to_char(t),
+        "failures": failures,
+        "tokens_in_total": dict_get(stats, "tokens_in_total", 0),
+        "tokens_out_total": dict_get(stats, "tokens_out_total", 0),
+        "last_seen": dict_get(stats, "last_seen", 0.0)
+    }
+}
+
+// -- Persistence --
+
+// Load matrix from disk JSON file
+fn load_matrix() {
+    let raw = nova_read(DATA_FILE)
+    if3 raw == "" {
+        return T_MAYBE
+    }
+    try3 {
+        let saved = json_decode(raw)
+        let loaded = dict_get(saved, "matrix", {})
+        let tq     = dict_get(saved, "total_queries", 0)
+        matrix = loaded
+        total_queries = tq
+        print("[TMatrix] Loaded from disk | total_queries=" + str(tq))
+        return T_TRUE
+    } else {
+        print("[TMatrix] Load failed -- starting fresh")
+        matrix = {}
+        total_queries = 0
+        return T_FALSE
+    }
+}
+
+// Save matrix to disk JSON file
+fn save_matrix() {
+    let payload = {
+        "matrix": matrix,
+        "total_queries": total_queries,
+        "saved_at": time(),
+        "version": VERSION
+    }
+    let encoded = json_encode(payload)
+    let result = nova_write(DATA_FILE, encoded)
+    if3 result == T_TRUE {
+        return T_TRUE
+    }
+    print("[TMatrix] Save failed")
+    return T_FALSE
+}
+
+// ============================================================
+// Route Handlers
+// ============================================================
+
+// POST /tmatrix/record
+// Body: { model, channel, latency_ms, quality_trit, tokens_in, tokens_out }
+fn tmatrix_record(body) {
+    let model       = lower(dict_get(body, "model", ""))
+    let channel     = upper(dict_get(body, "channel", ""))
+    let latency_ms  = float(dict_get(body, "latency_ms", 0))
+    let quality_trit = int(dict_get(body, "quality_trit", 0))
+    let tokens_in   = int(dict_get(body, "tokens_in", 0))
+    let tokens_out  = int(dict_get(body, "tokens_out", 0))
+
+    if3 model == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "missing model"}
+    }
+    if3 channel == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "missing channel"}
+    }
+    if3 is_valid_channel(channel) == T_FALSE {
+        return {"ok": false, "trit": T_FALSE, "error": "unknown channel: " + channel}
+    }
+
+    // Clamp inputs
+    if3 latency_ms < 0.0 {
+        let latency_ms = 0.0
+    }
+    if3 quality_trit < -1 {
+        let quality_trit = -1
+    }
+    if3 quality_trit > 1 {
+        let quality_trit = 1
+    }
+    if3 tokens_in < 0 {
+        let tokens_in = 0
+    }
+    if3 tokens_out < 0 {
+        let tokens_out = 0
+    }
+
+    // Enforce model cap (check if model is new and cap is reached)
+    let model_exists = dict_has(matrix, model)
+    if3 model_exists == false {
+        let model_count = len(keys(matrix))
+        if3 model_count >= MAX_MODELS {
+            return {"ok": false, "trit": T_FALSE, "error": "model cap reached (" + str(MAX_MODELS) + ")"}
+        }
+        // Create empty model entry
+        let _m = dict_set(matrix, model, {})
+    }
+
+    // Ensure model entry exists
+    let model_data = dict_get(matrix, model, {})
+
+    // Ensure channel entry exists within model
+    let ch_exists = dict_has(model_data, channel)
+    if3 ch_exists == false {
+        let _cs = dict_set(model_data, channel, empty_stats())
+    }
+
+    // Update stats
+    let stats = dict_get(model_data, channel, {})
+    let new_queries   = dict_get(stats, "queries", 0) + 1
+    let new_lat       = dict_get(stats, "total_latency", 0.0) + latency_ms
+    let new_qscore    = quality_trit_to_score(quality_trit)
+    let new_qsum      = dict_get(stats, "quality_sum", 0.0) + new_qscore
+    let new_qcount    = dict_get(stats, "quality_count", 0) + 1
+    let new_failures  = dict_get(stats, "failures", 0)
+    if3 quality_trit < 0 {
+        let new_failures = new_failures + 1
+    }
+    let new_tin  = dict_get(stats, "tokens_in_total", 0) + tokens_in
+    let new_tout = dict_get(stats, "tokens_out_total", 0) + tokens_out
+
+    let _q  = dict_set(stats, "queries", new_queries)
+    let _l  = dict_set(stats, "total_latency", new_lat)
+    let _qs = dict_set(stats, "quality_sum", new_qsum)
+    let _qc = dict_set(stats, "quality_count", new_qcount)
+    let _f  = dict_set(stats, "failures", new_failures)
+    let _ti = dict_set(stats, "tokens_in_total", new_tin)
+    let _to = dict_set(stats, "tokens_out_total", new_tout)
+    let _ls = dict_set(stats, "last_seen", time())
+
+    let _chs = dict_set(model_data, channel, stats)
+    let _mm  = dict_set(matrix, model, model_data)
+
+    total_queries = total_queries + 1
+    let record_count  = record_count + 1
+
+    // Batch save every H13 records
+    if3 record_count >= SAVE_INTERVAL {
+        let _sv = save_matrix()
+        let record_count = 0
+    }
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "recorded": true,
+        "model": model,
+        "channel": channel
+    }
+}
+
+// GET /tmatrix/leaderboard
+// Top models by channel, sorted descending by score
+fn tmatrix_leaderboard(body) {
+    let result = {}
+    let ci = 0
+    while3 ci < len(CHANNELS) {
+        let channel = dict_get(CHANNELS, ci)
+        let entries = []
+        let model_names = keys(matrix)
+        let mi = 0
+        while3 mi < len(model_names) {
+            let mname = dict_get(model_names, mi)
+            let model_data = dict_get(matrix, mname, {})
+            if3 dict_has(model_data, channel) {
+                let stats = dict_get(model_data, channel, {})
+                let q = dict_get(stats, "queries", 0)
+                if3 q > 0 {
+                    let score = compute_score(stats)
+                    let t = score_to_trit(score)
+                    let _ae = append(entries, {
+                        "model": mname,
+                        "score": score,
+                        "queries": q,
+                        "trit": t,
+                        "char": trit_to_char(t)
+                    })
+                }
+            }
+            let mi = mi + 1
+        }
+        // Sort entries descending by score (insertion sort)
+        let n = len(entries)
+        let si = 1
+        while3 si < n {
+            let key_entry = dict_get(entries, si)
+            let key_score = dict_get(key_entry, "score", 0.0)
+            let j = si - 1
+            while3 j >= 0 {
+                let je = dict_get(entries, j)
+                let js = dict_get(je, "score", 0.0)
+                if3 js < key_score {
+                    let _sv = dict_set(entries, j + 1, je)
+                    let _sv = dict_set(entries, j, key_entry)
+                    let j = j - 1
+                } else {
+                    let j = -1
+                }
+            }
+            let si = si + 1
+        }
+        if3 len(entries) > 0 {
+            let _rs = dict_set(result, channel, entries)
+        }
+        let ci = ci + 1
+    }
+    return {"ok": true, "leaderboard": result, "trit": T_TRUE}
+}
+
+// POST /tmatrix/model
+// Body: { model: "model_name" }
+// Returns detailed stats for one model across all channels
+fn tmatrix_model(body) {
+    let mname = lower(dict_get(body, "model", ""))
+    if3 mname == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "missing model"}
+    }
+    if3 dict_has(matrix, mname) == false {
+        return {"ok": false, "trit": T_FALSE, "error": "model not found: " + mname}
+    }
+
+    let model_data = dict_get(matrix, mname, {})
+    let channels_detail = {}
+    let total_q     = 0
+    let total_fail  = 0
+    let total_lat   = 0.0
+    let total_qsum  = 0.0
+    let total_qcount = 0
+
+    let ch_names = keys(model_data)
+    let ci = 0
+    while3 ci < len(ch_names) {
+        let ch = dict_get(ch_names, ci)
+        let stats = dict_get(model_data, ch, {})
+        let detail = build_channel_detail(stats)
+        let d_queries = dict_get(detail, "queries", 0)
+        if3 d_queries > 0 {
+            let _cd = dict_set(channels_detail, ch, detail)
+            let total_q     = total_q + dict_get(stats, "queries", 0)
+            let total_fail  = total_fail + dict_get(stats, "failures", 0)
+            let total_lat   = total_lat + dict_get(stats, "total_latency", 0.0)
+            let total_qsum  = total_qsum + dict_get(stats, "quality_sum", 0.0)
+            let total_qcount = total_qcount + dict_get(stats, "quality_count", 0)
+        }
+        let ci = ci + 1
+    }
+
+    let overall_score = 0.0
+    if3 total_q > 0 {
+        let ovq = 0.5
+        if3 total_qcount > 0 {
+            let ovq = total_qsum / total_qcount
+        }
+        let ovspeed = 1.0 - ((total_lat / total_q) / MAX_LATENCY)
+        if3 ovspeed < 0.0 {
+            let ovspeed = 0.0
+        }
+        if3 ovspeed > 1.0 {
+            let ovspeed = 1.0
+        }
+        let ovrel = (total_q - total_fail) / total_q
+        let overall_score = round((ovq * 0.6) + (ovspeed * 0.3) + (ovrel * 0.1), 4)
+    }
+
+    let ot = score_to_trit(overall_score)
+    return {
+        "ok": true,
+        "model": mname,
+        "overall_score": overall_score,
+        "total_queries": total_q,
+        "channels_active": len(keys(channels_detail)),
+        "channels": channels_detail,
+        "trit": ot
+    }
+}
+
+// POST /tmatrix/channel
+// Body: { channel: "CHANNEL_NAME" }
+// Returns best models for a specific channel, sorted by score
+fn tmatrix_channel(body) {
+    let ch = upper(dict_get(body, "channel", ""))
+    if3 ch == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "missing channel"}
+    }
+    if3 is_valid_channel(ch) == T_FALSE {
+        return {"ok": false, "trit": T_FALSE, "error": "unknown channel: " + ch}
+    }
+
+    let entries = []
+    let model_names = keys(matrix)
+    let mi = 0
+    while3 mi < len(model_names) {
+        let mname = dict_get(model_names, mi)
+        let model_data = dict_get(matrix, mname, {})
+        if3 dict_has(model_data, ch) {
+            let stats = dict_get(model_data, ch, {})
+            let detail = build_channel_detail(stats)
+            let d_queries = dict_get(detail, "queries", 0)
+            if3 d_queries > 0 {
+                let _dm = dict_set(detail, "model", mname)
+                let _ae = append(entries, detail)
+            }
+        }
+        let mi = mi + 1
+    }
+
+    // Insertion sort descending by score
+    let n = len(entries)
+    let si = 1
+    while3 si < n {
+        let key_entry = dict_get(entries, si)
+        let key_score = dict_get(key_entry, "score", 0.0)
+        let j = si - 1
+        while3 j >= 0 {
+            let je = dict_get(entries, j)
+            let js = dict_get(je, "score", 0.0)
+            if3 js < key_score {
+                let _sv = dict_set(entries, j + 1, je)
+                let _sv = dict_set(entries, j, key_entry)
+                let j = j - 1
+            } else {
+                let j = -1
+            }
+        }
+        let si = si + 1
+    }
+
+    let ch_trit = T_TRUE
+    if3 len(entries) == 0 {
+        let ch_trit = T_MAYBE
+    }
+    return {
+        "ok": true,
+        "channel": ch,
+        "models": entries,
+        "count": len(entries),
+        "trit": ch_trit
+    }
+}
+
+// POST /tmatrix/recommend
+// Body: { channel, max_latency (optional) }
+// Returns top H3=3 models meeting constraints
+fn tmatrix_recommend(body) {
+    let ch = upper(dict_get(body, "channel", ""))
+    if3 ch == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "missing channel"}
+    }
+    if3 is_valid_channel(ch) == T_FALSE {
+        return {"ok": false, "trit": T_FALSE, "error": "unknown channel: " + ch}
+    }
+
+    let max_lat_raw = dict_get(body, "max_latency", -1)
+    let use_lat_filter = T_FALSE
+    let max_lat = 0.0
+    if3 max_lat_raw != -1 {
+        let use_lat_filter = T_TRUE
+        let max_lat = float(max_lat_raw)
+    }
+
+    let candidates = []
+    let model_names = keys(matrix)
+    let mi = 0
+    while3 mi < len(model_names) {
+        let mname = dict_get(model_names, mi)
+        let model_data = dict_get(matrix, mname, {})
+        if3 dict_has(model_data, ch) {
+            let stats = dict_get(model_data, ch, {})
+            let q = dict_get(stats, "queries", 0)
+            if3 q > 0 {
+                let tot_lat = dict_get(stats, "total_latency", 0.0)
+                let avg_lat = round(tot_lat / q, 1)
+                // Apply latency filter if requested
+                let pass_filter = T_TRUE
+                if3 use_lat_filter == T_TRUE {
+                    if3 avg_lat > max_lat {
+                        let pass_filter = T_FALSE
+                    }
+                }
+                if3 pass_filter == T_TRUE {
+                    let score = compute_score(stats)
+                    let t = score_to_trit(score)
+                    let _ac = append(candidates, {
+                        "model": mname,
+                        "score": score,
+                        "avg_latency_ms": avg_lat,
+                        "queries": q,
+                        "trit": t,
+                        "char": trit_to_char(t)
+                    })
+                }
+            }
+        }
+        let mi = mi + 1
+    }
+
+    // Insertion sort descending by score
+    let n = len(candidates)
+    let si = 1
+    while3 si < n {
+        let key_entry = dict_get(candidates, si)
+        let key_score = dict_get(key_entry, "score", 0.0)
+        let j = si - 1
+        while3 j >= 0 {
+            let je = dict_get(candidates, j)
+            let js = dict_get(je, "score", 0.0)
+            if3 js < key_score {
+                let _sv = dict_set(candidates, j + 1, je)
+                let _sv = dict_set(candidates, j, key_entry)
+                let j = j - 1
+            } else {
+                let j = -1
+            }
+        }
+        let si = si + 1
+    }
+
+    // Take top H3=3 candidates
+    let top_count = min(H3, len(candidates))
+    let top = slice(candidates, 0, top_count)
+
+    if3 len(top) == 0 {
+        return {
+            "ok": true,
+            "channel": ch,
+            "recommendation": {},
+            "alternatives": [],
+            "message": "no models with data for this channel",
+            "trit": T_MAYBE
+        }
+    }
+
+    let best = dict_get(top, 0)
+    let alts = []
+    if3 len(top) > 1 {
+        let alts = slice(top, 1, len(top))
+    }
+
+    return {
+        "ok": true,
+        "channel": ch,
+        "max_latency_filter": max_lat_raw,
+        "recommendation": best,
+        "alternatives": alts,
+        "total_candidates": len(candidates),
+        "trit": T_TRUE
+    }
+}
+
+// GET /tmatrix/matrix
+// Full model x channel grid, each cell = composite score
+fn tmatrix_full(body) {
+    let grid = {}
+    let model_names = keys(matrix)
+    // Sort model names (insertion sort ascending)
+    let sorted_models = model_names
+    let n = len(sorted_models)
+    let si = 1
+    while3 si < n {
+        let key_m = dict_get(sorted_models, si)
+        let j = si - 1
+        while3 j >= 0 {
+            let je = dict_get(sorted_models, j)
+            if3 je > key_m {
+                let _sv = dict_set(sorted_models, j + 1, je)
+                let _sv = dict_set(sorted_models, j, key_m)
+                let j = j - 1
+            } else {
+                let j = -1
+            }
+        }
+        let si = si + 1
+    }
+
+    let mi = 0
+    while3 mi < len(sorted_models) {
+        let mname = dict_get(sorted_models, mi)
+        let model_data = dict_get(matrix, mname, {})
+        let row = {}
+        let ci = 0
+        while3 ci < len(CHANNELS) {
+            let ch = dict_get(CHANNELS, ci)
+            if3 dict_has(model_data, ch) {
+                let stats = dict_get(model_data, ch, {})
+                let q = dict_get(stats, "queries", 0)
+                if3 q > 0 {
+                    let score = compute_score(stats)
+                    let t = score_to_trit(score)
+                    let _rs = dict_set(row, ch, {
+                        "score": score,
+                        "queries": q,
+                        "char": trit_to_char(t)
+                    })
+                }
+            }
+            let ci = ci + 1
+        }
+        if3 len(keys(row)) > 0 {
+            let _gs = dict_set(grid, mname, row)
+        }
+        let mi = mi + 1
+    }
+
+    return {
+        "ok": true,
+        "matrix": grid,
+        "models": len(keys(grid)),
+        "channels": CHANNELS,
+        "trit": T_TRUE
+    }
+}
+
+// GET /tmatrix/stats
+fn tmatrix_stats(body) {
+    let model_names = keys(matrix)
+    // Count unique channels in use
+    let ch_set = {}
+    let mi = 0
+    while3 mi < len(model_names) {
+        let mname = dict_get(model_names, mi)
+        let model_data = dict_get(matrix, mname, {})
+        let ch_names = keys(model_data)
+        let ci = 0
+        while3 ci < len(ch_names) {
+            let ch = dict_get(ch_names, ci)
+            let _cs = dict_set(ch_set, ch, 1)
+            let ci = ci + 1
+        }
+        let mi = mi + 1
+    }
+    return {
+        "ok": true,
+        "total_queries": total_queries,
+        "unique_models": len(model_names),
+        "unique_channels": len(keys(ch_set)),
+        "max_models": MAX_MODELS,
+        "channels_available": len(CHANNELS),
+        "save_interval": SAVE_INTERVAL,
+        "data_file": DATA_FILE,
+        "trit": T_TRUE
+    }
+}
+
+// GET /tmatrix/health
+fn tmatrix_health(body) {
+    let model_names = keys(matrix)
+    let ch_set = {}
+    let mi = 0
+    while3 mi < len(model_names) {
+        let mname = dict_get(model_names, mi)
+        let model_data = dict_get(matrix, mname, {})
+        let ch_names = keys(model_data)
+        let ci = 0
+        while3 ci < len(ch_names) {
+            let ch = dict_get(ch_names, ci)
+            let _cs = dict_set(ch_set, ch, 1)
+            let ci = ci + 1
+        }
+        let mi = mi + 1
+    }
+    return {
+        "ok": true,
+        "service": SERVICE,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "trit": T_TRUE,
+        "runtime": "novalang",
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "total_queries": total_queries,
+        "unique_models": len(model_names),
+        "unique_channels": len(keys(ch_set)),
+        "max_models": MAX_MODELS,
+        "channels_available": len(CHANNELS),
+        "save_interval": SAVE_INTERVAL
+    }
+}
+
+// GET /health (orchestrator standard endpoint)
+fn health(body) {
+    return tmatrix_health(body)
+}
+
+// POST /tmatrix/flush
+// Force save to disk on demand (replaces background thread save)
+fn tmatrix_flush(body) {
+    let result = save_matrix()
+    if3 result == T_TRUE {
+        return {
+            "ok": true,
+            "trit": T_TRUE,
+            "flushed": true,
+            "total_queries": total_queries,
+            "models": len(keys(matrix))
+        }
+    }
+    return {"ok": false, "trit": T_FALSE, "error": "save failed"}
+}
+
+// POST /tmatrix/load
+// Reload matrix from disk (hot reload without restart)
+fn tmatrix_load(body) {
+    let result = load_matrix()
+    if3 result == T_TRUE {
+        return {
+            "ok": true,
+            "trit": T_TRUE,
+            "loaded": true,
+            "total_queries": total_queries,
+            "models": len(keys(matrix))
+        }
+    }
+    if3 result == T_MAYBE {
+        return {
+            "ok": true,
+            "trit": T_MAYBE,
+            "loaded": false,
+            "msg": "no data file found -- fresh start"
+        }
+    }
+    return {"ok": false, "trit": T_FALSE, "error": "load failed"}
+}
+
+// ============================================================
+// Boot: load persisted data
+// ============================================================
+let _boot_load = load_matrix()
+
+// ============================================================
+// Route Registration
+// ============================================================
+troute(server, "GET",  "/health",              "health")
+troute(server, "GET",  "/tmatrix/health",      "tmatrix_health")
+troute(server, "GET",  "/tmatrix/leaderboard", "tmatrix_leaderboard")
+troute(server, "GET",  "/tmatrix/matrix",      "tmatrix_full")
+troute(server, "GET",  "/tmatrix/stats",       "tmatrix_stats")
+troute(server, "POST", "/tmatrix/record",      "tmatrix_record")
+troute(server, "POST", "/tmatrix/recommend",   "tmatrix_recommend")
+troute(server, "POST", "/tmatrix/model",       "tmatrix_model")
+troute(server, "POST", "/tmatrix/channel",     "tmatrix_channel")
+troute(server, "POST", "/tmatrix/flush",       "tmatrix_flush")
+troute(server, "POST", "/tmatrix/load",        "tmatrix_load")
+
+// ============================================================
+// Startup Banner
+// ============================================================
+print("[TMatrix] NovaX Ternary Model Performance Matrix v" + VERSION)
+print("[TMatrix] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TMatrix] MAX_MODELS=" + str(MAX_MODELS) + " | SAVE_INTERVAL=H13=" + str(SAVE_INTERVAL) + " | CHANNELS=" + str(len(CHANNELS)))
+print("[TMatrix] Score = (quality*0.6) + (speed*0.3) + (reliability*0.1)")
+print("[TMatrix] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13) + " BLOCK=" + str(BLOCK))
+print("[TMatrix] GET  /health | /tmatrix/health | /tmatrix/leaderboard | /tmatrix/matrix | /tmatrix/stats")
+print("[TMatrix] POST /tmatrix/record | /tmatrix/recommend | /tmatrix/model | /tmatrix/channel | /tmatrix/flush | /tmatrix/load")
+
+tstart(server)

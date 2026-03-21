@@ -1,0 +1,239 @@
+// ================================================================
+// nova_cloud_api.nova — Pure NovaLang Cloud API Caller
+// Replaces cloud_api_call.py Python bridge with native HTTP
+// Uses http_post_headers() builtin (NovaX Pure v1.2)
+// ================================================================
+// Usage from other .nova services:
+//   import3("nova_cloud_api.nova")
+//   let result = cloud_call("openai", "gpt-4o-mini", "Hello", "")
+//   let text = dict_get(result, "response") ?? ""
+// ================================================================
+
+let _cloud_config = null
+let CONFIG_PATH = "C:/NovaX/cloud_config.json"
+
+// ── Helpers to avoid if3 scoping issues ──
+fn _build_messages(prompt, system_prompt) {
+    if3 len(system_prompt) > 0 {
+        return [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
+    }
+    return [{"role": "user", "content": prompt}]
+}
+
+fn _build_anthropic_body(model, prompt, system_prompt) {
+    let messages = [{"role": "user", "content": prompt}]
+    if3 len(system_prompt) > 0 {
+        return json_encode({"model": model, "messages": messages, "max_tokens": 2048, "system": system_prompt})
+    }
+    return json_encode({"model": model, "messages": messages, "max_tokens": 2048})
+}
+
+fn _pick_model(model, provider_cfg) {
+    if3 len(model) > 0 { return model }
+    let models = dict_get(provider_cfg, "models") ?? []
+    let first_model = try3 { models[0] } fail { "" }
+    return first_model
+}
+
+// ── Load cloud config (cached after first call) ──
+fn load_cloud_config() {
+    if3 _cloud_config != null { return _cloud_config }
+    let raw = try3 { read_file(CONFIG_PATH) } fail { "" }
+    if3 len(raw) == 0 { return {} }
+    let cfg = try3 { json_decode(raw) } fail { {} }
+    _cloud_config = cfg
+    return cfg
+}
+
+// ── Get API key: config first, then env var fallback ──
+fn get_api_key(provider, provider_cfg) {
+    let key = dict_get(provider_cfg, "key") ?? ""
+    if3 len(key) > 0 { return key }
+    // Env var fallback
+    if3 provider == "openai" { return env_get("OPENAI_API_KEY", "") }
+    if3 provider == "anthropic" { return env_get("ANTHROPIC_API_KEY", "") }
+    if3 provider == "openrouter" { return env_get("OPENROUTER_API_KEY", "") }
+    if3 provider == "huggingface" { return env_get("HF_TOKEN", "") }
+    if3 provider == "groq_direct" { return env_get("GROQ_API_KEY", "") }
+    if3 provider == "google_ai_studio" { return env_get("GOOGLE_API_KEY", "") }
+    if3 provider == "github_models" { return env_get("GITHUB_TOKEN", "") }
+    if3 provider == "sambanova_direct" { return env_get("SAMBANOVA_API_KEY", "") }
+    if3 provider == "cerebras_direct" { return env_get("CEREBRAS_API_KEY", "") }
+    if3 provider == "mistral_direct" { return env_get("MISTRAL_API_KEY", "") }
+    if3 provider == "nvidia_nim" { return env_get("NVIDIA_API_KEY", "") }
+    if3 provider == "cloudflare_ai" { return env_get("CLOUDFLARE_API_KEY", "") }
+    if3 provider == "kluster_ai" { return env_get("KLUSTER_API_KEY", "") }
+    if3 provider == "deepinfra" { return env_get("DEEPINFRA_API_KEY", "") }
+    if3 provider == "together_direct" { return env_get("TOGETHER_API_KEY", "") }
+    if3 provider == "cohere_direct" { return env_get("COHERE_API_KEY", "") }
+    if3 provider == "apifreellm" { return env_get("APIFREELLM_KEY", "free") }
+    return ""
+}
+
+// ── OpenAI-compatible call (OpenAI, OpenRouter, Groq, Together, etc.) ──
+fn call_openai_api(url, key, model, prompt, system_prompt, extra_headers) {
+    let messages = _build_messages(prompt, system_prompt)
+    let body = json_encode({"model": model, "messages": messages, "max_tokens": 2048})
+    // Build headers — extra_headers override defaults
+    let headers = dict_set(extra_headers, "Content-Type", "application/json")
+    headers = dict_set(headers, "Authorization", "Bearer " + key)
+    let endpoint = url + "/chat/completions"
+    let t0 = time()
+    let resp = try3 { http_post_headers(endpoint, body, headers, 30000) } fail { {"error": "http_failed"} }
+    let elapsed = time() - t0
+    let ms = floor(elapsed * 1000)
+    let err = dict_get(resp, "error") ?? ""
+    if3 err != "" { return {"ok": false, "error": err, "time_ms": ms} }
+    // Parse response body — try raw first, then sanitize control chars if needed
+    let resp_body = dict_get(resp, "body") ?? ""
+    let resp_body = trim(resp_body)
+    // Try raw json_decode first (works for pretty-printed JSON from most APIs)
+    let data = try3 { json_decode(resp_body) } fail { null }
+    if3 data == null {
+        // Fallback: sanitize control chars that break json_decode (code-heavy responses)
+        let resp_body2 = replace(resp_body, "\n", "\\n")
+        let resp_body2 = replace(resp_body2, "\r", "\\r")
+        let resp_body2 = replace(resp_body2, "\t", "\\t")
+        let data = try3 { json_decode(resp_body2) } fail { {"error": "parse_failed"} }
+    }
+    let parse_err = dict_get(data, "error") ?? ""
+    if3 parse_err != "" { return {"ok": false, "error": parse_err, "time_ms": ms} }
+    // Extract text from choices[0].message.content
+    let choices = dict_get(data, "choices") ?? []
+    let first = try3 { choices[0] } fail { {} }
+    let msg = dict_get(first, "message") ?? {}
+    let text = dict_get(msg, "content") ?? ""
+    // Extract real token usage from OpenAI/compatible API response
+    let usage = dict_get(data, "usage") ?? {}
+    let total_tok = dict_get(usage, "total_tokens") ?? 0
+    if3 total_tok == 0 { total_tok = max(floor(len(text) / 4), 1) }
+    return {"ok": true, "response": text, "model": model, "time_ms": ms, "tokens": total_tok}
+}
+
+// ── Anthropic Messages API call ──
+fn call_anthropic_api(key, model, prompt, system_prompt) {
+    let body = _build_anthropic_body(model, prompt, system_prompt)
+    let headers = {
+        "Content-Type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01"
+    }
+    let t0 = time()
+    let resp = try3 { http_post_headers("https://api.anthropic.com/v1/messages", body, headers, 30000) } fail { {"error": "http_failed"} }
+    let elapsed = time() - t0
+    let ms = floor(elapsed * 1000)
+    let err = dict_get(resp, "error") ?? ""
+    if3 err != "" { return {"ok": false, "error": err, "time_ms": ms} }
+    let resp_body = dict_get(resp, "body") ?? ""
+    let resp_body = trim(resp_body)
+    let data = try3 { json_decode(resp_body) } fail { null }
+    if3 data == null {
+        let resp_body2 = replace(resp_body, "\n", "\\n")
+        let resp_body2 = replace(resp_body2, "\r", "\\r")
+        let resp_body2 = replace(resp_body2, "\t", "\\t")
+        let data = try3 { json_decode(resp_body2) } fail { {"error": "parse_failed"} }
+    }
+    let parse_err = dict_get(data, "error") ?? ""
+    if3 parse_err != "" { return {"ok": false, "error": parse_err, "time_ms": ms} }
+    // Anthropic format: content[0].text
+    let content = dict_get(data, "content") ?? []
+    let first = try3 { content[0] } fail { {} }
+    let text = dict_get(first, "text") ?? ""
+    // Anthropic usage: input_tokens + output_tokens
+    let usage = dict_get(data, "usage") ?? {}
+    let total_tok = (dict_get(usage, "input_tokens") ?? 0) + (dict_get(usage, "output_tokens") ?? 0)
+    if3 total_tok == 0 { total_tok = max(floor(len(text) / 4), 1) }
+    return {"ok": true, "response": text, "model": model, "time_ms": ms, "tokens": total_tok}
+}
+
+// ── Google AI Studio (Gemini) call — different API format ──
+fn call_google_api(key, model, prompt, system_prompt) {
+    let contents = [{"role": "user", "parts": [{"text": prompt}]}]
+    let body_dict = {"contents": contents, "generationConfig": {"maxOutputTokens": 2048}}
+    if3 len(system_prompt) > 0 {
+        body_dict = dict_set(body_dict, "systemInstruction", {"parts": [{"text": system_prompt}]})
+    }
+    let body = json_encode(body_dict)
+    let endpoint = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + key
+    let headers = {"Content-Type": "application/json"}
+    let t0 = time()
+    let resp = try3 { http_post_headers(endpoint, body, headers, 30000) } fail { {"error": "http_failed"} }
+    let elapsed = time() - t0
+    let ms = floor(elapsed * 1000)
+    let err = dict_get(resp, "error") ?? ""
+    if3 err != "" { return {"ok": false, "error": err, "time_ms": ms} }
+    let resp_body = dict_get(resp, "body") ?? ""
+    let resp_body = trim(resp_body)
+    let data = try3 { json_decode(resp_body) } fail { null }
+    if3 data == null {
+        let resp_body2 = replace(resp_body, "\n", "\\n")
+        let resp_body2 = replace(resp_body2, "\r", "\\r")
+        let resp_body2 = replace(resp_body2, "\t", "\\t")
+        let data = try3 { json_decode(resp_body2) } fail { {"error": "parse_failed"} }
+    }
+    let parse_err = dict_get(data, "error") ?? ""
+    if3 parse_err != "" { return {"ok": false, "error": parse_err, "time_ms": ms} }
+    let candidates = dict_get(data, "candidates") ?? []
+    let first = try3 { candidates[0] } fail { {} }
+    let content = dict_get(first, "content") ?? {}
+    let parts = dict_get(content, "parts") ?? []
+    let first_part = try3 { parts[0] } fail { {} }
+    let text = dict_get(first_part, "text") ?? ""
+    // Google: usageMetadata.totalTokenCount
+    let usage_meta = dict_get(data, "usageMetadata") ?? {}
+    let total_tok = dict_get(usage_meta, "totalTokenCount") ?? 0
+    if3 total_tok == 0 { total_tok = max(floor(len(text) / 4), 1) }
+    return {"ok": true, "response": text, "model": model, "time_ms": ms, "tokens": total_tok}
+}
+
+// ── Main entry point: call any configured provider ──
+fn cloud_call(provider, model, prompt, system_prompt) {
+    if3 len(prompt) == 0 { return {"ok": false, "error": "missing_prompt"} }
+    let config = load_cloud_config()
+    let provider_cfg = dict_get(config, provider) ?? {}
+    let key = get_api_key(provider, provider_cfg)
+    if3 len(key) == 0 { return {"ok": false, "error": "no_key_for_" + provider} }
+    // Resolve model
+    let model = _pick_model(model, provider_cfg)
+    if3 len(model) == 0 { return {"ok": false, "error": "no_model_for_" + provider} }
+    // Check "via" field — some providers route through OpenRouter
+    let via = dict_get(provider_cfg, "via") ?? ""
+    if3 via == "openrouter" { or_cfg = dict_get(config, "openrouter") ?? {}
+        let or_key = dict_get(or_cfg, "key") ?? key
+        let extra = {"HTTP-Referer": "https://novax.ai", "X-Title": "NovaX Cloud Router"}
+        let result = call_openai_api("https://openrouter.ai/api/v1", or_key, model, prompt, system_prompt, extra)
+        result = dict_set(result, "provider", provider)
+        result = dict_set(result, "via", "openrouter")
+        return result
+    }
+    // Anthropic: different API format
+    if3 provider == "anthropic" { result = call_anthropic_api(key, model, prompt, system_prompt)
+        result = dict_set(result, "provider", "anthropic")
+        return result
+    }
+    // OpenRouter: native call with identity headers
+    if3 provider == "openrouter" { extra = {"HTTP-Referer": "https://novax.ai", "X-Title": "NovaX Cloud Router"}
+        let result = call_openai_api("https://openrouter.ai/api/v1", key, model, prompt, system_prompt, extra)
+        result = dict_set(result, "provider", "openrouter")
+        return result
+    }
+    // Google AI Studio: Gemini REST API (not OpenAI-compatible)
+    if3 provider == "google_ai_studio" {
+        let result = call_google_api(key, model, prompt, system_prompt)
+        result = dict_set(result, "provider", "google_ai_studio")
+        return result
+    }
+    // Google (routed to Google AI Studio directly — not via OpenRouter)
+    if3 provider == "google" {
+        let gas_cfg = dict_get(config, "google_ai_studio") ?? {}
+        let gas_key = dict_get(gas_cfg, "key") ?? key
+        let result = call_google_api(gas_key, model, prompt, system_prompt)
+        result = dict_set(result, "provider", "google")
+        return result
+    }
+    // OpenAI and all other OpenAI-compatible providers (Cerebras, SambaNova, Groq, etc.)
+    let url = dict_get(provider_cfg, "url") ?? "https://api.openai.com/v1"
+    let result = call_openai_api(url, key, model, prompt, system_prompt, {})
+    result = dict_set(result, "provider", provider)
+    return result
+}

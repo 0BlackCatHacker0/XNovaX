@@ -1,0 +1,344 @@
+// Nova TNotify v1.0 - Ternary Notification Hub (N-S Flow Model)
+// Port 9975: Central notification system for all NovaX services
+//
+// N-S Mapping:
+//   notification_flow = velocity_field (stream of alerts/events)
+//   channels          = flow_pipes (system, ai, security, error, health, user, debug)
+//   priority          = pressure_gradient (1=low/info, 2=medium/warn, 3=high/critical)
+//   rate_limiting     = viscous_dampening (prevents notification flood)
+//   subscribers       = boundary_sinks (consume notifications via webhooks)
+//   Re < 27 (H3^3)   = laminar (normal notification rate)
+//   Re > 343 (H7^3)  = turbulent (notification storm)
+//
+// States: +1 DELIVERED, 0 PENDING/queued, -1 RATE_LIMITED
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9975
+let server = tserve(PORT, "TNotify v1.0 - Ternary Notification Hub")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let RE_LAMINAR   = 27    // H3^3
+let RE_TURBULENT = 343   // H7^3
+let BLOCK_SIZE   = 2187  // H3^7
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Configuration --
+let MAX_NOTIFICATIONS = 1000
+let RATE_LIMIT_PER_MIN = 91   // H7 * H13 = 91 notifs/min/source
+let MAX_SUBSCRIBERS = 91      // H7 * H13
+let CHANNELS = ["system", "ai", "security", "error", "health", "user", "debug"]
+
+// -- State --
+let notifications = []     // global ordered buffer [{id, channel, source, title, body, priority, timestamp, read}]
+let subscribers = {}       // channel -> [{callback_url, subscribed_at}]
+let rate_counters = {}     // source -> [timestamps]
+let total_sent = 0
+let total_read = 0
+let total_rate_limited = 0
+
+// -- Helpers --
+fn trim_notifications() {
+    if3 len(notifications) > MAX_NOTIFICATIONS { notifications = slice(notifications, len(notifications) - MAX_NOTIFICATIONS, len(notifications))
+    }
+}
+
+fn check_rate_limit(source) {
+    // Check if source has exceeded RATE_LIMIT_PER_MIN in the last 60 seconds
+    let now = time()
+    let counter = dict_get(rate_counters, source) ?? []
+    // Filter to last 60 seconds
+    let recent = []
+    let i = 0
+    while3 i < len(counter) {
+        if3 dict_get(counter, i) > now - 60 { _a = append(recent, dict_get(counter, i))
+        }
+        i = i + 1
+    }
+    rate_counters = dict_set(rate_counters, source, recent)
+    if3 len(recent) >= RATE_LIMIT_PER_MIN {
+        return T_FALSE
+    }
+    // Record this notification
+    recent = append(recent, now)
+    rate_counters = dict_set(rate_counters, source, recent)
+    return T_TRUE
+}
+
+fn priority_name(p) {
+    if3 p == 3 {
+        return "high"
+    }
+    if3 p == 2 {
+        return "medium"
+    }
+    return "low"
+}
+
+fn is_valid_channel(ch) {
+    let i = 0
+    while3 i < len(CHANNELS) {
+        if3 dict_get(CHANNELS, i) == ch {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// -- Deliver to subscribers (fire-and-forget) --
+fn deliver_webhooks(channel, notif) {
+    let subs = dict_get(subscribers, channel) ?? []
+    let delivered = 0
+    let i = 0
+    while3 i < len(subs) {
+        let sub = dict_get(subs, i)
+        let url = dict_get(sub, "callback_url") ?? ""
+        if3 url != "" {
+            try3 {
+                let _r = http_post(url, notif, 3)
+                delivered = delivered + 1
+            } fail {
+                // fire and forget - webhook failure is not critical
+            }
+        }
+        i = i + 1
+    }
+    return delivered
+}
+
+// ============================================================
+// Route Handlers
+// ============================================================
+
+// POST /tnotify/send -- emit a notification
+fn send_notification(body) {
+    let channel = dict_get(body, "channel") ?? "system"
+    let source = dict_get(body, "source") ?? "unknown"
+    let title = dict_get(body, "title") ?? ""
+    let msg_body = dict_get(body, "body") ?? ""
+    let priority = dict_get(body, "priority") ?? 1
+
+    if3 title == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "title required"}
+    }
+    if3 is_valid_channel(channel) == false { channel = "system"
+    }
+    // Clamp priority to 1-3
+    if3 priority < 1 { priority = 1 }
+    if3 priority > 3 { priority = 3 }
+
+    // Rate limit check
+    let rate_ok = check_rate_limit(source)
+    if3 rate_ok == T_FALSE {
+        total_rate_limited = total_rate_limited + 1
+        return {
+            "ok": false,
+            "trit": T_FALSE,
+            "error": "rate limited",
+            "limit": RATE_LIMIT_PER_MIN,
+            "source": source
+        }
+    }
+
+    let notif = {
+        "id": uuid_hex(H13),
+        "channel": channel,
+        "source": source,
+        "title": title,
+        "body": msg_body,
+        "priority": priority,
+        "priority_name": priority_name(priority),
+        "timestamp": time(),
+        "read": false
+    }
+
+    notifications = append(notifications, notif)
+    trim_notifications()
+    total_sent = total_sent + 1
+
+    // Deliver to channel subscribers
+    let delivered = deliver_webhooks(channel, notif)
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "notification_id": dict_get(notif, "id"),
+        "channel": channel,
+        "priority": priority,
+        "subscribers_notified": delivered
+    }
+}
+
+// GET /tnotify/feed -- get recent notifications
+fn feed(body) {
+    let n = dict_get(body, "n") ?? 50
+    if3 n > 200 { n = 200 }
+    let channel = dict_get(body, "channel") ?? ""
+
+    let result = []
+    // Iterate backwards for most recent first
+    let i = len(notifications) - 1
+    while3 i >= 0 {
+        if3 len(result) >= n { i = -1  // break
+        } else { notif = dict_get(notifications, i)
+            if3 channel == "" { _ar = append(result, notif)
+            } else {
+                if3 dict_get(notif, "channel") == channel { _ar = append(result, notif)
+                }
+            }
+            i = i - 1
+        }
+    }
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "notifications": result,
+        "count": len(result),
+        "total": len(notifications)
+    }
+}
+
+// POST /tnotify/read -- mark notification as read
+fn mark_read(body) {
+    let notif_id = dict_get(body, "id") ?? ""
+    if3 notif_id == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "id required"}
+    }
+
+    let i = 0
+    while3 i < len(notifications) {
+        let notif = dict_get(notifications, i)
+        if3 dict_get(notif, "id") == notif_id { notif = dict_set(notif, "read", true)
+            total_read = total_read + 1
+            return {"ok": true, "trit": T_TRUE, "marked": notif_id}
+        }
+        i = i + 1
+    }
+    return {"ok": false, "trit": T_FALSE, "error": "notification not found"}
+}
+
+// POST /tnotify/subscribe -- register webhook for a channel
+fn subscribe(body) {
+    let channel = dict_get(body, "channel") ?? ""
+    let callback_url = dict_get(body, "callback_url") ?? ""
+
+    if3 channel == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "channel required"}
+    }
+    if3 callback_url == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "callback_url required"}
+    }
+
+    let subs = dict_get(subscribers, channel) ?? []
+    if3 len(subs) >= MAX_SUBSCRIBERS {
+        return {"ok": false, "trit": T_FALSE, "error": "max subscribers reached for channel"}
+    }
+
+    let sub = {
+        "callback_url": callback_url,
+        "subscribed_at": time(),
+        "id": uuid_hex(H13)
+    }
+    subs = append(subs, sub)
+    subscribers = dict_set(subscribers, channel, subs)
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "subscription_id": dict_get(sub, "id"),
+        "channel": channel
+    }
+}
+
+// GET /tnotify/stats -- notification statistics
+fn stats(body) {
+    let unread = 0
+    let i = 0
+    while3 i < len(notifications) {
+        let notif = dict_get(notifications, i)
+        if3 dict_get(notif, "read") == false { unread = unread + 1
+        }
+        i = i + 1
+    }
+
+    // Count by channel
+    let by_channel = {}
+    let j = 0
+    while3 j < len(notifications) {
+        let notif = dict_get(notifications, j)
+        let ch = dict_get(notif, "channel") ?? "unknown"
+        by_channel = dict_set(by_channel, ch, (dict_get(by_channel, ch) ?? 0) + 1)
+        j = j + 1
+    }
+
+    // Count subscribers per channel
+    let sub_counts = {}
+    let ch_keys = keys(subscribers)
+    let k = 0
+    while3 k < len(ch_keys) {
+        let ch = dict_get(ch_keys, k)
+        sub_counts = dict_set(sub_counts, ch, len(dict_get(subscribers, ch) ?? []))
+        k = k + 1
+    }
+
+    // Reynolds: notification_rate drives turbulence
+    let re = total_sent
+    let regime = "laminar"
+    if3 re >= RE_TURBULENT { regime = "turbulent" }
+    if3 re >= RE_LAMINAR {
+        if3 re < RE_TURBULENT { regime = "transitional" }
+    }
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "total_sent": total_sent,
+        "total_read": total_read,
+        "total_rate_limited": total_rate_limited,
+        "unread": unread,
+        "buffered": len(notifications),
+        "max_buffer": MAX_NOTIFICATIONS,
+        "by_channel": by_channel,
+        "subscribers": sub_counts,
+        "reynolds": re,
+        "regime": regime
+    }
+}
+
+// GET /health
+fn health(body) {
+    let resp = ns_health_dict("nova-tnotify", "1.0", PORT, {})
+    resp = dict_set(resp, "total_sent", total_sent)
+    resp = dict_set(resp, "buffered", len(notifications))
+    resp = dict_set(resp, "channels", CHANNELS)
+    return resp
+}
+
+// ============================================================
+// Route Registration
+// ============================================================
+troute(server, "GET",  "/health",              "health")
+troute(server, "GET",  "/tnotify/feed",        "feed")
+troute(server, "GET",  "/tnotify/stats",       "stats")
+troute(server, "POST", "/tnotify/send",        "send_notification")
+troute(server, "POST", "/tnotify/read",        "mark_read")
+troute(server, "POST", "/tnotify/subscribe",   "subscribe")
+
+print("[TNotify] NovaLang TNotify v1.0 - Ternary Notification Hub")
+print("[TNotify] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TNotify] Channels: system, ai, security, error, health, user, debug")
+print("[TNotify] Rate limit: " + str(RATE_LIMIT_PER_MIN) + " notifs/min/source (H7*H13)")
+print("[TNotify] Routes: /health, /tnotify/feed, /tnotify/stats, /tnotify/send, /tnotify/read, /tnotify/subscribe")
+
+tstart(server)

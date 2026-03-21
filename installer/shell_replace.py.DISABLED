@@ -1,0 +1,299 @@
+"""
+NovaX Shell Replacement -- Windows Explorer Shell Swap (SAFE VERSION)
+Registers NovaX Desktop as a COMPANION to explorer.exe, not a replacement.
+
+SAFETY GUARANTEES:
+  1. explorer.exe ALWAYS runs — never removed, always started first
+  2. Browser opens in --app mode (has close button, Alt+F4, resizable)
+  3. No infinite keep_alive loops — clean exit path
+  4. Kill switch hotkey documented in launcher
+  5. Backup of original shell BEFORE any changes
+  6. Single-command revert always available
+
+Registry: HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\Shell
+Default: explorer.exe
+NovaX:   A safe launcher that starts explorer.exe FIRST, then NovaX services
+"""
+import json
+import os
+import sys
+import ctypes
+import subprocess
+import time
+
+NOVAX_ROOT = r"C:\NovaX"
+SHELL_LAUNCHER = os.path.join(NOVAX_ROOT, "installer", "novax_shell.bat")
+BACKUP_FILE = os.path.join(NOVAX_ROOT, "memory", "shell_backup.json")
+REG_PATH = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon"
+REG_KEY = "Shell"
+DEFAULT_SHELL = "explorer.exe"
+
+
+def is_admin():
+    """Check if running with administrator privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def _read_registry_shell():
+    """Read the current Shell value from registry."""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_READ)
+        value, _ = winreg.QueryValueEx(key, REG_KEY)
+        winreg.CloseKey(key)
+        return value
+    except Exception:
+        return DEFAULT_SHELL
+
+
+def _write_registry_shell(value):
+    """Write a new Shell value to registry."""
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, REG_KEY, 0, winreg.REG_SZ, value)
+        winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _create_launcher():
+    """Create the SAFE NovaX shell launcher batch file.
+
+    SAFETY RULES (never violate these):
+    1. explorer.exe starts FIRST, always
+    2. --app mode, never --kiosk (user can close/resize/Alt+F4)
+    3. No infinite loops — script exits cleanly after launching
+    4. Kill switch path printed to console
+    """
+    os.makedirs(os.path.dirname(SHELL_LAUNCHER), exist_ok=True)
+
+    # Detect python and browser paths at launcher creation time
+    python_exe = os.path.join(NOVAX_ROOT, "ai_env", "Scripts", "python.exe")
+    if not os.path.exists(python_exe):
+        python_exe = sys.executable
+
+    # Detect browser - check multiple locations
+    edge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+
+    browser_cmd = None
+    for p in edge_paths + chrome_paths:
+        if os.path.exists(p):
+            browser_cmd = p
+            break
+
+    if not browser_cmd:
+        browser_cmd = edge_paths[0]  # fallback
+
+    kill_bat = os.path.join(NOVAX_ROOT, "NovaX_KILL.bat")
+
+    bat_content = f"""@echo off
+title NovaX_Shell_Launcher
+cd /d "{NOVAX_ROOT}"
+
+REM ╔══════════════════════════════════════════════════════════╗
+REM ║  NovaX SAFE Shell Launcher                               ║
+REM ║  explorer.exe ALWAYS runs — you always have Windows      ║
+REM ║  Kill switch: {kill_bat}         ║
+REM ║  Or: Ctrl+Shift+Esc → Task Manager → kill NovaX procs   ║
+REM ╚══════════════════════════════════════════════════════════╝
+
+REM ── SAFETY STEP 1: Always ensure explorer.exe is running ──
+tasklist /FI "IMAGENAME eq explorer.exe" | find /I "explorer.exe" >nul
+if errorlevel 1 (
+    echo [SAFETY] Starting explorer.exe...
+    start explorer.exe
+    timeout /t 3 /nobreak >nul
+)
+
+REM ── SAFETY STEP 2: Verify explorer is alive before continuing ──
+tasklist /FI "IMAGENAME eq explorer.exe" | find /I "explorer.exe" >nul
+if errorlevel 1 (
+    echo [CRITICAL] explorer.exe failed to start! Aborting NovaX shell.
+    start explorer.exe
+    exit /b 1
+)
+
+echo [OK] explorer.exe is running — Windows desktop is available.
+
+REM ── Start NovaX services (hidden, minimized) ──
+start /min "NovaX_Services" "{python_exe}" start_all.py 2>nul
+
+REM ── Wait for orchestrator (max 60s, NON-BLOCKING) ──
+set /a tries=0
+:wait_loop
+set /a tries+=1
+if %tries% gtr 30 goto launch_browser
+timeout /t 2 /nobreak >nul
+"{python_exe}" -c "import socket; s=socket.socket(); s.settimeout(1); r=s.connect_ex(('127.0.0.1',9999)); s.close(); exit(0 if r==0 else 1)" 2>nul
+if errorlevel 1 goto wait_loop
+
+:launch_browser
+REM ── Open NovaX Desktop in APP mode (has close button, resizable) ──
+REM    NEVER use --kiosk (traps the user with no escape)
+start "" "{browser_cmd}" --app="http://localhost:9999/nova_desktop.html" --disable-infobars --no-first-run --disable-session-crashed-bubble --noerrdialogs
+
+REM ── Clean exit — NO infinite loop ──
+REM    explorer.exe is the real shell, this script just launched NovaX alongside it.
+echo [OK] NovaX Desktop launched. This window will close in 5 seconds.
+echo [OK] To kill all NovaX: run {kill_bat}
+timeout /t 5 /nobreak >nul
+exit /b 0
+"""
+    with open(SHELL_LAUNCHER, "w", encoding="utf-8") as f:
+        f.write(bat_content)
+    return SHELL_LAUNCHER
+
+
+def backup_current():
+    """Backup the current shell setting."""
+    current = _read_registry_shell()
+    backup = {
+        "original_shell": current,
+        "backed_up_at": time.time(),
+        "user": os.environ.get("USERNAME", "unknown"),
+    }
+    os.makedirs(os.path.dirname(BACKUP_FILE), exist_ok=True)
+    with open(BACKUP_FILE, "w") as f:
+        json.dump(backup, f, indent=2)
+    return backup
+
+
+def install_shell():
+    """Install NovaX as a COMPANION shell alongside explorer.exe.
+
+    SAFETY: The registry Shell value is set to BOTH explorer.exe AND
+    the NovaX launcher, so Windows always has a working desktop.
+    The NovaX launcher also independently starts explorer.exe as a safety net.
+
+    When running as admin (via elevate.py), actually writes the registry.
+    Backs up the current shell first so it can always be reverted.
+    """
+    if not is_admin():
+        return {
+            "ok": False,
+            "error": "Administrator privileges required.",
+            "fix": "Use the OS panel or run: python installer/elevate.py shell-install",
+        }
+
+    # Backup current shell first
+    backup = backup_current()
+
+    # Create the SAFE launcher bat
+    launcher = _create_launcher()
+
+    # SAFETY: Shell value = "explorer.exe, <launcher>"
+    # Windows Winlogon supports comma-separated shell values — both will run.
+    # This means even if the NovaX launcher fails, explorer.exe still starts.
+    safe_shell_value = f"explorer.exe, {launcher}"
+
+    result = _write_registry_shell(safe_shell_value)
+    if result is not True:
+        return {
+            "ok": False,
+            "error": f"Registry write failed: {result}",
+            "backup": backup,
+        }
+
+    # Verify it took effect
+    current = _read_registry_shell()
+    if "explorer.exe" not in current.lower():
+        # CRITICAL SAFETY: If explorer.exe somehow isn't in the value, revert immediately
+        _write_registry_shell(DEFAULT_SHELL)
+        return {
+            "ok": False,
+            "error": "Safety check failed — explorer.exe not in shell value. Reverted.",
+            "actual": current,
+        }
+
+    return {
+        "ok": True,
+        "status": "installed",
+        "action": "shell_companion",
+        "backup": backup,
+        "launcher": launcher,
+        "previous_shell": backup.get("original_shell", "explorer.exe"),
+        "current_shell": current,
+        "safety": "explorer.exe runs alongside NovaX — full Windows access preserved",
+        "note": "Log out and back in to activate. explorer.exe always runs.",
+        "kill_switch": os.path.join(NOVAX_ROOT, "NovaX_KILL.bat"),
+        "revert": f'python "{os.path.join(NOVAX_ROOT, "installer", "elevate.py")}" shell-uninstall',
+    }
+
+
+def uninstall_shell():
+    """Revert to the original Windows shell."""
+    # Load backup
+    original = DEFAULT_SHELL
+    if os.path.exists(BACKUP_FILE):
+        try:
+            with open(BACKUP_FILE, "r") as f:
+                backup = json.load(f)
+            original = backup.get("original_shell", DEFAULT_SHELL)
+        except Exception:
+            pass
+
+    if not is_admin():
+        return {
+            "ok": False,
+            "error": "Administrator privileges required.",
+            "fix": "Use the OS panel or run: python installer/elevate.py shell-uninstall",
+        }
+
+    result = _write_registry_shell(original)
+    if result is True:
+        return {
+            "ok": True,
+            "status": "reverted",
+            "shell": original,
+            "note": "Log out and back in to restore Explorer.",
+        }
+    return {"ok": False, "error": str(result)}
+
+
+def shell_status():
+    """Check current shell replacement status."""
+    current = _read_registry_shell()
+    is_novax = SHELL_LAUNCHER in current or "novax" in current.lower()
+
+    backup = None
+    if os.path.exists(BACKUP_FILE):
+        try:
+            with open(BACKUP_FILE, "r") as f:
+                backup = json.load(f)
+        except Exception:
+            pass
+
+    return {
+        "current_shell": current,
+        "is_novax_shell": is_novax,
+        "is_default": current.lower() == DEFAULT_SHELL.lower(),
+        "launcher_exists": os.path.exists(SHELL_LAUNCHER),
+        "backup_exists": backup is not None,
+        "backup": backup,
+        "admin": is_admin(),
+    }
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(json.dumps(shell_status(), indent=2))
+    elif sys.argv[1] == "install":
+        print(json.dumps(install_shell(), indent=2))
+    elif sys.argv[1] == "uninstall":
+        print(json.dumps(uninstall_shell(), indent=2))
+    elif sys.argv[1] == "status":
+        print(json.dumps(shell_status(), indent=2))
+    else:
+        print(f"Usage: python shell_replace.py [install|uninstall|status]")

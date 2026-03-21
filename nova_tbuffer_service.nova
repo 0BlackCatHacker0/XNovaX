@@ -1,0 +1,527 @@
+// Nova TBuffer v3.0 - Unified Ternary Cache (N-S Flow Model)
+// Port 9886: Two-layer cache - SHA-256 exact match + 13-dim semantic similarity
+//
+// N-S Mapping:
+//   cache_entries  = fluid_particles
+//   exact_layer    = laminar_flow  (Re < 27, H3^3 - deterministic, ordered)
+//   semantic_layer = transitional  (27 < Re < 343, H7^3 - approximate match)
+//   cache_miss     = turbulent     (Re > 343 - no match, full inference needed)
+//   sha256_key     = pressure_field (unique, drives exact routing)
+//   cos_similarity = velocity_gradient (measures alignment between vectors)
+//   MAX_ENTRIES    = Re_critical boundary (10000 = H13 * H7^3 ceiling)
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3  -> ternary trit states (-1, 0, +1)
+//   H5=5  -> TZip pack unit (3^5 = 243 symbols per block)
+//   H7=7  -> composition unit (3^7 = 2187 BLOCK_SIZE)
+//   H13=13 -> carrier/frame width (entry_id hex length, vector dims)
+//
+// Reynolds Boundaries:
+//   Re < 27   (H3^3) = laminar  = exact cache hit
+//   27 < Re < 343 (H7^3) = transitional = semantic match
+//   Re > 343        = turbulent  = full cache miss
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9886
+let server = tserve(PORT, "TBuffer v3.0 - Unified Ternary Cache")
+
+// -- 3-5-7-13 Harmonic Constants --
+let RE_LAMINAR = 27       // H3^3 - exact match boundary
+let RE_TURBULENT = 343    // H7^3 - semantic fallback boundary
+let MAX_ENTRIES = 10000   // hard cap: N-S critical Reynolds ceiling
+
+// -- Cache State --
+let exact_cache = {}     // sha256_key -> {id, prompt, response, vector, channel, timestamp, hits}
+let semantic_store = []  // list of entries [{id, prompt, response, vector, channel, timestamp}]
+let entry_index = {}     // entry_id -> entry dict
+
+// -- Counters --
+let total_queries = 0
+let total_stores = 0
+let total_hits_exact = 0
+let total_hits_semantic = 0
+let total_misses = 0
+let total_writes = 0
+
+// -- 13-Dimension Text Feature Vector ------------------------------------------
+// Dims: [word_count, char_count, unique_words, avg_word_len, question_marks,
+//        exclamation_marks, commas, periods, uppercase_ratio, digit_ratio,
+//        max_word_len, sentence_count, vocabulary_richness]
+fn text_vector(text) {
+    let words = split(text)
+    let wc = len(words)
+    let cc = len(text)
+
+    // unique word count via dict presence tracking
+    let seen_words = {}
+    let uw = 0
+    let i = 0
+    while3 i < wc {
+        let w = lower(words[i])
+        if3 dict_has(seen_words, w) { i = i + 1
+        } else { seen_words = dict_set(seen_words, w, 1)
+            uw = uw + 1
+            i = i + 1
+        }
+    }
+
+    // avg word length
+    let total_wlen = 0
+    let wi = 0
+    while3 wi < wc {
+        total_wlen = total_wlen + len(words[wi])
+        wi = wi + 1
+    }
+    let wc_safe = wc
+    if3 wc == 0 { wc_safe = 1
+    }
+    let awl = round(total_wlen / wc_safe, 4)
+
+    // character counts - count each char type manually
+    let qm = 0
+    let em = 0
+    let cm = 0
+    let pm = 0
+    let upper_count = 0
+    let digit_count = 0
+    let max_wlen = 0
+    let ci = 0
+    let chars = split(text)
+
+    // word-level max length
+    let wmi = 0
+    while3 wmi < wc {
+        let wlen = len(words[wmi])
+        if3 wlen > max_wlen { max_wlen = wlen
+        }
+        wmi = wmi + 1
+    }
+
+    // character-level scan via split on empty string not available -
+    // use sha256 trick: convert to known representation and count substrings
+    // NovaLang: use split(text, sep) not available for single chars,
+    // so count occurrences via repeated string operations
+    // Approach: split by each punctuation marker using known builtins
+    let qm_parts = split(text + "Q", "?")
+    let qm = len(qm_parts) - 1
+
+    let em_parts = split(text + "E", "!")
+    let em = len(em_parts) - 1
+
+    let cm_parts = split(text + "C", ",")
+    let cm = len(cm_parts) - 1
+
+    let pm_parts = split(text + "P", ".")
+    let pm = len(pm_parts) - 1
+
+    // uppercase ratio: count uppercase letters A-Z
+    let uc_parts_A = split(text, "A")
+    let uc_count = len(uc_parts_A) - 1
+    let uc_parts_B = split(text, "B")
+    uc_count = uc_count + len(uc_parts_B) - 1
+    let uc_parts_C = split(text, "C")
+    uc_count = uc_count + len(uc_parts_C) - 1
+    let uc_parts_D = split(text, "D")
+    uc_count = uc_count + len(uc_parts_D) - 1
+    let uc_parts_E = split(text, "E")
+    uc_count = uc_count + len(uc_parts_E) - 1
+    let uc_parts_F = split(text, "F")
+    uc_count = uc_count + len(uc_parts_F) - 1
+    let uc_parts_G = split(text, "G")
+    uc_count = uc_count + len(uc_parts_G) - 1
+    let uc_parts_H = split(text, "H")
+    uc_count = uc_count + len(uc_parts_H) - 1
+    let uc_parts_I = split(text, "I")
+    uc_count = uc_count + len(uc_parts_I) - 1
+    let uc_parts_J = split(text, "J")
+    uc_count = uc_count + len(uc_parts_J) - 1
+    let uc_parts_K = split(text, "K")
+    uc_count = uc_count + len(uc_parts_K) - 1
+    let uc_parts_L = split(text, "L")
+    uc_count = uc_count + len(uc_parts_L) - 1
+    let uc_parts_M = split(text, "M")
+    uc_count = uc_count + len(uc_parts_M) - 1
+    let uc_parts_N = split(text, "N")
+    uc_count = uc_count + len(uc_parts_N) - 1
+    let uc_parts_O = split(text, "O")
+    uc_count = uc_count + len(uc_parts_O) - 1
+    let uc_parts_P = split(text, "P")
+    uc_count = uc_count + len(uc_parts_P) - 1
+    let uc_parts_Q = split(text, "Q")
+    uc_count = uc_count + len(uc_parts_Q) - 1
+    let uc_parts_R = split(text, "R")
+    uc_count = uc_count + len(uc_parts_R) - 1
+    let uc_parts_S = split(text, "S")
+    uc_count = uc_count + len(uc_parts_S) - 1
+    let uc_parts_T = split(text, "T")
+    uc_count = uc_count + len(uc_parts_T) - 1
+    let uc_parts_U = split(text, "U")
+    uc_count = uc_count + len(uc_parts_U) - 1
+    let uc_parts_V = split(text, "V")
+    uc_count = uc_count + len(uc_parts_V) - 1
+    let uc_parts_W = split(text, "W")
+    uc_count = uc_count + len(uc_parts_W) - 1
+    let uc_parts_X = split(text, "X")
+    uc_count = uc_count + len(uc_parts_X) - 1
+    let uc_parts_Y = split(text, "Y")
+    uc_count = uc_count + len(uc_parts_Y) - 1
+    let uc_parts_Z = split(text, "Z")
+    uc_count = uc_count + len(uc_parts_Z) - 1
+
+    // digit ratio: count 0-9
+    let dc_0 = split(text, "0")
+    let dc_count = len(dc_0) - 1
+    let dc_1 = split(text, "1")
+    dc_count = dc_count + len(dc_1) - 1
+    let dc_2 = split(text, "2")
+    dc_count = dc_count + len(dc_2) - 1
+    let dc_3 = split(text, "3")
+    dc_count = dc_count + len(dc_3) - 1
+    let dc_4 = split(text, "4")
+    dc_count = dc_count + len(dc_4) - 1
+    let dc_5 = split(text, "5")
+    dc_count = dc_count + len(dc_5) - 1
+    let dc_6 = split(text, "6")
+    dc_count = dc_count + len(dc_6) - 1
+    let dc_7 = split(text, "7")
+    dc_count = dc_count + len(dc_7) - 1
+    let dc_8 = split(text, "8")
+    dc_count = dc_count + len(dc_8) - 1
+    let dc_9 = split(text, "9")
+    dc_count = dc_count + len(dc_9) - 1
+
+    let cc_safe = cc
+    if3 cc == 0 { cc_safe = 1
+    }
+    let ur = round(uc_count / cc_safe, 6)
+    let dr = round(dc_count / cc_safe, 6)
+
+    // sentence_count = max(1, qm + em + pm)
+    let sc = qm + em + pm
+    if3 sc < 1 { sc = 1
+    }
+
+    // vocabulary richness = unique_words / max(1, word_count)
+    let vr = round(uw / wc_safe, 6)
+
+    return [wc, cc, uw, awl, qm, em, cm, pm, ur, dr, max_wlen, sc, vr]
+}
+
+// -- Cosine Similarity (delegates to builtin cos_sim) -------------------------
+fn cosine_sim(vec_a, vec_b) {
+    return cos_sim(vec_a, vec_b)
+}
+
+// -- Trim exact_cache to MAX_ENTRIES by removing oldest key -------------------
+fn trim_exact_cache() {
+    let ks = keys(exact_cache)
+    let sz = len(ks)
+    while3 sz > MAX_ENTRIES {
+        // Remove first key (oldest insertion order)
+        let first_key = ks[0]
+        exact_cache = dict_del(exact_cache, first_key)
+        ks = slice(ks, 1, len(ks))
+        sz = sz - 1
+    }
+}
+
+// -- Trim entry_index to MAX_ENTRIES by removing oldest key -------------------
+fn trim_entry_index() {
+    let ks = keys(entry_index)
+    let sz = len(ks)
+    while3 sz > MAX_ENTRIES {
+        let first_key = ks[0]
+        entry_index = dict_del(entry_index, first_key)
+        ks = slice(ks, 1, len(ks))
+        sz = sz - 1
+    }
+}
+
+// -- Trim semantic_store list to MAX_ENTRIES -----------------------------------
+fn trim_semantic_store() {
+    let sz = len(semantic_store)
+    if3 sz > MAX_ENTRIES { semantic_store = slice(semantic_store, sz - MAX_ENTRIES, sz)
+    }
+}
+
+// -- /tbuffer/query (POST) -----------------------------------------------------
+// Body: {prompt, threshold}
+// Returns: {ok, trit, layer, response?, similarity?, entry_id?, best_similarity?}
+fn tbuffer_query(req) {
+    total_queries = total_queries + 1
+    let body = try3 { json_decode(req["body"]) } fail { req }
+
+    let prompt = dict_get(body, "prompt") ?? ""
+    let threshold = dict_get(body, "threshold") ?? 0.85
+
+    if3 len(prompt) == 0 {
+        return {"ok": false, "trit": -1, "error": "prompt required"}
+    }
+
+    // Layer 1: exact SHA-256 match
+    let key = sha256(prompt)
+    if3 dict_has(exact_cache, key) { entry = dict_get(exact_cache, key) ?? {}
+        let old_hits = dict_get(entry, "hits") ?? 0
+        let new_hits = old_hits + 1
+        entry = dict_set(entry, "hits", new_hits)
+        exact_cache = dict_set(exact_cache, key, entry)
+        total_hits_exact = total_hits_exact + 1
+        return {
+            "ok": true,
+            "trit": 1,
+            "layer": "exact",
+            "response": dict_get(entry, "response") ?? "",
+            "hits": new_hits,
+            "entry_id": dict_get(entry, "id") ?? ""
+        }
+    }
+
+    // Layer 2: semantic cosine similarity over 13-dim vector
+    let vec = text_vector(prompt)
+    let best_score = 0.0
+    let best_entry = {}
+    let found_semantic = false
+    let si = 0
+    let slen = len(semantic_store)
+    while3 si < slen {
+        let candidate = semantic_store[si]
+        let cvec = dict_get(candidate, "vector") ?? []
+        let score = cosine_sim(vec, cvec)
+        if3 score > best_score { best_score = score
+            let best_entry = candidate
+            let found_semantic = true
+        }
+        si = si + 1
+    }
+
+    if3 found_semantic {
+        if3 best_score >= threshold {
+            total_hits_semantic = total_hits_semantic + 1
+            return {
+                "ok": true,
+                "trit": 0,
+                "layer": "semantic",
+                "similarity": round(best_score, 4),
+                "response": dict_get(best_entry, "response") ?? "",
+                "original_prompt": dict_get(best_entry, "prompt") ?? "",
+                "entry_id": dict_get(best_entry, "id") ?? ""
+            }
+        }
+    }
+
+    // Layer miss
+    total_misses = total_misses + 1
+    let miss_sim = 0.0
+    if3 found_semantic { miss_sim = round(best_score, 4)
+    }
+    return {
+        "ok": true,
+        "trit": -1,
+        "layer": "miss",
+        "best_similarity": miss_sim
+    }
+}
+
+// -- /tbuffer/store (POST) -----------------------------------------------------
+// Body: {prompt, response, channel}
+// Returns: {ok, trit, entry_id}
+fn tbuffer_store(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    total_stores = total_stores + 1
+
+    let prompt = dict_get(body, "prompt") ?? ""
+    let response = dict_get(body, "response") ?? ""
+    let channel = dict_get(body, "channel") ?? "default"
+
+    if3 len(prompt) == 0 {
+        return {"ok": false, "trit": -1, "error": "prompt required"}
+    }
+    if3 len(response) == 0 {
+        return {"ok": false, "trit": -1, "error": "response required"}
+    }
+
+    // Generate entry id: H13 = 13 hex chars
+    let eid = uuid_hex(H13)
+    let key = sha256(prompt)
+    let vec = text_vector(prompt)
+    let now = time()
+
+    let entry = {
+        "id": eid,
+        "prompt": prompt,
+        "response": response,
+        "vector": vec,
+        "channel": channel,
+        "timestamp": now,
+        "hits": 0
+    }
+
+    // Insert into exact_cache
+    exact_cache = dict_set(exact_cache, key, entry)
+    trim_exact_cache()
+
+    // Append to semantic_store
+    semantic_store = append(semantic_store, entry)
+    trim_semantic_store()
+
+    // Insert into entry_index
+    entry_index = dict_set(entry_index, eid, entry)
+    trim_entry_index()
+
+    return {"ok": true, "trit": 1, "entry_id": eid}
+}
+
+// -- /tbuffer/write (POST) -----------------------------------------------------
+// Body: {data, entry_id?}
+// Returns: {ok, trit, entry_id}
+fn tbuffer_write(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    total_writes = total_writes + 1
+
+    let data = dict_get(body, "data") ?? ""
+    let req_eid = dict_get(body, "entry_id") ?? ""
+
+    if3 len(data) == 0 {
+        return {"ok": false, "trit": -1, "error": "data required"}
+    }
+
+    let eid = req_eid
+    if3 len(eid) == 0 { eid = uuid_hex(H13)
+    }
+
+    let now = time()
+    let entry = {"id": eid, "data": data, "timestamp": now}
+    entry_index = dict_set(entry_index, eid, entry)
+    trim_entry_index()
+
+    return {"ok": true, "trit": 1, "entry_id": eid}
+}
+
+// -- /tbuffer/lookup (POST) ----------------------------------------------------
+// Body: {entry_id}
+// Returns: {ok, trit, entry}
+fn tbuffer_lookup(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let eid = dict_get(body, "entry_id") ?? ""
+
+    if3 len(eid) == 0 {
+        return {"ok": false, "trit": -1, "error": "entry_id required"}
+    }
+
+    if3 dict_has(entry_index, eid) { entry = dict_get(entry_index, eid) ?? {}
+        return {"ok": true, "trit": 1, "entry": entry}
+    }
+
+    return {"ok": false, "trit": -1, "error": "not found"}
+}
+
+// -- /tbuffer/invalidate (POST) ------------------------------------------------
+// Body: {entry_id?, prompt?}
+// Returns: {ok, trit, removed}
+fn tbuffer_invalidate(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let eid = dict_get(body, "entry_id") ?? ""
+    let prompt = dict_get(body, "prompt") ?? ""
+    let removed = 0
+
+    if3 len(eid) > 0 {
+        if3 dict_has(entry_index, eid) { entry_index = dict_del(entry_index, eid)
+            removed = removed + 1
+        }
+    }
+
+    if3 len(prompt) > 0 { key = sha256(prompt)
+        if3 dict_has(exact_cache, key) { exact_cache = dict_del(exact_cache, key)
+            removed = removed + 1
+        }
+    }
+
+    // Trit: TRUE if anything was removed, MAYBE if nothing matched
+    let result_trit = 0
+    if3 removed > 0 { result_trit = 1
+    }
+
+    return {"ok": true, "trit": result_trit, "removed": removed}
+}
+
+// -- /tbuffer/status (GET) -----------------------------------------------------
+fn tbuffer_status() {
+    let exact_count = len(keys(exact_cache))
+    let semantic_count = len(semantic_store)
+    let index_count = len(keys(entry_index))
+
+    // N-S Reynolds classification: hit_rate drives flow regime
+    let total_q = total_queries
+    let hit_total = total_hits_exact + total_hits_semantic
+    let hit_rate = 0.0
+    if3 total_q > 0 { hit_rate = round(hit_total / total_q, 4)
+    }
+
+    // Re = miss pressure * inverse hit_rate (high misses = turbulent)
+    let re = total_misses
+    let regime = "laminar"
+    if3 re > RE_LAMINAR { regime = "transitional"
+    }
+    if3 re > RE_TURBULENT { regime = "turbulent"
+    }
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "service": "tbuffer",
+        "port": PORT,
+        "version": "3.0",
+        "ternary": true,
+        "runtime": "novalang",
+        "exact_entries": exact_count,
+        "semantic_entries": semantic_count,
+        "indexed": index_count,
+        "max_entries": MAX_ENTRIES,
+        "stats": {
+            "total_queries": total_queries,
+            "total_stores": total_stores,
+            "total_writes": total_writes,
+            "hits_exact": total_hits_exact,
+            "hits_semantic": total_hits_semantic,
+            "misses": total_misses,
+            "hit_rate": hit_rate
+        },
+        "ns_flow": {
+            "reynolds": re,
+            "regime": regime,
+            "re_laminar": RE_LAMINAR,
+            "re_turbulent": RE_TURBULENT
+        },
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// -- /health (GET) -------------------------------------------------------------
+fn health() {
+    let _counters = {"total_requests": total_queries + total_stores + total_writes, "total_errors": total_misses}
+    let resp = ns_health_dict("tbuffer", "3.0", PORT, _counters)
+    resp = dict_set(resp, "harmonics", {"H3": H3, "H5": H5, "H7": H7, "H13": H13})
+    return resp
+}
+
+// -- Register Routes -----------------------------------------------------------
+troute(server, "GET",  "/health",            "health")
+troute(server, "GET",  "/tbuffer/status",    "tbuffer_status")
+troute(server, "POST", "/tbuffer/query",     "tbuffer_query")
+troute(server, "POST", "/tbuffer/store",     "tbuffer_store")
+troute(server, "POST", "/tbuffer/write",     "tbuffer_write")
+troute(server, "POST", "/tbuffer/lookup",    "tbuffer_lookup")
+troute(server, "POST", "/tbuffer/invalidate","tbuffer_invalidate")
+
+// -- Startup Banner ------------------------------------------------------------
+print("[TBuffer] NovaLang TBuffer v3.0 - Unified Ternary Cache")
+print("[TBuffer] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TBuffer] Layer 1: SHA-256 exact match (laminar, Re < " + str(RE_LAMINAR) + ")")
+print("[TBuffer] Layer 2: 13-dim cosine semantic match (transitional, Re < " + str(RE_TURBULENT) + ")")
+print("[TBuffer] Max entries: " + str(MAX_ENTRIES) + " | Entry ID length: H13=" + str(H13))
+print("[TBuffer] Routes: /health, /tbuffer/status, /tbuffer/query, /tbuffer/store, /tbuffer/write, /tbuffer/lookup, /tbuffer/invalidate")
+
+tstart(server)

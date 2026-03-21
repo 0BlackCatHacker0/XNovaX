@@ -1,0 +1,555 @@
+// ============================================================================
+// TGarlic -- Ternary Garlic-Onion Hybrid Anonymity Router Service
+// NovaX Anonymous Messaging + Tunnel Management + LeaseSet Publishing
+// Port 9996 | Ternary Micro-Tool | 3-5-7-13 Harmonics
+// ============================================================================
+// Merges i2P garlic routing with Tor onion routing through ternary logic:
+//
+//   CLOVE states:    +1=deliver, 0=delay, -1=decoy
+//   TUNNEL modes:    +1=garlic(unidirectional), 0=hybrid, -1=onion(bidirectional)
+//   LEASESET health: +1=fresh, 0=expiring, -1=stale
+//
+// Integration chain: TGarlic -> TShield (phantom IP) -> TGateway (entry/exit)
+// ============================================================================
+
+// -- Shared Libraries --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+import3("C:/NovaX/stdlib/tgarlic3.nova")
+
+let VERSION = "1.0"
+let PORT = 9996
+let SERVICE = "nova-tgarlic"
+let server = tserve(PORT, "TGarlic NovaLang")
+
+// -- Triad Peers --
+let TRIAD_PEERS = {
+    "tshield": "http://127.0.0.1:9987",
+    "tgateway": "http://127.0.0.1:9979",
+    "tvpn": "http://127.0.0.1:9989"
+}
+
+// -- State --
+let _garlic_state = 1
+let _network = tgarlic3_network_new("nova_garlic_net")
+let _message_log = []
+let _max_log = 130
+let _stats_total_sent = 0
+let _stats_total_received = 0
+let _stats_bundles_created = 0
+let _stats_decoys_generated = 0
+let _stats_tunnels_built = 0
+let _stats_leasesets_published = 0
+let _triad_events = []
+let _t0 = time()
+
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+fn _log_event(event_type, data) {
+    let entry = {
+        "type": event_type,
+        "data": data,
+        "time": time_ms()
+    }
+    _message_log = list_push(_message_log, entry)
+
+    // Trim to max
+    if3 len(_message_log) > _max_log {
+        _message_log = list_slice(_message_log, len(_message_log) - _max_log, len(_message_log))
+    }
+}
+
+fn _state_label(s) {
+    if3 s == 1 {
+        return "ROUTING"
+    }
+    if3 s == 0 {
+        return "DEGRADED"
+    }
+    return "OFFLINE"
+}
+
+fn _health_label(h) {
+    if3 h == 1 {
+        return "fresh"
+    }
+    if3 h == 0 {
+        return "expiring"
+    }
+    return "stale"
+}
+
+// ============================================================================
+// HEALTH + STATUS ENDPOINTS (GET — no params)
+// ============================================================================
+
+fn handle_health() {
+    let sl = _state_label(_garlic_state)
+    let resp = ns_health_dict(SERVICE, VERSION, PORT, {})
+    resp = dict_set(resp, "state", _garlic_state)
+    resp = dict_set(resp, "state_label", sl)
+    resp = dict_set(resp, "uptime", time() - _t0)
+    return resp
+}
+
+fn handle_status() {
+    let net_stats = tgarlic3_stats(_network)
+    let totals = {}
+    totals = dict_set(totals, "sent", _stats_total_sent)
+    totals = dict_set(totals, "received", _stats_total_received)
+    totals = dict_set(totals, "bundles", _stats_bundles_created)
+    totals = dict_set(totals, "decoys", _stats_decoys_generated)
+    totals = dict_set(totals, "tunnels", _stats_tunnels_built)
+    totals = dict_set(totals, "leasesets", _stats_leasesets_published)
+    return {
+        "ok": true,
+        "service": SERVICE,
+        "version": VERSION,
+        "state": _garlic_state,
+        "state_label": _state_label(_garlic_state),
+        "uptime": time() - _t0,
+        "network": net_stats,
+        "totals": totals,
+        "log_count": len(_message_log),
+        "triad_events": len(_triad_events)
+    }
+}
+
+fn handle_log() {
+    return {
+        "ok": true,
+        "log": _message_log,
+        "total": len(_message_log)
+    }
+}
+
+fn handle_network_stats() {
+    let stats = tgarlic3_stats(_network)
+    return {"ok": true, "stats": stats}
+}
+
+fn handle_triad_status() {
+    let results = {}
+    let peer_names = keys(TRIAD_PEERS)
+    let i = 0
+    while3 i < len(peer_names) {
+        let pn = peer_names[i]
+        let pu = dict_get(TRIAD_PEERS, pn) ?? ""
+        let resp = try3 {
+            tfetch(pu + "/health")
+        } catch3 {
+            {"error": "unreachable"}
+        }
+        results = dict_set(results, pn, resp)
+        i = i + 1
+    }
+
+    return {
+        "ok": true,
+        "self_service": SERVICE,
+        "self_state": _garlic_state,
+        "self_version": VERSION,
+        "peers": results
+    }
+}
+
+// ============================================================================
+// CLOVE MANAGEMENT (POST — body param)
+// ============================================================================
+
+fn handle_clove_create(body) {
+    let payload = dict_get(body, "payload") ?? ""
+    let dest = dict_get(body, "dest") ?? "unknown"
+    let clove_type = dict_get(body, "type") ?? 1
+
+    if3 payload == "" {
+        return {"ok": false, "error": "payload required"}
+    }
+
+    let clove = tgarlic3_clove_new(payload, dest, clove_type)
+    _log_event("clove_created", {"dest": dest})
+
+    return {
+        "ok": true,
+        "clove": clove,
+        "trit": dict_get(clove, "trit") ?? 0
+    }
+}
+
+fn handle_clove_ack(body) {
+    let msg_id = dict_get(body, "msg_id") ?? ""
+    let return_tunnel = dict_get(body, "return_tunnel") ?? "default"
+
+    if3 msg_id == "" {
+        return {"ok": false, "error": "msg_id required"}
+    }
+
+    let ack = tgarlic3_clove_ack(msg_id, return_tunnel)
+    _log_event("ack_created", {"msg_id": msg_id})
+
+    return {"ok": true, "ack": ack}
+}
+
+fn handle_clove_decoy(body) {
+    let decoy = tgarlic3_clove_decoy()
+    _stats_decoys_generated = _stats_decoys_generated + 1
+    _log_event("decoy_created", {})
+
+    return {"ok": true, "decoy": decoy}
+}
+
+// ============================================================================
+// GARLIC BUNDLE MANAGEMENT
+// ============================================================================
+
+fn handle_bundle_create(body) {
+    let cloves = dict_get(body, "cloves") ?? []
+
+    if3 len(cloves) == 0 {
+        return {"ok": false, "error": "cloves array required"}
+    }
+
+    let garlic = tgarlic3_bundle(cloves)
+    _stats_bundles_created = _stats_bundles_created + 1
+    _log_event("bundle_created", {
+        "clove_count": dict_get(garlic, "clove_count") ?? 0,
+        "real_count": dict_get(garlic, "real_count") ?? 0
+    })
+
+    return {"ok": true, "garlic": garlic}
+}
+
+fn handle_bundle_unbundle(body) {
+    let garlic = dict_get(body, "garlic") ?? {}
+
+    let result = tgarlic3_unbundle(garlic)
+    let dropped = dict_get(result, "decoys_dropped") ?? 0
+    _stats_decoys_generated = _stats_decoys_generated + dropped
+    _log_event("bundle_unbundled", {"decoys_dropped": dropped})
+
+    return {"ok": true, "result": result}
+}
+
+// ============================================================================
+// TUNNEL MANAGEMENT
+// ============================================================================
+
+fn handle_tunnel_create(body) {
+    let name = dict_get(body, "name") ?? "tunnel_" + str(time_ms())
+    let hops = dict_get(body, "hops") ?? []
+    let mode = dict_get(body, "mode") ?? 0
+
+    if3 len(hops) == 0 {
+        return {"ok": false, "error": "hops array required"}
+    }
+
+    let tunnel = tgarlic3_tunnel_new(name, hops, mode)
+
+    // Check for error
+    let err = dict_get(tunnel, "error") ?? ""
+    if3 err != "" {
+        return {"ok": false, "error": err}
+    }
+
+    _stats_tunnels_built = _stats_tunnels_built + 1
+    _log_event("tunnel_created", {"name": name, "hops": len(hops), "mode": mode})
+
+    return {
+        "ok": true,
+        "tunnel": tunnel,
+        "alive": tgarlic3_tunnel_alive(tunnel)
+    }
+}
+
+fn handle_tunnel_status(body) {
+    let tunnel = dict_get(body, "tunnel") ?? {}
+
+    return {
+        "ok": true,
+        "alive": tgarlic3_tunnel_alive(tunnel),
+        "hop_count": dict_get(tunnel, "hop_count") ?? 0,
+        "gateway": dict_get(tunnel, "gateway") ?? "",
+        "endpoint": dict_get(tunnel, "endpoint") ?? ""
+    }
+}
+
+// ============================================================================
+// LEASESET MANAGEMENT
+// ============================================================================
+
+fn handle_leaseset_create(body) {
+    let dest = dict_get(body, "dest") ?? ""
+    let tunnels = dict_get(body, "tunnels") ?? []
+
+    if3 dest == "" {
+        return {"ok": false, "error": "dest required"}
+    }
+    if3 len(tunnels) == 0 {
+        return {"ok": false, "error": "tunnels array required"}
+    }
+
+    let ls = tgarlic3_leaseset_new(dest, tunnels)
+    _stats_leasesets_published = _stats_leasesets_published + 1
+    _log_event("leaseset_created", {"dest": dest, "lease_count": dict_get(ls, "lease_count") ?? 0})
+
+    return {"ok": true, "leaseset": ls}
+}
+
+fn handle_leaseset_health(body) {
+    let ls = dict_get(body, "leaseset") ?? {}
+    let health = tgarlic3_leaseset_health(ls)
+    let label = _health_label(health)
+
+    return {"ok": true, "health": health, "label": label}
+}
+
+// ============================================================================
+// SESSION TAG MANAGEMENT
+// ============================================================================
+
+fn handle_session_create(body) {
+    let peer = dict_get(body, "peer") ?? ""
+
+    if3 peer == "" {
+        return {"ok": false, "error": "peer name required"}
+    }
+
+    let session = tgarlic3_session_new(peer)
+    _log_event("session_created", {"peer": peer})
+
+    return {
+        "ok": true,
+        "session": session,
+        "tags_remaining": dict_get(session, "tags_remaining") ?? 0
+    }
+}
+
+fn handle_session_use_tag(body) {
+    let session = dict_get(body, "session") ?? {}
+
+    let result = tgarlic3_session_use_tag(session)
+    let updated = dict_get(result, "session") ?? session
+    let needs_restock = dict_get(result, "needs_restock") ?? false
+
+    return {
+        "ok": true,
+        "session": updated,
+        "tag_used": dict_get(result, "tag") ?? "",
+        "tags_remaining": dict_get(updated, "tags_remaining") ?? 0,
+        "needs_restock": needs_restock
+    }
+}
+
+fn handle_session_restock(body) {
+    let session = dict_get(body, "session") ?? {}
+
+    let restocked = tgarlic3_session_restock(session)
+    _log_event("session_restocked", {"peer": dict_get(restocked, "peer") ?? "unknown"})
+
+    return {
+        "ok": true,
+        "session": restocked,
+        "tags_remaining": dict_get(restocked, "tags_remaining") ?? 0
+    }
+}
+
+// ============================================================================
+// ROUTE MANAGEMENT
+// ============================================================================
+
+fn handle_route_create(body) {
+    let name = dict_get(body, "name") ?? "route_" + str(time_ms())
+    let out_hops = dict_get(body, "outbound") ?? []
+    let in_hops = dict_get(body, "inbound") ?? []
+    let mode = dict_get(body, "mode") ?? 0
+
+    if3 len(out_hops) == 0 {
+        return {"ok": false, "error": "outbound hops required"}
+    }
+    if3 len(in_hops) == 0 {
+        return {"ok": false, "error": "inbound hops required"}
+    }
+
+    let route = tgarlic3_route_new(name, out_hops, in_hops, mode)
+
+    // Check for tunnel errors
+    let ob = dict_get(route, "outbound") ?? {}
+    let ib = dict_get(route, "inbound") ?? {}
+    let out_err = dict_get(ob, "error") ?? ""
+    let in_err = dict_get(ib, "error") ?? ""
+    if3 out_err != "" {
+        return {"ok": false, "error": "outbound: " + out_err}
+    }
+    if3 in_err != "" {
+        return {"ok": false, "error": "inbound: " + in_err}
+    }
+
+    _log_event("route_created", {"name": name, "total_hops": dict_get(route, "total_hops") ?? 0})
+
+    return {"ok": true, "route": route}
+}
+
+fn handle_route_send(body) {
+    let route = dict_get(body, "route") ?? {}
+    let payload = dict_get(body, "payload") ?? ""
+    let dest = dict_get(body, "dest") ?? ""
+    let ls = dict_get(body, "leaseset") ?? {}
+
+    if3 payload == "" {
+        return {"ok": false, "error": "payload required"}
+    }
+    if3 dest == "" {
+        return {"ok": false, "error": "dest required"}
+    }
+
+    let sent = tgarlic3_route_send(route, payload, dest, ls)
+    _stats_total_sent = _stats_total_sent + 1
+
+    let sg = dict_get(sent, "garlic") ?? {}
+    _log_event("message_sent", {"dest": dest, "cloves": dict_get(sg, "clove_count") ?? 0})
+
+    return {"ok": true, "sent": sent}
+}
+
+// ============================================================================
+// NETWORK MANAGEMENT (multi-route, multi-session)
+// ============================================================================
+
+fn handle_network_add_route(body) {
+    let name = dict_get(body, "name") ?? ""
+    let out_hops = dict_get(body, "outbound") ?? []
+    let in_hops = dict_get(body, "inbound") ?? []
+    let mode = dict_get(body, "mode") ?? 1
+
+    if3 name == "" {
+        return {"ok": false, "error": "route name required"}
+    }
+
+    let result = tgarlic3_network_add_route(_network, name, out_hops, in_hops, mode)
+    _network = dict_get(result, "net") ?? _network
+
+    return {"ok": true, "route": dict_get(result, "route") ?? {}}
+}
+
+fn handle_network_add_session(body) {
+    let peer = dict_get(body, "peer") ?? ""
+
+    if3 peer == "" {
+        return {"ok": false, "error": "peer name required"}
+    }
+
+    let result = tgarlic3_network_add_session(_network, peer)
+    _network = dict_get(result, "net") ?? _network
+    let sess = dict_get(result, "session") ?? {}
+
+    return {
+        "ok": true,
+        "session": sess,
+        "tags": dict_get(sess, "tags_remaining") ?? 0
+    }
+}
+
+fn handle_network_publish_leaseset(body) {
+    let dest = dict_get(body, "dest") ?? SERVICE
+
+    let result = tgarlic3_network_publish_leaseset(_network, dest)
+    _network = dict_get(result, "net") ?? _network
+    _stats_leasesets_published = _stats_leasesets_published + 1
+
+    return {
+        "ok": true,
+        "leaseset": dict_get(result, "leaseset") ?? {}
+    }
+}
+
+// ============================================================================
+// TRIAD EVENT HANDLER
+// ============================================================================
+
+fn handle_triad_event(body) {
+    let event_type = dict_get(body, "type") ?? "unknown"
+    let source = dict_get(body, "source") ?? "unknown"
+    let data = dict_get(body, "data") ?? {}
+
+    let event = {
+        "type": event_type,
+        "source": source,
+        "data": data,
+        "time": time_ms()
+    }
+
+    _triad_events = list_push(_triad_events, event)
+
+    // Trim event log
+    if3 len(_triad_events) > _max_log {
+        _triad_events = list_slice(_triad_events, len(_triad_events) - _max_log, len(_triad_events))
+    }
+
+    // React to shield events
+    if3 source == "tshield" {
+        if3 event_type == "threat_detected" {
+            _garlic_state = 0
+            _log_event("degraded_by_threat", data)
+        }
+        if3 event_type == "all_clear" {
+            _garlic_state = 1
+            _log_event("restored_by_shield", data)
+        }
+    }
+
+    return {"ok": true, "processed": event_type}
+}
+
+// ============================================================================
+// ROUTE TABLE
+// ============================================================================
+
+// GET endpoints (handler takes no params)
+troute(server, "GET",  "/health",                       "handle_health")
+troute(server, "GET",  "/status",                       "handle_status")
+troute(server, "GET",  "/api/status",                   "handle_status")
+troute(server, "GET",  "/api/log",                      "handle_log")
+troute(server, "GET",  "/api/network/stats",            "handle_network_stats")
+troute(server, "GET",  "/api/triad/status",             "handle_triad_status")
+
+// POST: Clove endpoints
+troute(server, "POST", "/api/clove/create",             "handle_clove_create")
+troute(server, "POST", "/api/clove/ack",                "handle_clove_ack")
+troute(server, "POST", "/api/clove/decoy",              "handle_clove_decoy")
+
+// POST: Bundle endpoints
+troute(server, "POST", "/api/bundle/create",            "handle_bundle_create")
+troute(server, "POST", "/api/bundle/unbundle",          "handle_bundle_unbundle")
+
+// POST: Tunnel endpoints
+troute(server, "POST", "/api/tunnel/create",            "handle_tunnel_create")
+troute(server, "POST", "/api/tunnel/status",            "handle_tunnel_status")
+
+// POST: LeaseSet endpoints
+troute(server, "POST", "/api/leaseset/create",          "handle_leaseset_create")
+troute(server, "POST", "/api/leaseset/health",          "handle_leaseset_health")
+
+// POST: Session tag endpoints
+troute(server, "POST", "/api/session/create",           "handle_session_create")
+troute(server, "POST", "/api/session/use-tag",          "handle_session_use_tag")
+troute(server, "POST", "/api/session/restock",          "handle_session_restock")
+
+// POST: Route endpoints
+troute(server, "POST", "/api/route/create",             "handle_route_create")
+troute(server, "POST", "/api/route/send",               "handle_route_send")
+
+// POST: Network management
+troute(server, "POST", "/api/network/add-route",        "handle_network_add_route")
+troute(server, "POST", "/api/network/add-session",      "handle_network_add_session")
+troute(server, "POST", "/api/network/publish-leaseset", "handle_network_publish_leaseset")
+
+// POST: Triad integration
+troute(server, "POST", "/api/triad/event",              "handle_triad_event")
+
+print(f"[TGarlic] Ternary Garlic-Onion Hybrid Router v{VERSION}")
+print(f"[TGarlic] Listening on 127.0.0.1:{PORT}")
+print(f"[TGarlic] Integration: TShield(:9987) + TGateway(:9979) + TVPN(:9989)")
+print(f"[TGarlic] 3-5-7-13: 3 layers, 5 max cloves, 7 max hops, 13 session tags")
+tlisten(server)

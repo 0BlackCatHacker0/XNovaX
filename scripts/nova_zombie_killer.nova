@@ -1,0 +1,150 @@
+// nova_zombie_killer.nova — Find and kill ALL duplicate NovaX processes
+// Keeps exactly 1 instance of each service. Kills watchdog FIRST.
+// NovaLang conversion of kill_all_zombies.py
+
+print("=== NovaX Zombie Killer ===")
+print("")
+
+// Phase 1: Get all Python processes via PowerShell
+fn get_python_procs() {
+  let cmd = "powershell -NoProfile -Command \"Get-CimInstance Win32_Process -Filter \\\"Name='python.exe' or Name='pythonw.exe'\\\" | Select ProcessId,CommandLine | ConvertTo-Json\""
+  let raw = shell(cmd)
+  let trimmed = trim(raw)
+  if3 cmp3(len(trimmed), 0) {
+    return []
+  } maybe {
+    return []
+  } else {
+  }
+  let data = json_decode(trimmed)
+  return data
+}
+
+// Phase 2: Extract script name from command line
+fn extract_script(cmdline) {
+  let parts = split(cmdline, " ")
+  let script = null
+  let idx = 0
+  let plen = len(parts)
+  while3 idx < plen {
+    let part = parts[idx]
+    let is_py = contains(part, ".py")
+    if3 is_py {
+      let segments = split(part, "\\")
+      let script = segments[len(segments) - 1]
+      return script
+    } maybe {
+    } else {
+    }
+    let idx = idx + 1
+  }
+  return script
+}
+
+// Phase 3: Kill a PID
+fn kill_pid(pid) {
+  let cmd = "taskkill /F /PID " + str(pid)
+  let result = shell(cmd)
+  print("  Killed PID " + str(pid))
+  return 1
+}
+
+// Main
+let procs = get_python_procs()
+let killed = 0
+
+// Group by script name — build a mapping
+let scripts = {}
+let pi = 0
+let pcount = len(procs)
+while3 pi < pcount {
+  let p = procs[pi]
+  let pid = dict_get(p, "ProcessId") ?? 0
+  let cmd = dict_get(p, "CommandLine") ?? ""
+  let script = extract_script(cmd)
+  if3 script {
+    let existing = dict_get(scripts, script) ?? []
+    let existing = append(existing, pid)
+    let scripts = dict_set(scripts, script, existing)
+  } maybe {
+  } else {
+  }
+  let pi = pi + 1
+}
+
+// PHASE 1: Kill ALL watchdog instances FIRST
+let wd_key = "novax_watchdog.py"
+let wd_pids = dict_get(scripts, wd_key) ?? []
+let wd_count = len(wd_pids)
+if3 cmp3(wd_count, 0) {
+  print("[PHASE 1] Killing ALL watchdog instances: " + str(wd_count) + " PIDs")
+  let wi = 0
+  while3 wi < wd_count {
+    let wpid = wd_pids[wi]
+    kill_pid(wpid)
+    let killed = killed + 1
+    let wi = wi + 1
+  }
+  sleep(1)
+} maybe {
+} else {
+}
+
+// PHASE 2: Kill duplicate instances (keep lowest PID)
+let all_keys = keys(scripts)
+let ki = 0
+let kcount = len(all_keys)
+while3 ki < kcount {
+  let sname = all_keys[ki]
+  // Skip watchdog — already handled
+  let is_wd = contains(sname, "watchdog")
+  if3 is_wd {
+    let ki = ki + 1
+    continue3
+  } maybe {
+  } else {
+  }
+  let pids = dict_get(scripts, sname) ?? []
+  let pc = len(pids)
+  if3 cmp3(pc, 1) {
+    // More than 1 PID — kill duplicates, keep first (lowest)
+    print("[PHASE 2] " + sname + ": keeping PID " + str(pids[0]) + ", killing " + str(pc - 1) + " duplicates")
+    let di = 1
+    while3 di < pc {
+      kill_pid(pids[di])
+      let killed = killed + 1
+      let di = di + 1
+    }
+  } maybe {
+  } else {
+  }
+  let ki = ki + 1
+}
+
+print("")
+print("=== Killed " + str(killed) + " zombie processes ===")
+
+// Verify
+sleep(2)
+let remaining = get_python_procs()
+let nova_count = 0
+let ri = 0
+let rcount = len(remaining)
+while3 ri < rcount {
+  let rp = remaining[ri]
+  let rcmd = dict_get(rp, "CommandLine") ?? ""
+  let has_nova = contains(rcmd, "nova")
+  if3 has_nova {
+    let nova_count = nova_count + 1
+    let rscript = extract_script(rcmd)
+    let rpid = dict_get(rp, "ProcessId") ?? 0
+    print("  PID=" + str(rpid) + " " + str(rscript))
+  } maybe {
+  } else {
+  }
+  let ri = ri + 1
+}
+
+print("Remaining NovaX processes: " + str(nova_count))
+print("")
+print("=== Zombie Killer Complete ===")

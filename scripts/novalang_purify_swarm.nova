@@ -1,0 +1,382 @@
+// NovaLang Purification Swarm
+// Sends purification tasks to 20+ cloud AI models.
+// Each model generates pure NovaLang replacements for Python bridges.
+// Usage: novalang run scripts/novalang_purify_swarm.nova [--phase 1|2|3] [--dry-run]
+
+let ROOT = "C:/NovaX"
+let CLOUD_CFG = ROOT + "/cloud_config.json"
+let RESULTS_DIR = ROOT + "/swarm_results/purify"
+let TIMEOUT = 120
+
+// Cloud Models (confirmed live from Big Tripple Test)
+let SWARM_MODELS = {
+    "openai": {"url": "", "key": "", "models": ["gpt-4o", "gpt-4.1", "gpt-4.1-mini", "o3-mini"]},
+    "anthropic": {"url": "", "key": "", "models": ["claude-sonnet-4-20250514"]},
+    "openrouter": {
+        "url": "https://openrouter.ai/api/v1", "key": "",
+        "models": [
+            "deepseek/deepseek-chat-v3.1",
+            "deepseek/deepseek-r1-0528",
+            "qwen/qwen3-235b-a22b-thinking-2507",
+            "qwen/qwen3-coder:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "nousresearch/hermes-3-llama-3.1-405b:free",
+            "mistralai/mistral-small-3.1-24b-instruct:free",
+            "google/gemma-3-27b-it:free",
+            "nvidia/nemotron-3-nano-30b-a3b:free",
+            "arcee-ai/trinity-large-preview:free",
+            "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
+            "stepfun/step-3.5-flash:free",
+            "upstage/solar-pro-3:free",
+            "openai/gpt-oss-120b:free",
+            "qwen/qwen3-next-80b-a3b-instruct:free"
+        ]
+    }
+}
+
+// NovaLang Builtin Inventory string
+let NOVALANG_BUILTINS = "=== NovaLang Native Builtins (available without Python) ===\n\nNETWORKING:\n  http_get(url) -> string response body\n  http_post(url, body) -> string response body\n  http_put(url, body) -> string response body\n  http_delete(url) -> string response body\n\nJSON:\n  json_decode(string) -> dict/list\n  json_encode(value) -> string\n\nFILE I/O:\n  file_read(path) -> string contents\n  file_write(path, content) -> bool\n  file_exists(path) -> bool\n  file_delete(path) -> bool\n\nSHELL:\n  shell(command) -> string stdout\n\nSTRINGS:\n  len(s), contains(s, sub), split(s, delim), join(arr, delim)\n  replace(s, old, new), trim(s), upper(s), lower(s)\n  substr(s, start, length), starts_with(s, prefix), ends_with(s, suffix)\n  format(template, ...args)\n\nCOLLECTIONS:\n  append(arr, item), len(arr), dict_get(d, key, default)\n  dict_set(d, key, val), dict_keys(d), dict_values(d), dict_has(d, key)\n  range(start, end), slice(arr, start, end)\n\nTYPE CONVERSION:\n  to_string(val), to_int(val), to_float(val), type_of(val)\n\nMATH:\n  math_abs(n), math_floor(n), math_ceil(n), math_round(n)\n  math_sqrt(n), math_pow(base, exp), math_min(a, b), math_max(a, b)\n  math_random() -> float 0-1\n\nSYSTEM:\n  time() -> epoch ms, sleep(ms), env_get(name), env_set(name, val)\n  print(msg), println(msg)\n\nSERVER (tserve framework):\n  tserve(port) -> server handle\n  troute(server, method, path, handler_fn)\n  tresp(body, status_code) -> response\n\nTERNARY (unique to NovaLang):\n  bool3(val), not3(a), and3(a,b), or3(a,b), merge3(a, default)\n  cmp3(a,b), trit(val), tryte(val), trit_count(s)\n  bt(decimal), bt_val(bt_string), bt_neg(bt_string)\n  bt_add(a,b), bt_sub(a,b), bt_mul(a,b), bt_pack(s), bt_unpack(bytes)\n  health3(port), health3_all(), health3_bt()\n\nCONTROL FLOW:\n  if3/maybe/else, match3, try3/uncertain/fail3, while3/maybe/done3, for/for3, break3, continue3, return"
+
+// Python Dependency Map
+let PYTHON_DEPS = {
+    "phase1_core": {
+        "description": "NovaLang core - the interpreter itself calls Python for these",
+        "priority": "HIGHEST - must be pure first",
+        "files": {
+            "novalang.nova": {"python_calls": 26, "what_for": "Advanced string ops, regex, datetime, base64, crypto hashing, URL parsing, file glob, directory ops, temp files, subprocess, environment variables, platform detection"}
+        }
+    },
+    "phase2_services": {
+        "description": "Service helpers - .nova services that bridge to Python helpers",
+        "priority": "HIGH - convert after core is pure",
+        "files": {
+            "nova_thttp_service.nova": {"python_calls": 38, "what_for": "HTTP client ops, URL parsing, headers, cookies, SSL, multipart"},
+            "nova_tmedia_service.nova": {"python_calls": 37, "what_for": "Audio/video processing, FFmpeg commands, media metadata"},
+            "nova_tmarkdown_service.nova": {"python_calls": 34, "what_for": "Markdown parsing, HTML conversion, syntax highlighting"},
+            "nova_tools_service.nova": {"python_calls": 32, "what_for": "File ops, process management, system info, archive handling"},
+            "nova_tspin_service.nova": {"python_calls": 31, "what_for": "Text spinning, synonym replacement, NLP operations"},
+            "nova_tnet_service.nova": {"python_calls": 29, "what_for": "Network ops, DNS, ping, port scanning, socket ops"},
+            "nova_tyaml_service.nova": {"python_calls": 26, "what_for": "YAML parsing, dumping, validation, schema checking"},
+            "nova_tsqlite_service.nova": {"python_calls": 23, "what_for": "SQLite database operations, queries, schema management"},
+            "nova_timage_service.nova": {"python_calls": 21, "what_for": "Image processing, resize, convert, metadata, thumbnails"},
+            "nova_tcsv_service.nova": {"python_calls": 18, "what_for": "CSV parsing, writing, filtering, column ops"},
+            "nova_tjson_service.nova": {"python_calls": 15, "what_for": "JSON schema validation, JSONPath queries, diff/patch"},
+            "nova_tregex_service.nova": {"python_calls": 14, "what_for": "Regex matching, replace, capture groups, named groups"},
+            "nova_tbase64_service.nova": {"python_calls": 12, "what_for": "Base64 encode/decode, URL-safe variants"},
+            "nova_thash_service.nova": {"python_calls": 11, "what_for": "SHA256, MD5, HMAC, bcrypt password hashing"}
+        }
+    },
+    "phase3_microsoft": {
+        "description": "Microsoft Engine - Win32 API bridge (LAST)",
+        "priority": "LAST - requires pure NovaLang + pure services first",
+        "files": {
+            "nova_microsoft_engine.nova": {"python_calls": 1, "what_for": "Calls microsoft_api_call.py for window management, registry ops, process control, theme switching, clipboard ops, toast notifications, system info"}
+        }
+    }
+}
+
+// Python Helper Files list
+let PYTHON_HELPERS = [
+    "ability_sync.py", "appcontrol_helper.py", "cloud_api_call.py",
+    "cortex_helper.py", "deepstorage_helper.py", "go_best.py",
+    "hivemind_batch_merge.py", "hivemind_helper.py", "hivemind_model_inject.py",
+    "microsoft_api_call.py", "pacman_mega_discover.py", "pacman_stats.py",
+    "stt_helper.py", "talchemy_helper.py", "tcompress_helper.py",
+    "tdigest_helper.py", "tfetch_helper.py", "uia_helper.py",
+    "vault_helper.py", "vpn_helper.py"
+]
+
+fn3 build_prompt(phase) {
+    let phase_info = dict_get(PYTHON_DEPS, "phase" + to_string(phase) + "_core", null)
+    if3 phase == 1 {
+        let title = "Phase 1: NovaLang Core Purification"
+        let deps = dict_get(PYTHON_DEPS, "phase1_core", {})
+    } else3 phase == 2 {
+        let title = "Phase 2: Service Helper Purification"
+        let deps = dict_get(PYTHON_DEPS, "phase2_services", {})
+    } else3 {
+        let title = "Phase 3: Microsoft Engine Conversion"
+        let deps = dict_get(PYTHON_DEPS, "phase3_microsoft", {})
+    }
+
+    let files_desc = ""
+    let dep_files = dict_get(deps, "files", {})
+    for3 fname in dict_keys(dep_files) {
+        let info = dict_get(dep_files, fname, {})
+        let pcalls = dict_get(info, "python_calls", 0)
+        let what = dict_get(info, "what_for", "")
+        let files_desc = files_desc + "\n  - " + fname + ": " + to_string(pcalls) + " Python calls - " + what
+    }
+
+    let prompt = "You are a NovaLang compiler engineer. NovaLang is a custom programming language with ternary logic (TRUE/MAYBE/FALSE = +1/0/-1) and its own runtime builtins.\n\nYOUR TASK: " + title + "\nPriority: " + dict_get(deps, "priority", "") + "\n\nGOAL: Generate pure NovaLang code that replaces ALL Python bridge calls in these files:" + files_desc + "\n\n" + NOVALANG_BUILTINS + "\n\n=== CRITICAL RULES ===\n1. NO Python calls. No shell(\"python ...\"). No py_call(). No run_python().\n2. Use ONLY the builtins listed above.\n3. For HTTP operations, use http_get/http_post/http_put/http_delete directly.\n4. For file operations, use file_read/file_write/file_exists/file_delete.\n5. For JSON, use json_decode/json_encode.\n6. For complex operations, use shell() with system binaries (ffmpeg, magick, curl, etc.)\n7. For Win32 API calls, use shell(\"powershell -Command ...\").\n8. Every function must return a ternary result: +1 (success), 0 (partial), -1 (failure).\n9. Preserve the exact same API endpoints and response formats.\n10. Use try3 { } uncertain { } fail3 { } for error handling.\n\nSTART GENERATING NOW. Be thorough and complete."
+
+    return3 prompt
+}
+
+fn3 load_cloud_config() {
+    let raw = read_file(CLOUD_CFG)
+    let cfg = parse_json(raw)
+
+    if3 dict_has(cfg, "openai") {
+        let oai = dict_get(cfg, "openai", {})
+        let SWARM_MODELS = dict_set(SWARM_MODELS, "openai", dict_set(dict_set(dict_get(SWARM_MODELS, "openai", {}), "url", dict_get(oai, "url", "")), "key", dict_get(oai, "key", "")))
+    }
+    if3 dict_has(cfg, "anthropic") {
+        let ant = dict_get(cfg, "anthropic", {})
+        let SWARM_MODELS = dict_set(SWARM_MODELS, "anthropic", dict_set(dict_set(dict_get(SWARM_MODELS, "anthropic", {}), "url", dict_get(ant, "url", "")), "key", dict_get(ant, "key", "")))
+    }
+    if3 dict_has(cfg, "openrouter") {
+        let orr = dict_get(cfg, "openrouter", {})
+        let SWARM_MODELS = dict_set(SWARM_MODELS, "openrouter", dict_set(dict_set(dict_get(SWARM_MODELS, "openrouter", {}), "url", dict_get(orr, "url", "")), "key", dict_get(orr, "key", "")))
+    }
+
+    // Check env vars
+    let env_oai = env_get("OPENAI_API_KEY")
+    if3 env_oai != "" {
+        let oai_cfg = dict_get(SWARM_MODELS, "openai", {})
+        if3 dict_get(oai_cfg, "key", "") == "" {
+            let SWARM_MODELS = dict_set(SWARM_MODELS, "openai", dict_set(oai_cfg, "key", env_oai))
+        }
+    }
+
+    return3 cfg
+}
+
+fn3 query_openai_compat(url, key, model, prompt) {
+    let headers_json = to_json({"Content-Type": "application/json", "Authorization": "Bearer " + key})
+    let body = to_json({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You are a NovaLang compiler engineer. Generate pure NovaLang code only."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 16384,
+        "temperature": 0.3
+    })
+
+    try3 {
+        let resp = http_post(url + "/chat/completions", body)
+        let data = parse_json(resp)
+        let choices = dict_get(data, "choices", [])
+        let first = dict_get(choices, 0, {})
+        let msg = dict_get(first, "message", {})
+        let content = dict_get(msg, "content", "")
+        return3 {"ok": true, "response": content, "model": model, "tokens": dict_get(data, "usage", {})}
+    } fail3 {
+        return3 {"ok": false, "error": "HTTP request failed", "model": model}
+    }
+}
+
+fn3 query_anthropic_api(url, key, model, prompt) {
+    let body = to_json({
+        "model": model,
+        "max_tokens": 16384,
+        "messages": [{"role": "user", "content": prompt}],
+        "system": "You are a NovaLang compiler engineer. Generate pure NovaLang code only.",
+        "temperature": 0.3
+    })
+
+    try3 {
+        // Use shell curl for Anthropic due to custom headers
+        let escaped_body = replace(body, "\"", "\\\"")
+        let cmd = "curl -s -X POST \"" + url + "/v1/messages\" -H \"Content-Type: application/json\" -H \"x-api-key: " + key + "\" -H \"anthropic-version: 2023-06-01\" -d \"" + escaped_body + "\""
+        let resp = shell(cmd)
+        let data = parse_json(resp)
+        let content_blocks = dict_get(data, "content", [])
+        let content = ""
+        for3 block in content_blocks {
+            if3 dict_get(block, "type", "") == "text" {
+                let content = content + dict_get(block, "text", "")
+            }
+        }
+        return3 {"ok": true, "response": content, "model": model, "tokens": dict_get(data, "usage", {})}
+    } fail3 {
+        return3 {"ok": false, "error": "Anthropic request failed", "model": model}
+    }
+}
+
+fn3 dispatch_model(provider, model, prompt) {
+    let cfg = dict_get(SWARM_MODELS, provider, {})
+    let url = dict_get(cfg, "url", "")
+    let key = dict_get(cfg, "key", "")
+
+    if3 key == "" {
+        return3 {"ok": false, "error": "no_api_key", "model": model, "provider": provider}
+    }
+
+    let t0 = time()
+
+    let result = {}
+    if3 provider == "anthropic" {
+        let result = query_anthropic_api(url, key, model, prompt)
+    } else3 {
+        let result = query_openai_compat(url, key, model, prompt)
+    }
+
+    let elapsed = math_round((time() - t0) / 1000)
+    let result = dict_set(result, "time_s", elapsed)
+    let result = dict_set(result, "provider", provider)
+    return3 result
+}
+
+fn3 save_result(result, phase, results_dir) {
+    let model_raw = dict_get(result, "model", "unknown")
+    let model_safe = replace(replace(model_raw, "/", "_"), ":", "_")
+    let fname = results_dir + "/phase" + to_string(phase) + "_" + model_safe + ".json"
+    write_file(fname, to_json(result))
+
+    if3 dict_get(result, "ok", false) == true {
+        let response = dict_get(result, "response", "")
+        if3 len(response) > 0 {
+            let code_fname = results_dir + "/phase" + to_string(phase) + "_" + model_safe + ".nova"
+            let header = "// Generated by " + model_raw + "\n// Phase " + to_string(phase) + " NovaLang Purification\n\n"
+            write_file(code_fname, header + response)
+        }
+    }
+
+    return3 fname
+}
+
+fn3 run_swarm(phase, dry_run) {
+    println("============================================================")
+    println("  NovaLang Purification Swarm - Phase " + to_string(phase))
+    println("============================================================")
+
+    load_cloud_config()
+    let prompt = build_prompt(phase)
+    println("  Prompt length: " + to_string(len(prompt)) + " chars")
+
+    // Build task list
+    let tasks = []
+    for3 provider in dict_keys(SWARM_MODELS) {
+        let cfg = dict_get(SWARM_MODELS, provider, {})
+        let key = dict_get(cfg, "key", "")
+        if3 key == "" {
+            continue3
+        }
+        let models = dict_get(cfg, "models", [])
+        for3 model in models {
+            let tasks = append(tasks, {"provider": provider, "model": model})
+        }
+    }
+
+    println("  Tasks queued: " + to_string(len(tasks)))
+
+    if3 dry_run == true {
+        println("\n  [DRY RUN] Would query these models:")
+        for3 task in tasks {
+            let p = dict_get(task, "provider", "")
+            let m = dict_get(task, "model", "")
+            println("    " + p + "/" + m)
+        }
+        return3 null
+    }
+
+    // Create results directory
+    let ts = shell("powershell -Command \"Get-Date -Format 'yyyyMMdd_HHmmss'\"")
+    let ts = trim(ts)
+    let results_dir = RESULTS_DIR + "/phase" + to_string(phase) + "_" + ts
+    shell("mkdir \"" + replace(results_dir, "/", "\\") + "\"")
+
+    write_file(results_dir + "/prompt.txt", prompt)
+
+    println("\n  Launching swarm... (timeout: " + to_string(TIMEOUT) + "s per model)")
+    println("  Results dir: " + results_dir)
+
+    let success = 0
+    let failed = 0
+    let results = []
+
+    // Sequential dispatch (NovaLang has no threading)
+    for3 task in tasks {
+        let provider = dict_get(task, "provider", "")
+        let model = dict_get(task, "model", "")
+
+        try3 {
+            let result = dispatch_model(provider, model, prompt)
+            if3 dict_get(result, "ok", false) == true {
+                let resp_len = len(dict_get(result, "response", ""))
+                println("  [+1] " + provider + "/" + model + " - " + to_string(dict_get(result, "time_s", 0)) + "s, " + to_string(resp_len) + " chars")
+                let success = success + 1
+            } else3 {
+                let err = dict_get(result, "error", "unknown")
+                println("  [-1] " + provider + "/" + model + " - " + substr(err, 0, 80))
+                let failed = failed + 1
+            }
+            save_result(result, phase, results_dir)
+            let results = append(results, result)
+        } fail3 {
+            println("  [-1] " + provider + "/" + model + " - EXCEPTION")
+            let failed = failed + 1
+        }
+    }
+
+    println("\n============================================================")
+    println("  SWARM COMPLETE - Phase " + to_string(phase))
+    println("  Success: " + to_string(success) + "/" + to_string(len(tasks)) + " | Failed: " + to_string(failed) + "/" + to_string(len(tasks)))
+    println("  Results: " + results_dir)
+    println("============================================================")
+
+    // Save summary
+    let summary = {
+        "phase": phase,
+        "total_models": len(tasks),
+        "success": success,
+        "failed": failed,
+        "prompt_length": len(prompt)
+    }
+    write_file(results_dir + "/summary.json", to_json(summary))
+
+    return3 results_dir
+}
+
+fn3 merge_results(results_dir) {
+    let listing = shell("dir /b \"" + replace(results_dir, "/", "\\") + "\\*.nova\" 2>nul")
+    let nova_files = split(trim(listing), "\n")
+
+    if3 len(nova_files) == 0 {
+        println("  No .nova results to merge.")
+        return3 null
+    }
+
+    println("\n  Merging " + to_string(len(nova_files)) + " results...")
+
+    let merged = "// NovaLang Purification - Merged Swarm Results\n\n"
+    for3 nf in nova_files {
+        if3 len(trim(nf)) > 0 {
+            let content = read_file(results_dir + "/" + trim(nf))
+            let merged = merged + "\n// -- MODEL: " + trim(nf) + " --\n" + content + "\n\n"
+        }
+    }
+
+    let merged_path = results_dir + "/_MERGED_PURIFICATION.nova"
+    write_file(merged_path, merged)
+    println("  Merged file: " + merged_path)
+    return3 merged_path
+}
+
+// Main entry
+let args = shell("echo %*")
+let phase = 1
+let dry_run = false
+
+if3 contains(args, "--phase 2") {
+    let phase = 2
+} else3 contains(args, "--phase 3") {
+    let phase = 3
+}
+if3 contains(args, "--dry-run") {
+    let dry_run = true
+}
+if3 contains(args, "--merge-only") {
+    // Extract path after --merge-only
+    let parts = split(args, "--merge-only ")
+    if3 len(parts) > 1 {
+        merge_results(trim(dict_get(parts, 1, "")))
+    }
+} else3 {
+    let rd = run_swarm(phase, dry_run)
+    if3 rd != null {
+        merge_results(rd)
+    }
+}

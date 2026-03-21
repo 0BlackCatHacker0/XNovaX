@@ -1,0 +1,181 @@
+// NovaX Brain Server v2 — Port 9990
+// Wraps Ollama API with NovaX-specific system prompts.
+// Provides /generate and /chat endpoints for local AI inference.
+// Falls back gracefully if Ollama is unreachable.
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9990
+let OLLAMA_HOST = "http://127.0.0.1:11434"
+let DEFAULT_MODEL = "mixtral"
+let TRUE = 1
+let FALSE = -1
+let MAYBE = 0
+
+let NOVAX_BRAIN_PROMPT = "You are Nova Brain, the local AI engine for NovaX OS. You run on the user's machine via Ollama. You are fast, private, and capable. When given a task, respond with clear, actionable output."
+
+let START_TIME = time_ms()
+
+fn ollama_generate(prompt, model, system_prompt) {
+    let use_model = model
+    if3 use_model == "" {
+        use_model = DEFAULT_MODEL
+    }
+    let use_system = system_prompt
+    if3 use_system == "" {
+        use_system = NOVAX_BRAIN_PROMPT
+    }
+    let payload = {
+        "model": use_model,
+        "prompt": prompt,
+        "system": use_system,
+        "stream": false
+    }
+    let result = try3 {
+        http_post(OLLAMA_HOST + "/api/generate", payload)
+    } fail {
+        null
+    }
+    if3 result == null {
+        return {"ok": FALSE, "error": "Ollama unreachable", "model": use_model}
+    }
+    let body_str = dict_get(result, "body") ?? ""
+    let data = try3 { json_decode(body_str) } fail { null }
+    if3 data == null {
+        return {"ok": FALSE, "error": "Invalid response from Ollama", "model": use_model}
+    }
+    let response_text = dict_get(data, "response") ?? ""
+    let eval_count = dict_get(data, "eval_count") ?? 0
+    return {"ok": TRUE, "response": response_text, "model": use_model, "eval_count": eval_count}
+}
+
+fn ollama_chat(messages, model) {
+    let use_model = model
+    if3 use_model == "" {
+        use_model = DEFAULT_MODEL
+    }
+    let payload = {
+        "model": use_model,
+        "messages": messages,
+        "stream": false
+    }
+    let result = try3 {
+        http_post(OLLAMA_HOST + "/api/chat", payload)
+    } fail {
+        null
+    }
+    if3 result == null {
+        return {"ok": FALSE, "error": "Ollama unreachable", "model": use_model}
+    }
+    let body_str = dict_get(result, "body") ?? ""
+    let data = try3 { json_decode(body_str) } fail { null }
+    if3 data == null {
+        return {"ok": FALSE, "error": "Invalid response", "model": use_model}
+    }
+    let msg = dict_get(data, "message") ?? {}
+    let content = dict_get(msg, "content") ?? ""
+    return {"ok": TRUE, "response": content, "model": use_model}
+}
+
+fn list_models() {
+    let result = try3 {
+        http_get(OLLAMA_HOST + "/api/tags")
+    } fail {
+        null
+    }
+    if3 result == null {
+        return []
+    }
+    let body_str = dict_get(result, "body") ?? ""
+    let data = try3 { json_decode(body_str) } fail { null }
+    if3 data == null {
+        return []
+    }
+    let models = dict_get(data, "models") ?? []
+    let names = []
+    let i = 0
+    while3 i < len(models) {
+        let m = models[i]
+        let name = dict_get(m, "name") ?? ""
+        if3 name != "" {
+            names = append(names, name)
+        }
+        i = i + 1
+    }
+    return names
+}
+
+// ── HTTP Routes ──
+
+fn handle_health(req) {
+    let models = list_models()
+    let uptime_ms = time_ms() - START_TIME
+    let uptime_s = uptime_ms / 1000
+    return {
+        "status": "ok",
+        "trit": 1,
+        "service": "nova-brain",
+        "version": "2.0.0",
+        "port": PORT,
+        "ollama_host": OLLAMA_HOST,
+        "default_model": DEFAULT_MODEL,
+        "available_models": len(models),
+        "models": models,
+        "uptime": uptime_s
+    }
+}
+
+fn handle_generate(req) {
+    let body = dict_get(req, "body") ?? {}
+    let prompt = dict_get(body, "prompt") ?? ""
+    if3 prompt == "" {
+        prompt = dict_get(body, "text") ?? ""
+    }
+    let model = dict_get(body, "model") ?? ""
+    let system_prompt = dict_get(body, "system") ?? ""
+
+    if3 prompt == "" {
+        return {"ok": FALSE, "error": "No prompt provided"}
+    }
+
+    let t0 = time_ms()
+    let result = ollama_generate(prompt, model, system_prompt)
+    let duration = (time_ms() - t0) / 1000
+    result = dict_set(result, "duration", duration)
+    return result
+}
+
+fn handle_chat(req) {
+    let body = dict_get(req, "body") ?? {}
+    let messages = dict_get(body, "messages") ?? []
+    let model = dict_get(body, "model") ?? ""
+
+    if3 len(messages) == 0 {
+        return {"ok": FALSE, "error": "No messages provided"}
+    }
+
+    let result = ollama_chat(messages, model)
+    return result
+}
+
+fn handle_models(req) {
+    return {"models": list_models()}
+}
+
+// ── Server startup ──
+
+let server = tserve(PORT, "Nova Brain v2.0 — Ollama AI Bridge")
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/status", "handle_health")
+troute(server, "POST", "/generate", "handle_generate")
+troute(server, "POST", "/think", "handle_generate")
+troute(server, "POST", "/chat", "handle_chat")
+troute(server, "GET", "/models", "handle_models")
+
+print("NovaX Brain Server v2.0")
+print("  Port: " + to_str(PORT) + " | Ollama: " + OLLAMA_HOST)
+print("  Default model: " + DEFAULT_MODEL)
+
+tstart(server)

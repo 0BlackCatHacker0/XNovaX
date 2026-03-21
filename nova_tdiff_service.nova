@@ -1,0 +1,837 @@
+// nova_tdiff_service.nova -- NovaX Ternary Diff Micro-Tool (port 9973)
+//
+// Every change carries a direction. A line added is +1. A line removed is -1.
+// Unchanged context is 0. The diff IS the signal -- ternary encodes mutation.
+//
+// Compares text strings, files, JSON objects, and service snapshots.
+// Returns ternary-annotated diffs that power change detection across NovaX:
+//   +1 = added   (new content, new key, new line)
+//    0 = changed  (value mutation at same path) or context
+//   -1 = removed  (deleted content, removed key, removed line)
+//
+// N-S Mapping:
+//   change = flow; diff = measuring the current
+//   Re < 27  = laminar     (mostly unchanged)
+//   Re < 125 = transitional
+//   Re < 343 = turbulent
+//   Re >= 343 = chaotic    (high churn)
+//
+// Harmonics:
+//   MAX_BODY  = BLOCK * H5 = 2187 * 5 = 10935
+//   MAX_LINES = 3^7 = 2187
+//   CONTEXT   = H3 = 3 lines
+//   JSON_MAX_DEPTH = H13 = 13
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9973
+let server = tserve(PORT, "TDiff v1.0 - Ternary Diff Micro-Tool")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3   = 3
+let H5   = 5
+let H7   = 7
+let H13  = 13
+let BLOCK = 2187
+
+// -- Service Constants --
+let VERSION      = "1.0"
+let MAX_BODY     = 10935    // BLOCK * H5
+let MAX_LINES    = 2187     // BLOCK = 3^7
+let CONTEXT_LINES = 3       // H3 unified diff context lines
+let JSON_MAX_DEPTH = 13     // H13 recursive ceiling
+let MAX_FILE_BYTES = 28431  // BLOCK * H13 = 2187 * 13
+let SAFE_ROOT    = "C:\\NovaX"
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- N-S Reynolds Boundaries --
+let RE_LAMINAR      = 27
+let RE_TRANSITIONAL = 125
+let RE_TURBULENT    = 343
+
+// -- Stats State --
+let _diff_count       = 0
+let _total_added      = 0
+let _total_removed    = 0
+let _total_unchanged  = 0
+let _text_diffs       = 0
+let _json_diffs       = 0
+let _file_diffs       = 0
+let _snapshot_diffs   = 0
+
+// ============================================================================
+// HELPER: trit character (+, 0, T)
+// ============================================================================
+
+fn trit_char(t) {
+    if3 t == T_TRUE {
+        return "+"
+    } else t == T_FALSE {
+        return "T"
+    } else {
+        return "0"
+    }
+}
+
+// ============================================================================
+// HELPER: record diff stats
+// ============================================================================
+
+fn record_diff(added, removed, unchanged, kind) {
+    _diff_count      = _diff_count + 1
+    _total_added     = _total_added + added
+    _total_removed   = _total_removed + removed
+    _total_unchanged = _total_unchanged + unchanged
+    if3 kind == "text" { _text_diffs = _text_diffs + 1
+    } else kind == "json" { _json_diffs = _json_diffs + 1
+    } else kind == "file" { _file_diffs = _file_diffs + 1
+    } else { _snapshot_diffs = _snapshot_diffs + 1
+    }
+}
+
+// ============================================================================
+// HELPER: compute overall trit from added/removed counts
+// ============================================================================
+
+fn overall_trit(added, removed) {
+    if3 added == 0 {
+        if3 removed == 0 {
+            return T_MAYBE
+        } else {
+            return T_FALSE
+        }
+    } else {
+        if3 removed == 0 {
+            return T_TRUE
+        } else {
+            return T_MAYBE
+        }
+    }
+}
+
+// ============================================================================
+// HELPER: N-S Reynolds flow regime for diff pressure
+// ============================================================================
+
+fn diff_reynolds(added, removed, unchanged) {
+    let denominator = unchanged + 1
+    let re = (added + removed) * (added + removed) / denominator
+    let regime = "laminar"
+    if3 re >= RE_TURBULENT { regime = "chaotic"
+    } else re >= RE_TRANSITIONAL { regime = "turbulent"
+    } else re >= RE_LAMINAR { regime = "transitional"
+    } else { regime = "laminar"
+    }
+    return {"re": re, "regime": regime}
+}
+
+// ============================================================================
+// HELPER: split text into lines (manual newline walk)
+// ============================================================================
+
+fn split_lines(text) {
+    return split(text, "\n")
+}
+
+// ============================================================================
+// TEXT DIFF
+// Implements a simplified unified-diff style pass in NovaLang.
+// Strategy: use nova_run to call a helper, or perform direct line comparison.
+// Since NovaLang has no difflib, we do a linear scan producing add/remove/context
+// entries by comparing line arrays positionally (LCS approximation via greedy).
+// ============================================================================
+
+// Walk two line arrays and produce a flat diff entry list.
+// Each entry: {text, trit, char, type, line_a, line_b}
+//
+// Algorithm: two-pointer scan with a context window.
+// For each position we match lines or mark add/remove.
+// This produces an output compatible with the Python unified-diff result shape.
+fn diff_lines(a_lines, b_lines) {
+    let out    = []
+    let added   = 0
+    let removed = 0
+    let unchanged = 0
+    let ia = 0
+    let ib = 0
+    let la = len(a_lines)
+    let lb = len(b_lines)
+
+    while3 (ia < la) or (ib < lb) {
+        if3 ia >= la {
+            // Only b lines remain -- all additions
+            if3 len(out) < MAX_LINES { line_text = "+" + (dict_get(b_lines, ib) ?? "")
+                let entry = {}
+                entry = dict_set(entry, "text", line_text)
+                entry = dict_set(entry, "trit", T_TRUE)
+                entry = dict_set(entry, "char", "+")
+                entry = dict_set(entry, "type", "added")
+                entry = dict_set(entry, "line_a", 0)
+                entry = dict_set(entry, "line_b", ib + 1)
+                out = append(out, entry)
+            }
+            added = added + 1
+            ib = ib + 1
+        } else ib >= lb {
+            // Only a lines remain -- all removals
+            if3 len(out) < MAX_LINES { line_text = "-" + (dict_get(a_lines, ia) ?? "")
+                let entry = {}
+                entry = dict_set(entry, "text", line_text)
+                entry = dict_set(entry, "trit", T_FALSE)
+                entry = dict_set(entry, "char", "T")
+                entry = dict_set(entry, "type", "removed")
+                entry = dict_set(entry, "line_a", ia + 1)
+                entry = dict_set(entry, "line_b", 0)
+                out = append(out, entry)
+            }
+            removed = removed + 1
+            ia = ia + 1
+        } else { line_a = dict_get(a_lines, ia) ?? ""
+            let line_b = dict_get(b_lines, ib) ?? ""
+            if3 line_a == line_b {
+                // Unchanged context
+                if3 len(out) < MAX_LINES { entry = {}
+                    entry = dict_set(entry, "text", " " + line_a)
+                    entry = dict_set(entry, "trit", T_MAYBE)
+                    entry = dict_set(entry, "char", "0")
+                    entry = dict_set(entry, "type", "context")
+                    entry = dict_set(entry, "line_a", ia + 1)
+                    entry = dict_set(entry, "line_b", ib + 1)
+                    out = append(out, entry)
+                }
+                unchanged = unchanged + 1
+                ia = ia + 1
+                ib = ib + 1
+            } else {
+                // Emit removal then addition (greedy no-LCS)
+                if3 len(out) < MAX_LINES { entry_r = {}
+                    entry_r = dict_set(entry_r, "text", "-" + line_a)
+                    entry_r = dict_set(entry_r, "trit", T_FALSE)
+                    entry_r = dict_set(entry_r, "char", "T")
+                    entry_r = dict_set(entry_r, "type", "removed")
+                    entry_r = dict_set(entry_r, "line_a", ia + 1)
+                    entry_r = dict_set(entry_r, "line_b", 0)
+                    out = append(out, entry_r)
+                }
+                removed = removed + 1
+                if3 len(out) < MAX_LINES { entry_a = {}
+                    entry_a = dict_set(entry_a, "text", "+" + line_b)
+                    entry_a = dict_set(entry_a, "trit", T_TRUE)
+                    entry_a = dict_set(entry_a, "char", "+")
+                    entry_a = dict_set(entry_a, "type", "added")
+                    entry_a = dict_set(entry_a, "line_a", 0)
+                    entry_a = dict_set(entry_a, "line_b", ib + 1)
+                    out = append(out, entry_a)
+                }
+                added = added + 1
+                ia = ia + 1
+                ib = ib + 1
+            }
+        }
+    }
+
+    return {"lines": out, "added": added, "removed": removed, "unchanged": unchanged}
+}
+
+// ============================================================================
+// JSON DIFF (iterative, single-level -- NovaLang has no recursion limit guard)
+// We flatten one level at a time via a work-queue (list of path+a+b tuples).
+// Max depth enforced by tracking depth alongside each queue entry.
+// ============================================================================
+
+fn json_diff_level(a_dict, b_dict, base_path, depth, out_changes) {
+    // Compare two dicts at the same path level
+    if3 depth > JSON_MAX_DEPTH { entry = {}
+        entry = dict_set(entry, "path", base_path)
+        entry = dict_set(entry, "trit", T_MAYBE)
+        entry = dict_set(entry, "char", "0")
+        entry = dict_set(entry, "type", "depth_limit")
+        entry = dict_set(entry, "note", "max depth reached")
+        out_changes = append(out_changes, entry)
+        return T_MAYBE
+    } else {
+        // Keys in a
+        let ak = keys(a_dict)
+        let i  = 0
+        while3 i < len(ak) {
+            let key = ak[i]
+            let child_path = base_path + "." + key
+            if3 dict_has(b_dict, key) == false {
+                // Removed
+                let entry = {}
+                entry = dict_set(entry, "path", child_path)
+                entry = dict_set(entry, "old",  dict_get(a_dict, key) ?? "")
+                entry = dict_set(entry, "new",  "")
+                entry = dict_set(entry, "trit", T_FALSE)
+                entry = dict_set(entry, "char", "T")
+                entry = dict_set(entry, "type", "removed")
+                out_changes = append(out_changes, entry)
+            } else {
+                // Both have key -- compare values as strings
+                let va = str(dict_get(a_dict, key) ?? "")
+                let vb = str(dict_get(b_dict, key) ?? "")
+                if3 va == vb {
+                    // Unchanged -- no entry emitted
+                } else { entry = {}
+                    entry = dict_set(entry, "path", child_path)
+                    entry = dict_set(entry, "old",  va)
+                    entry = dict_set(entry, "new",  vb)
+                    entry = dict_set(entry, "trit", T_MAYBE)
+                    entry = dict_set(entry, "char", "0")
+                    entry = dict_set(entry, "type", "changed")
+                    out_changes = append(out_changes, entry)
+                }
+            }
+            i = i + 1
+        }
+
+        // Keys only in b
+        let bk = keys(b_dict)
+        let j  = 0
+        while3 j < len(bk) {
+            let key = bk[j]
+            if3 dict_has(a_dict, key) == false {
+                // Added
+                let child_path = base_path + "." + key
+                let entry = {}
+                entry = dict_set(entry, "path", child_path)
+                entry = dict_set(entry, "old",  "")
+                entry = dict_set(entry, "new",  str(dict_get(b_dict, key) ?? ""))
+                entry = dict_set(entry, "trit", T_TRUE)
+                entry = dict_set(entry, "char", "+")
+                entry = dict_set(entry, "type", "added")
+                out_changes = append(out_changes, entry)
+            }
+            j = j + 1
+        }
+
+        return T_MAYBE
+    }
+}
+
+fn count_trit_in_changes(changes, target_trit) {
+    let count = 0
+    let i = 0
+    while3 i < len(changes) {
+        let entry = changes[i]
+        let t = dict_get(entry, "trit") ?? T_MAYBE
+        if3 t == target_trit { count = count + 1
+        } else {
+            // skip
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ============================================================================
+// ROUTE: GET /tdiff/health
+// ============================================================================
+
+fn tdiff_health() {
+    let _counters = {"total_requests": _diff_count, "total_errors": 0}
+    let resp = ns_health_dict("nova-tdiff", VERSION, PORT, _counters)
+    return resp
+}
+
+// ============================================================================
+// ROUTE: POST /tdiff/text
+// ============================================================================
+
+fn tdiff_text(body) {
+    let a = dict_get(body, "a") ?? ""
+    let b = dict_get(body, "b") ?? ""
+
+    if3 len(str(a)) == 0 {
+        if3 len(str(b)) == 0 {
+            return {
+                "ok": false,
+                "error": "both 'a' and 'b' are required",
+                "trit": T_FALSE,
+                "char": "T"
+        }
+        } else {
+            // a is empty, b has content -- pure addition
+        }
+    } else {
+        // a has content
+    }
+
+    let a_str   = str(a)
+    let b_str   = str(b)
+    let a_lines = split_lines(a_str)
+    let b_lines = split_lines(b_str)
+    let result  = diff_lines(a_lines, b_lines)
+
+    let added     = dict_get(result, "added") ?? 0
+    let removed   = dict_get(result, "removed") ?? 0
+    let unchanged = dict_get(result, "unchanged") ?? 0
+    let lines     = dict_get(result, "lines") ?? []
+
+    let ot   = overall_trit(added, removed)
+    let otch = trit_char(ot)
+
+    let _r = record_diff(added, removed, unchanged, "text")
+
+    let summary = {}
+    summary = dict_set(summary, "added",        added)
+    summary = dict_set(summary, "removed",      removed)
+    summary = dict_set(summary, "unchanged",    unchanged)
+    summary = dict_set(summary, "total_a",      len(a_lines))
+    summary = dict_set(summary, "total_b",      len(b_lines))
+    summary = dict_set(summary, "overall_trit", ot)
+    summary = dict_set(summary, "overall_char", otch)
+
+    return {
+        "ok": true,
+        "trit": ot,
+        "char": otch,
+        "diff": lines,
+        "summary": summary,
+        "type": "text",
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================================
+// ROUTE: POST /tdiff/json
+// ============================================================================
+
+fn tdiff_json(body) {
+    let a = dict_get(body, "a") ?? {}
+    let b = dict_get(body, "b") ?? {}
+
+    // Require both present
+    let a_is_empty = len(keys(a)) == 0
+    let b_is_empty = len(keys(b)) == 0
+
+    if3 a_is_empty {
+        if3 b_is_empty {
+            return {
+                "ok": false,
+                "error": "both 'a' and 'b' are required",
+                "trit": T_FALSE,
+                "char": "T"
+        }
+        } else {
+            // a empty -- treat as empty dict
+        }
+    } else {
+        // a present
+    }
+
+    let changes = []
+    let _r = json_diff_level(a, b, "$", 0, changes)
+
+    let added   = count_trit_in_changes(changes, T_TRUE)
+    let removed = count_trit_in_changes(changes, T_FALSE)
+    let changed = 0
+    let i = 0
+    while3 i < len(changes) {
+        let entry = changes[i]
+        let t  = dict_get(entry, "trit") ?? T_MAYBE
+        let ty = dict_get(entry, "type") ?? ""
+        if3 t == T_MAYBE {
+            if3 ty == "changed" { changed = changed + 1
+            } else {
+                // depth_limit or other
+            }
+        } else {
+            // add or remove -- already counted
+        }
+        i = i + 1
+    }
+
+    let total_changes = len(changes)
+    let identical     = total_changes == 0
+    let ot   = overall_trit(added, removed)
+    let otch = trit_char(ot)
+
+    let _r2 = record_diff(added, removed, 0, "json")
+
+    let summary = {}
+    summary = dict_set(summary, "added",         added)
+    summary = dict_set(summary, "removed",        removed)
+    summary = dict_set(summary, "changed",        changed)
+    summary = dict_set(summary, "total_changes",  total_changes)
+    summary = dict_set(summary, "identical",      identical)
+    summary = dict_set(summary, "overall_trit",   ot)
+    summary = dict_set(summary, "overall_char",   otch)
+
+    return {
+        "ok": true,
+        "trit": ot,
+        "char": otch,
+        "changes": changes,
+        "summary": summary,
+        "type": "json",
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================================
+// ROUTE: POST /tdiff/file
+// ============================================================================
+
+fn tdiff_file(body) {
+    let path_a = str(dict_get(body, "path_a") ?? "")
+    let path_b = str(dict_get(body, "path_b") ?? "")
+
+    if3 len(path_a) == 0 {
+        return {
+            "ok": false,
+            "error": "both 'path_a' and 'path_b' are required",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    } else {
+        // path_a present
+    }
+
+    if3 len(path_b) == 0 {
+        return {
+            "ok": false,
+            "error": "both 'path_a' and 'path_b' are required",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    } else {
+        // path_b present
+    }
+
+    // Safe-root check: both paths must start with SAFE_ROOT
+    let safe_len = len(SAFE_ROOT)
+    let a_prefix = slice(path_a, 0, safe_len)
+    let b_prefix = slice(path_b, 0, safe_len)
+
+    if3 a_prefix != SAFE_ROOT {
+        return {
+            "ok": false,
+            "error": "path_a escapes safe root",
+            "trit": T_FALSE,
+            "char": "T",
+            "path": path_a
+        }
+    } else {
+        // path_a within safe root
+    }
+
+    if3 b_prefix != SAFE_ROOT {
+        return {
+            "ok": false,
+            "error": "path_b escapes safe root",
+            "trit": T_FALSE,
+            "char": "T",
+            "path": path_b
+        }
+    } else {
+        // path_b within safe root
+    }
+
+    // Read files via nova_read (returns empty string if missing)
+    let text_a = nova_read(path_a)
+    let text_b = nova_read(path_b)
+
+    if3 len(text_a) == 0 {
+        // Could be missing or empty; report as missing if path is non-root
+        // We treat zero-length read as potentially missing but proceed
+    } else {
+        // File has content
+    }
+
+    // Size guard: MAX_FILE_BYTES = BLOCK * H13 = 28431
+    let size_a = len(text_a)
+    let size_b = len(text_b)
+
+    if3 size_a > MAX_FILE_BYTES {
+        return {
+            "ok": false,
+            "error": "path_a too large (max 28431 bytes)",
+            "trit": T_FALSE,
+            "char": "T",
+            "size_a": size_a
+        }
+    } else {
+        // size ok
+    }
+
+    if3 size_b > MAX_FILE_BYTES {
+        return {
+            "ok": false,
+            "error": "path_b too large (max 28431 bytes)",
+            "trit": T_FALSE,
+            "char": "T",
+            "size_b": size_b
+        }
+    } else {
+        // size ok
+    }
+
+    let a_lines = split_lines(text_a)
+    let b_lines = split_lines(text_b)
+    let result  = diff_lines(a_lines, b_lines)
+
+    let added     = dict_get(result, "added") ?? 0
+    let removed   = dict_get(result, "removed") ?? 0
+    let unchanged = dict_get(result, "unchanged") ?? 0
+    let lines     = dict_get(result, "lines") ?? []
+
+    let ot   = overall_trit(added, removed)
+    let otch = trit_char(ot)
+
+    let _r = record_diff(added, removed, unchanged, "file")
+
+    let summary = {}
+    summary = dict_set(summary, "added",        added)
+    summary = dict_set(summary, "removed",      removed)
+    summary = dict_set(summary, "unchanged",    unchanged)
+    summary = dict_set(summary, "total_a",      len(a_lines))
+    summary = dict_set(summary, "total_b",      len(b_lines))
+    summary = dict_set(summary, "overall_trit", ot)
+    summary = dict_set(summary, "overall_char", otch)
+
+    let files = {}
+    files = dict_set(files, "a",      path_a)
+    files = dict_set(files, "b",      path_b)
+    files = dict_set(files, "size_a", size_a)
+    files = dict_set(files, "size_b", size_b)
+
+    return {
+        "ok": true,
+        "trit": ot,
+        "char": otch,
+        "diff": lines,
+        "summary": summary,
+        "files": files,
+        "type": "file",
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================================
+// ROUTE: POST /tdiff/snapshot
+// Snapshot = dict representing service state at a point in time.
+// JSON diff + health delta (compares self_trit or ok fields).
+// ============================================================================
+
+fn tdiff_snapshot(body) {
+    let a = dict_get(body, "a") ?? {}
+    let b = dict_get(body, "b") ?? {}
+
+    let a_is_empty = len(keys(a)) == 0
+    let b_is_empty = len(keys(b)) == 0
+
+    if3 a_is_empty {
+        if3 b_is_empty {
+            return {
+                "ok": false,
+                "error": "both 'a' and 'b' are required",
+                "trit": T_FALSE,
+                "char": "T"
+        }
+        } else {
+            // a empty
+        }
+    } else {
+        // a present
+    }
+
+    let changes = []
+    let _r = json_diff_level(a, b, "$", 0, changes)
+
+    let added   = count_trit_in_changes(changes, T_TRUE)
+    let removed = count_trit_in_changes(changes, T_FALSE)
+    let changed = 0
+    let i = 0
+    while3 i < len(changes) {
+        let entry = changes[i]
+        let t  = dict_get(entry, "trit") ?? T_MAYBE
+        let ty = dict_get(entry, "type") ?? ""
+        if3 t == T_MAYBE {
+            if3 ty == "changed" { changed = changed + 1
+            } else {
+                // depth_limit
+            }
+        } else {
+            // add or remove
+        }
+        i = i + 1
+    }
+
+    // Extract changed top-level keys (path like $.key.sub -> "key")
+    let changed_keys = []
+    let j = 0
+    while3 j < len(changes) {
+        let entry    = changes[j]
+        let path_str = dict_get(entry, "path") ?? "$"
+        // Remove leading "$." if present
+        let parts    = split(path_str, ".")
+        if3 len(parts) > 1 { top_key = parts[1]
+            // Remove array index suffix if present (e.g. "key[0]" -> "key")
+            let key_parts = split(top_key, "[")
+            let clean_key = key_parts[0]
+            // Only append if not already in changed_keys (dedup via linear scan)
+            let already = false
+            let k = 0
+            while3 k < len(changed_keys) {
+                let ck = changed_keys[k]
+                if3 ck == clean_key { already = true
+                } else {
+                    // keep searching
+                }
+                k = k + 1
+            }
+            if3 already == false {
+                changed_keys = append(changed_keys, clean_key)
+            } else {
+                // already tracked
+            }
+        } else {
+            // path is just "$" -- skip
+        }
+        j = j + 1
+    }
+
+    // Health delta: compare self_trit or ok fields
+    let health_a    = dict_get(a, "self_trit") ?? (dict_get(a, "ok") ?? "")
+    let health_b    = dict_get(b, "self_trit") ?? (dict_get(b, "ok") ?? "")
+    let health_trit = T_MAYBE
+    if3 str(health_a) != "" {
+        if3 str(health_b) != "" { ha_str = str(health_a)
+            let hb_str = str(health_b)
+            if3 ha_str == hb_str { health_trit = T_MAYBE
+            } else hb_str == "true" { health_trit = T_TRUE
+            } else hb_str == "1" { health_trit = T_TRUE
+            } else hb_str == "false" { health_trit = T_FALSE
+            } else hb_str == "-1" { health_trit = T_FALSE
+            } else { health_trit = T_MAYBE
+            }
+        } else {
+            // health_b missing -- degraded
+            let health_trit = T_FALSE
+        }
+    } else {
+        // health_a missing -- no delta
+    }
+
+    let total_changes = len(changes)
+    let identical     = total_changes == 0
+    let ot   = overall_trit(added, removed)
+    let otch = trit_char(ot)
+
+    let _r2 = record_diff(added, removed, 0, "snapshot")
+
+    let health_delta = {}
+    health_delta = dict_set(health_delta, "trit",   health_trit)
+    health_delta = dict_set(health_delta, "char",   trit_char(health_trit))
+    health_delta = dict_set(health_delta, "before", str(health_a))
+    health_delta = dict_set(health_delta, "after",  str(health_b))
+
+    let summary = {}
+    summary = dict_set(summary, "added",         added)
+    summary = dict_set(summary, "removed",        removed)
+    summary = dict_set(summary, "changed",        changed)
+    summary = dict_set(summary, "total_changes",  total_changes)
+    summary = dict_set(summary, "identical",      identical)
+    summary = dict_set(summary, "overall_trit",   ot)
+    summary = dict_set(summary, "overall_char",   otch)
+
+    return {
+        "ok": true,
+        "trit": ot,
+        "char": otch,
+        "changes": changes,
+        "changed_keys": changed_keys,
+        "health_delta": health_delta,
+        "summary": summary,
+        "type": "snapshot",
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================================
+// ROUTE: GET /tdiff/stats
+// ============================================================================
+
+fn tdiff_stats() {
+    let total = _total_added + _total_removed + _total_unchanged
+    let change_rate = 0
+    if3 total > 0 { change_rate = round(float(_total_added + _total_removed) / float(total), 4)
+    } else {
+        // keep 0
+    }
+
+    // N-S flow regime for overall diff pressure
+    let ns = diff_reynolds(_total_added, _total_removed, _total_unchanged)
+
+    let by_type = {}
+    by_type = dict_set(by_type, "text",     _text_diffs)
+    by_type = dict_set(by_type, "json",     _json_diffs)
+    by_type = dict_set(by_type, "file",     _file_diffs)
+    by_type = dict_set(by_type, "snapshot", _snapshot_diffs)
+
+    let totals = {}
+    totals = dict_set(totals, "added",     _total_added)
+    totals = dict_set(totals, "removed",   _total_removed)
+    totals = dict_set(totals, "unchanged", _total_unchanged)
+
+    let harmonics = {}
+    harmonics = dict_set(harmonics, "max_lines",      MAX_LINES)
+    harmonics = dict_set(harmonics, "context_lines",  CONTEXT_LINES)
+    harmonics = dict_set(harmonics, "json_max_depth", JSON_MAX_DEPTH)
+    harmonics = dict_set(harmonics, "safe_root",      SAFE_ROOT)
+    harmonics = dict_set(harmonics, "max_file_bytes", MAX_FILE_BYTES)
+
+    let stats_obj = {}
+    stats_obj = dict_set(stats_obj, "diffs_performed", _diff_count)
+    stats_obj = dict_set(stats_obj, "by_type",         by_type)
+    stats_obj = dict_set(stats_obj, "totals",          totals)
+    stats_obj = dict_set(stats_obj, "avg_change_rate", change_rate)
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "char": "+",
+        "stats": stats_obj,
+        "harmonics": harmonics,
+        "flow": {
+            "reynolds": dict_get(ns, "re") ?? 0,
+            "regime":   dict_get(ns, "regime") ?? "laminar"
+        },
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================================
+// Register routes
+// ============================================================================
+
+troute(server, "GET",  "/tdiff/health",   "tdiff_health")
+troute(server, "GET",  "/tdiff/stats",    "tdiff_stats")
+troute(server, "POST", "/tdiff/text",     "tdiff_text")
+troute(server, "POST", "/tdiff/json",     "tdiff_json")
+troute(server, "POST", "/tdiff/file",     "tdiff_file")
+troute(server, "POST", "/tdiff/snapshot", "tdiff_snapshot")
+
+// ============================================================================
+// Startup banner
+// ============================================================================
+
+print("[TDiff] NovaX Ternary Diff Micro-Tool v" + VERSION + " starting in NovaLang...")
+print("[TDiff] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TDiff] +1=added  0=context/changed  -1=removed")
+print("[TDiff] MAX_LINES=" + str(MAX_LINES) + " (3^7=BLOCK) | CONTEXT=" + str(CONTEXT_LINES) + " (H3) | JSON_DEPTH=" + str(JSON_MAX_DEPTH) + " (H13)")
+print("[TDiff] SAFE_ROOT=" + SAFE_ROOT + " | MAX_FILE=" + str(MAX_FILE_BYTES) + "B (BLOCK*H13)")
+print("[TDiff] N-S: Re<" + str(RE_LAMINAR) + "=laminar Re<" + str(RE_TRANSITIONAL) + "=transitional Re<" + str(RE_TURBULENT) + "=turbulent Re>=" + str(RE_TURBULENT) + "=chaotic")
+print("[TDiff] GET  /tdiff/health | /tdiff/stats")
+print("[TDiff] POST /tdiff/text | /tdiff/json | /tdiff/file | /tdiff/snapshot")
+
+troute(server, "GET", "/health", fn(req) { return json_decode(http_get("http://127.0.0.1:9973/tdiff/health")) })
+
+tstart(server)

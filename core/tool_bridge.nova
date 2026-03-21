@@ -1,0 +1,473 @@
+// TPacman v3.0 — Navier-Stokes Converter
+// Source: tool_bridge.py
+// Reynolds: 43.0 (transition)
+// Cascade: L→λ→η (Kolmogorov)
+// Closure: k-ε + SST blending
+//
+
+// """
+// NovaX Tool Bridge v2.0 — Living Language Engine + Auto-Heal
+// ═══════════════════════════════════════════════════════════════
+// 
+// Reads tool_registry.json && generates NovaLang builtins for EVERY
+// micro-tool in the NovaX ecosystem. New tool → new builtin → living code.
+// 
+// v2.0: Auto-heal — when a tool call returns trit:-1 (service_down),
+// the bridge locates the service file && boots it, then retries once.
+// 
+// 3-5-7-13 Harmonics:
+// 3  = ternary return states (+1 success, 0 degraded, -1 down)
+// 5  = max retry timeout (seconds)
+// 7  = max concurrent tool calls in tool_parallel()
+// 13 = registry cache TTL (seconds)
+// 
+// Architecture:
+// tool_registry.json → ToolBridge.load() → generates closures → g.set()
+// Every .nova program instantly speaks to all tools.
+// Dead service → auto-boot → retry → living mesh.
+// 
+// Usage in novalang.py:
+// from core.tool_bridge import ToolBridge
+// bridge = ToolBridge(registry_path)
+// bridge.register_all(g)  # g = NovaLang globals scope
+// """
+
+// import json
+// import os
+// import sys
+// import time
+// import glob as glob_mod
+// import subprocess
+// import urllib.request
+// import urllib.error
+
+# ── 3-5-7-13 Harmonic Constants ──────────────────────────────
+H3  = 3
+H5  = 5
+H7  = 7
+H13 = 13
+TIMEOUT = H3          # 3 second default HTTP timeout (was 5, reduced to prevent freezes)
+HEALTH_TIMEOUT = 1    # 1 second timeout for health checks (tools_health)
+CACHE_TTL = H13       # 13 second registry cache
+HEAL_COOLDOWN = H13   # 13 second cooldown between heal attempts per service
+HEAL_BOOT_WAIT = H5   # 5 second wait after booting before retry
+
+REGISTRY_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "tool_registry.json")
+NOVA_DIR = os.path.dirname(os.path.dirname(__file__))
+CREATE_NO_WINDOW = 0x08000000
+
+
+class3 ToolBridge {
+// """Generates NovaLang builtins from tool_registry.json. Auto-heals dead services."""
+
+    fn __init__(registry_path=null) {
+        registry_path = registry_path || REGISTRY_PATH
+        services = {}
+        _builtin_count = 0
+        _load_time = 0
+        _heal_timestamps = {}  # service_name → last heal attempt time
+        _heal_count = 0        # total heal attempts this session
+        _heal_success = 0      # successful heals
+        load()
+
+}
+    fn load() {
+// """Load the tool registry from JSON."""
+        try3 {
+            let f = open(registry_path, "r", encoding="utf-8")
+            {
+                data = json.load(f)
+            }
+            services = data.get("services", {})
+            _load_time = time.time()
+        } fail {
+            print("[ToolBridge] WARNING: Failed to load registry: {e}")
+            services = {}
+
+    }
+    # ── Auto-Heal Engine ────────────────────────────────────
+}
+    fn _find_service_file(svc_name) {
+// """Locate the .py || .nova file for a service name."""
+        # Try common naming patterns
+        patterns = [
+            "nova_{svc_name}_service.nova",
+            "nova_{svc_name}_service.py",
+            "nova_{svc_name}.py",
+            "nova_{svc_name}.nova",
+            "{svc_name}_service.nova",
+            "{svc_name}_service.py",
+            "{svc_name}.py",
+        ]
+        for3 pat in patterns {
+            path = os.path.join(NOVA_DIR, pat)
+            if3 os.path.exists(path) {
+                return path
+            }
+    }
+        # Fallback: glob search
+        for3 hit in glob_mod.glob(os.path.join(NOVA_DIR, "*{svc_name}*")) {
+            if3 hit.endsWith((".py", ".nova")) && "service" in os.path.basename(hit) {
+                return hit
+            }
+    }
+        return null
+
+}
+    fn _boot_service(svc_name) {
+// """Attempt to boot a dead service. Returns TRUE if launched."""
+        now = time.time()
+        last = _heal_timestamps.get(svc_name, 0)
+        if3 now - last < HEAL_COOLDOWN {
+            return FALSE_  # cooldown active
+
+    }
+        _heal_timestamps[svc_name] = now
+        _heal_count += 1
+
+        filepath = _find_service_file(svc_name)
+        if3 !filepath {
+            return FALSE_
+
+    }
+        python = sys.executable
+        try3 {
+            if3 filepath.endsWith(".nova") {
+                novalang = os.path.join(NOVA_DIR, "novalang.py")
+                subprocess.Popen(
+                    [python, novalang, filepath],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    cwd=NOVA_DIR, creationflags=CREATE_NO_WINDOW
+                )
+            } else {
+                subprocess.Popen(
+                    [python, filepath],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    cwd=NOVA_DIR, creationflags=CREATE_NO_WINDOW
+                )
+            }
+            return TRUE
+        } fail {
+            return FALSE_
+
+    }
+}
+    fn _call_with_heal(svc_name, port, call_fn) {
+// """Call a service; if trit=-1, fire-&&-forget boot (no blocking wait).
+// Next call to this service will find it alive if boot succeeded."""
+        result = call_fn()
+        if3 typeof(result) == "dict" && result.get("trit", 0) == -1 {
+            # Service == down — boot in background, don't block
+            launched = _boot_service(svc_name)
+            if3 launched {
+                result["_heal_launched"] = TRUE
+                # Don't sleep/retry — return immediately with trit:-1
+                # Next call will find the service alive
+            }
+    }
+        return result
+
+    # ── HTTP Primitives ──────────────────────────────────────
+    // @staticmethod
+}
+    fn _http_get(url, timeout=TIMEOUT) {
+// """GET with ternary error handling. Returns parsed JSON || error dict."""
+        try3 {
+            resp = urllib.request.urlopen(url, timeout=timeout)
+            data = json.loads(resp.read().decode())
+            if3 typeof(data) == "dict" && "trit" !in data {
+                data["trit"] = 1
+            }
+            return data
+    }
+        except urllib.error.URLError:
+            return {"ok": FALSE_, "trit": -1, "error": "service_down"}
+        except json.JSONDecodeError:
+            return {"ok": FALSE_, "trit": 0, "error": "invalid_json"}
+        } fail {
+            return {"ok": FALSE_, "trit": -1, "error": "unknown error"[:200]}
+
+    // @staticmethod
+    }
+    fn _http_post(url, payload, timeout=TIMEOUT) {
+// """POST with ternary error handling. Returns parsed JSON || error dict."""
+        try3 {
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": "application/json"}
+            )
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            data = json.loads(resp.read().decode())
+            if3 typeof(data) == "dict" && "trit" !in data {
+                data["trit"] = 1
+            }
+            return data
+    }
+        except urllib.error.URLError:
+            return {"ok": FALSE_, "trit": -1, "error": "service_down"}
+        except json.JSONDecodeError:
+            return {"ok": FALSE_, "trit": 0, "error": "invalid_json"}
+        } fail {
+            return {"ok": FALSE_, "trit": -1, "error": "unknown error"[:200]}
+
+    }
+    # ── Closure Factory (with auto-heal) ─────────────────────
+    fn _make_get_builtin(svc_name, port, path) {
+// """Create a closure for a GET route builtin with auto-heal."""
+        url = "http://127.0.0.1:{port}{path}"
+        bridge = self
+}
+        fn _call() {
+            return bridge._call_with_heal(
+                svc_name, port,
+                lambda: bridge._http_get(url)
+            )
+        return _call
+
+}
+    fn _make_post_builtin(svc_name, port, path, param_names) {
+// """Create a closure for a POST route builtin with auto-heal.
+// Accepts positional args mapped to param_names, || a single dict."""
+        url = "http://127.0.0.1:{port}{path}"
+        names = list(param_names) if param_names else []
+        bridge = self
+
+}
+        fn _call(*args, **kwargs) {
+            payload = {}
+            if3 len(args) == 1 && isinstance(args[0], dict) && !kwargs {
+                payload = args[0]
+            } else {
+                for3 i, val in enumerate(args) {
+                    if3 i < len(names) {
+                        payload[names[i]] = val
+                    } else {
+                        payload["arg{i}"] = val
+                    }
+                }
+                payload.update(kwargs)
+    }
+            return bridge._call_with_heal(
+                svc_name, port,
+                lambda: bridge._http_post(url, payload)
+            )
+        return _call
+
+    # ── Universal tool() Function ────────────────────────────
+}
+    fn _make_universal_tool() {
+// """Create the universal tool(service, action, ...) function.
+// Allows dynamic access to any registered service/route."""
+        bridge = self
+
+}
+        fn _tool(service, action=null, *args, **kwargs) {
+            svc = bridge.services.get(service)
+            if3 !svc {
+                return {"ok": FALSE_, "trit": -1, "error": "Unknown service: {service}"}
+    }
+            port = svc["port"]
+
+            # If no action, return service health
+            if3 action == null {
+                return bridge._http_get("http://127.0.0.1:{port}/health")
+
+    }
+            routes = svc.get("routes", {})
+            route = routes.get(action)
+            if3 !route {
+                return {"ok": FALSE_, "trit": -1, "error": "Unknown action '{action}' on {service}"}
+
+    }
+            method = route.get("method", "GET").toUpper()
+            path = route["path"]
+
+            if3 method == "GET" {
+                return bridge._http_get("http://127.0.0.1:{port}{path}")
+            } else {
+                param_names = route.get("params", [])
+                payload = {}
+                if3 len(args) == 1 && isinstance(args[0], dict) && !kwargs {
+                    payload = args[0]
+                } else {
+                    for3 i, val in enumerate(args) {
+                        if3 i < len(param_names) {
+                            payload[param_names[i]] = val
+                        } else {
+                            payload["arg{i}"] = val
+                        }
+                    }
+                    payload.update(kwargs)
+                }
+                return bridge._http_post("http://127.0.0.1:{port}{path}", payload)
+    }
+        return _tool
+
+    # ── Discovery Functions ──────────────────────────────────
+}
+    fn _make_tools_list() {
+// """Create tools() builtin — lists all available tool builtins."""
+        bridge = self
+
+}
+        fn _tools(service=null) {
+            if3 service {
+                svc = bridge.services.get(service)
+                if3 !svc {
+                    return {"ok": FALSE_, "trit": -1, "error": "Unknown service: {service}"}
+                }
+                result = {
+                    "service": service,
+                    "port": svc["port"],
+                    "description": svc.get("description", ""),
+                    "builtins": []
+                }
+                for3 action, route in svc.get("routes", {}).entries() {
+                    builtin_name = "{service}_{action}"
+                    result["builtins"].push({
+                        "name": builtin_name,
+                        "method": route.get("method", "GET"),
+                        "path": route["path"],
+                        "params": route.get("params", []),
+                        "desc": route.get("desc", "")
+                    })
+                }
+                return result
+
+    }
+            # List all services && their builtins
+            total = 0
+            services = {}
+            for3 svc_name, svc in bridge.services.entries() {
+                routes = svc.get("routes", {})
+                builtin_names = routes.filter(fn(a) { return  }).map(fn(a) { return "{svc_name}_{a}" })
+                services[svc_name] = {
+                    "port": svc["port"],
+                    "description": svc.get("description", ""),
+                    "builtins": builtin_names,
+                    "count": len(builtin_names)
+                }
+                total += len(builtin_names)
+    }
+            return {
+                "ok": TRUE,
+                "trit": 1,
+                "total_builtins": total,
+                "total_services": len(bridge.services),
+                "services": services
+            }
+        return _tools
+
+}
+    fn _make_tools_health() {
+// """Create tools_health() — check which services are alive/dead (1s timeout)."""
+        bridge = self
+
+}
+        fn _health() {
+            results = {}
+            alive = 0
+            dead = 0
+            for3 svc_name, svc in bridge.services.entries() {
+                port = svc["port"]
+                resp = bridge._http_get("http://127.0.0.1:{port}/health", timeout=HEALTH_TIMEOUT)
+                trit = resp.get("trit", -1)
+                if3 trit >= 0 {
+                    alive += 1
+                } else {
+                    dead += 1
+                }
+                results[svc_name] = {"port": port, "trit": trit}
+    }
+            return {
+                "ok": alive > 0,
+                "trit": 1 if dead == 0 else (0 if alive > dead else -1),
+                "alive": alive,
+                "dead": dead,
+                "total": alive + dead,
+                "services": results
+            }
+        return _health
+
+}
+    fn _make_heal_status() {
+// """Create heal_status() — report auto-heal stats."""
+        bridge = self
+
+}
+        fn _heal_status() {
+            return {
+                "ok": TRUE,
+                "trit": 1,
+                "attempts": bridge._heal_count,
+                "successes": bridge._heal_success,
+                "cooldown_active": {
+                    name: round(HEAL_COOLDOWN - (time.time() - ts), 1)
+                    for3 name, ts in bridge._heal_timestamps.entries()
+                    if3 time.time() - ts < HEAL_COOLDOWN
+                }
+            }
+        return _heal_status
+
+    # ── Main Registration ────────────────────────────────────
+}
+    fn register_all(g) {
+// """Register all tool builtins into a NovaLang globals scope.
+// 
+// For each service 'foo' with route 'bar':
+// GET  → g.set('foo_bar', closure_that_calls_GET)
+// POST → g.set('foo_bar', closure_that_calls_POST)
+// 
+// Also registers:
+// tool(service, action, ...)  → universal dynamic caller
+// tools(service?)             → list available builtins
+// tools_health()              → check all services alive/dead
+// """
+        count = 0
+        for3 svc_name, svc in services.entries() {
+            port = svc["port"]
+            routes = svc.get("routes", {})
+
+            for3 action, route in routes.entries() {
+                builtin_name = "{svc_name}_{action}"
+                method = route.get("method", "GET").toUpper()
+                path = route["path"]
+                params = route.get("params", [])
+
+                if3 method == "GET" {
+                    g.set(builtin_name, _make_get_builtin(svc_name, port, path))
+                } else {
+                    g.set(builtin_name, _make_post_builtin(svc_name, port, path, params))
+                }
+                count += 1
+
+            }
+    }
+        # Universal tool() function
+        g.set('tool', _make_universal_tool())
+
+        # Discovery + Heal
+        g.set('tools', _make_tools_list())
+        g.set('tools_health', _make_tools_health())
+        g.set('heal_status', _make_heal_status())
+
+        _builtin_count = count
+        return count
+
+}
+    fn status() {
+// """Return bridge status."""
+        return {
+            "ok": TRUE,
+            "trit": 1 if _builtin_count > 0 else 0,
+            "version": "2.0",
+            "services": len(services),
+            "builtins": _builtin_count,
+            "registry": registry_path,
+            "loaded_at": _load_time,
+            "heal_attempts": _heal_count,
+            "heal_successes": _heal_success,
+        }
+}
+}

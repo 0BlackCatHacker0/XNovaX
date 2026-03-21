@@ -1,0 +1,618 @@
+// NovaX TStream HTTP Admin Service v1.0.0 -- NovaLang port
+// Handles the HTTP admin/push side of TStream (port 9955).
+// WebSocket streaming (port 9954) stays in nova_tstream.py.
+//
+// Architecture:
+//   This .nova file = HTTP server on :9955
+//   nova_tstream.py  = WebSocket server on :9954
+//   Clients that cannot use WebSockets use GET /tstream/poll for events.
+//
+// Endpoints:
+//   GET  /health              -- quick health check
+//   GET  /tstream/health      -- full health (alias)
+//   GET  /tstream/stats       -- push/poll counters and quality trits
+//   GET  /tstream/channels    -- per-channel history sizes
+//   GET  /tstream/poll        -- poll buffered events (?channel=X&since=N)
+//   POST /tstream/push        -- push event: {"channel":"...","data":{...}}
+//   POST /tstream/broadcast   -- alias for /tstream/push
+//   POST /tstream/clear       -- clear history buffer (optional body: {"channel":"X"})
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3 (ternary base)  H5=5 (TZip pack)  H7=7 (composition)  H13=13 (carrier)
+//   BLOCK = 3^7 = 2187
+
+// ---------------------------------------------------------------------------
+// Server declaration
+// ---------------------------------------------------------------------------
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9955
+let server = tserve(PORT, "tstream-admin")
+
+// ---------------------------------------------------------------------------
+// Harmonic constants
+// ---------------------------------------------------------------------------
+let H3    = 3
+let H5    = 5
+let H7    = 7
+let H13   = 13
+let BLOCK = 2187
+
+// Ternary truth values
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// Service metadata
+let VERSION      = "1.0.0"
+let SERVICE_NAME = "tstream-admin"
+let WS_PORT      = 9954
+
+// Event ring buffer limits (per channel)
+let HISTORY_SIZE     = 100
+let MAX_PUSH_BODY    = 6561
+let MAX_EVENTS_PER_SEC = 1000
+
+// Valid channel names (stored as list for iteration)
+let VALID_CHANNELS = ["health", "metrics", "events", "logs", "flow", "alerts"]
+
+// ---------------------------------------------------------------------------
+// Mutable state
+// ---------------------------------------------------------------------------
+// Per-channel event ring buffers (list of event dicts, newest appended last).
+// Trimmed to HISTORY_SIZE on every push.
+let buf_health  = []
+let buf_metrics = []
+let buf_events  = []
+let buf_logs    = []
+let buf_flow    = []
+let buf_alerts  = []
+
+// Global monotonic sequence counter
+let seq_counter = 0
+
+// Start timestamp (seconds since epoch, captured at module load)
+let started_at = time()
+
+// Push / poll counters
+let stat_pushes_received = 0
+let stat_events_stored   = 0
+let stat_polls_served    = 0
+let stat_errors          = 0
+
+// Ternary quality counters
+let trit_strong  = 0
+let trit_partial = 0
+let trit_failed  = 0
+
+// Simple 1-second rate-limit window: list of timestamps
+let rate_window = []
+
+// ---------------------------------------------------------------------------
+// Helper: record a ternary outcome
+// ---------------------------------------------------------------------------
+fn record_trit(t) {
+    if3 t > 0 { trit_strong = trit_strong + 1
+    } else if3 t < 0 { trit_failed = trit_failed + 1
+    } else { trit_partial = trit_partial + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: compute uptime in seconds
+// ---------------------------------------------------------------------------
+fn get_uptime() {
+    let now = time()
+    let diff = now - started_at
+    let u = int(diff)
+    u
+}
+
+// ---------------------------------------------------------------------------
+// Helper: advance and return next sequence number
+// ---------------------------------------------------------------------------
+fn next_seq() {
+    seq_counter = seq_counter + 1
+    seq_counter
+}
+
+// ---------------------------------------------------------------------------
+// Helper: rate-limit check (returns T_TRUE if under limit, T_FALSE if over)
+// ---------------------------------------------------------------------------
+fn rate_ok() {
+    let now = time()
+    // Drop timestamps older than 1 second
+    let fresh = []
+    let i = 0
+    let n = len(rate_window)
+    while3 i < n {
+        let ts = dict_get(rate_window, i)
+        if3 (now - ts) < 1 { fresh = append(fresh, ts)
+        }
+        i = i + 1
+    }
+    rate_window = fresh
+    let window_len = len(rate_window)
+    if3 window_len < MAX_EVENTS_PER_SEC { rate_window = append(rate_window, now)
+        T_TRUE
+    } else {
+        T_FALSE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: resolve a channel name to its buffer variable
+// Returns the buffer list (or empty list if unknown channel).
+// Because NovaLang has no references, we return a copy and callers
+// must call set_channel_buf to write back.
+// ---------------------------------------------------------------------------
+fn get_channel_buf(channel) {
+    if3 channel == "health" {
+        buf_health
+    } else if3 channel == "metrics" {
+        buf_metrics
+    } else if3 channel == "events" {
+        buf_events
+    } else if3 channel == "logs" {
+        buf_logs
+    } else if3 channel == "flow" {
+        buf_flow
+    } else if3 channel == "alerts" {
+        buf_alerts
+    } else {
+        []
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: write back a buffer for a channel
+// ---------------------------------------------------------------------------
+fn set_channel_buf(channel, buf) {
+    if3 channel == "health" { buf_health = buf
+    } else if3 channel == "metrics" { buf_metrics = buf
+    } else if3 channel == "events" { buf_events = buf
+    } else if3 channel == "logs" { buf_logs = buf
+    } else if3 channel == "flow" { buf_flow = buf
+    } else if3 channel == "alerts" { buf_alerts = buf
+    }
+    T_TRUE
+}
+
+// ---------------------------------------------------------------------------
+// Helper: trim a buffer list to the last HISTORY_SIZE entries
+// ---------------------------------------------------------------------------
+fn trim_buf(buf) {
+    let n = len(buf)
+    if3 n > HISTORY_SIZE {
+        // Keep only the last HISTORY_SIZE items
+        let start = n - HISTORY_SIZE
+        let trimmed = slice(buf, start, n)
+        trimmed
+    } else {
+        buf
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: validate channel name (T_TRUE / T_FALSE)
+// ---------------------------------------------------------------------------
+fn valid_channel(channel) {
+    if3 contains(VALID_CHANNELS, channel) {
+        T_TRUE
+    } else {
+        T_FALSE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build ternary char (+, 0, T)
+// ---------------------------------------------------------------------------
+fn tchar(t) {
+    if3 t > 0 {
+        "+"
+    } else if3 t < 0 {
+        "T"
+    } else {
+        "0"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: classify Reynolds number into flow regime
+// ---------------------------------------------------------------------------
+fn tregime(re_val) {
+    // Boundaries: 3^3=27, 5^3=125, 7^3=343
+    if3 re_val < 27 {
+        "laminar"
+    } else if3 re_val < 125 {
+        "transitional"
+    } else if3 re_val < 343 {
+        "turbulent"
+    } else {
+        "chaotic"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: compute naive Reynolds number from push rate in last 60 seconds.
+// Uses stat_pushes_received / max(uptime_seconds,1) * 60 as a proxy.
+// ---------------------------------------------------------------------------
+fn compute_reynolds() {
+    let up = get_uptime()
+    if3 up < 1 { up = 1
+    }
+    let re = (stat_pushes_received * 60) / up
+    int(re)
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build channel info dict (subscribers placeholder = 0 for HTTP-only)
+// ---------------------------------------------------------------------------
+fn channel_info_dict(channel) {
+    let buf = get_channel_buf(channel)
+    let hsz = len(buf)
+    let info = {}
+    info = dict_set(info, "subscribers", 0)
+    info = dict_set(info, "history_size", hsz)
+    info = dict_set(info, "history_max", HISTORY_SIZE)
+    info
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build the full health response dict
+// ---------------------------------------------------------------------------
+fn build_health() {
+    let re_val = compute_reynolds()
+    let up     = get_uptime()
+    let st = T_TRUE
+    if3 up < 5 { st = T_MAYBE
+    }
+    if3 re_val > 343 { st = T_MAYBE
+    }
+    let regime = tregime(re_val)
+    let ch_str = join(VALID_CHANNELS, ", ")
+    let q = {}
+    q = dict_set(q, "strong",  trit_strong)
+    q = dict_set(q, "partial", trit_partial)
+    q = dict_set(q, "failed",  trit_failed)
+    let h = {}
+    h = dict_set(h, "ok",          T_TRUE)
+    h = dict_set(h, "service",     SERVICE_NAME)
+    h = dict_set(h, "port",        PORT)
+    h = dict_set(h, "ws_port",     WS_PORT)
+    h = dict_set(h, "version",     VERSION)
+    h = dict_set(h, "ternary",     T_TRUE)
+    h = dict_set(h, "self_trit",   st)
+    h = dict_set(h, "char",        tchar(st))
+    h = dict_set(h, "reynolds",    re_val)
+    h = dict_set(h, "flow_regime", regime)
+    h = dict_set(h, "uptime",      up)
+    h = dict_set(h, "channels",    ch_str)
+    h = dict_set(h, "quality",     q)
+    h
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build full stats response dict
+// ---------------------------------------------------------------------------
+fn build_stats() {
+    let re_val = compute_reynolds()
+    let up     = get_uptime()
+    let regime = tregime(re_val)
+    let q = {}
+    q = dict_set(q, "strong",  trit_strong)
+    q = dict_set(q, "partial", trit_partial)
+    q = dict_set(q, "failed",  trit_failed)
+    let msg = {}
+    msg = dict_set(msg, "pushes",   stat_pushes_received)
+    msg = dict_set(msg, "stored",   stat_events_stored)
+    msg = dict_set(msg, "polls",    stat_polls_served)
+    msg = dict_set(msg, "errors",   stat_errors)
+    let buf_h = {}
+    buf_h = dict_set(buf_h, "health",  len(buf_health))
+    buf_h = dict_set(buf_h, "metrics", len(buf_metrics))
+    buf_h = dict_set(buf_h, "events",  len(buf_events))
+    buf_h = dict_set(buf_h, "logs",    len(buf_logs))
+    buf_h = dict_set(buf_h, "flow",    len(buf_flow))
+    buf_h = dict_set(buf_h, "alerts",  len(buf_alerts))
+    let rl = {}
+    rl = dict_set(rl, "max_per_sec",    MAX_EVENTS_PER_SEC)
+    rl = dict_set(rl, "current_window", len(rate_window))
+    let s = {}
+    s = dict_set(s, "ok",          T_TRUE)
+    s = dict_set(s, "service",     SERVICE_NAME)
+    s = dict_set(s, "version",     VERSION)
+    s = dict_set(s, "uptime",      up)
+    s = dict_set(s, "reynolds",    re_val)
+    s = dict_set(s, "flow_regime", regime)
+    s = dict_set(s, "messages",    msg)
+    s = dict_set(s, "history",     buf_h)
+    s = dict_set(s, "rate_limit",  rl)
+    s = dict_set(s, "quality",     q)
+    s = dict_set(s, "trit",        T_TRUE)
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build channel overview response
+// ---------------------------------------------------------------------------
+fn build_channels() {
+    let ch_info = {}
+    ch_info = dict_set(ch_info, "health",  channel_info_dict("health"))
+    ch_info = dict_set(ch_info, "metrics", channel_info_dict("metrics"))
+    ch_info = dict_set(ch_info, "events",  channel_info_dict("events"))
+    ch_info = dict_set(ch_info, "logs",    channel_info_dict("logs"))
+    ch_info = dict_set(ch_info, "flow",    channel_info_dict("flow"))
+    ch_info = dict_set(ch_info, "alerts",  channel_info_dict("alerts"))
+    let resp = {}
+    resp = dict_set(resp, "ok",       T_TRUE)
+    resp = dict_set(resp, "channels", ch_info)
+    resp = dict_set(resp, "valid",    VALID_CHANNELS)
+    resp = dict_set(resp, "trit",     T_TRUE)
+    resp
+}
+
+// ---------------------------------------------------------------------------
+// Helper: push one event into the correct buffer
+// Returns T_TRUE on success, T_FALSE on bad channel, T_MAYBE on rate limit.
+// ---------------------------------------------------------------------------
+fn push_event(channel, data) {
+    let cv = valid_channel(channel)
+    if3 cv != T_TRUE {
+        stat_errors = stat_errors + 1
+        let dummy = record_trit(T_FALSE)
+        T_FALSE
+    } else { rok = rate_ok()
+        if3 rok != T_TRUE {
+            stat_errors = stat_errors + 1
+            let dummy = record_trit(T_FALSE)
+            T_MAYBE
+        } else { seq = next_seq()
+            let now = time()
+            let ev = {}
+            ev = dict_set(ev, "channel", channel)
+            ev = dict_set(ev, "data",    data)
+            ev = dict_set(ev, "ts",      now)
+            ev = dict_set(ev, "seq",     seq)
+            let buf = get_channel_buf(channel)
+            buf = append(buf, ev)
+            let buf = trim_buf(buf)
+            let dummy = set_channel_buf(channel, buf)
+            stat_pushes_received = stat_pushes_received + 1
+            stat_events_stored   = stat_events_stored   + 1
+            let dummy2 = record_trit(T_TRUE)
+            T_TRUE
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: collect events from a buffer since a given sequence number.
+// Returns list of matching event dicts.
+// ---------------------------------------------------------------------------
+fn events_since(buf, since_seq) {
+    let result = []
+    let i = 0
+    let n = len(buf)
+    while3 i < n {
+        let ev = dict_get(buf, i)
+        let ev_seq = dict_get(ev, "seq")
+        if3 ev_seq > since_seq { result = append(result, ev)
+        }
+        i = i + 1
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers
+// ---------------------------------------------------------------------------
+
+// GET /health
+fn handle_health_get(req) {
+    let counters = {}
+    counters = dict_set(counters, "pushes", stat_pushes_received)
+    counters = dict_set(counters, "stored", stat_events_stored)
+    counters = dict_set(counters, "polls", stat_polls_served)
+    counters = dict_set(counters, "errors", stat_errors)
+    counters = dict_set(counters, "trit_strong", trit_strong)
+    counters = dict_set(counters, "trit_partial", trit_partial)
+    counters = dict_set(counters, "trit_failed", trit_failed)
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, counters)
+    resp = dict_set(resp, "ws_port", WS_PORT)
+    resp = dict_set(resp, "note", "WS streaming on port 9954 (nova_tstream.py)")
+    return resp
+}
+
+// GET /tstream/health  (alias)
+fn handle_tstream_health_get(req) {
+    return handle_health_get(req)
+}
+
+// GET /tstream/stats
+fn handle_stats_get(req) {
+    return build_stats()
+}
+
+// GET /tstream/channels
+fn handle_channels_get(req) {
+    return build_channels()
+}
+
+// GET /tstream/poll?channel=X&since=N
+//   Returns buffered events for channel X that arrived after sequence N.
+//   If since is omitted or 0, returns the most recent min(H13,history) events.
+//   Clients should store the highest seq they received and pass it as since=N.
+fn handle_poll_get(req) {
+    let channel = dict_get(req, "channel")
+    let since_raw = dict_get(req, "since")
+    // Validate channel
+    if3 channel == "" {
+        stat_errors = stat_errors + 1
+        let dummy = record_trit(T_FALSE)
+        let err = {}
+        err = dict_set(err, "ok",             T_FALSE)
+        err = dict_set(err, "error",          "missing channel query param")
+        err = dict_set(err, "valid_channels", VALID_CHANNELS)
+        err = dict_set(err, "trit",           T_FALSE)
+        err
+    } else { cv = valid_channel(channel)
+        if3 cv != T_TRUE {
+            stat_errors = stat_errors + 1
+            let dummy = record_trit(T_FALSE)
+            let err = {}
+            err = dict_set(err, "ok",             T_FALSE)
+            err = dict_set(err, "error",          "unknown channel")
+            err = dict_set(err, "valid_channels", VALID_CHANNELS)
+            err = dict_set(err, "trit",           T_FALSE)
+            err
+        } else { since = 0
+            if3 since_raw != "" { since = int(since_raw)
+            }
+            let buf = get_channel_buf(channel)
+            let evts = []
+            if3 since > 0 { evts = events_since(buf, since)
+            } else {
+                // Return up to H13 (13) most recent events when no since given
+                let buf_len = len(buf)
+                let start = buf_len - H13
+                if3 start < 0 { start = 0
+                }
+                let evts = slice(buf, start, buf_len)
+            }
+            let evt_count = len(evts)
+            stat_polls_served = stat_polls_served + 1
+            let dummy = record_trit(T_TRUE)
+            let resp = {}
+            resp = dict_set(resp, "ok",      T_TRUE)
+            resp = dict_set(resp, "channel", channel)
+            resp = dict_set(resp, "events",  evts)
+            resp = dict_set(resp, "count",   evt_count)
+            resp = dict_set(resp, "trit",    T_TRUE)
+            return resp
+        }
+    }
+}
+
+// POST /tstream/push  body: {"channel":"X","data":{...}}
+fn handle_push_post(req) {
+    let channel = dict_get(req, "channel")
+    let data    = dict_get(req, "data")
+    if3 channel == "" {
+        stat_errors = stat_errors + 1
+        let dummy = record_trit(T_FALSE)
+        let err = {}
+        err = dict_set(err, "ok",             T_FALSE)
+        err = dict_set(err, "error",          "missing channel field")
+        err = dict_set(err, "valid_channels", VALID_CHANNELS)
+        err = dict_set(err, "trit",           T_FALSE)
+        err
+    } else { result = push_event(channel, data)
+        if3 result == T_TRUE { buf = get_channel_buf(channel)
+            let hsz = len(buf)
+            let resp = {}
+            resp = dict_set(resp, "ok",           T_TRUE)
+            resp = dict_set(resp, "channel",      channel)
+            resp = dict_set(resp, "seq",          seq_counter)
+            resp = dict_set(resp, "history_size", hsz)
+            resp = dict_set(resp, "trit",         T_TRUE)
+            resp
+        } else if3 result == T_MAYBE { err = {}
+            err = dict_set(err, "ok",    T_FALSE)
+            err = dict_set(err, "error", "rate limit exceeded")
+            err = dict_set(err, "trit",  T_MAYBE)
+            err
+        } else { err = {}
+            err = dict_set(err, "ok",             T_FALSE)
+            err = dict_set(err, "error",          "invalid channel")
+            err = dict_set(err, "valid_channels", VALID_CHANNELS)
+            err = dict_set(err, "trit",           T_FALSE)
+            return err
+        }
+    }
+}
+
+// POST /tstream/broadcast  (alias for push)
+fn handle_broadcast_post(req) {
+    return handle_push_post(req)
+}
+
+// POST /tstream/clear  body (optional): {"channel":"X"}
+//   If channel is present, clears that channel only.
+//   If body is empty or channel is absent, clears all channels.
+fn handle_clear_post(req) {
+    let channel = dict_get(req, "channel")
+    if3 channel != "" {
+        // Clear a single channel
+        let cv = valid_channel(channel)
+        if3 cv != T_TRUE {
+            stat_errors = stat_errors + 1
+            let dummy = record_trit(T_FALSE)
+            let err = {}
+            err = dict_set(err, "ok",             T_FALSE)
+            err = dict_set(err, "error",          "unknown channel")
+            err = dict_set(err, "valid_channels", VALID_CHANNELS)
+            err = dict_set(err, "trit",           T_FALSE)
+            err
+        } else { dummy = set_channel_buf(channel, [])
+            let dummy2 = record_trit(T_TRUE)
+            let resp = {}
+            resp = dict_set(resp, "ok",      T_TRUE)
+            resp = dict_set(resp, "cleared", channel)
+            resp = dict_set(resp, "trit",    T_TRUE)
+            resp
+        }
+    } else {
+        // Clear all channels
+        let buf_health  = []
+        let buf_metrics = []
+        let buf_events  = []
+        let buf_logs    = []
+        let buf_flow    = []
+        let buf_alerts  = []
+        let dummy = record_trit(T_TRUE)
+        let resp = {}
+        resp = dict_set(resp, "ok",      T_TRUE)
+        resp = dict_set(resp, "cleared", "all")
+        resp = dict_set(resp, "trit",    T_TRUE)
+        return resp
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Route registrations
+// ---------------------------------------------------------------------------
+let r1  = troute(server, "GET",  "/health",             handle_health_get)
+let r2  = troute(server, "GET",  "/tstream/health",     handle_tstream_health_get)
+let r3  = troute(server, "GET",  "/tstream/stats",      handle_stats_get)
+let r4  = troute(server, "GET",  "/tstream/channels",   handle_channels_get)
+let r5  = troute(server, "GET",  "/tstream/poll",       handle_poll_get)
+let r6  = troute(server, "POST", "/tstream/push",       handle_push_post)
+let r7  = troute(server, "POST", "/tstream/broadcast",  handle_broadcast_post)
+let r8  = troute(server, "POST", "/tstream/clear",      handle_clear_post)
+
+// ---------------------------------------------------------------------------
+// Startup banner
+// ---------------------------------------------------------------------------
+print("[TStream-Admin] NovaX TStream HTTP Admin v1.0.0 starting...")
+print("[TStream-Admin] HTTP port: 9955 | WS port (Python): 9954")
+print("[TStream-Admin] Harmonics: H3=3 H5=5 H7=7 H13=13 BLOCK=2187")
+print("[TStream-Admin] Channels: health, metrics, events, logs, flow, alerts")
+print("[TStream-Admin] History buffer: 100 events/channel")
+print("[TStream-Admin] Endpoints:")
+print("[TStream-Admin]   GET  /health              -- health check")
+print("[TStream-Admin]   GET  /tstream/health      -- health (alias)")
+print("[TStream-Admin]   GET  /tstream/stats       -- push/poll counters")
+print("[TStream-Admin]   GET  /tstream/channels    -- channel buffer sizes")
+print("[TStream-Admin]   GET  /tstream/poll        -- poll events (HTTP fallback)")
+print("[TStream-Admin]   POST /tstream/push        -- push event to buffer")
+print("[TStream-Admin]   POST /tstream/broadcast   -- push event (alias)")
+print("[TStream-Admin]   POST /tstream/clear       -- clear event buffer(s)")
+print("[TStream-Admin] ternary=true | ready")
+
+// ---------------------------------------------------------------------------
+// Start server
+// ---------------------------------------------------------------------------
+tstart(server)

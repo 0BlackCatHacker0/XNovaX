@@ -1,0 +1,367 @@
+// Nova TBus v1.0 - Ternary Pub/Sub Message Bus (N-S Flow Model)
+// Port 9945: Pub/Sub event routing with topic replay and callback delivery
+//
+// N-S Mapping:
+//   event_flow        = velocity_field (messages flowing through topics)
+//   topic             = flow_channel (N-S pipe segment)
+//   publish           = pressure_source (injects momentum into channel)
+//   subscribers       = boundary_conditions (consume flow energy)
+//   priority +1/0/-1  = trit-weighted pressure gradient
+//   replay            = downstream_probe (sample historical flow)
+//   Re < 27 (H3^3)   = laminar (few topics, low churn)
+//   Re > 343 (H7^3)  = turbulent (many topics, high publish rate)
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3  = 3   (ternary base, trit states: -1/0/+1)
+//   H5  = 5   (TZip pack unit, 3^5=243 tryte range)
+//   H7  = 7   (composition unit, 3^7=2187 BLOCK_SIZE)
+//   H13 = 13  (carrier/frame, 13-char event IDs)
+//   MAX_EVENTS per topic = 1000 (capped ring via slice)
+//   MAX_TOPICS = 1000 (prevent OOM from unbounded creation)
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let VERSION = "1.1"
+let PORT = 9945
+let server = tserve(PORT, "TBus v1.1 - Ternary Pub/Sub Message Bus")
+let _ns = ns_init_counters()
+
+let BLOCK_SIZE    = 2187  // H7^3 * H3 = 3^7
+let MAX_EVENTS    = 1000  // max events stored per topic ring
+let MAX_TOPICS    = 1000  // max distinct topics
+
+// -- Ternary Constants --
+let TRUE  =  1
+let MAYBE =  0
+let FALSE = -1
+
+// -- Core State --
+// topics dict: topic_name -> { "events": [], "subscribers": {} }
+// subscribers dict (nested): sub_id -> { "callback_url", "filter", "priority", "created" }
+let topics       = {}
+let total_pub    = 0
+let total_sub    = 0
+let total_unsub  = 0
+let total_del    = 0
+
+// -- Internal: get or create a topic entry --
+fn _ensure_topic(name) {
+    if3 dict_has(topics, name) {
+        return dict_get(topics, name) ?? {}
+    } else { entry = {"events": [], "subscribers": {}}
+        topics = dict_set(topics, name, entry)
+        return entry
+    }
+}
+
+// -- Internal: trim topic event list to MAX_EVENTS using slice --
+fn _trim_events(evts) {
+    if3 len(evts) > MAX_EVENTS {
+        // keep the newest MAX_EVENTS
+        return slice(evts, len(evts) - MAX_EVENTS, len(evts))
+    } else {
+        return evts
+    }
+}
+
+// -- POST /tbus/publish --
+fn publish(body) {
+    let topic    = dict_get(body, "topic") ?? ""
+    let data     = dict_get(body, "data") ?? {}
+    let priority = int(dict_get(body, "priority") ?? 0)
+
+    // Clamp priority to trit range
+    let priority = max(-1, min(1, priority))
+
+    if3 topic == "" {
+        return {"ok": false, "trit": FALSE, "error": "topic required"}
+    } else {
+        // Topic count guard (only for new topics)
+        let topic_count = len(keys(topics))
+        if3 dict_has(topics, topic) == false {
+            if3 topic_count >= MAX_TOPICS {
+                return {"ok": false, "trit": FALSE, "error": "max topics reached"}
+            } else {
+                // Create the topic
+                let _dummy = _ensure_topic(topic)
+        } else {
+            // Topic already exists - no-op
+            let _dummy = 0
+        }
+
+        let event_id = uuid_hex(H13)
+        let ts       = time()
+
+        let event = {
+            "id":        event_id,
+            "topic":     topic,
+            "data":      data,
+            "priority":  priority,
+            "timestamp": ts
+        }
+
+        // Append event and trim ring
+        let tentry  = dict_get(topics, topic) ?? {"events": [], "subscribers": {}}
+        let evts    = dict_get(tentry, "events") ?? []
+        let updated = append(evts, event)
+        let trimmed = _trim_events(updated)
+        let tentry  = dict_set(tentry, "events", trimmed)
+        let topics  = dict_set(topics, topic, tentry)
+
+        // Gather subscribers
+        let subs    = dict_get(tentry, "subscribers") ?? {}
+        let sub_ids = keys(subs)
+        let sub_cnt = len(sub_ids)
+
+        // Deliver fire-and-forget to each subscriber callback
+        let i = 0
+        while3 i < sub_cnt {
+            let sid  = sub_ids[i]
+            let sub  = dict_get(subs, sid) ?? {}
+            let curl = dict_get(sub, "callback_url") ?? ""
+            if3 curl != "" {
+                try3 {
+                    let _resp = http_post(curl, event)
+                } else {
+                    // fire-and-forget: swallow delivery errors
+                    let _resp = 0
+            } else { _skip = 0
+            }
+            i = i + 1
+        }
+
+        total_pub = total_pub + 1
+
+        if3 sub_cnt == 0 {
+            return {
+                "ok":          true,
+                "trit":        MAYBE,
+                "event_id":    event_id,
+                "subscribers": 0,
+                "msg":         "published but no subscribers"
+        } else {
+            return {
+                "ok":          true,
+                "trit":        TRUE,
+                "event_id":    event_id,
+                "subscribers": sub_cnt
+            }
+        }
+    }
+}
+
+// -- POST /tbus/subscribe --
+}
+}
+}
+fn subscribe(body) {
+    let topic        = dict_get(body, "topic") ?? ""
+    let callback_url = dict_get(body, "callback_url") ?? ""
+    let filter_rule  = dict_get(body, "filter") ?? ""
+    let priority     = int(dict_get(body, "priority") ?? 0)
+
+    if3 topic == "" {
+        return {"ok": false, "trit": FALSE, "error": "topic required"}
+    } else { sub_id = uuid_hex(H13)
+        let ts     = time()
+
+        let sub = {
+            "callback_url": callback_url,
+            "filter":       filter_rule,
+            "priority":     priority,
+            "created":      ts
+        }
+
+        // Ensure topic exists
+        let _dummy  = _ensure_topic(topic)
+        let tentry  = dict_get(topics, topic) ?? {"events": [], "subscribers": {}}
+        let subs    = dict_get(tentry, "subscribers") ?? {}
+        let subs    = dict_set(subs, sub_id, sub)
+        let tentry  = dict_set(tentry, "subscribers", subs)
+        let topics  = dict_set(topics, topic, tentry)
+
+        total_sub = total_sub + 1
+
+        return {
+            "ok":              true,
+            "trit":            TRUE,
+            "subscription_id": sub_id,
+            "topic":           topic
+        }
+    }
+}
+
+// -- POST /tbus/unsubscribe --
+fn unsubscribe(body) {
+    let sub_id = dict_get(body, "id") ?? ""
+
+    if3 sub_id == "" {
+        return {"ok": false, "trit": FALSE, "error": "id required"}
+    } else {
+        // Walk all topics looking for the sub_id
+        let topic_names = keys(topics)
+        let n           = len(topic_names)
+        let i           = 0
+        let found       = false
+        let result      = {"ok": false, "trit": FALSE, "error": "subscription not found"}
+
+        while3 i < n {
+            if3 found == false { tname  = topic_names[i]
+                let tentry = dict_get(topics, tname) ?? {"events": [], "subscribers": {}}
+                let subs   = dict_get(tentry, "subscribers") ?? {}
+
+                if3 dict_has(subs, sub_id) { subs   = dict_del(subs, sub_id)
+                    tentry = dict_set(tentry, "subscribers", subs)
+                    topics = dict_set(topics, tname, tentry)
+                    total_unsub = total_unsub + 1
+                    let found  = true
+                    let result = {"ok": true, "trit": TRUE, "removed": sub_id}
+                } else { i = i + 1
+            } else { i = i + 1
+            }
+        }
+
+        return result
+    }
+}
+
+// -- GET /tbus/topics --
+}
+fn list_topics(body) {
+    let names  = keys(topics)
+    let n      = len(names)
+    let i      = 0
+    let result = {}
+
+    while3 i < n {
+        let tname  = names[i]
+        let tentry = dict_get(topics, tname) ?? {"events": [], "subscribers": {}}
+        let evts   = dict_get(tentry, "events") ?? []
+        let subs   = dict_get(tentry, "subscribers") ?? {}
+        let ecnt   = len(evts)
+        let scnt   = len(keys(subs))
+
+        // Get latest timestamp: last element if events exist, else 0
+        let latest = 0
+        if3 ecnt > 0 { last_evt = evts[ecnt - 1]
+            let latest   = dict_get(last_evt, "timestamp") ?? 0
+        } else { latest = 0
+        }
+
+        let tsummary = {
+            "subscribers": scnt,
+            "events":      ecnt,
+            "latest":      latest
+        }
+        result = dict_set(result, tname, tsummary)
+        i = i + 1
+    }
+
+    return {"ok": true, "trit": TRUE, "topics": result}
+}
+
+// -- POST /tbus/replay --
+fn replay(body) {
+    let topic = dict_get(body, "topic") ?? ""
+    let n     = int(dict_get(body, "n") ?? 10)
+
+    // Cap n at 100
+    let n = min(n, 100)
+
+    if3 topic == "" {
+        return {"ok": false, "trit": FALSE, "error": "topic required"}
+    } else { tentry = dict_get(topics, topic) ?? {"events": [], "subscribers": {}}
+        let evts   = dict_get(tentry, "events") ?? []
+        let ecnt   = len(evts)
+
+        // Slice the last n events
+        let start  = ecnt - n
+        if3 start < 0 { start = 0
+        } else { start = start
+        }
+
+        let recent = slice(evts, start, ecnt)
+        let rcnt   = len(recent)
+
+        return {
+            "ok":    true,
+            "trit":  TRUE,
+            "topic": topic,
+            "count": rcnt,
+            "events": recent
+        }
+    }
+}
+
+// -- GET /health --
+fn health(body) {
+    let topic_cnt = len(keys(topics))
+    let h = ns_health_dict("nova-tbus", VERSION, PORT, _ns)
+    h = dict_set(h, "runtime", "novalang")
+    h = dict_set(h, "topics", topic_cnt)
+    h = dict_set(h, "max_topics", MAX_TOPICS)
+    return h
+}
+
+// -- GET /tbus/stats --
+fn stats(body) {
+    let topic_cnt = len(keys(topics))
+    let total_evts = 0
+    let total_subs = 0
+
+    let names = keys(topics)
+    let n     = len(names)
+    let i     = 0
+
+    while3 i < n {
+        let tname  = names[i]
+        let tentry = dict_get(topics, tname) ?? {"events": [], "subscribers": {}}
+        let evts   = dict_get(tentry, "events") ?? []
+        let subs   = dict_get(tentry, "subscribers") ?? {}
+        total_evts = total_evts + len(evts)
+        total_subs = total_subs + len(keys(subs))
+        i = i + 1
+    }
+
+    return {
+        "ok":          true,
+        "trit":        TRUE,
+        "ternary":     true,
+        "runtime":     "novalang",
+        "service":     "nova-tbus",
+        "port":        PORT,
+        "topics":      topic_cnt,
+        "total_events": total_evts,
+        "active_subs": total_subs,
+        "lifetime": {
+            "published":    total_pub,
+            "subscribed":   total_sub,
+            "unsubscribed": total_unsub
+        },
+        "limits": {
+            "max_topics":     MAX_TOPICS,
+            "max_events_per_topic": MAX_EVENTS,
+            "max_replay":     100
+        },
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "re_boundaries": {"laminar": RE_LAMINAR, "turbulent": RE_TURBULENT}
+    }
+}
+
+// -- Register routes --
+troute(server, "GET",  "/health",          "health")
+troute(server, "GET",  "/tbus/topics",     "list_topics")
+troute(server, "GET",  "/tbus/stats",      "stats")
+troute(server, "POST", "/tbus/publish",    "publish")
+troute(server, "POST", "/tbus/subscribe",  "subscribe")
+troute(server, "POST", "/tbus/unsubscribe","unsubscribe")
+troute(server, "POST", "/tbus/replay",     "replay")
+
+print("[TBus] NovaLang TBus v1.1 - Ternary Pub/Sub Message Bus")
+print("[TBus] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TBus] Max topics: " + str(MAX_TOPICS) + " | Max events/topic: " + str(MAX_EVENTS))
+print("[TBus] Harmonic frame: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TBus] Routes: /health, /tbus/topics, /tbus/stats, /tbus/publish, /tbus/subscribe, /tbus/unsubscribe, /tbus/replay")
+
+tstart(server)

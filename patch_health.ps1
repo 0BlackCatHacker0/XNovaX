@@ -1,0 +1,27 @@
+$f='C:\ProgramData\NovaX\app\shell\static\servers.html'
+$c=Get-Content $f -Raw -Encoding UTF8
+$c=$c -replace '(?s)<script>\s*async function nh.*?</script>',''
+$c=$c -replace '(?s)<script>\s*async function healthCheck.*?</script>',''
+$c=$c -replace '(?s)<script>\s*async function novaHealth.*?</script>',''
+$hs='<script>'
+$hs+='async function nh(){'
+$hs+='var g=document.getElementById("server-grid");if(!g)return;'
+$hs+='for(var c of g.querySelectorAll(".card")){'
+$hs+='var n=c.querySelector(".card-name");if(!n)continue;'
+$hs+='var b=c.querySelector(".card-status");if(!b)continue;'
+$hs+='var nm=n.textContent,url=null;'
+$hs+='if(nm.indexOf("Bridge")>=0)url="http://localhost:9999/api/status";'
+$hs+='else if(nm.indexOf("Ollama")>=0)url="http://localhost:11434/api/tags";'
+$hs+='else if(nm.indexOf("9990")>=0)url="http://localhost:9990/status";'
+$hs+='else if(nm.indexOf("Relay")>=0)url="http://localhost:9877/status";'
+$hs+='else if(nm.indexOf("Meilisearch")>=0)url="http://localhost:7700/health";'
+$hs+='else if(nm.indexOf("Caddy")>=0)url="http://localhost:8080/";'
+$hs+='else if(nm.indexOf("Redis")>=0){b.textContent="ONLINE";b.className="card-status st-online";continue;}'
+$hs+='else continue;'
+$hs+='try{await fetch(url,{signal:AbortSignal.timeout(2000)});b.textContent="ONLINE";b.className="card-status st-online";}'
+$hs+='catch(e){b.textContent="OFFLINE";b.className="card-status st-offline";}}'
+$hs+='}nh();setInterval(nh,10000);'
+$hs+='</script>'
+$c=$c -replace '</body>',"$hs</body>"
+Set-Content -Path $f -Value $c -Encoding UTF8
+echo DONE

@@ -1,0 +1,218 @@
+// ============================================================================
+// nova_audit_engine.nova — Deep Codebase Audit Engine
+// ============================================================================
+// Uses HiveMind's model army to analyze NovaX services for:
+//   - v1.3→v1.4 upgrade opportunities
+//   - Bug patterns (dict_set without reassign, localhost vs 127.0.0.1)
+//   - Dead code detection
+//   - Quality scoring
+//
+// Uses v1.4 features: ??, default params, in operator, spread
+// Port: 9938 | Ternary Micro-Tool
+// ============================================================================
+
+import3 "C:\\NovaX\\stdlib\\circuit3.nova"
+import3 "C:\\NovaX\\stdlib\\retry3.nova"
+import3 "C:\\NovaX\\stdlib\\metrics3.nova"
+
+let PORT = 9938
+let SERVICE = "nova-audit-engine"
+let VERSION = "1.0.0"
+let server = tserve(PORT, SERVICE)
+
+let _metrics = metrics3_new("audit")
+let _audit_results = {}
+
+// ── Bug Patterns to Detect ────────────────────────────────────────
+let BUG_PATTERNS = [
+    {"name": "dict_set_no_reassign", "pattern": "dict_set(", "anti_pattern": "= dict_set(", "severity": "high", "msg": "dict_set() without reassignment — value will be lost"},
+    {"name": "localhost_usage", "pattern": "localhost:", "anti_pattern": "127.0.0.1", "severity": "medium", "msg": "Using localhost instead of 127.0.0.1 — IPv6 2s penalty"},
+    {"name": "while_not_while3", "pattern": "while ", "anti_pattern": "while3 ", "severity": "low", "msg": "Using 'while' instead of 'while3' — not ternary-native"},
+    {"name": "if_not_if3", "pattern": "if ", "anti_pattern": "if3 ", "severity": "low", "msg": "Using 'if' instead of 'if3' — not ternary-native"},
+    {"name": "break_not_break3", "pattern": "break", "anti_pattern": "break3", "severity": "low", "msg": "Using 'break' instead of 'break3'"}
+]
+
+// ── v1.4 Feature Detection ────────────────────────────────────────
+let V14_FEATURES = [
+    {"name": "null_coalesce", "pattern": "??", "desc": "Null coalescing operator"},
+    {"name": "range_op", "pattern": "..", "desc": "Range operator"},
+    {"name": "spread_op", "pattern": "...", "desc": "Spread operator"},
+    {"name": "in_op", "pattern": " in ", "desc": "In membership operator"},
+    {"name": "default_params", "pattern": " = ", "desc": "Default parameters (in fn signatures)"}
+]
+
+// ── Scan a single file for issues ─────────────────────────────────
+fn audit_file(filepath) {
+    let content = try3 { read_file(filepath) } fail { "" }
+    if3 len(content) == 0 {
+        return {"file": filepath, "trit": -1, "error": "cannot read"}
+    }
+    let lines = split(content, "\n")
+    let issues = []
+    let v14_usage = {}
+    let line_count = len(lines)
+
+    // Check each bug pattern
+    let pi = 0
+    while3 pi < len(BUG_PATTERNS) {
+        let pat = BUG_PATTERNS[pi]
+        let pat_name = dict_get(pat, "name") ?? "unknown"
+        let pattern = dict_get(pat, "pattern") ?? ""
+        let anti = dict_get(pat, "anti_pattern") ?? ""
+        let sev = dict_get(pat, "severity") ?? "low"
+        let msg = dict_get(pat, "msg") ?? ""
+        let li = 0
+        while3 li < line_count {
+            let line = lines[li]
+            let trimmed = trim(line)
+            // Skip comments
+            if3 starts_with(trimmed, "//") {
+                li = li + 1
+                continue3
+            }
+            if3 contains(trimmed, pattern) {
+                // Check if anti-pattern is also present (means it's correct usage)
+                if3 contains(trimmed, anti) != true {
+                    issues = append(issues, {
+                        "line": li + 1,
+                        "pattern": pat_name,
+                        "severity": sev,
+                        "msg": msg,
+                        "code": trimmed
+                    })
+                }
+            }
+            li = li + 1
+        }
+        pi = pi + 1
+    }
+
+    // Check v1.4 feature usage
+    let fi = 0
+    while3 fi < len(V14_FEATURES) {
+        let feat = V14_FEATURES[fi]
+        let fname = dict_get(feat, "name") ?? ""
+        let fpat = dict_get(feat, "pattern") ?? ""
+        let found = 0
+        let li = 0
+        while3 li < line_count {
+            if3 contains(lines[li], fpat) {
+                found = found + 1
+            }
+            li = li + 1
+        }
+        v14_usage = dict_set(v14_usage, fname, found)
+        fi = fi + 1
+    }
+
+    // Calculate quality score (0-100)
+    let high_issues = 0
+    let med_issues = 0
+    let low_issues = 0
+    let qi = 0
+    while3 qi < len(issues) {
+        let sev = dict_get(issues[qi], "severity") ?? "low"
+        if3 sev == "high" { high_issues = high_issues + 1 }
+        if3 sev == "medium" { med_issues = med_issues + 1 }
+        if3 sev == "low" { low_issues = low_issues + 1 }
+        qi = qi + 1
+    }
+    let penalty = (high_issues * 10) + (med_issues * 5) + (low_issues * 1)
+    let score = 100 - penalty
+    if3 score < 0 { score = 0 }
+
+    let trit = 1
+    if3 score < 70 { trit = 0 }
+    if3 score < 40 { trit = -1 }
+
+    return {
+        "file": filepath,
+        "trit": trit,
+        "score": score,
+        "lines": line_count,
+        "issues": issues,
+        "issue_count": len(issues),
+        "high": high_issues,
+        "medium": med_issues,
+        "low": low_issues,
+        "v14_features": v14_usage
+    }
+}
+
+// ── Scan all .nova files in a directory ───────────────────────────
+fn audit_directory(dir_path = "C:\\NovaX") {
+    let files = try3 { dir_list(dir_path) } fail { [] }
+    let results = []
+    let total_issues = 0
+    let total_files = 0
+    let total_lines = 0
+
+    let i = 0
+    while3 i < len(files) {
+        let f = files[i]
+        if3 ends_with(f, ".nova") {
+            let filepath = dir_path + "\\" + f
+            let result = audit_file(filepath)
+            results = append(results, result)
+            total_issues = total_issues + (dict_get(result, "issue_count") ?? 0)
+            total_lines = total_lines + (dict_get(result, "lines") ?? 0)
+            total_files = total_files + 1
+        }
+        i = i + 1
+    }
+
+    let avg_score = 0
+    if3 total_files > 0 {
+        let sum = 0
+        let j = 0
+        while3 j < len(results) {
+            sum = sum + (dict_get(results[j], "score") ?? 0)
+            j = j + 1
+        }
+        avg_score = sum / total_files
+    }
+
+    return {
+        "directory": dir_path,
+        "total_files": total_files,
+        "total_lines": total_lines,
+        "total_issues": total_issues,
+        "avg_score": avg_score,
+        "results": results
+    }
+}
+
+// ── HTTP Endpoints ────────────────────────────────────────────────
+
+troute(server, "GET", "/health", "handle_health")
+fn handle_health(req) {
+    return {"ok": true, "service": SERVICE, "version": VERSION, "port": PORT}
+}
+
+troute(server, "POST", "/audit/file", "handle_audit_file")
+fn handle_audit_file(req) {
+    let body = json_decode(req["body"])
+    let filepath = dict_get(body, "file") ?? ""
+    if3 len(filepath) == 0 {
+        return {"ok": false, "error": "provide 'file' path"}
+    }
+    _metrics = metrics3_inc(_metrics, "audits")
+    return audit_file(filepath)
+}
+
+troute(server, "POST", "/audit/directory", "handle_audit_dir")
+fn handle_audit_dir(req) {
+    let body = json_decode(req["body"])
+    let dir = dict_get(body, "directory") ?? "C:\\NovaX"
+    _metrics = metrics3_inc(_metrics, "dir_audits")
+    return audit_directory(dir)
+}
+
+troute(server, "GET", "/audit/stats", "handle_stats")
+fn handle_stats(req) {
+    return metrics3_report(_metrics)
+}
+
+// ── Startup ──
+print("[AUDIT] Nova Audit Engine v" + VERSION + " starting on :" + str(PORT))
+tstart(server)

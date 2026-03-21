@@ -1,0 +1,689 @@
+// ================================================================
+// nova_quantize.nova -- Ternary Quantization Service v2.0.0
+// ================================================================
+// Converts arbitrary data to/from ternary-encoded representations.
+// Implements TZip packing (5 trits -> 1 byte, 3^5=243 states)
+// and provides density analysis for ternary-encoded payloads.
+//
+// Ternary Math:
+//   A trit has 3 states: -1, 0, +1  (balanced ternary)
+//   1 trit encodes log2(3) = 1.585 bits of information
+//   5 trits = 3^5 = 243 unique values, fits in 1 byte (0-242)
+//   This is TZip packing -- 95% byte utilization (243/256)
+//   7 trits = 3^7 = 2187 = one harmonic block (H7)
+//   13 trits = 3^13 = 1,594,323 = carrier frame (H13)
+//
+// Balanced ternary encoding of a byte (0-255):
+//   value = t4*81 + t3*27 + t2*9 + t1*3 + t0*1   (offset by 121)
+//   Each ti in {-1, 0, +1}, stored as {0, 1, 2} in the trit array
+//
+// Port: 9944 | Trit: +1 success, 0 partial, -1 error
+// ================================================================
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+import3("C:/NovaX/lib/nova_http_utils.nova")
+
+let PORT = 9944
+let VERSION = "2.0.0"
+let SERVICE_NAME = "nova-quantize"
+let _ns = ns_init_counters()
+
+// ── 3-5-7-13 Harmonic Constants ──
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK_SIZE = 2187           // 3^7 = harmonic block
+let TZIP_STATES = 243           // 3^5 = TZip pack size
+let TZIP_WIDTH = 5              // 5 trits per TZip byte
+let TERNARY_DENSITY = 1585      // 1.585x info density (x1000)
+let TRIT_OFFSET = 121           // (243-1)/2 = balanced ternary center
+
+// ── Quantization statistics (running counters) ──
+let _stats = {}
+_stats = dict_set(_stats, "total_quantized", 0)
+_stats = dict_set(_stats, "total_packed", 0)
+_stats = dict_set(_stats, "total_unpacked", 0)
+_stats = dict_set(_stats, "total_density_checks", 0)
+_stats = dict_set(_stats, "total_trits_produced", 0)
+_stats = dict_set(_stats, "total_bytes_packed", 0)
+_stats = dict_set(_stats, "boot_time", time())
+
+// ================================================================
+// CORE: Value to balanced ternary trits
+// ================================================================
+// Converts a numeric value (0-242) into 5 balanced ternary trits.
+// Each trit is -1, 0, or +1.
+//
+// Algorithm:
+//   1. Offset value by -121 to center at 0 (balanced range: -121 to +121)
+//   2. Repeatedly divide by 3, remainder determines trit:
+//      remainder 0 -> trit 0
+//      remainder 1 -> trit +1
+//      remainder 2 -> trit -1 (carry +1 to next position)
+//   Simplified: we use positional extraction with powers of 3
+//
+// Powers of 3: 3^0=1, 3^1=3, 3^2=9, 3^3=27, 3^4=81
+// ================================================================
+fn value_to_trits(val) {
+    // Clamp to valid TZip range [0, 242]
+    let v = val
+    if3 v < 0 { v = 0 }
+    if3 v > 242 { v = 242 }
+
+    // Convert to balanced ternary centered at 121
+    // balanced = val - 121, range [-121, +121]
+    let balanced = v - TRIT_OFFSET
+
+    // Extract 5 trits from balanced value
+    // We work with the offset value and extract digit by digit
+    let trits = []
+    let work = v
+    let i = 0
+
+    // Extract 5 base-3 digits (unbalanced first)
+    let d0 = work - ((work / 3) * 3)
+    work = work / 3
+    let d1 = work - ((work / 3) * 3)
+    work = work / 3
+    let d2 = work - ((work / 3) * 3)
+    work = work / 3
+    let d3 = work - ((work / 3) * 3)
+    work = work / 3
+    let d4 = work - ((work / 3) * 3)
+
+    // Convert unbalanced digits {0,1,2} to balanced trits {-1,0,+1}
+    // 0 -> -1, 1 -> 0, 2 -> +1
+    let t0 = d0 - 1
+    let t1 = d1 - 1
+    let t2 = d2 - 1
+    let t3 = d3 - 1
+    let t4 = d4 - 1
+
+    trits = append(trits, t4)
+    trits = append(trits, t3)
+    trits = append(trits, t2)
+    trits = append(trits, t1)
+    trits = append(trits, t0)
+
+    return trits
+}
+
+// ================================================================
+// CORE: Balanced ternary trits back to value
+// ================================================================
+// Reverses value_to_trits: 5 trits -> value in [0, 242]
+//
+// Each trit ti in {-1, 0, +1} stored as {0, 1, 2} internally
+// value = (t4+1)*81 + (t3+1)*27 + (t2+1)*9 + (t1+1)*3 + (t0+1)
+// ================================================================
+fn trits_to_value(trits) {
+    // Need exactly 5 trits
+    let count = len(trits)
+    if3 count < 5 { return -1 }
+
+    let t4 = trits[0]
+    let t3 = trits[1]
+    let t2 = trits[2]
+    let t1 = trits[3]
+    let t0 = trits[4]
+
+    // Convert balanced trits {-1,0,+1} back to unbalanced {0,1,2}
+    let d4 = t4 + 1
+    let d3 = t3 + 1
+    let d2 = t2 + 1
+    let d1 = t1 + 1
+    let d0 = t0 + 1
+
+    // Reconstruct: d4*81 + d3*27 + d2*9 + d1*3 + d0
+    let val = (d4 * 81) + (d3 * 27) + (d2 * 9) + (d1 * 3) + d0
+    return val
+}
+
+// ================================================================
+// CORE: Quantize a string to ternary trit array
+// ================================================================
+// Each character's ASCII code (0-255) is mapped to a value 0-242
+// (clamped to TZip range), then converted to 5 balanced trits.
+// Result: array of trits, length = input_length * 5
+// ================================================================
+fn quantize_string(input) {
+    let chars = split(input, "")
+    let all_trits = []
+    let char_count = len(chars)
+    let idx = 0
+
+    for3 ch in chars {
+        // Get character code, clamp to TZip range
+        let code = char_code(ch)
+        if3 code > 242 { code = 242 }
+
+        // Convert to 5 balanced trits
+        let trits = value_to_trits(code)
+        for3 t in trits {
+            all_trits = append(all_trits, t)
+        }
+        idx = idx + 1
+    }
+
+    return all_trits
+}
+
+// ================================================================
+// CORE: Dequantize trit array back to string
+// ================================================================
+// Takes array of trits, groups into chunks of 5, converts each
+// chunk back to a character code, reconstructs string.
+// ================================================================
+fn dequantize_trits(trits) {
+    let total = len(trits)
+    let chars = []
+    let pos = 0
+
+    // Process 5 trits at a time
+    while3 pos + 4 < total {
+        let chunk = []
+        chunk = append(chunk, trits[pos])
+        chunk = append(chunk, trits[pos + 1])
+        chunk = append(chunk, trits[pos + 2])
+        chunk = append(chunk, trits[pos + 3])
+        chunk = append(chunk, trits[pos + 4])
+
+        let val = trits_to_value(chunk)
+        if3 val >= 0 {
+            let ch = from_char_code(val)
+            chars = append(chars, ch)
+        }
+        pos = pos + 5
+    }
+
+    return join(chars, "")
+}
+
+// ================================================================
+// CORE: TZip Pack -- 5 trits into 1 byte (3^5=243)
+// ================================================================
+// Packing formula:
+//   byte = (t0+1)*1 + (t1+1)*3 + (t2+1)*9 + (t3+1)*27 + (t4+1)*81
+//   Range: [0, 242] -- fits in a single unsigned byte
+//   Utilization: 243/256 = 94.9% of byte space used
+//
+// This is the fundamental TZip compression unit.
+// 5 trits encode 5 * 1.585 = 7.925 bits of ternary information
+// packed into 8 binary bits -- near-perfect efficiency.
+// ================================================================
+fn tzip_pack(trits) {
+    let total = len(trits)
+    let packed = []
+    let pos = 0
+    let bytes_out = 0
+
+    while3 pos + 4 < total {
+        let t4 = trits[pos]
+        let t3 = trits[pos + 1]
+        let t2 = trits[pos + 2]
+        let t1 = trits[pos + 3]
+        let t0 = trits[pos + 4]
+
+        // Pack: (t4+1)*81 + (t3+1)*27 + (t2+1)*9 + (t1+1)*3 + (t0+1)
+        let byte_val = ((t4 + 1) * 81) + ((t3 + 1) * 27) + ((t2 + 1) * 9) + ((t1 + 1) * 3) + (t0 + 1)
+        packed = append(packed, byte_val)
+        bytes_out = bytes_out + 1
+        pos = pos + 5
+    }
+
+    // Handle remaining trits (pad with 0 = neutral)
+    let remaining = total - pos
+    if3 remaining > 0 {
+        let t4 = 0
+        let t3 = 0
+        let t2 = 0
+        let t1 = 0
+        let t0 = 0
+        if3 remaining >= 1 { t4 = trits[pos] }
+        if3 remaining >= 2 { t3 = trits[pos + 1] }
+        if3 remaining >= 3 { t2 = trits[pos + 2] }
+        if3 remaining >= 4 { t1 = trits[pos + 3] }
+        let byte_val = ((t4 + 1) * 81) + ((t3 + 1) * 27) + ((t2 + 1) * 9) + ((t1 + 1) * 3) + (t0 + 1)
+        packed = append(packed, byte_val)
+        bytes_out = bytes_out + 1
+    }
+
+    return {
+        "bytes": packed,
+        "byte_count": bytes_out,
+        "trit_count": total,
+        "remaining_trits": remaining
+    }
+}
+
+// ================================================================
+// CORE: TZip Unpack -- 1 byte back to 5 trits
+// ================================================================
+// Reverse of tzip_pack:
+//   Given byte_val in [0, 242], extract 5 balanced trits
+//   by dividing by powers of 3 and subtracting 1.
+// ================================================================
+fn tzip_unpack(packed_bytes, original_trit_count) {
+    let all_trits = []
+    let total_expected = original_trit_count
+
+    for3 byte_val in packed_bytes {
+        let trits = value_to_trits(byte_val)
+        for3 t in trits {
+            all_trits = append(all_trits, t)
+        }
+    }
+
+    // Trim to original trit count (remove padding)
+    if3 total_expected > 0 {
+        let trimmed = []
+        let idx = 0
+        for3 t in all_trits {
+            if3 idx < total_expected {
+                trimmed = append(trimmed, t)
+            }
+            idx = idx + 1
+        }
+        return trimmed
+    }
+
+    return all_trits
+}
+
+// ================================================================
+// CORE: Ternary Density Calculation
+// ================================================================
+// Density ratio = (ternary_info_bits) / (binary_bits_used)
+//
+// For TZip: 5 trits * 1.585 bits = 7.925 bits in 8 binary bits
+//   density = 7.925 / 8 = 0.990 (99% efficient)
+//
+// For raw data: measures how much ternary information
+// is encoded per binary byte of storage.
+//
+// Trit distribution analysis:
+//   +1 count, 0 count, -1 count -> entropy calculation
+//   Perfect balance: equal distribution = maximum entropy
+//   Skewed: more zeros = higher compressibility (sparsity)
+// ================================================================
+fn calc_density(trits) {
+    let total = len(trits)
+    if3 total == 0 {
+        return {"density": 0, "trit": -1, "error": "empty_input"}
+    }
+
+    // Count trit distribution
+    let pos_count = 0
+    let zero_count = 0
+    let neg_count = 0
+
+    for3 t in trits {
+        if3 t == 1 { pos_count = pos_count + 1 }
+        if3 t == 0 { zero_count = zero_count + 1 }
+        if3 t == -1 { neg_count = neg_count + 1 }
+    }
+
+    // Ternary info bits = total_trits * log2(3) = total * 1.585
+    let info_bits = (total * TERNARY_DENSITY) / 1000
+
+    // Binary bytes needed for TZip packing
+    let packed_bytes = (total + 4) / 5
+    let binary_bits = packed_bytes * 8
+
+    // Density ratio: how efficiently ternary fills binary storage
+    // density_pct = (info_bits * 100) / binary_bits
+    let density_pct = 0
+    if3 binary_bits > 0 {
+        density_pct = (info_bits * 100) / binary_bits
+    }
+
+    // Sparsity: fraction of zero trits (important for compute skip)
+    // sparsity_pct = (zero_count * 100) / total
+    let sparsity_pct = (zero_count * 100) / total
+
+    // Balance score: how evenly distributed are the trits?
+    // Perfect balance = 33.3% each. Deviation from perfect = imbalance.
+    // balance = 100 - max_deviation_from_33%
+    let third = total / 3
+    let dev_pos = pos_count - third
+    if3 dev_pos < 0 { dev_pos = 0 - dev_pos }
+    let dev_zero = zero_count - third
+    if3 dev_zero < 0 { dev_zero = 0 - dev_zero }
+    let dev_neg = neg_count - third
+    if3 dev_neg < 0 { dev_neg = 0 - dev_neg }
+
+    let max_dev = dev_pos
+    if3 dev_zero > max_dev { max_dev = dev_zero }
+    if3 dev_neg > max_dev { max_dev = dev_neg }
+
+    let balance_pct = 0
+    if3 third > 0 {
+        balance_pct = 100 - ((max_dev * 100) / third)
+    }
+
+    // Density trit: +1 if >= 90%, 0 if >= 70%, -1 if < 70%
+    let density_trit = -1
+    if3 density_pct >= 70 { density_trit = 0 }
+    if3 density_pct >= 90 { density_trit = 1 }
+
+    return {
+        "ok": 1,
+        "trit": density_trit,
+        "total_trits": total,
+        "info_bits": info_bits,
+        "packed_bytes": packed_bytes,
+        "binary_bits": binary_bits,
+        "density_pct": density_pct,
+        "sparsity_pct": sparsity_pct,
+        "balance_pct": balance_pct,
+        "distribution": {
+            "positive": pos_count,
+            "zero": zero_count,
+            "negative": neg_count
+        },
+        "compression_vs_ascii": {
+            "ascii_bytes": total / 5,
+            "tzip_bytes": packed_bytes,
+            "ratio": "1:1 (ternary preserves information density)"
+        },
+        "tzip_utilization": "94.9% (243/256 byte states used)"
+    }
+}
+
+// ================================================================
+// Handlers
+// ================================================================
+
+// GET /health -- service health check
+fn handle_health(req) {
+    return ns_health_dict(SERVICE_NAME, VERSION, PORT, _ns)
+}
+
+// POST /quantize -- convert data to ternary-encoded representation
+// Body: { "data": "string to quantize" }
+// Returns: trit array + metadata
+fn handle_quantize(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let data = dict_get(body, "data") ?? ""
+
+    let data_str = str(data)
+    if3 len(data_str) == 0 {
+        _ns = ns_record(_ns, 0, 1)
+        return {"ok": -1, "trit": -1, "error": "missing 'data' field"}
+    }
+
+    let result = try3 {
+        let trits = quantize_string(data_str)
+        let trit_count = len(trits)
+        let char_count = len(split(data_str, ""))
+
+        // Update running stats
+        let prev_q = dict_get(_stats, "total_quantized") ?? 0
+        _stats = dict_set(_stats, "total_quantized", prev_q + 1)
+        let prev_t = dict_get(_stats, "total_trits_produced") ?? 0
+        _stats = dict_set(_stats, "total_trits_produced", prev_t + trit_count)
+
+        // Verify roundtrip
+        let roundtrip = dequantize_trits(trits)
+        let roundtrip_ok = 0
+        if3 roundtrip == data_str { roundtrip_ok = 1 } fail {
+            "ok": 1,
+            "trit": 1,
+            "input": data_str,
+            "input_chars": char_count,
+            "trits": trits,
+            "trit_count": trit_count,
+            "trits_per_char": TZIP_WIDTH,
+            "info_bits": (trit_count * TERNARY_DENSITY) / 1000,
+            "roundtrip_verified": roundtrip_ok,
+            "encoding": "balanced_ternary",
+            "trit_values": "{-1, 0, +1}"
+        }
+    } {
+        _ns = ns_record(_ns, 0, 1)
+        {"ok": -1, "trit": -1, "error": "quantization failed"}
+    }
+
+    return result
+}
+
+// POST /tzip -- TZip pack: 5 trits -> 1 byte (3^5=243)
+// Body: { "trits": [-1, 0, 1, ...] } OR { "data": "string to pack" }
+// Returns: packed byte array + metadata
+fn handle_tzip(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+
+    let result = try3 {
+        // Accept either raw trits or string data
+        let trits = dict_get(body, "trits") ?? null
+        let data = dict_get(body, "data") ?? ""
+
+        // If no trits provided, quantize the data string first
+        let use_trits = trits
+        if3 trits == null {
+            let data_str = str(data)
+            if3 len(data_str) == 0 {
+                _ns = ns_record(_ns, 0, 1)
+                return {"ok": -1, "trit": -1, "error": "provide 'trits' array or 'data' string"}
+            }
+            use_trits = quantize_string(data_str)
+        }
+
+        let trit_count = len(use_trits)
+        let packed = tzip_pack(use_trits)
+        let packed_bytes = dict_get(packed, "bytes") ?? []
+        let byte_count = dict_get(packed, "byte_count") ?? 0
+
+        // Update stats
+        let prev_p = dict_get(_stats, "total_packed") ?? 0
+        _stats = dict_set(_stats, "total_packed", prev_p + 1)
+        let prev_b = dict_get(_stats, "total_bytes_packed") ?? 0
+        _stats = dict_set(_stats, "total_bytes_packed", prev_b + byte_count)
+
+        // Compression ratio: trit_count trits -> byte_count bytes
+        // Each trit would naively take 1 byte, so ratio = trit_count / byte_count
+        let compression_ratio = 0
+        if3 byte_count > 0 {
+            compression_ratio = trit_count / byte_count
+        }
+
+        {
+            "ok": 1,
+            "trit": 1,
+            "packed_bytes": packed_bytes,
+            "byte_count": byte_count,
+            "trit_count": trit_count,
+            "compression_ratio": compression_ratio,
+            "tzip_states": TZIP_STATES,
+            "tzip_width": TZIP_WIDTH,
+            "packing": "5 trits -> 1 byte (3^5=243)",
+            "byte_utilization": "94.9% (243/256)"
+        }
+    } {
+        _ns = ns_record(_ns, 0, 1)
+        {"ok": -1, "trit": -1, "error": "tzip packing failed"}
+    }
+
+    return result
+}
+
+// POST /tunzip -- TZip unpack: 1 byte -> 5 trits
+// Body: { "packed_bytes": [121, 200, ...], "trit_count": 10 }
+// Returns: unpacked trit array + decoded string
+fn handle_tunzip(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+
+    let result = try3 {
+        let packed_bytes = dict_get(body, "packed_bytes") ?? []
+        let trit_count = dict_get(body, "trit_count") ?? 0
+
+        if3 len(packed_bytes) == 0 {
+            _ns = ns_record(_ns, 0, 1)
+            return {"ok": -1, "trit": -1, "error": "missing 'packed_bytes' array"}
+        }
+
+        // If trit_count not specified, assume full packing (5 per byte)
+        let expected = trit_count
+        if3 expected == 0 {
+            expected = len(packed_bytes) * TZIP_WIDTH
+        }
+
+        let trits = tzip_unpack(packed_bytes, expected)
+        let actual_trits = len(trits)
+
+        // Try to decode as string
+        let decoded = dequantize_trits(trits)
+
+        // Update stats
+        let prev_u = dict_get(_stats, "total_unpacked") ?? 0
+        _stats = dict_set(_stats, "total_unpacked", prev_u + 1)
+
+        {
+            "ok": 1,
+            "trit": 1,
+            "trits": trits,
+            "trit_count": actual_trits,
+            "decoded_string": decoded,
+            "byte_count": len(packed_bytes),
+            "unpacking": "1 byte -> 5 trits (3^5=243)"
+        }
+    } {
+        _ns = ns_record(_ns, 0, 1)
+        {"ok": -1, "trit": -1, "error": "tzip unpacking failed"}
+    }
+
+    return result
+}
+
+// POST /density -- calculate ternary density ratio
+// Body: { "trits": [-1, 0, 1, ...] } OR { "data": "string to analyze" }
+// Returns: density metrics, sparsity, balance score
+fn handle_density(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+
+    let result = try3 {
+        let trits = dict_get(body, "trits") ?? null
+        let data = dict_get(body, "data") ?? ""
+
+        let use_trits = trits
+        if3 trits == null {
+            let data_str = str(data)
+            if3 len(data_str) == 0 {
+                _ns = ns_record(_ns, 0, 1)
+                return {"ok": -1, "trit": -1, "error": "provide 'trits' array or 'data' string"}
+            }
+            use_trits = quantize_string(data_str)
+        }
+
+        // Update stats
+        let prev_d = dict_get(_stats, "total_density_checks") ?? 0
+        _stats = dict_set(_stats, "total_density_checks", prev_d + 1)
+
+        calc_density(use_trits)
+    } {
+        _ns = ns_record(_ns, 0, 1)
+        {"ok": -1, "trit": -1, "error": "density calculation failed"}
+    }
+
+    return result
+}
+
+// GET /stats -- quantization service statistics
+fn handle_stats(req) {
+    _ns = ns_record(_ns, 0, 0)
+
+    let now = time()
+    let boot = dict_get(_stats, "boot_time") ?? now
+    let uptime = now - boot
+
+    let total_q = dict_get(_stats, "total_quantized") ?? 0
+    let total_p = dict_get(_stats, "total_packed") ?? 0
+    let total_u = dict_get(_stats, "total_unpacked") ?? 0
+    let total_d = dict_get(_stats, "total_density_checks") ?? 0
+    let total_trits = dict_get(_stats, "total_trits_produced") ?? 0
+    let total_bytes = dict_get(_stats, "total_bytes_packed") ?? 0
+    let total_ops = total_q + total_p + total_u + total_d
+
+    // Efficiency: trits produced per byte packed
+    let efficiency = 0
+    if3 total_bytes > 0 {
+        efficiency = total_trits / total_bytes
+    }
+
+    // Service health trit: +1 if active, 0 if idle, -1 if errored
+    let stats_trit = 0
+    if3 total_ops > 0 { stats_trit = 1 }
+
+    return {
+        "ok": 1,
+        "trit": stats_trit,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_seconds": uptime,
+        "operations": {
+            "total": total_ops,
+            "quantized": total_q,
+            "packed": total_p,
+            "unpacked": total_u,
+            "density_checks": total_d
+        },
+        "throughput": {
+            "total_trits_produced": total_trits,
+            "total_bytes_packed": total_bytes,
+            "trits_per_packed_byte": efficiency
+        },
+        "constants": {
+            "h3": H3,
+            "h5": H5,
+            "h7": H7,
+            "h13": H13,
+            "block_size": BLOCK_SIZE,
+            "tzip_states": TZIP_STATES,
+            "tzip_width": TZIP_WIDTH,
+            "ternary_density": "1.585 bits/trit",
+            "trit_offset": TRIT_OFFSET
+        },
+        "math": {
+            "tzip_packing": "5 trits -> 1 byte (3^5=243 of 256 states)",
+            "byte_utilization": "94.9%",
+            "info_per_trit": "log2(3) = 1.585 bits",
+            "info_per_tzip_byte": "7.925 bits (5 * 1.585)",
+            "harmonic_block": "3^7 = 2187 trits = 437.4 TZip bytes",
+            "carrier_frame": "3^13 = 1,594,323 trits"
+        }
+    }
+}
+
+// ================================================================
+// Routes
+// ================================================================
+let server = tserve(PORT, SERVICE_NAME)
+troute(server, "GET",  "/health",   "handle_health")
+troute(server, "POST", "/quantize", "handle_quantize")
+troute(server, "POST", "/tzip",     "handle_tzip")
+troute(server, "POST", "/tunzip",   "handle_tunzip")
+troute(server, "POST", "/density",  "handle_density")
+troute(server, "GET",  "/stats",    "handle_stats")
+
+print("================================================")
+print("[quantize] NovaX Ternary Quantization v2.0.0")
+print("[quantize] Port: 9944 | Encoding: balanced ternary")
+print("[quantize] TZip: 5 trits -> 1 byte (3^5=243)")
+print("[quantize] Harmonics: H3=3 H5=5 H7=7 H13=13")
+print("[quantize] Endpoints:")
+print("[quantize]   GET  /health   - service status")
+print("[quantize]   POST /quantize - data -> ternary trits")
+print("[quantize]   POST /tzip     - pack 5 trits -> 1 byte")
+print("[quantize]   POST /tunzip   - unpack 1 byte -> 5 trits")
+print("[quantize]   POST /density  - ternary density analysis")
+print("[quantize]   GET  /stats    - quantization statistics")
+print("================================================")
+
+tstart(server)

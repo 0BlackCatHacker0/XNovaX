@@ -1,0 +1,364 @@
+// NovaX TYAML Micro-Tool v1.0 -- Pure NovaLang (wraps yq CLI)
+// Operations: parse, validate, to_json, to_yaml, query, set, merge, keys
+//
+// Usage: novalang.exe tyaml.nova <operation> [args...]
+//   parse <yaml_file>                    -- Parse YAML file to JSON
+//   validate <yaml_file>                 -- Validate YAML syntax
+//   to_json <yaml_file> <out_json>       -- Convert YAML to JSON file
+//   to_yaml <json_file> <out_yaml>       -- Convert JSON to YAML file
+//   query <yaml_file> <dot_path>         -- Query value at dot-path
+//   set <yaml_file> <dot_path> <value>   -- Set value at dot-path (writes back)
+//   merge <base_file> <overlay_file>     -- Deep merge two YAML files
+//   keys <yaml_file> [depth]             -- List keys at given depth
+
+let YQ = "C:/NovaX/tools/yq.exe"
+let argv = args()
+let op = ""
+if3 len(argv) > 0 {
+    op = lower(argv[0])
+}
+
+// ============================================================================
+// HELPER: check file exists
+// ============================================================================
+fn check_exists(fpath) {
+    let win_path = replace(fpath, "/", "\\")
+    let result = trim(shell("if exist \"" + win_path + "\" (echo yes) else (echo no)"))
+    if3 contains(result, "yes") {
+        return true
+    }
+    return false
+}
+
+// ============================================================================
+// OP: parse -- Read YAML and output as JSON
+// ============================================================================
+fn do_parse() {
+    if3 len(argv) < 2 {
+        print("{\"ok\":false,\"error\":\"yaml_file required\"}")
+        return 0
+    }
+    let fpath = argv[1]
+    if3 check_exists(fpath) == false {
+        print("{\"ok\":false,\"error\":\"file not found\"}")
+        return 0
+    }
+    let win_path = replace(fpath, "/", "\\")
+    let cmd = YQ + " -o json \"" + win_path + "\""
+    let output = trim(shell(cmd))
+
+    if3 len(output) == 0 {
+        print("{\"ok\":false,\"error\":\"empty or invalid YAML\"}")
+        return 0
+    }
+
+    // Wrap result in our standard format
+    let r = {}
+    r = dict_set(r, "ok", true)
+    r = dict_set(r, "json_str", output)
+    // Try to get key count
+    let keys_cmd = YQ + " \"keys | length\" \"" + win_path + "\""
+    let key_count_str = trim(shell(keys_cmd))
+    let key_count = 0
+    if3 len(key_count_str) > 0 {
+        key_count = to_int(key_count_str)
+    }
+    r = dict_set(r, "key_count", key_count)
+    print(json_encode(r))
+    return 0
+}
+
+// ============================================================================
+// OP: validate -- Check if YAML is valid
+// ============================================================================
+fn do_validate() {
+    if3 len(argv) < 2 {
+        print("{\"ok\":false,\"error\":\"yaml_file required\"}")
+        return 0
+    }
+    let fpath = argv[1]
+    if3 check_exists(fpath) == false {
+        print("{\"ok\":false,\"error\":\"file not found\"}")
+        return 0
+    }
+    let win_path = replace(fpath, "/", "\\")
+    // Try to parse -- if yq succeeds, YAML is valid
+    let cmd = YQ + " \"true\" \"" + win_path + "\" 2>&1"
+    let output = trim(shell(cmd))
+
+    let valid = true
+    let error_msg = ""
+    if3 contains(lower(output), "error") {
+        valid = false
+        error_msg = output
+    }
+    if3 contains(lower(output), "bad") {
+        valid = false
+        error_msg = output
+    }
+
+    // Get line count and file size
+    let content = read_file(fpath)
+    let lines = split(content, "\n")
+    let line_count = len(lines)
+    let char_count = len(content)
+
+    let r = {}
+    r = dict_set(r, "ok", true)
+    r = dict_set(r, "valid", valid)
+    r = dict_set(r, "line_count", line_count)
+    r = dict_set(r, "char_count", char_count)
+    if3 valid == false {
+        r = dict_set(r, "error", error_msg)
+    }
+    print(json_encode(r))
+    return 0
+}
+
+// ============================================================================
+// OP: to_json -- Convert YAML file to JSON file
+// ============================================================================
+fn do_to_json() {
+    if3 len(argv) < 3 {
+        print("{\"ok\":false,\"error\":\"yaml_file and out_json required\"}")
+        return 0
+    }
+    let fpath = argv[1]
+    let out_path = argv[2]
+    if3 check_exists(fpath) == false {
+        print("{\"ok\":false,\"error\":\"input file not found\"}")
+        return 0
+    }
+    let win_in = replace(fpath, "/", "\\")
+    let win_out = replace(out_path, "/", "\\")
+    let cmd = YQ + " -o json \"" + win_in + "\" > \"" + win_out + "\""
+    shell(cmd)
+
+    // Verify output
+    if3 check_exists(out_path) {
+        let size_cmd = "for %I in (\"" + win_out + "\") do @echo %~zI"
+        let out_size = to_int(trim(shell(size_cmd)))
+        let r = {}
+        r = dict_set(r, "ok", true)
+        r = dict_set(r, "output_path", out_path)
+        r = dict_set(r, "output_size", out_size)
+        print(json_encode(r))
+    }
+    if3 check_exists(out_path) == false {
+        print("{\"ok\":false,\"error\":\"conversion failed\"}")
+    }
+    return 0
+}
+
+// ============================================================================
+// OP: to_yaml -- Convert JSON file to YAML file
+// ============================================================================
+fn do_to_yaml() {
+    if3 len(argv) < 3 {
+        print("{\"ok\":false,\"error\":\"json_file and out_yaml required\"}")
+        return 0
+    }
+    let fpath = argv[1]
+    let out_path = argv[2]
+    if3 check_exists(fpath) == false {
+        print("{\"ok\":false,\"error\":\"input file not found\"}")
+        return 0
+    }
+    let win_in = replace(fpath, "/", "\\")
+    let win_out = replace(out_path, "/", "\\")
+    let cmd = YQ + " -P -o yaml \"" + win_in + "\" > \"" + win_out + "\""
+    shell(cmd)
+
+    if3 check_exists(out_path) {
+        let size_cmd = "for %I in (\"" + win_out + "\") do @echo %~zI"
+        let out_size = to_int(trim(shell(size_cmd)))
+        let r = {}
+        r = dict_set(r, "ok", true)
+        r = dict_set(r, "output_path", out_path)
+        r = dict_set(r, "output_size", out_size)
+        print(json_encode(r))
+    }
+    if3 check_exists(out_path) == false {
+        print("{\"ok\":false,\"error\":\"conversion failed\"}")
+    }
+    return 0
+}
+
+// ============================================================================
+// OP: query -- Get value at dot-path
+// ============================================================================
+fn do_query() {
+    if3 len(argv) < 3 {
+        print("{\"ok\":false,\"error\":\"yaml_file and dot_path required\"}")
+        return 0
+    }
+    let fpath = argv[1]
+    let dot_path = argv[2]
+    if3 check_exists(fpath) == false {
+        print("{\"ok\":false,\"error\":\"file not found\"}")
+        return 0
+    }
+    let win_path = replace(fpath, "/", "\\")
+
+    // Convert dot path (a.b.c) to yq path (.a.b.c)
+    let yq_path = "." + dot_path
+    let cmd = YQ + " -o json \"" + yq_path + "\" \"" + win_path + "\""
+    let output = trim(shell(cmd))
+
+    let val_type = "string"
+    if3 output == "null" {
+        val_type = "null"
+    }
+    if3 starts_with(output, "{") {
+        val_type = "object"
+    }
+    if3 starts_with(output, "[") {
+        val_type = "array"
+    }
+    if3 output == "true" {
+        val_type = "boolean"
+    }
+    if3 output == "false" {
+        val_type = "boolean"
+    }
+
+    let r = {}
+    r = dict_set(r, "ok", true)
+    r = dict_set(r, "path", dot_path)
+    r = dict_set(r, "value_str", output)
+    r = dict_set(r, "type", val_type)
+    print(json_encode(r))
+    return 0
+}
+
+// ============================================================================
+// OP: set -- Set value at dot-path and write back
+// ============================================================================
+fn do_set() {
+    if3 len(argv) < 4 {
+        print("{\"ok\":false,\"error\":\"yaml_file dot_path value required\"}")
+        return 0
+    }
+    let fpath = argv[1]
+    let dot_path = argv[2]
+    let new_value = argv[3]
+    if3 check_exists(fpath) == false {
+        print("{\"ok\":false,\"error\":\"file not found\"}")
+        return 0
+    }
+    let win_path = replace(fpath, "/", "\\")
+    let yq_path = "." + dot_path
+
+    // Determine if value is a string or number/bool
+    let value_expr = "\"" + new_value + "\""
+    // If it looks like a number or bool, don't quote
+    if3 new_value == "true" { value_expr = "true" }
+    if3 new_value == "false" { value_expr = "false" }
+    if3 new_value == "null" { value_expr = "null" }
+    // Check if numeric
+    let is_num = true
+    let ni = 0
+    while3 ni < len(new_value) {
+        let ch = slice(new_value, ni, ni + 1)
+        if3 contains("0123456789.-", ch) == false {
+            is_num = false
+            ni = len(new_value)
+        }
+        ni = ni + 1
+    }
+    if3 is_num == true {
+        if3 len(new_value) > 0 {
+            value_expr = new_value
+        }
+    }
+
+    let cmd = YQ + " -i \"" + yq_path + " = " + value_expr + "\" \"" + win_path + "\""
+    let output = trim(shell(cmd))
+
+    let r = {}
+    r = dict_set(r, "ok", true)
+    r = dict_set(r, "path", dot_path)
+    r = dict_set(r, "value", new_value)
+    r = dict_set(r, "file", fpath)
+    print(json_encode(r))
+    return 0
+}
+
+// ============================================================================
+// OP: merge -- Deep merge two YAML files
+// ============================================================================
+fn do_merge() {
+    if3 len(argv) < 3 {
+        print("{\"ok\":false,\"error\":\"base_file and overlay_file required\"}")
+        return 0
+    }
+    let base_file = argv[1]
+    let overlay_file = argv[2]
+    if3 check_exists(base_file) == false {
+        print("{\"ok\":false,\"error\":\"base file not found\"}")
+        return 0
+    }
+    if3 check_exists(overlay_file) == false {
+        print("{\"ok\":false,\"error\":\"overlay file not found\"}")
+        return 0
+    }
+    let win_base = replace(base_file, "/", "\\")
+    let win_overlay = replace(overlay_file, "/", "\\")
+
+    // yq merge: use eval-all with * operator for deep merge
+    let cmd = YQ + " eval-all \". as $item ireduce ({}; . * $item)\" \"" + win_base + "\" \"" + win_overlay + "\""
+    let output = trim(shell(cmd))
+
+    let r = {}
+    r = dict_set(r, "ok", true)
+    r = dict_set(r, "merged_yaml", output)
+    r = dict_set(r, "base", base_file)
+    r = dict_set(r, "overlay", overlay_file)
+    print(json_encode(r))
+    return 0
+}
+
+// ============================================================================
+// OP: keys -- List keys at given depth
+// ============================================================================
+fn do_keys() {
+    if3 len(argv) < 2 {
+        print("{\"ok\":false,\"error\":\"yaml_file required\"}")
+        return 0
+    }
+    let fpath = argv[1]
+    let depth = 1
+    if3 len(argv) > 2 {
+        depth = to_int(argv[2])
+    }
+    if3 check_exists(fpath) == false {
+        print("{\"ok\":false,\"error\":\"file not found\"}")
+        return 0
+    }
+    let win_path = replace(fpath, "/", "\\")
+
+    let cmd = YQ + " -o json \"keys\" \"" + win_path + "\""
+    let output = trim(shell(cmd))
+
+    let r = {}
+    r = dict_set(r, "ok", true)
+    r = dict_set(r, "keys_json", output)
+    r = dict_set(r, "depth", depth)
+    print(json_encode(r))
+    return 0
+}
+
+// ============================================================================
+// Dispatch
+// ============================================================================
+if3 op == "parse" { do_parse() }
+if3 op == "validate" { do_validate() }
+if3 op == "to_json" { do_to_json() }
+if3 op == "to_yaml" { do_to_yaml() }
+if3 op == "query" { do_query() }
+if3 op == "set" { do_set() }
+if3 op == "merge" { do_merge() }
+if3 op == "keys" { do_keys() }
+if3 len(op) == 0 {
+    print("{\"ok\":false,\"error\":\"operation required: parse|validate|to_json|to_yaml|query|set|merge|keys\"}")
+}

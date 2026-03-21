@@ -1,0 +1,157 @@
+// Profile all NovaX services by /health latency (parallel via sequential probing).
+
+try3 {
+    let resp = http_get("http://127.0.0.1:9999/api/services/status")
+    let data = parse_json(resp)
+} fail3 {
+    println("Cannot reach orchestrator")
+    return3 -1
+}
+
+let services = dict_get(data, "services", [])
+println("Profiling " + to_string(len(services)) + " services...\n")
+
+fn3 probe(svc) {
+    let name = dict_get(svc, "name", "?")
+    let port = dict_get(svc, "port", 0)
+    if3 port == 0 {
+        return3 {"latency": 999999.0, "name": name, "port": port, "status": "DOWN"}
+    }
+    let t0 = time()
+    try3 {
+        let r = http_get("http://127.0.0.1:" + to_string(port) + "/health")
+        let latency = time() - t0
+        return3 {"latency": latency, "name": name, "port": port, "status": "OK"}
+    } fail3 {
+        let latency = time() - t0
+        return3 {"latency": latency, "name": name, "port": port, "status": "ERR"}
+    }
+}
+
+let results = []
+for3 svc in services {
+    let result = probe(svc)
+    let results = append(results, result)
+}
+
+// Sort by latency descending (manual bubble sort)
+let n = len(results)
+let i = 0
+while3 i < n {
+    let j = 0
+    while3 j < n - i - 1 {
+        let a = dict_get(dict_get(results, j, {}), "latency", 0)
+        let b = dict_get(dict_get(results, j + 1, {}), "latency", 0)
+        if3 a < b {
+            let tmp = dict_get(results, j, {})
+            let results = dict_set(results, j, dict_get(results, j + 1, {}))
+            let results = dict_set(results, j + 1, tmp)
+        }
+        let j = j + 1
+    }
+    let i = i + 1
+}
+
+println("Top 20 slowest:")
+println("------------------------------------------------------------")
+let idx = 0
+while3 idx < math_min(20, len(results)) {
+    let r = dict_get(results, idx, {})
+    let lat = dict_get(r, "latency", 0)
+    let name = dict_get(r, "name", "?")
+    let port = dict_get(r, "port", 0)
+    let status = dict_get(r, "status", "?")
+    if3 lat >= 999000 {
+        println("  " + name + " :" + to_string(port) + "  DOWN")
+    } else3 {
+        println("  " + name + " :" + to_string(port) + "  " + to_string(math_round(lat)) + "ms  " + status)
+    }
+    let idx = idx + 1
+}
+
+println("")
+
+// Categorize results
+let ok_results = []
+let err_results = []
+let down_results = []
+for3 r in results {
+    let s = dict_get(r, "status", "")
+    if3 s == "OK" {
+        let ok_results = append(ok_results, r)
+    } else3 s == "ERR" {
+        let err_results = append(err_results, r)
+    } else3 {
+        let down_results = append(down_results, r)
+    }
+}
+
+if3 len(ok_results) > 0 {
+    let total_lat = 0
+    let min_lat = 999999
+    let max_lat = 0
+    for3 r in ok_results {
+        let lat = dict_get(r, "latency", 0)
+        let total_lat = total_lat + lat
+        let min_lat = math_min(min_lat, lat)
+        let max_lat = math_max(max_lat, lat)
+    }
+    let avg_lat = math_round(total_lat / len(ok_results))
+    println("Healthy: " + to_string(len(ok_results)) + " | Avg: " + to_string(avg_lat) + "ms | Min: " + to_string(math_round(min_lat)) + "ms | Max: " + to_string(math_round(max_lat)) + "ms")
+
+    // N-S Flow Regimes: H3^3=27, H5^3=125, H7^3=343
+    let laminar = 0
+    let transition = 0
+    let turbulent = 0
+    let chaotic = 0
+    let chaotic_list = []
+    let turbulent_list = []
+
+    for3 r in ok_results {
+        let lat = dict_get(r, "latency", 0)
+        if3 lat < 27 {
+            let laminar = laminar + 1
+        } else3 lat < 125 {
+            let transition = transition + 1
+        } else3 lat < 343 {
+            let turbulent = turbulent + 1
+            let turbulent_list = append(turbulent_list, r)
+        } else3 {
+            let chaotic = chaotic + 1
+            let chaotic_list = append(chaotic_list, r)
+        }
+    }
+
+    println("\nN-S Flow Regimes:")
+    println("  LAMINAR   (<27ms):  " + to_string(laminar) + " services")
+    println("  TRANSITION (27-125ms): " + to_string(transition) + " services")
+    println("  TURBULENT (125-343ms): " + to_string(turbulent) + " services")
+    println("  CHAOTIC   (>343ms): " + to_string(chaotic) + " services")
+
+    if3 len(chaotic_list) > 0 {
+        println("\nCHAOTIC (needs optimization):")
+        for3 r in chaotic_list {
+            println("  " + dict_get(r, "name", "") + " :" + to_string(dict_get(r, "port", 0)) + " = " + to_string(math_round(dict_get(r, "latency", 0))) + "ms")
+        }
+    }
+    if3 len(turbulent_list) > 0 {
+        println("\nTURBULENT (consider optimizing):")
+        for3 r in turbulent_list {
+            println("  " + dict_get(r, "name", "") + " :" + to_string(dict_get(r, "port", 0)) + " = " + to_string(math_round(dict_get(r, "latency", 0))) + "ms")
+        }
+    }
+}
+
+if3 len(err_results) > 0 {
+    println("\nERROR (unhealthy): " + to_string(len(err_results)))
+    for3 r in err_results {
+        println("  " + dict_get(r, "name", "") + " :" + to_string(dict_get(r, "port", 0)) + " = " + to_string(math_round(dict_get(r, "latency", 0))) + "ms")
+    }
+}
+
+if3 len(down_results) > 0 {
+    println("\nDOWN: " + to_string(len(down_results)))
+    for3 r in down_results {
+        println("  " + dict_get(r, "name", "") + " :" + to_string(dict_get(r, "port", 0)))
+    }
+}

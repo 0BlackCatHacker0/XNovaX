@@ -1,0 +1,313 @@
+// Nova TMetrics v1.0 - Ternary Service Telemetry (N-S Flow Model)
+// Port 9953: Real-time service-level metrics and Reynolds health scoring
+//
+// N-S Mapping:
+//   metric_flow      = velocity_field (telemetry data stream)
+//   request_rate     = flow_velocity (throughput pressure)
+//   avg_latency      = viscosity (resistance to flow)
+//   error_count      = turbulent_energy (flow disruption)
+//   Reynolds = (request_rate * avg_latency) / error_dampening
+//   error_dampening = 1000 / max(1, errors) -- more errors = less damping = higher Re
+//   Re < 27 (H3^3)  = LAMINAR (green, healthy)
+//   Re < 125 (H5^3) = TRANSITIONAL (yellow, watch)
+//   Re < 343 (H7^3) = TURBULENT (orange, stressed)
+//   Re >= 343        = CHAOTIC (red, overloaded)
+//
+// Services push metrics via POST /tmetrics/record
+// TMetrics probes services on-demand via POST /tmetrics/poll
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let VERSION = "1.1"
+let PORT = 9953
+let server = tserve(PORT, "TMetrics v1.1 - Ternary Service Telemetry")
+let _ns = ns_init_counters()
+
+let MAX_DATAPOINTS = 1000
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Known Services (port -> name) --
+let known_services = {}
+known_services = dict_set(known_services, "orchestrator", 9999)
+known_services = dict_set(known_services, "cloud-router", 9878)
+known_services = dict_set(known_services, "hivemind", 9881)
+known_services = dict_set(known_services, "nexus", 9882)
+known_services = dict_set(known_services, "tbus", 9945)
+known_services = dict_set(known_services, "tresilience", 9948)
+known_services = dict_set(known_services, "tintelligence", 9924)
+known_services = dict_set(known_services, "twatch", 9950)
+known_services = dict_set(known_services, "tbuffer", 9886)
+known_services = dict_set(known_services, "tsniffer", 9926)
+known_services = dict_set(known_services, "tauth", 9952)
+known_services = dict_set(known_services, "tnotify", 9975)
+
+// -- Metrics Store: service_name -> { request_count, error_count, latencies, last_seen, first_seen } --
+let metrics = {}
+let total_records = 0
+let total_polls = 0
+
+// -- Ensure a metrics entry exists --
+fn ensure_metric(name, port) {
+    if3 dict_has(metrics, name) == false { entry = {
+            "port": port,
+            "request_count": 0,
+            "error_count": 0,
+            "latencies": [],
+            "last_seen": 0,
+            "first_seen": time(),
+            "endpoints": {}
+        }
+        metrics = dict_set(metrics, name, entry)
+    }
+    return dict_get(metrics, name)
+}
+
+// -- Trim latencies list to MAX_DATAPOINTS --
+fn trim_latencies(entry) {
+    let lats = dict_get(entry, "latencies") ?? []
+    if3 len(lats) > MAX_DATAPOINTS { trimmed = slice(lats, len(lats) - MAX_DATAPOINTS, len(lats))
+        entry = dict_set(entry, "latencies", trimmed)
+    }
+    return entry
+}
+
+// -- Compute Reynolds for a service entry --
+fn compute_reynolds(entry) {
+    let lats = dict_get(entry, "latencies") ?? []
+    let req_count = dict_get(entry, "request_count") ?? 0
+    let err_count = dict_get(entry, "error_count") ?? 0
+    if3 len(lats) == 0 {
+        return 0
+    }
+    let avg_lat = sum(lats) / max(1, len(lats))
+    let dampening = 1000 / max(1, err_count)
+    let re = (req_count * avg_lat) / max(dampening, 1)
+    return round(re, 2)
+}
+
+// -- Flow regime classification --
+fn flow_regime(re) {
+    if3 re < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re < RE_TRANSITIONAL {
+        return "transitional"
+    }
+    if3 re < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// -- Health trit from Reynolds --
+fn health_trit(re) {
+    if3 re < RE_LAMINAR {
+        return T_TRUE
+    }
+    if3 re < RE_TURBULENT {
+        return T_MAYBE
+    }
+    return T_FALSE
+}
+
+// -- trit char --
+fn trit_to_char(t) {
+    if3 t == 1 {
+        return "1"
+    }
+    if3 t == 0 {
+        return "0"
+    }
+    return "T"
+}
+
+// ============================================================
+// Route Handlers
+// ============================================================
+
+// POST /tmetrics/record -- services push their own metrics
+fn record(body) {
+    let name = dict_get(body, "service") ?? ""
+    let port = dict_get(body, "port") ?? 0
+    let latency = dict_get(body, "latency_ms") ?? 0
+    let is_ok = dict_get(body, "ok") ?? true
+    let endpoint = dict_get(body, "endpoint") ?? "/health"
+
+    if3 name == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "service name required"}
+    }
+
+    let entry = ensure_metric(name, port)
+    entry = dict_set(entry, "request_count", (dict_get(entry, "request_count") ?? 0) + 1)
+    if3 is_ok == false { entry = dict_set(entry, "error_count", (dict_get(entry, "error_count") ?? 0) + 1)
+    }
+    let lats = dict_get(entry, "latencies") ?? []
+    lats = append(lats, latency)
+    entry = dict_set(entry, "latencies", lats)
+    entry = dict_set(entry, "last_seen", time())
+    entry = trim_latencies(entry)
+    metrics = dict_set(metrics, name, entry)
+    total_records = total_records + 1
+
+    return {"ok": true, "trit": T_TRUE, "service": name, "recorded": true}
+}
+
+// POST /tmetrics/poll -- probe a service by name
+fn poll(body) {
+    let name = dict_get(body, "name") ?? ""
+    if3 name == "" {
+        return {"ok": false, "trit": T_FALSE, "error": "name required"}
+    }
+    let port = dict_get(known_services, name) ?? 0
+    if3 port == 0 {
+        // Check if already registered
+        let existing = dict_get(metrics, name)
+        if3 existing != null { port = dict_get(existing, "port") ?? 0
+        }
+    }
+    if3 port == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "unknown service: " + name}
+    }
+
+    let url = "http://127.0.0.1:" + str(port) + "/health"
+    let t0 = time()
+    let result = null
+    try3 {
+        result = http_get(url, 3)
+        latency = round((time() - t0) * 1000, 2)
+        let entry = ensure_metric(name, port)
+        entry = dict_set(entry, "request_count", (dict_get(entry, "request_count") ?? 0) + 1)
+        let lats = dict_get(entry, "latencies") ?? []
+        lats = append(lats, latency)
+        entry = dict_set(entry, "latencies", lats)
+        entry = dict_set(entry, "last_seen", time())
+        entry = trim_latencies(entry)
+        metrics = dict_set(metrics, name, entry)
+        total_polls = total_polls + 1
+        return {"ok": true, "trit": T_TRUE, "service": name, "latency_ms": latency, "port": port}
+    } else { latency = round((time() - t0) * 1000, 2)
+        let entry = ensure_metric(name, port)
+        entry = dict_set(entry, "request_count", (dict_get(entry, "request_count") ?? 0) + 1)
+        entry = dict_set(entry, "error_count", (dict_get(entry, "error_count") ?? 0) + 1)
+        entry = dict_set(entry, "last_seen", time())
+        metrics = dict_set(metrics, name, entry)
+        return {"ok": false, "trit": T_FALSE, "service": name, "latency_ms": latency, "error": "unreachable"}
+    }
+}
+
+// GET /tmetrics/dashboard -- full metrics for all services
+fn dashboard(body) {
+    let all_names = keys(metrics)
+    let services = {}
+    let i = 0
+    while3 i < len(all_names) {
+        let name = all_names[i]
+        let entry = dict_get(metrics, name)
+        let re = compute_reynolds(entry)
+        let lats = dict_get(entry, "latencies") ?? []
+        let avg_lat = 0
+        if3 len(lats) > 0 { avg_lat = round(sum(lats) / len(lats), 2)
+        }
+        let snap = {
+            "port": dict_get(entry, "port") ?? 0,
+            "request_count": dict_get(entry, "request_count") ?? 0,
+            "error_count": dict_get(entry, "error_count") ?? 0,
+            "avg_latency_ms": avg_lat,
+            "datapoints": len(lats),
+            "reynolds": re,
+            "flow_regime": flow_regime(re),
+            "trit": health_trit(re),
+            "char": trit_to_char(health_trit(re)),
+            "last_seen": dict_get(entry, "last_seen") ?? 0
+        }
+        services = dict_set(services, name, snap)
+        i = i + 1
+    }
+
+    // System-wide Reynolds: average of all service Re
+    let total_re = 0
+    let count = len(all_names)
+    let j = 0
+    while3 j < count {
+        let name = all_names[j]
+        let entry = dict_get(metrics, name)
+        total_re = total_re + compute_reynolds(entry)
+        j = j + 1
+    }
+    let system_re = 0
+    if3 count > 0 { system_re = round(total_re / count, 2)
+    }
+
+    return {
+        "ok": true,
+        "trit": health_trit(system_re),
+        "services": services,
+        "service_count": count,
+        "system_reynolds": system_re,
+        "system_regime": flow_regime(system_re),
+        "total_records": total_records,
+        "total_polls": total_polls,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// GET /tmetrics/reynolds -- system Reynolds summary
+fn reynolds_status(body) {
+    let all_names = keys(metrics)
+    let total_re = 0
+    let count = len(all_names)
+    let i = 0
+    while3 i < count {
+        let name = all_names[i]
+        let entry = dict_get(metrics, name)
+        total_re = total_re + compute_reynolds(entry)
+        i = i + 1
+    }
+    let system_re = 0
+    if3 count > 0 { system_re = round(total_re / count, 2)
+    }
+    return {
+        "ok": true,
+        "trit": health_trit(system_re),
+        "reynolds": system_re,
+        "regime": flow_regime(system_re),
+        "services_tracked": count,
+        "boundaries": {
+            "laminar": RE_LAMINAR,
+            "transitional": RE_TRANSITIONAL,
+            "turbulent": RE_TURBULENT
+        }
+    }
+}
+
+// GET /health
+fn health(body) {
+    let svc_count = len(keys(metrics))
+    let h = ns_health_dict("nova-tmetrics", VERSION, PORT, _ns)
+    h = dict_set(h, "runtime", "novalang")
+    h = dict_set(h, "services_tracked", svc_count)
+    h = dict_set(h, "total_records", total_records)
+    h = dict_set(h, "total_polls", total_polls)
+    return h
+}
+
+// ============================================================
+// Route Registration
+// ============================================================
+troute(server, "GET",  "/health",             "health")
+troute(server, "GET",  "/tmetrics/dashboard",  "dashboard")
+troute(server, "GET",  "/tmetrics/reynolds",   "reynolds_status")
+troute(server, "POST", "/tmetrics/record",     "record")
+troute(server, "POST", "/tmetrics/poll",       "poll")
+
+print("[TMetrics] NovaLang TMetrics v1.1 - Ternary Service Telemetry")
+print("[TMetrics] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TMetrics] N-S Boundaries: Re<27=laminar | Re<125=transitional | Re<343=turbulent")
+print("[TMetrics] Routes: /health, /tmetrics/dashboard, /tmetrics/reynolds, /tmetrics/record, /tmetrics/poll")
+
+tstart(server)

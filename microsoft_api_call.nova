@@ -1,0 +1,428 @@
+// microsoft_api_call.nova -- Win32 bridge for nova_microsoft_engine.nova
+// Calls powershell/netstat for system info, window management, process listing
+// Registry, theme, clipboard, and notifications via shell() commands
+//
+// Usage: Called by nova_microsoft_engine.nova via shell("novalang.exe microsoft_api_call.nova <json_payload>")
+//   or via http endpoint
+
+// ── Registry hive map ──
+let HIVE_MAP = {
+    "HKLM": "HKEY_LOCAL_MACHINE",
+    "HKEY_LOCAL_MACHINE": "HKEY_LOCAL_MACHINE",
+    "HKCU": "HKEY_CURRENT_USER",
+    "HKEY_CURRENT_USER": "HKEY_CURRENT_USER",
+    "HKCR": "HKEY_CLASSES_ROOT",
+    "HKEY_CLASSES_ROOT": "HKEY_CLASSES_ROOT",
+    "HKU": "HKEY_USERS",
+    "HKEY_USERS": "HKEY_USERS"
+}
+
+// ── Tool: windows — list, focus, resize, minimize, maximize ──
+fn3 handle_windows(op, payload) {
+    if3 op == "list" {
+        let cmd = "powershell -NoProfile -Command \"Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | Select-Object Id,ProcessName,MainWindowTitle | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        if3 dict_get(r, "code") != 0 {
+            return3 {"ok": false, "error": dict_get(r, "stderr") ?? "shell_failed"}
+        }
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        if3 len(raw) == 0 {
+            return3 {"ok": true, "windows": []}
+        }
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "windows": data}
+        } catch3 {
+            return3 {"ok": false, "error": "json_parse_failed"}
+        }
+    }
+
+    let hwnd = dict_get(payload, "hwnd") ?? 0
+    if3 hwnd == 0 {
+        return3 {"ok": false, "error": "hwnd_required"}
+    }
+
+    if3 op == "focus" {
+        let cmd = "powershell -NoProfile -Command \"Add-Type -Name Win -Namespace Native -MemberDefinition '[DllImport(\\\"user32.dll\\\")] public static extern bool SetForegroundWindow(IntPtr hWnd);'; [Native.Win]::SetForegroundWindow(" + str(hwnd) + ")\""
+        let r = shell(cmd)
+        return3 {"ok": true, "action": "focus", "hwnd": hwnd}
+    }
+
+    if3 op == "minimize" {
+        let cmd = "powershell -NoProfile -Command \"Add-Type -Name Win -Namespace Native -MemberDefinition '[DllImport(\\\"user32.dll\\\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);'; [Native.Win]::ShowWindow(" + str(hwnd) + ", 6)\""
+        let r = shell(cmd)
+        return3 {"ok": true, "action": "minimize", "hwnd": hwnd}
+    }
+
+    if3 op == "maximize" {
+        let cmd = "powershell -NoProfile -Command \"Add-Type -Name Win -Namespace Native -MemberDefinition '[DllImport(\\\"user32.dll\\\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);'; [Native.Win]::ShowWindow(" + str(hwnd) + ", 3)\""
+        let r = shell(cmd)
+        return3 {"ok": true, "action": "maximize", "hwnd": hwnd}
+    }
+
+    if3 op == "resize" {
+        let width = dict_get(payload, "width") ?? 800
+        let height = dict_get(payload, "height") ?? 600
+        let cmd = "powershell -NoProfile -Command \"Add-Type -Name Win -Namespace Native -MemberDefinition '[DllImport(\\\"user32.dll\\\")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);'; [Native.Win]::SetWindowPos(" + str(hwnd) + ", [IntPtr]::Zero, 0, 0, " + str(width) + ", " + str(height) + ", 0x0006)\""
+        let r = shell(cmd)
+        return3 {"ok": true, "action": "resize", "hwnd": hwnd, "width": width, "height": height}
+    }
+
+    return3 {"ok": false, "error": "unknown_op", "op": op}
+}
+
+// ── Tool: registry — read, query (READ-ONLY) ──
+fn3 handle_registry(op, payload) {
+    let key_path = dict_get(payload, "key") ?? ""
+    if3 len(key_path) == 0 {
+        return3 {"ok": false, "error": "key_required"}
+    }
+
+    if3 op == "read" {
+        let value_name = dict_get(payload, "value") ?? ""
+        let val_arg = ""
+        if3 len(value_name) > 0 {
+            val_arg = " -Name '" + value_name + "'"
+        }
+        let cmd = "powershell -NoProfile -Command \"try { $v = Get-ItemProperty -Path 'Registry::" + key_path + "'" + val_arg + " -ErrorAction Stop; $v | ConvertTo-Json -Compress } catch { Write-Error $_.Exception.Message }\""
+        let r = shell(cmd)
+        if3 dict_get(r, "code") != 0 {
+            return3 {"ok": false, "error": "key_not_found", "key": key_path}
+        }
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        if3 len(raw) == 0 {
+            return3 {"ok": false, "error": "key_not_found", "key": key_path}
+        }
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "key": key_path, "data": data}
+        } catch3 {
+            return3 {"ok": true, "key": key_path, "data": raw}
+        }
+    }
+
+    if3 op == "query" {
+        let cmd = "powershell -NoProfile -Command \"try { $k = Get-Item -Path 'Registry::" + key_path + "' -ErrorAction Stop; $subs = $k.GetSubKeyNames(); $vals = @(); foreach($n in $k.GetValueNames()) { $vals += @{name=$n; data=$k.GetValue($n); type=$k.GetValueKind($n).ToString()} }; @{subkeys=$subs; values=$vals} | ConvertTo-Json -Compress -Depth 3 } catch { Write-Error $_.Exception.Message }\""
+        let r = shell(cmd)
+        if3 dict_get(r, "code") != 0 {
+            return3 {"ok": false, "error": "key_not_found", "key": key_path}
+        }
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "key": key_path, "subkeys": dict_get(data, "subkeys") ?? [], "values": dict_get(data, "values") ?? []}
+        } catch3 {
+            return3 {"ok": false, "error": "parse_failed"}
+        }
+    }
+
+    return3 {"ok": false, "error": "unknown_op", "op": op}
+}
+
+// ── Tool: process — list, info, ports ──
+fn3 handle_process(op, payload) {
+    if3 op == "list" {
+        let cmd = "powershell -NoProfile -Command \"Get-Process | Select-Object Id,ProcessName,@{N='MemMB';E={[math]::Round($_.WorkingSet64/1MB,1)}},@{N='CPU_s';E={[math]::Round($_.CPU,2)}} | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        if3 len(raw) == 0 {
+            return3 {"ok": true, "processes": []}
+        }
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "count": len(data), "processes": data}
+        } catch3 {
+            return3 {"ok": false, "error": "parse_failed"}
+        }
+    }
+
+    if3 op == "info" {
+        let pid = dict_get(payload, "pid") ?? 0
+        let name = dict_get(payload, "name") ?? ""
+        filt = ""
+        if3 pid > 0 {
+            filt = " | Where-Object {$_.Id -eq " + str(pid) + "}"
+        } else3 {
+            if3 len(name) > 0 {
+                filt = " | Where-Object {$_.ProcessName -like '*" + name + "*'}"
+            } else3 {
+                return3 {"ok": false, "error": "pid_or_name_required"}
+            }
+        }
+        let cmd = "powershell -NoProfile -Command \"Get-Process" + filt + " | Select-Object Id,ProcessName,Path,@{N='MemMB';E={[math]::Round($_.WorkingSet64/1MB,1)}},@{N='CPU_s';E={[math]::Round($_.CPU,2)}},StartTime,MainWindowTitle | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        if3 len(raw) == 0 {
+            return3 {"ok": false, "error": "not_found"}
+        }
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "processes": data}
+        } catch3 {
+            return3 {"ok": false, "error": "parse_failed"}
+        }
+    }
+
+    if3 op == "ports" {
+        let cmd = "netstat -ano"
+        let r = shell(cmd)
+        let raw = dict_get(r, "stdout") ?? ""
+        let lines = split(raw, "\n")
+        let entries = []
+        for3 li in range(len(lines)) {
+            if3 li < 4 { continue }
+            let line = trim(lines[li])
+            if3 len(line) == 0 { continue }
+            let parts = split(line, " ")
+            // Filter empty parts from multiple spaces
+            let clean = []
+            for3 p in parts {
+                if3 len(trim(p)) > 0 {
+                    clean = append(clean, trim(p))
+                }
+            }
+            if3 len(clean) >= 4 {
+                let pid_str = clean[len(clean) - 1]
+                let pid_val = try3 { int(pid_str) } catch3 { 0 }
+                let state = ""
+                if3 len(clean) >= 5 { state = clean[3] }
+                entries = append(entries, {
+                    "proto": clean[0],
+                    "local": clean[1],
+                    "remote": clean[2],
+                    "state": state,
+                    "pid": pid_val
+                })
+            }
+        }
+        // Filter by pid if provided
+        let filter_pid = dict_get(payload, "pid") ?? 0
+        if3 filter_pid > 0 {
+            let filtered = []
+            for3 e in entries {
+                if3 dict_get(e, "pid") == filter_pid {
+                    filtered = append(filtered, e)
+                }
+            }
+            entries = filtered
+        }
+        // Limit to 200
+        if3 len(entries) > 200 {
+            entries = slice(entries, 0, 200)
+        }
+        return3 {"ok": true, "count": len(entries), "connections": entries}
+    }
+
+    return3 {"ok": false, "error": "unknown_op", "op": op}
+}
+
+// ── Tool: system — info, cpu, memory, disk, gpu ──
+fn3 handle_system(op, payload) {
+    if3 op == "info" {
+        let cmd = "powershell -NoProfile -Command \"@{os=[System.Environment]::OSVersion.VersionString; machine=[System.Environment]::MachineName; processor=[System.Environment]::GetEnvironmentVariable('PROCESSOR_IDENTIFIER'); cores=[System.Environment]::ProcessorCount} | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "system": data}
+        } catch3 {
+            return3 {"ok": true, "os": raw}
+        }
+    }
+
+    if3 op == "os" {
+        return3 handle_system("info", payload)
+    }
+
+    if3 op == "cpu" {
+        let cmd = "powershell -NoProfile -Command \"Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,LoadPercentage | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "cpu": data}
+        } catch3 {
+            return3 {"ok": false, "error": "parse_failed"}
+        }
+    }
+
+    if3 op == "memory" {
+        let cmd = "powershell -NoProfile -Command \"$os = Get-CimInstance Win32_OperatingSystem; @{total_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,2); free_gb=[math]::Round($os.FreePhysicalMemory/1MB,2); used_gb=[math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/1MB,2); percent_used=[math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory)/$os.TotalVisibleMemorySize*100,1)} | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "memory": data}
+        } catch3 {
+            return3 {"ok": false, "error": "parse_failed"}
+        }
+    }
+
+    if3 op == "disk" {
+        let cmd = "powershell -NoProfile -Command \"Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Used -gt 0} | ForEach-Object { @{drive=$_.Name+':'; total_gb=[math]::Round(($_.Used+$_.Free)/1GB,2); used_gb=[math]::Round($_.Used/1GB,2); free_gb=[math]::Round($_.Free/1GB,2); percent_used=[math]::Round($_.Used/($_.Used+$_.Free)*100,1)} } | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "drives": data}
+        } catch3 {
+            return3 {"ok": false, "error": "parse_failed"}
+        }
+    }
+
+    if3 op == "gpu" {
+        let cmd = "powershell -NoProfile -Command \"Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,DriverVersion,VideoProcessor,@{N='VRAM_MB';E={[math]::Round($_.AdapterRAM/1MB,0)}} | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        if3 len(raw) == 0 {
+            return3 {"ok": true, "gpus": []}
+        }
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "gpus": data}
+        } catch3 {
+            return3 {"ok": false, "error": "parse_failed"}
+        }
+    }
+
+    return3 {"ok": false, "error": "unknown_op", "op": op}
+}
+
+// ── Tool: theme — darkmode, accent, wallpaper ──
+fn3 handle_theme(op, payload) {
+    if3 op == "darkmode" {
+        let cmd = "powershell -NoProfile -Command \"$k = Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize'; @{dark_mode_apps=($k.AppsUseLightTheme -eq 0); dark_mode_system=($k.SystemUsesLightTheme -eq 0)} | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "dark_mode_apps": dict_get(data, "dark_mode_apps"), "dark_mode_system": dict_get(data, "dark_mode_system")}
+        } catch3 {
+            return3 {"ok": false, "error": "registry_read_failed"}
+        }
+    }
+
+    if3 op == "accent" {
+        let cmd = "powershell -NoProfile -Command \"$k = Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\DWM'; @{accent_color=$k.AccentColor; colorization=$k.ColorizationColor} | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        try3 {
+            let data = json_decode(raw)
+            return3 {"ok": true, "accent": data}
+        } catch3 {
+            return3 {"ok": false, "error": "registry_read_failed"}
+        }
+    }
+
+    if3 op == "wallpaper" {
+        let cmd = "powershell -NoProfile -Command \"$k = Get-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop'; @{wallpaper=$k.WallPaper; style=$k.WallpaperStyle; tile=$k.TileWallpaper} | ConvertTo-Json -Compress\""
+        let r = shell(cmd)
+        let raw = trim(dict_get(r, "stdout") ?? "")
+        try3 {
+            let data = json_decode(raw)
+            let style_code = str(dict_get(data, "style") ?? "0")
+            let mode = "unknown"
+            if3 str(dict_get(data, "tile") ?? "0") == "1" { mode = "tile" }
+            else3 {
+                if3 style_code == "0" { mode = "center" }
+                if3 style_code == "2" { mode = "stretch" }
+                if3 style_code == "6" { mode = "fit" }
+                if3 style_code == "10" { mode = "fill" }
+                if3 style_code == "22" { mode = "span" }
+            }
+            return3 {"ok": true, "wallpaper": dict_get(data, "wallpaper"), "style": mode}
+        } catch3 {
+            return3 {"ok": false, "error": "registry_read_failed"}
+        }
+    }
+
+    return3 {"ok": false, "error": "unknown_op", "op": op}
+}
+
+// ── Tool: clipboard — read ──
+fn3 handle_clipboard(op, payload) {
+    if3 op == "read" {
+        let cmd = "powershell -NoProfile -Command \"Get-Clipboard\""
+        let r = shell(cmd)
+        let text = trim(dict_get(r, "stdout") ?? "")
+        return3 {"ok": true, "content": text, "encoding": "unicode"}
+    }
+    return3 {"ok": false, "error": "unknown_op", "op": op}
+}
+
+// ── Tool: notify — toast ──
+fn3 handle_notify(op, payload) {
+    if3 op == "toast" {
+        let title = dict_get(payload, "title") ?? "NovaX"
+        let message = dict_get(payload, "message") ?? ""
+        title = replace(replace(title, "\"", "'"), "`", "'")
+        message = replace(replace(message, "\"", "'"), "`", "'")
+
+        let ps_script = "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); $n = New-Object System.Windows.Forms.NotifyIcon; $n.Icon = [System.Drawing.SystemIcons]::Information; $n.BalloonTipTitle = '" + title + "'; $n.BalloonTipText = '" + message + "'; $n.Visible = $true; $n.ShowBalloonTip(5000); Start-Sleep -Seconds 6; $n.Dispose()"
+        let cmd = "powershell -NoProfile -WindowStyle Hidden -Command \"" + ps_script + "\""
+        let r = shell(cmd)
+        return3 {"ok": true, "sent": true, "method": "balloon", "title": title}
+    }
+    return3 {"ok": false, "error": "unknown_op", "op": op}
+}
+
+// ── Main dispatcher ──
+let TOOL_HANDLERS = {
+    "windows": "windows",
+    "registry": "registry",
+    "process": "process",
+    "system": "system",
+    "theme": "theme",
+    "clipboard": "clipboard",
+    "notify": "notify"
+}
+
+fn3 dispatch(payload) {
+    let tool = dict_get(payload, "tool") ?? ""
+    let op = dict_get(payload, "op") ?? ""
+
+    if3 tool == "windows" { return3 handle_windows(op, payload) }
+    if3 tool == "registry" { return3 handle_registry(op, payload) }
+    if3 tool == "process" { return3 handle_process(op, payload) }
+    if3 tool == "system" { return3 handle_system(op, payload) }
+    if3 tool == "theme" { return3 handle_theme(op, payload) }
+    if3 tool == "clipboard" { return3 handle_clipboard(op, payload) }
+    if3 tool == "notify" { return3 handle_notify(op, payload) }
+
+    return3 {"ok": false, "error": "unknown_tool", "tool": tool}
+}
+
+// Entry point: read JSON from args or stdin
+let args = sys_args()
+if3 len(args) >= 2 {
+    // Check for --file flag
+    if3 args[0] == "--file" {
+        let raw = read_file(args[1])
+        let payload = json_decode(raw)
+        let result = dispatch(payload)
+        print(json_encode(result))
+    } else3 {
+        // Direct JSON argument
+        try3 {
+            let payload = json_decode(args[0])
+            let result = dispatch(payload)
+            print(json_encode(result))
+        } catch3 {
+            print(json_encode({"ok": false, "error": "invalid_json_arg"}))
+        }
+    }
+} else3 {
+    // Read from stdin
+    let raw = read_stdin()
+    if3 len(trim(raw)) == 0 {
+        print(json_encode({"ok": false, "error": "no_input"}))
+    } else3 {
+        try3 {
+            let payload = json_decode(raw)
+            let result = dispatch(payload)
+            print(json_encode(result))
+        } catch3 {
+            print(json_encode({"ok": false, "error": "parse_error"}))
+        }
+    }
+}

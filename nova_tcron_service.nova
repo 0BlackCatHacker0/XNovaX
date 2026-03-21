@@ -1,0 +1,1327 @@
+// NovaX TCron Service v1.0 - Ternary Automation Engine (NovaLang port)
+// Port 9910: Cron/scheduling, directory watching, task manager, command execution
+//
+// 7 ternary-native automation tools on 3-5-7-13 harmonic constants:
+//   1. /tcron/schedule  -- Schedule recurring commands (interval-based)
+//   2. /tcron/list      -- List all scheduled tasks + watchers
+//   3. /tcron/cancel    -- Cancel a scheduled task or watcher by ID
+//   4. /tcron/watch     -- Directory watcher (file change -> run command)
+//   5. /tcron/task      -- Taskwarrior-style task manager (CRUD)
+//   6. /tcron/run-once  -- Execute a command once with timeout + capture
+//   7. /tcron/chain     -- Chain commands with ternary gate logic
+//
+// NOTE: NovaLang has no background threads.
+//   Scheduling and watching are tick-driven. Call POST /tcron/tick periodically
+//   (every 1-3 seconds) from the orchestrator or tscheduler to advance state.
+//   Watcher snapshots are taken on each tick via nova_run (dir command).
+//
+// N-S Mapping:
+//   task_stream     = velocity_field (scheduled work flowing through time)
+//   interval_sec    = viscosity (how often a task flows)
+//   run_count       = accumulated_flux (total executions)
+//   fail_count      = turbulent_energy (error pressure)
+//   Reynolds(task)  = fail_count / max(1, run_count)
+//   RE_LAMINAR=27   = max watchers
+//   RE_TURBULENT=343 = max scheduled tasks
+//
+// Endpoints:
+//   GET  /health           -- Health check
+//   GET  /tcron/status     -- Full scheduler stats
+//   POST /tcron/schedule   -- Schedule a recurring command
+//   POST /tcron/list       -- List scheduled tasks and watchers
+//   POST /tcron/cancel     -- Cancel a task or watcher by ID
+//   POST /tcron/watch      -- Watch a directory for file changes
+//   POST /tcron/task       -- CRUD task manager
+//   POST /tcron/run-once   -- Execute command once
+//   POST /tcron/chain      -- Chain commands with ternary gates
+//   POST /tcron/tick       -- Advance scheduler and watchers (call periodically)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9910
+let server = tserve(PORT, "TCron v1.0 - Ternary Automation Engine")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE    = 2187   // 3^7 = H7 composed
+let RE_LAMINAR    = 27     // H3^H3 = max watchers
+let RE_TRANSITION = 125    // H5^H3
+let RE_TURBULENT  = 343    // H7^H3 = max scheduled tasks
+
+let TOOLS_COUNT     = H7   // 7 tools in this service
+let VERSION         = "1.0.0"
+let SERVICE_NAME    = "nova-tcron"
+let MIN_INTERVAL    = H3   // 3 seconds minimum task interval
+let CMD_TIMEOUT     = H13  // 13 seconds default command timeout
+let WATCH_POLL      = H3   // 3 seconds between watcher snapshots
+let HISTORY_MAX     = 91   // H13 * H7 ring size
+
+// -- Global Stats --
+let stat_ops           = 0
+let stat_cmds_run      = 0
+let stat_total_exec_ms = 0
+let stat_trit_true     = 0
+let stat_trit_maybe    = 0
+let stat_trit_false    = 0
+let stat_t0            = time()
+
+// by_tool counters (one per tool name)
+let by_tool_schedule  = 0
+let by_tool_list      = 0
+let by_tool_cancel    = 0
+let by_tool_watch     = 0
+let by_tool_task      = 0
+let by_tool_run_once  = 0
+let by_tool_chain     = 0
+let by_tool_tick      = 0
+
+// -- Scheduled Tasks State --
+// _sched: dict keyed by string task_id (e.g. "1", "2")
+// Each task: {id, command, interval, cwd, max_runs, run_count,
+//             last_run, last_result_trit, created_at, active, next_run}
+let _sched     = {}
+let _sched_seq = 0   // auto-increment ID counter
+
+// -- Watcher State --
+// _watchers: dict keyed by string watch_id (e.g. "w1", "w2")
+// Each watcher: {id, directory, command, pattern, cwd, active,
+//                created_at, changes_detected, last_change, last_file,
+//                last_snap, next_poll}
+let _watchers   = {}
+let _watcher_seq = 0
+
+// -- Managed Tasks State (task manager, Tool 5) --
+// _tasks: list of task dicts
+// Each task: {id, title, description, priority, priority_label, status,
+//             tags, due, created_at, completed_at}
+let _tasks     = []
+let _task_seq  = 0
+
+// -- Execution History (ring buffer, most-recent appended last) --
+let _exec_history = []
+
+// ===========================================================================
+// HELPER: trit character for display
+// ===========================================================================
+fn trit_char(t) {
+    if3 t == 1 {
+        return "+"
+    } else t == 0 {
+        return "~"
+    } else {
+        return "-"
+    }
+}
+
+// ===========================================================================
+// HELPER: balanced ternary string from single trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == 1 {
+        return "1"
+    } else t == 0 {
+        return "0"
+    } else {
+        return "T"
+    }
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_stat(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    } else trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    } else {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "schedule" {
+        by_tool_schedule = by_tool_schedule + 1
+    }
+    if3 tool_name == "list" {
+        by_tool_list = by_tool_list + 1
+    }
+    if3 tool_name == "cancel" {
+        by_tool_cancel = by_tool_cancel + 1
+    }
+    if3 tool_name == "watch" {
+        by_tool_watch = by_tool_watch + 1
+    }
+    if3 tool_name == "task" {
+        by_tool_task = by_tool_task + 1
+    }
+    if3 tool_name == "run-once" {
+        by_tool_run_once = by_tool_run_once + 1
+    }
+    if3 tool_name == "chain" {
+        by_tool_chain = by_tool_chain + 1
+    }
+    if3 tool_name == "tick" {
+        by_tool_tick = by_tool_tick + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    } else re_num < RE_TRANSITION {
+        return "transitional"
+    } else re_num < RE_TURBULENT {
+        return "turbulent"
+    } else {
+        return "chaotic"
+    }
+}
+
+// ===========================================================================
+// HELPER: check dangerous command (returns "" if safe, or error string)
+// ===========================================================================
+fn check_dangerous(command) {
+    let cmd_lc = lower(command)
+    // Block the most destructive patterns
+    if3 contains(cmd_lc, "rm -rf /") {
+        return "Blocked dangerous command pattern: rm -rf /"
+    }
+    if3 contains(cmd_lc, "rm -rf ~") {
+        return "Blocked dangerous command pattern: rm -rf ~"
+    }
+    if3 contains(cmd_lc, "del /s /q c:\\") {
+        return "Blocked dangerous command pattern: del /s /q c:\\"
+    }
+    if3 contains(cmd_lc, "format c:") {
+        return "Blocked dangerous command pattern: format c:"
+    }
+    if3 contains(cmd_lc, "mkfs") {
+        return "Blocked dangerous command pattern: mkfs"
+    }
+    if3 contains(cmd_lc, "dd if=/dev/zero") {
+        return "Blocked dangerous command pattern: dd if=/dev/zero"
+    }
+    if3 contains(cmd_lc, "shutdown") {
+        return "Blocked dangerous command pattern: shutdown"
+    }
+    if3 contains(cmd_lc, "reboot") {
+        return "Blocked dangerous command pattern: reboot"
+    }
+    if3 contains(cmd_lc, "taskkill /f /im explorer") {
+        return "Blocked dangerous command pattern: taskkill /f /im explorer"
+    }
+    if3 contains(cmd_lc, "net user") {
+        return "Blocked dangerous command pattern: net user"
+    }
+    if3 contains(cmd_lc, "reg delete") {
+        return "Blocked dangerous command pattern: reg delete"
+    }
+    return ""
+}
+
+// ===========================================================================
+// HELPER: execute a command via nova_run, return result dict
+// nova_run returns stdout string on success or error string on failure
+// ===========================================================================
+fn exec_command(command, timeout) {
+    let blocked = check_dangerous(command)
+    if3 blocked != "" {
+        return {
+            "ok":          false,
+            "stdout":      "",
+            "stderr":      blocked,
+            "exit_code":   -1,
+            "duration_ms": 0,
+            "trit":        T_FALSE
+        }
+    }
+    let t0 = time()
+    try3 {
+        let out = nova_run(command, timeout)
+        let elapsed = round((time() - t0) * 1000, 2)
+        stat_cmds_run = stat_cmds_run + 1
+        stat_total_exec_ms = stat_total_exec_ms + elapsed
+        // nova_run returns stdout string; non-empty = success
+        let trit = T_TRUE
+        if3 out == "" { trit = T_MAYBE
+        }
+        return {
+            "ok":          true,
+            "stdout":      out,
+            "stderr":      "",
+            "exit_code":   0,
+            "duration_ms": elapsed,
+            "trit":        trit
+        }
+    } catch3 {
+        let elapsed = round((time() - t0) * 1000, 2)
+        stat_cmds_run = stat_cmds_run + 1
+        stat_total_exec_ms = stat_total_exec_ms + elapsed
+        return {
+            "ok":          false,
+            "stdout":      "",
+            "stderr":      "command failed or timed out",
+            "exit_code":   -1,
+            "duration_ms": elapsed,
+            "trit":        T_FALSE
+        }
+    }
+}
+
+// ===========================================================================
+// HELPER: trim exec history to HISTORY_MAX
+// ===========================================================================
+fn trim_history() {
+    let hlen = len(_exec_history)
+    if3 hlen > HISTORY_MAX { keep = slice(_exec_history, hlen - HISTORY_MAX, hlen)
+        _exec_history = keep
+    }
+}
+
+// ===========================================================================
+// HELPER: count active items in a dict of records with "active" field
+// ===========================================================================
+fn count_active_dict(d) {
+    let ks    = keys(d)
+    let total = len(ks)
+    let count = 0
+    let i = 0
+    while3 i < total {
+        let k = ks[i]
+        let v = dict_get(d, k) ?? {}
+        let a = dict_get(v, "active") ?? false
+        if3 a == true { count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ===========================================================================
+// TOOL 1: ROUTE HANDLER -- POST /tcron/schedule
+// Schedule a recurring command (tick-driven, no background threads)
+// Body: {command, interval?, cwd?, max_runs?, id?}
+// ===========================================================================
+fn route_schedule(body) {
+    let t0      = time()
+    let command = dict_get(body, "command") ?? ""
+    if3 command == "" {
+        return {"ok": false, "error": "command required", "trit": T_FALSE, "char": "-"}
+    }
+
+    let interval = dict_get(body, "interval") ?? CMD_TIMEOUT
+    let cwd      = dict_get(body, "cwd") ?? ""
+    let max_runs = dict_get(body, "max_runs") ?? 0
+    let id_req   = dict_get(body, "id") ?? ""
+
+    // Enforce minimum interval (H3 = 3 seconds)
+    let iv = int(interval)
+    if3 iv < MIN_INTERVAL { iv = MIN_INTERVAL
+    }
+
+    // If updating existing task by ID
+    if3 id_req != "" {
+        if3 dict_has(_sched, id_req) == true {
+            // Remove old, create updated
+            let _d = dict_del(_sched, id_req)
+            let now = time()
+            let updated = {
+                "id":               id_req,
+                "command":          command,
+                "interval":         iv,
+                "cwd":              cwd,
+                "max_runs":         max_runs,
+                "run_count":        0,
+                "last_run":         0,
+                "last_result_trit": T_MAYBE,
+                "created_at":       now,
+                "active":           true,
+                "next_run":         now
+            }
+            _sched = dict_set(_sched, id_req, updated)
+            let trit = T_MAYBE
+            let ms = round((time() - t0) * 1000, 2)
+            let _r = record_stat("schedule", trit)
+            return {
+                "ok":      true,
+                "task_id": id_req,
+                "action":  "updated",
+                "task":    updated,
+                "trit":    trit,
+                "bt":      bt_one(trit),
+                "ms":      ms
+            }
+        }
+    }
+
+    // Cap at RE_TURBULENT (343) active tasks
+    let active_count = count_active_dict(_sched)
+    if3 active_count >= RE_TURBULENT {
+        return {
+            "ok":    false,
+            "error": "Too many active tasks (max 343)",
+            "trit":  T_FALSE,
+            "char":  "-"
+        }
+    }
+
+    // Create new task
+    _sched_seq = _sched_seq + 1
+    let new_id = str(_sched_seq)
+    let now = time()
+    let task = {
+        "id":               new_id,
+        "command":          command,
+        "interval":         iv,
+        "cwd":              cwd,
+        "max_runs":         max_runs,
+        "run_count":        0,
+        "last_run":         0,
+        "last_result_trit": T_MAYBE,
+        "created_at":       now,
+        "active":           true,
+        "next_run":         now
+    }
+    _sched = dict_set(_sched, new_id, task)
+
+    let trit = T_TRUE
+    let ms   = round((time() - t0) * 1000, 2)
+    let _r   = record_stat("schedule", trit)
+    return {
+        "ok":      true,
+        "task_id": new_id,
+        "action":  "scheduled",
+        "task":    task,
+        "trit":    trit,
+        "bt":      bt_one(trit),
+        "ms":      ms
+    }
+}
+
+// ===========================================================================
+// TOOL 2: ROUTE HANDLER -- POST /tcron/list
+// List all scheduled tasks, watchers, and managed task count
+// Body: {active_only?}
+// ===========================================================================
+fn route_list(body) {
+    let t0          = time()
+    let active_only = dict_get(body, "active_only") ?? false
+
+    // Collect scheduled tasks
+    let sched_keys  = keys(_sched)
+    let sched_list  = []
+    let i = 0
+    while3 i < len(sched_keys) {
+        let k = sched_keys[i]
+        let t = dict_get(_sched, k) ?? {}
+        let is_active = dict_get(t, "active") ?? false
+        if3 active_only == true {
+            if3 is_active == true { _r = append(sched_list, t)
+        } else { _r = append(sched_list, t)
+        }
+        i = i + 1
+    }
+
+    // Collect watchers
+    let watch_keys  = keys(_watchers)
+    let watch_list  = []
+    let j = 0
+    while3 j < len(watch_keys) {
+        let k = watch_keys[j]
+        let w = dict_get(_watchers, k) ?? {}
+        watch_list = append(watch_list, w)
+        j = j + 1
+    }
+
+    let active_sched   = count_active_dict(_sched)
+    let active_watch   = count_active_dict(_watchers)
+    let managed_count  = len(_tasks)
+
+    let trit = T_TRUE
+    if3 (active_sched + active_watch) == 0 { trit = T_MAYBE
+    }
+
+    let ms = round((time() - t0) * 1000, 2)
+    let _r = record_stat("list", trit)
+    return {
+        "ok":              true,
+        "scheduled_tasks": sched_list,
+        "watchers":        watch_list,
+        "managed_tasks":   managed_count,
+        "active_scheduled": active_sched,
+        "active_watchers": active_watch,
+        "trit":            trit,
+        "bt":              bt_one(trit),
+        "ms":              ms
+    }
+}
+
+// ===========================================================================
+// TOOL 3: ROUTE HANDLER -- POST /tcron/cancel
+// Cancel a scheduled task or watcher by ID
+// Body: {id, type?}  type = "schedule" (default) or "watch"
+// ===========================================================================
+}
+fn route_cancel(body) {
+    let t0          = time()
+    let task_id     = dict_get(body, "id") ?? ""
+    let cancel_type = dict_get(body, "type") ?? "schedule"
+
+    if3 task_id == "" {
+        return {"ok": false, "error": "id required", "trit": T_FALSE, "char": "-"}
+    }
+
+    let trit = T_MAYBE
+    if3 cancel_type == "watch" { wid = str(task_id)
+        if3 dict_has(_watchers, wid) == true { _d = dict_del(_watchers, wid)
+            let trit = T_TRUE
+    } else { sid = str(task_id)
+        if3 dict_has(_sched, sid) == true {
+            // Mark inactive and remove
+            let _d = dict_del(_sched, sid)
+            let trit = T_TRUE
+        }
+    }
+
+    let ms = round((time() - t0) * 1000, 2)
+    let _r = record_stat("cancel", trit)
+    return {
+        "ok":       trit == T_TRUE,
+        "id":       task_id,
+        "cancelled": trit == T_TRUE,
+        "trit":     trit,
+        "bt":       bt_one(trit),
+        "ms":       ms
+    }
+}
+
+// ===========================================================================
+// HELPER: take directory snapshot via nova_run (dir /b /s)
+// Returns a string that changes when files change (file listing + sizes)
+// ===========================================================================
+}
+fn take_dir_snapshot(directory) {
+    let cmd = "dir /b /s /t:w " + directory + " 2>nul"
+    try3 {
+        let out = nova_run(cmd, H7)
+        return out
+    } catch3 {
+        return ""
+    }
+}
+
+// ===========================================================================
+// TOOL 4: ROUTE HANDLER -- POST /tcron/watch
+// Register a directory watcher (polled on tick)
+// Body: {directory, command, pattern?, cwd?}
+// ===========================================================================
+fn route_watch(body) {
+    let t0        = time()
+    let directory = dict_get(body, "directory") ?? (dict_get(body, "path") ?? "")
+    let command   = dict_get(body, "command") ?? ""
+
+    if3 directory == "" {
+        return {"ok": false, "error": "directory required", "trit": T_FALSE, "char": "-"}
+    }
+    if3 command == "" {
+        return {"ok": false, "error": "command required", "trit": T_FALSE, "char": "-"}
+    }
+
+    // Cap at RE_LAMINAR (27) active watchers
+    let active_count = count_active_dict(_watchers)
+    if3 active_count >= RE_LAMINAR {
+        return {
+            "ok":    false,
+            "error": "Too many active watchers (max 27)",
+            "trit":  T_FALSE,
+            "char":  "-"
+        }
+    }
+
+    let pattern = dict_get(body, "pattern") ?? "*"
+    let cwd     = dict_get(body, "cwd") ?? directory
+    let now     = time()
+
+    // Take initial snapshot so we have a baseline
+    let snap = take_dir_snapshot(directory)
+
+    _watcher_seq = _watcher_seq + 1
+    let wid = "w" + str(_watcher_seq)
+
+    let watcher = {
+        "id":               wid,
+        "directory":        directory,
+        "command":          command,
+        "pattern":          pattern,
+        "cwd":              cwd,
+        "active":           true,
+        "created_at":       now,
+        "changes_detected": 0,
+        "last_change":      0,
+        "last_file":        "",
+        "last_snap":        snap,
+        "next_poll":        now
+    }
+    _watchers = dict_set(_watchers, wid, watcher)
+
+    let trit = T_TRUE
+    let ms   = round((time() - t0) * 1000, 2)
+    let _r   = record_stat("watch", trit)
+    return {
+        "ok":      true,
+        "watch_id": wid,
+        "watcher":  watcher,
+        "trit":     trit,
+        "bt":       bt_one(trit),
+        "ms":       ms
+    }
+}
+
+// ===========================================================================
+// TOOL 5: ROUTE HANDLER -- POST /tcron/task
+// Taskwarrior-style CRUD task manager with ternary priority
+// Body: {action, ...fields}
+// ===========================================================================
+fn route_task(body) {
+    let t0     = time()
+    let action = dict_get(body, "action") ?? "list"
+
+    if3 action == "add" { title = dict_get(body, "title") ?? ""
+        if3 title == "" {
+            return {"ok": false, "error": "title required for add", "trit": T_FALSE, "char": "-"}
+        }
+        let priority_str = lower(dict_get(body, "priority") ?? "medium")
+        let priority = T_MAYBE
+        if3 priority_str == "high" { priority = T_TRUE
+        }
+        if3 priority_str == "low" { priority = T_FALSE
+        }
+        let now = time()
+        _task_seq = _task_seq + 1
+        let new_task = {
+            "id":             _task_seq,
+            "title":          title,
+            "description":    dict_get(body, "description") ?? "",
+            "priority":       priority,
+            "priority_label": priority_str,
+            "status":         "pending",
+            "tags":           dict_get(body, "tags") ?? [],
+            "due":            dict_get(body, "due") ?? "",
+            "created_at":     now,
+            "completed_at":   0
+        }
+        _tasks = append(_tasks, new_task)
+        let ms = round((time() - t0) * 1000, 2)
+        let _s = record_stat("task", T_TRUE)
+        return {
+            "ok":     true,
+            "action": "added",
+            "task":   new_task,
+            "trit":   T_TRUE,
+            "bt":     bt_one(T_TRUE),
+            "ms":     ms
+        }
+    }
+
+    if3 action == "complete" { task_id = dict_get(body, "id") ?? 0
+        let found   = false
+        let result_task = {}
+        let i = 0
+        while3 i < len(_tasks) {
+            let t = _tasks[i]
+            let tid = dict_get(t, "id") ?? -1
+            if3 tid == task_id { _a = dict_set(t, "status", "completed")
+                t = dict_set(t, "completed_at", time())
+                let found = true
+                let result_task = t
+            }
+            i = i + 1
+        }
+        if3 found == true { ms = round((time() - t0) * 1000, 2)
+            let _s = record_stat("task", T_TRUE)
+            return {
+                "ok":     true,
+                "action": "completed",
+                "task":   result_task,
+                "trit":   T_TRUE,
+                "bt":     bt_one(T_TRUE),
+                "ms":     ms
+            }
+        }
+        return {"ok": false, "error": "Task not found", "trit": T_MAYBE, "char": "~"}
+    }
+
+    if3 action == "delete" { task_id = dict_get(body, "id") ?? 0
+        let before  = len(_tasks)
+        let kept    = []
+        let i = 0
+        while3 i < len(_tasks) {
+            let t   = _tasks[i]
+            let tid = dict_get(t, "id") ?? -1
+            if3 tid != task_id { _r = append(kept, t)
+            }
+            i = i + 1
+        }
+        _tasks   = kept
+        let deleted  = before - len(_tasks)
+        let trit = T_MAYBE
+        if3 deleted > 0 { trit = T_TRUE
+        }
+        let ms = round((time() - t0) * 1000, 2)
+        let _s = record_stat("task", trit)
+        return {
+            "ok":      deleted > 0,
+            "action":  "deleted",
+            "deleted": deleted,
+            "trit":    trit,
+            "bt":      bt_one(trit),
+            "ms":      ms
+        }
+    }
+
+    if3 action == "update" { task_id = dict_get(body, "id") ?? 0
+        let found   = false
+        let result_task = {}
+        let i = 0
+        while3 i < len(_tasks) {
+            let t   = _tasks[i]
+            let tid = dict_get(t, "id") ?? -1
+            if3 tid == task_id {
+                // Apply updates from body
+                let new_title = dict_get(body, "title") ?? ""
+                if3 new_title != "" { _a = dict_set(t, "title", new_title)
+                }
+                let new_desc = dict_get(body, "description") ?? ""
+                if3 new_desc != "" { _b = dict_set(t, "description", new_desc)
+                }
+                let new_pri = dict_get(body, "priority") ?? ""
+                if3 new_pri != "" { np_str = lower(new_pri)
+                    let np = T_MAYBE
+                    if3 np_str == "high" { np = T_TRUE
+                    }
+                    if3 np_str == "low" { np = T_FALSE
+                    }
+                    t = dict_set(t, "priority", np)
+                    t = dict_set(t, "priority_label", np_str)
+                }
+                let new_status = dict_get(body, "status") ?? ""
+                if3 new_status != "" { _e = dict_set(t, "status", new_status)
+                }
+                let new_due = dict_get(body, "due") ?? ""
+                if3 new_due != "" { _f = dict_set(t, "due", new_due)
+                }
+                let found = true
+                let result_task = t
+            }
+            i = i + 1
+        }
+        if3 found == true { ms = round((time() - t0) * 1000, 2)
+            let _s = record_stat("task", T_TRUE)
+            return {
+                "ok":     true,
+                "action": "updated",
+                "task":   result_task,
+                "trit":   T_TRUE,
+                "bt":     bt_one(T_TRUE),
+                "ms":     ms
+            }
+        }
+        return {"ok": false, "error": "Task not found", "trit": T_MAYBE, "char": "~"}
+    }
+
+    // Default: list (with optional filters)
+    let status_filter   = dict_get(body, "status") ?? ""
+    let priority_filter = dict_get(body, "priority") ?? ""
+    let tag_filter      = dict_get(body, "tag") ?? ""
+
+    let filtered = []
+    let i = 0
+    while3 i < len(_tasks) {
+        let t   = _tasks[i]
+        let include = true
+
+        if3 status_filter != "" { ts = dict_get(t, "status") ?? ""
+            if3 ts != status_filter { include = false
+            }
+        }
+
+        if3 priority_filter != "" { pf_str = lower(priority_filter)
+            let pf_trit = T_MAYBE
+            if3 pf_str == "high" { pf_trit = T_TRUE
+            }
+            if3 pf_str == "low" { pf_trit = T_FALSE
+            }
+            let tp = dict_get(t, "priority") ?? T_MAYBE
+            if3 tp != pf_trit { include = false
+            }
+        }
+
+        if3 include == true { _r = append(filtered, t)
+        }
+        i = i + 1
+    }
+
+    let trit = T_TRUE
+    if3 len(filtered) == 0 { trit = T_MAYBE
+    }
+    let ms = round((time() - t0) * 1000, 2)
+    let _s = record_stat("task", trit)
+    return {
+        "ok":     true,
+        "action": "list",
+        "count":  len(filtered),
+        "tasks":  filtered,
+        "trit":   trit,
+        "bt":     bt_one(trit),
+        "ms":     ms
+    }
+}
+
+// ===========================================================================
+// TOOL 6: ROUTE HANDLER -- POST /tcron/run-once
+// Execute a command once with timeout + capture
+// Body: {command, timeout?, cwd?}
+// ===========================================================================
+fn route_run_once(body) {
+    let t0      = time()
+    let command = dict_get(body, "command") ?? ""
+    if3 command == "" {
+        return {"ok": false, "error": "command required", "trit": T_FALSE, "char": "-"}
+    }
+
+    let timeout = dict_get(body, "timeout") ?? CMD_TIMEOUT
+    let ti      = int(timeout)
+
+    let result = exec_command(command, ti)
+    let trit   = dict_get(result, "trit") ?? T_FALSE
+    let ms     = round((time() - t0) * 1000, 2)
+
+    let _r = record_stat("run-once", trit)
+
+    // Add history entry
+    let entry = {
+        "tool":        "run-once",
+        "command":     command,
+        "trit":        trit,
+        "duration_ms": dict_get(result, "duration_ms") ?? 0,
+        "ts":          time()
+    }
+    _exec_history = append(_exec_history, entry)
+    let _t = trim_history()
+
+    return {
+        "ok":          dict_get(result, "ok") ?? false,
+        "command":     command,
+        "stdout":      dict_get(result, "stdout") ?? "",
+        "stderr":      dict_get(result, "stderr") ?? "",
+        "exit_code":   dict_get(result, "exit_code") ?? -1,
+        "duration_ms": dict_get(result, "duration_ms") ?? 0,
+        "trit":        trit,
+        "bt":          bt_one(trit),
+        "ms":          ms
+    }
+}
+
+// ===========================================================================
+// HELPER: execute one chain step, return step result dict
+// ===========================================================================
+fn exec_chain_step(step_num, cmd_str, timeout) {
+    let result = exec_command(cmd_str, timeout)
+    let trit   = dict_get(result, "trit") ?? T_FALSE
+    return {
+        "step":        step_num,
+        "command":     cmd_str,
+        "exit_code":   dict_get(result, "exit_code") ?? -1,
+        "stdout":      dict_get(result, "stdout") ?? "",
+        "stderr":      dict_get(result, "stderr") ?? "",
+        "duration_ms": dict_get(result, "duration_ms") ?? 0,
+        "trit":        trit
+    }
+}
+
+// ===========================================================================
+// TOOL 7: ROUTE HANDLER -- POST /tcron/chain
+// Chain commands with ternary gate logic
+// Body: {commands: [str|{command,timeout?,cwd?}], on_maybe?, timeout?, cwd?}
+// ===========================================================================
+fn route_chain(body) {
+    let t0       = time()
+    let commands = dict_get(body, "commands") ?? []
+    if3 len(commands) == 0 {
+        return {"ok": false, "error": "commands list required", "trit": T_FALSE, "char": "-"}
+    }
+
+    let on_maybe      = dict_get(body, "on_maybe") ?? "continue"
+    let default_to    = dict_get(body, "timeout") ?? CMD_TIMEOUT
+    let default_ti    = int(default_to)
+    let steps         = []
+    let overall_trit  = T_TRUE
+    let aborted       = false
+    let abort_reason  = ""
+    let step_num      = 0
+
+    while3 step_num < len(commands) {
+        let cmd_item = commands[step_num]
+        let cmd_str  = ""
+        let cmd_ti   = default_ti
+
+        // cmd_item can be a string or a dict
+        let item_type = type_of(cmd_item)
+        if3 item_type == "dict" { cmd_str = dict_get(cmd_item, "command") ?? ""
+            let to_val  = dict_get(cmd_item, "timeout") ?? default_ti
+            let cmd_ti  = int(to_val)
+        } else { cmd_str = str(cmd_item)
+        }
+
+        if3 cmd_str == "" {
+            // Empty command -- skip (MAYBE)
+            let skip_step = {
+                "step":    step_num + 1,
+                "command": "",
+                "skipped": true,
+                "reason":  "empty command",
+                "trit":    T_MAYBE
+            }
+            steps = append(steps, skip_step)
+            step_num = step_num + 1
+        } else {
+            // Not aborted yet -- execute
+            if3 aborted == false { step_result = exec_chain_step(step_num + 1, cmd_str, cmd_ti)
+                let step_trit   = dict_get(step_result, "trit") ?? T_FALSE
+                steps = append(steps, step_result)
+
+                if3 step_trit == T_FALSE {
+                    // Hard failure: abort chain
+                    let overall_trit = T_FALSE
+                    let aborted      = true
+                    let abort_reason = "Step " + str(step_num + 1) + " failed (trit=-1)"
+                } else step_trit == T_MAYBE {
+                    // MAYBE: check policy
+                    if3 on_maybe == "stop" { overall_trit = T_MAYBE
+                        let aborted      = true
+                        let abort_reason = "Step " + str(step_num + 1) + " returned MAYBE, on_maybe=stop"
+                    } else {
+                        // Downgrade overall if it was TRUE
+                        if3 overall_trit == T_TRUE { overall_trit = T_MAYBE
+                        }
+                    }
+                }
+                step_num = step_num + 1
+            } else {
+                // Chain is aborted -- mark remaining as skipped
+                let skip_step = {
+                    "step":    step_num + 1,
+                    "command": cmd_str,
+                    "skipped": true,
+                    "reason":  "chain aborted",
+                    "trit":    T_MAYBE
+                }
+                steps = append(steps, skip_step)
+                step_num = step_num + 1
+            }
+        }
+    }
+
+    // Count completed (not skipped) and skipped
+    let completed_count = 0
+    let skipped_count   = 0
+    let si = 0
+    while3 si < len(steps) {
+        let s = steps[si]
+        let is_skip = dict_get(s, "skipped") ?? false
+        if3 is_skip == true { skipped_count = skipped_count + 1
+        } else { completed_count = completed_count + 1
+        }
+        si = si + 1
+    }
+
+    let ms = round((time() - t0) * 1000, 2)
+    let _r = record_stat("chain", overall_trit)
+
+    // Add history entry
+    let h_entry = {
+        "tool":        "chain",
+        "steps":       len(commands),
+        "completed":   completed_count,
+        "trit":        overall_trit,
+        "duration_ms": ms,
+        "ts":          time()
+    }
+    _exec_history = append(_exec_history, h_entry)
+    let _t = trim_history()
+
+    return {
+        "ok":          overall_trit != T_FALSE,
+        "steps":       steps,
+        "total_steps": len(commands),
+        "completed":   completed_count,
+        "skipped":     skipped_count,
+        "aborted":     aborted,
+        "abort_reason": abort_reason,
+        "on_maybe":    on_maybe,
+        "trit":        overall_trit,
+        "bt":          bt_one(overall_trit),
+        "ms":          ms
+    }
+}
+
+// ===========================================================================
+// TICK HELPER: advance scheduled tasks -- fire due ones via exec_command
+// Returns {fired, succeeded, failed, tick_log}
+// ===========================================================================
+fn tick_scheduled(now) {
+    let sched_keys = keys(_sched)
+    let fired      = 0
+    let succeeded  = 0
+    let failed_now = 0
+    let tick_log   = []
+
+    let i = 0
+    while3 i < len(sched_keys) {
+        let k    = sched_keys[i]
+        let t    = dict_get(_sched, k) ?? {}
+        let act  = dict_get(t, "active") ?? false
+        let nrun = dict_get(t, "next_run") ?? now + 9999
+
+        if3 act == true {
+            if3 now >= nrun { cmd  = dict_get(t, "command") ?? ""
+                let ti   = dict_get(t, "interval") ?? CMD_TIMEOUT
+                let result = exec_command(cmd, int(ti))
+                let trit   = dict_get(result, "trit") ?? T_FALSE
+                let elms   = dict_get(result, "duration_ms") ?? 0
+
+                // Update task state
+                t = dict_set(t, "last_run", now)
+                t = dict_set(t, "last_result_trit", trit)
+                let rc = dict_get(t, "run_count") ?? 0
+                t = dict_set(t, "run_count", rc + 1)
+                let iv = dict_get(t, "interval") ?? CMD_TIMEOUT
+                t = dict_set(t, "next_run", now + iv)
+
+                // Check max_runs
+                let max_runs = dict_get(t, "max_runs") ?? 0
+                let new_rc   = rc + 1
+                if3 max_runs > 0 {
+                    if3 new_rc >= max_runs { _deac = dict_set(t, "active", false)
+                    }
+                }
+
+                if3 trit == T_FALSE { failed_now = failed_now + 1
+                } else { succeeded = succeeded + 1
+                }
+
+                let _s   = dict_set(_sched, k, t)
+                fired = fired + 1
+
+                let entry = {
+                    "id":          k,
+                    "command":     cmd,
+                    "trit":        trit,
+                    "char":        trit_char(trit),
+                    "elapsed_ms":  elms,
+                    "ts":          now
+                }
+                _exec_history = append(_exec_history, entry)
+                tick_log = append(tick_log, entry)
+            }
+        }
+
+        i = i + 1
+    }
+
+    return {
+        "fired":     fired,
+        "succeeded": succeeded,
+        "failed":    failed_now,
+        "tick_log":  tick_log
+    }
+}
+
+// ===========================================================================
+// TICK HELPER: advance watchers -- poll directories and fire on change
+// Returns {polled, changes, watcher_log}
+// ===========================================================================
+fn tick_watchers(now) {
+    let wkeys       = keys(_watchers)
+    let polled      = 0
+    let changes     = 0
+    let watcher_log = []
+
+    let i = 0
+    while3 i < len(wkeys) {
+        let k    = wkeys[i]
+        let w    = dict_get(_watchers, k) ?? {}
+        let act  = dict_get(w, "active") ?? false
+        let npoll = dict_get(w, "next_poll") ?? now + 9999
+
+        if3 act == true {
+            if3 now >= npoll { dir  = dict_get(w, "directory") ?? ""
+                let cmd  = dict_get(w, "command") ?? ""
+                let prev = dict_get(w, "last_snap") ?? ""
+
+                // Take new snapshot
+                let new_snap = take_dir_snapshot(dir)
+
+                // Compare snapshots (simple string diff)
+                if3 new_snap != prev {
+                    // Change detected -- run the watcher command
+                    let _exec = exec_command(cmd, CMD_TIMEOUT)
+                    let cd   = dict_get(w, "changes_detected") ?? 0
+                    let _a   = dict_set(w, "changes_detected", cd + 1)
+                    let _b   = dict_set(w, "last_change", now)
+                    let _c   = dict_set(w, "last_snap", new_snap)
+                    changes = changes + 1
+
+                    let wentry = {
+                        "id":        k,
+                        "directory": dir,
+                        "command":   cmd,
+                        "change":    true,
+                        "ts":        now
+                    }
+                    watcher_log = append(watcher_log, wentry)
+                } else {
+                    // No change -- just update snapshot timestamp
+                    w = dict_set(w, "last_snap", new_snap)
+                }
+
+                // Schedule next poll (WATCH_POLL = H3 = 3 seconds)
+                w = dict_set(w, "next_poll", now + WATCH_POLL)
+                _watchers = dict_set(_watchers, k, w)
+                polled = polled + 1
+            }
+        }
+
+        i = i + 1
+    }
+
+    return {
+        "polled":      polled,
+        "changes":     changes,
+        "watcher_log": watcher_log
+    }
+}
+
+// ===========================================================================
+// TICK: POST /tcron/tick
+// Drive all scheduled tasks and watchers. Call externally every 1-3 seconds.
+// Body: {} (no required fields)
+// ===========================================================================
+fn route_tick(body) {
+    let t0  = time()
+    let now = t0
+
+    // Advance scheduled tasks
+    let sched_result  = tick_scheduled(now)
+    let sched_fired   = dict_get(sched_result, "fired") ?? 0
+    let sched_succ    = dict_get(sched_result, "succeeded") ?? 0
+    let sched_fail    = dict_get(sched_result, "failed") ?? 0
+    let sched_log     = dict_get(sched_result, "tick_log") ?? []
+
+    // Advance watchers
+    let watch_result  = tick_watchers(now)
+    let watch_polled  = dict_get(watch_result, "polled") ?? 0
+    let watch_changes = dict_get(watch_result, "changes") ?? 0
+    let watch_log     = dict_get(watch_result, "watcher_log") ?? []
+
+    // Trim history ring buffer
+    let _t = trim_history()
+
+    // Ternary result for this tick
+    let tick_trit = T_TRUE
+    let total_fired = sched_fired + watch_polled
+    if3 total_fired == 0 { tick_trit = T_MAYBE
+    }
+    if3 sched_fail > 0 {
+        if3 sched_fail >= sched_fired { tick_trit = T_FALSE
+        }
+    }
+
+    let ms = round((time() - t0) * 1000, 2)
+    let _r = record_stat("tick", tick_trit)
+
+    return {
+        "ok":            true,
+        "scheduled_fired": sched_fired,
+        "scheduled_ok":  sched_succ,
+        "scheduled_fail": sched_fail,
+        "watchers_polled": watch_polled,
+        "changes_detected": watch_changes,
+        "tick_results":  sched_log,
+        "watch_results": watch_log,
+        "history_size":  len(_exec_history),
+        "trit":          tick_trit,
+        "bt":            bt_one(tick_trit),
+        "char":          trit_char(tick_trit),
+        "ms":            ms
+    }
+}
+
+// ===========================================================================
+// ROUTE: GET /health
+// ===========================================================================
+fn route_health(body) {
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    let active_sched = count_active_dict(_sched)
+    let active_watch = count_active_dict(_watchers)
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "active_scheduled", active_sched)
+    resp = dict_set(resp, "active_watchers", active_watch)
+    resp = dict_set(resp, "uptime_s", round(time() - stat_t0, 1))
+    resp = dict_set(resp, "harmonics", "3-5-7-13")
+    return resp
+}
+
+// ===========================================================================
+// ROUTE: GET /tcron/status
+// Full stats: counters, scheduler state, watcher state, task manager state
+// ===========================================================================
+fn route_status(body) {
+    let uptime       = round(time() - stat_t0, 1)
+    let sched_keys   = keys(_sched)
+    let sched_total  = len(sched_keys)
+    let active_sched = count_active_dict(_sched)
+
+    // Sum run counts across all tasks
+    let total_runs = 0
+    let si = 0
+    while3 si < sched_total {
+        let k  = sched_keys[si]
+        let t  = dict_get(_sched, k) ?? {}
+        let rc = dict_get(t, "run_count") ?? 0
+        total_runs = total_runs + rc
+        si = si + 1
+    }
+
+    let watch_keys    = keys(_watchers)
+    let watch_total   = len(watch_keys)
+    let active_watch  = count_active_dict(_watchers)
+
+    // Sum changes detected across all watchers
+    let total_changes = 0
+    let wi = 0
+    while3 wi < watch_total {
+        let k  = watch_keys[wi]
+        let w  = dict_get(_watchers, k) ?? {}
+        let cd = dict_get(w, "changes_detected") ?? 0
+        total_changes = total_changes + cd
+        wi = wi + 1
+    }
+
+    // Task manager counts
+    let managed_total = len(_tasks)
+    let pending_count = 0
+    let done_count    = 0
+    let ti = 0
+    while3 ti < managed_total {
+        let t  = _tasks[ti]
+        let ts = dict_get(t, "status") ?? ""
+        if3 ts == "pending" { pending_count = pending_count + 1
+        }
+        if3 ts == "completed" { done_count = done_count + 1
+        }
+        ti = ti + 1
+    }
+
+    return {
+        "ok":      true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port":    PORT,
+        "tools":   TOOLS_COUNT,
+        "ops":     stat_ops,
+        "commands_run": stat_cmds_run,
+        "total_exec_ms": round(stat_total_exec_ms, 2),
+        "trits": {
+            "true":  stat_trit_true,
+            "maybe": stat_trit_maybe,
+            "false": stat_trit_false
+        },
+        "by_tool": {
+            "schedule": by_tool_schedule,
+            "list":     by_tool_list,
+            "cancel":   by_tool_cancel,
+            "watch":    by_tool_watch,
+            "task":     by_tool_task,
+            "run-once": by_tool_run_once,
+            "chain":    by_tool_chain,
+            "tick":     by_tool_tick
+        },
+        "scheduler": {
+            "total":      sched_total,
+            "active":     active_sched,
+            "total_runs": total_runs
+        },
+        "watchers": {
+            "total":         watch_total,
+            "active":        active_watch,
+            "total_changes": total_changes
+        },
+        "tasks": {
+            "total":     managed_total,
+            "pending":   pending_count,
+            "completed": done_count
+        },
+        "history_size": len(_exec_history),
+        "uptime_s": uptime,
+        "constants": {
+            "H3":  H3,
+            "H5":  H5,
+            "H7":  H7,
+            "H13": H13,
+            "block_size": BLOCK_SIZE,
+            "reynolds": {
+                "laminar":    RE_LAMINAR,
+                "transition": RE_TRANSITION,
+                "turbulent":  RE_TURBULENT
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Register all routes
+// ===========================================================================
+troute(server, "GET",  "/health",         "route_health")
+troute(server, "GET",  "/tcron/health",   "route_health")
+troute(server, "GET",  "/tcron/status",   "route_status")
+troute(server, "POST", "/tcron/schedule", "route_schedule")
+troute(server, "POST", "/tcron/list",     "route_list")
+troute(server, "POST", "/tcron/cancel",   "route_cancel")
+troute(server, "POST", "/tcron/watch",    "route_watch")
+troute(server, "POST", "/tcron/task",     "route_task")
+troute(server, "POST", "/tcron/run-once", "route_run_once")
+troute(server, "POST", "/tcron/chain",    "route_chain")
+troute(server, "POST", "/tcron/tick",     "route_tick")
+
+// ===========================================================================
+// Banner
+// ===========================================================================
+print("[TCron] NovaX Ternary Automation Engine v" + VERSION)
+print("[TCron] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TCron] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TCron] Block size: " + str(BLOCK_SIZE) + " (3^7)")
+print("[TCron] Reynolds: " + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT) + " (3^3/5^3/7^3)")
+print("[TCron] Max scheduled tasks: " + str(RE_TURBULENT) + " | Max watchers: " + str(RE_LAMINAR))
+print("[TCron] Tools: schedule, list, cancel, watch, task, run-once, chain")
+print("[TCron] Tick endpoint: POST /tcron/tick -- call every 1-3 seconds externally")
+print("[TCron] Routes: /health, /tcron/status")
+print("[TCron]         /tcron/schedule, /tcron/list, /tcron/cancel, /tcron/watch")
+print("[TCron]         /tcron/task, /tcron/run-once, /tcron/chain, /tcron/tick")
+print("[TCron] NOTE: No background threads. Tick-driven execution via POST /tcron/tick")
+print("[TCron] Ready at http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

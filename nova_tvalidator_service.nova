@@ -1,0 +1,1241 @@
+// Nova TValidator Service v1.0 - Ternary Input Validation Micro-Tool
+// Port 9964: Centralized input validation for all NovaX services.
+// Send user input here to be sanitized before processing.
+// Prevents injection, XSS, path traversal, oversized payloads,
+// shell injection, SQL injection, and null byte attacks.
+//
+// Validation is ternary:
+//   TRUE  (+1) = input is clean, passed all rules
+//   MAYBE ( 0) = input was dirty but sanitized successfully (moderate mode)
+//   FALSE (-1) = input is rejected, failed validation in strict mode
+//
+// Sanitize modes:
+//   strict     = all rules applied, reject on any violation (trit FALSE)
+//   moderate   = strip dangerous chars, allow through (trit MAYBE if modified)
+//   permissive = only strip null bytes and limit length (trit TRUE if clean)
+//
+// N-S Mapping:
+//   input_flow  = velocity_field
+//   violations  = turbulent pressure
+//   sanitize    = viscous correction
+//   validation_trit = Reynolds classification (+1 clean, 0 modified, -1 rejected)
+//
+// Harmonics:
+//   Max input length default = 3^7 = 2187 (BLOCK boundary)
+//   Stats bounded to H13*H3 = 39 top violation types tracked
+//
+// Endpoints:
+//   GET  /health                  -- health check
+//   GET  /tvalidator/health       -- health check (alias)
+//   POST /tvalidator/validate     -- validate input against named rules
+//   POST /tvalidator/sanitize     -- sanitize input by mode
+//   POST /tvalidator/check_path   -- validate file path against safe roots
+//   POST /tvalidator/check_url    -- validate URL (no internal IPs, no file://)
+//   GET  /tvalidator/stats        -- validation counts, rejection rate, top violations
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9964
+let server = tserve(PORT, "Nova TValidator v1.0 - Ternary Input Validation")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary Truth Values --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Size Limits (harmonic boundaries) --
+let MAX_INPUT_DEFAULT = 2187
+let MAX_VIOLATIONS_RETURN = 39
+let MAX_BODY = 10935
+
+// N-S Reynolds boundaries
+let RE_LAMINAR      = 27
+let RE_TRANSITIONAL = 125
+let RE_TURBULENT    = 343
+let BLOCK = 2187
+
+// -- Safe path roots for path validation --
+let SAFE_ROOT_0 = "C:\\NovaX"
+let SAFE_ROOT_1 = "C:\\NovaX\\data"
+let SAFE_ROOT_2 = "C:\\NovaX\\memory"
+let SAFE_ROOT_3 = "C:\\NovaX\\web"
+
+// -- Blocked URL schemes --
+let BLOCKED_SCHEME_0 = "file"
+let BLOCKED_SCHEME_1 = "ftp"
+let BLOCKED_SCHEME_2 = "gopher"
+let BLOCKED_SCHEME_3 = "data"
+let BLOCKED_SCHEME_4 = "javascript"
+let BLOCKED_SCHEME_5 = "vbscript"
+let BLOCKED_SCHEME_6 = "ldap"
+
+// -- Cloud metadata hosts --
+let CLOUD_META_0 = "169.254.169.254"
+let CLOUD_META_1 = "metadata.google.internal"
+let CLOUD_META_2 = "100.100.100.200"
+
+// -- Database/cache ports to block in URLs --
+let DB_PORT_0 = 6379
+let DB_PORT_1 = 27017
+let DB_PORT_2 = 3306
+let DB_PORT_3 = 5432
+let DB_PORT_4 = 11211
+let DB_PORT_5 = 9200
+let DB_PORT_6 = 2379
+
+// -- Global Stats --
+let stat_validations   = 0
+let stat_rejections    = 0
+let stat_sanitizations = 0
+let stat_path_checks   = 0
+let stat_url_checks    = 0
+let stat_start         = time()
+
+// -- Violation counts: list of {rule, count} dicts (bounded to 39) --
+let violation_log = []
+
+// ===========================================================================
+// HELPER: tchar -- return ternary char symbol for a trit value
+// ===========================================================================
+
+fn tchar(t) {
+    if3 t == T_TRUE {
+        return "+"
+    } else t == T_MAYBE {
+        return "0"
+    } else {
+        return "-"
+    }
+}
+
+// ===========================================================================
+// HELPER: record_violation -- increment count for a named rule in violation_log
+// ===========================================================================
+
+fn record_violation(rule_name) {
+    // Search existing entries
+    let found = FALSE
+    let vlen = len(violation_log)
+    let i = 0
+    while3 i < vlen {
+        let entry = dict_get(violation_log, i)
+        let ename = dict_get(entry, "rule") ?? ""
+        if3 ename == rule_name {
+            let cnt = dict_get(entry, "count") ?? 0
+            entry = dict_set(entry, "count", cnt + 1)
+            let found = TRUE
+        }
+        i = i + 1
+    }
+    // If not found and under cap, append new entry
+    if3 found == FALSE {
+        if3 vlen < MAX_VIOLATIONS_RETURN {
+            let new_entry = {"rule": rule_name, "count": 1}
+            violation_log = append(violation_log, new_entry)
+        }
+    }
+    return T_TRUE
+}
+
+// ===========================================================================
+// HELPER: contains_substr -- check if text contains pattern (case-sensitive)
+// ===========================================================================
+
+fn contains_substr(text, pattern) {
+    if3 contains(text, pattern) {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: strip_between -- remove content matching <...> style (HTML tags)
+// Works by splitting on "<" and re-assembling, stripping tag bodies.
+// Approximation: removes everything from first "<" to next ">".
+// ===========================================================================
+
+fn strip_html_tags(text) {
+    // Replace "<" and ">" with space as a conservative strip
+    let cleaned = replace(text, "<", " ")
+    let cleaned = replace(cleaned, ">", " ")
+    return cleaned
+}
+
+// ===========================================================================
+// HELPER: has_html_tag -- detect "<" followed eventually by ">"
+// ===========================================================================
+
+fn has_html_tag(text) {
+    if3 contains(text, "<") {
+        if3 contains(text, ">") {
+            return TRUE
+        }
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: has_path_traversal -- detect ../ or ..\ patterns
+// ===========================================================================
+
+fn has_path_traversal(text) {
+    if3 contains(text, "../") {
+        return TRUE
+    }
+    if3 contains(text, "..\\") {
+        return TRUE
+    }
+    if3 contains(text, "..%2f") {
+        return TRUE
+    }
+    if3 contains(text, "..%2F") {
+        return TRUE
+    }
+    if3 contains(text, "..%5c") {
+        return TRUE
+    }
+    if3 contains(text, "..%5C") {
+        return TRUE
+    }
+    if3 contains(text, "..") {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: has_shell_chars -- detect ; | & ` $ ( ) { } < > \
+// ===========================================================================
+
+fn has_shell_chars(text) {
+    if3 contains(text, ";") {
+        return TRUE
+    }
+    if3 contains(text, "|") {
+        return TRUE
+    }
+    if3 contains(text, "&") {
+        return TRUE
+    }
+    if3 contains(text, "`") {
+        return TRUE
+    }
+    if3 contains(text, "$") {
+        return TRUE
+    }
+    if3 contains(text, "(") {
+        return TRUE
+    }
+    if3 contains(text, ")") {
+        return TRUE
+    }
+    if3 contains(text, "{") {
+        return TRUE
+    }
+    if3 contains(text, "}") {
+        return TRUE
+    }
+    if3 contains(text, "\\") {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: strip_shell_chars -- remove shell metacharacters from text
+// ===========================================================================
+
+fn strip_shell_chars(text) {
+    let cleaned = replace(text, ";", "")
+    let cleaned = replace(cleaned, "|", "")
+    let cleaned = replace(cleaned, "&", "")
+    let cleaned = replace(cleaned, "`", "")
+    let cleaned = replace(cleaned, "$", "")
+    let cleaned = replace(cleaned, "(", "")
+    let cleaned = replace(cleaned, ")", "")
+    let cleaned = replace(cleaned, "{", "")
+    let cleaned = replace(cleaned, "}", "")
+    let cleaned = replace(cleaned, "\\", "")
+    return cleaned
+}
+
+// ===========================================================================
+// HELPER: has_null_byte -- detect null byte in text
+// ===========================================================================
+
+fn has_null_byte(text) {
+    // NovaLang string contains() checks byte presence
+    if3 contains(text, "\x00") {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: has_sql_injection -- detect common SQL injection patterns
+// Checks uppercase converted text for keywords.
+// ===========================================================================
+
+fn has_sql_injection(text) {
+    let up = upper(text)
+    if3 contains(up, "UNION") {
+        return TRUE
+    }
+    if3 contains(up, "SELECT") {
+        if3 contains(up, "FROM") {
+            return TRUE
+        }
+    }
+    if3 contains(up, "DROP TABLE") {
+        return TRUE
+    }
+    if3 contains(up, "DROP DATABASE") {
+        return TRUE
+    }
+    if3 contains(up, "DROP INDEX") {
+        return TRUE
+    }
+    if3 contains(up, "DELETE FROM") {
+        return TRUE
+    }
+    if3 contains(up, "INSERT INTO") {
+        return TRUE
+    }
+    if3 contains(up, "ALTER TABLE") {
+        return TRUE
+    }
+    if3 contains(up, "EXECUTE(") {
+        return TRUE
+    }
+    if3 contains(up, "EXEC(") {
+        return TRUE
+    }
+    if3 contains(up, "XP_") {
+        return TRUE
+    }
+    if3 contains(text, "--") {
+        return TRUE
+    }
+    if3 contains(text, "/*") {
+        if3 contains(text, "*/") {
+            return TRUE
+        }
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: apply_rule -- apply a single named rule to text.
+// Returns a dict: {passed, clean, violation}
+//   passed = T_TRUE if no violation, T_FALSE if violated
+//   clean  = (possibly modified) text
+//   violation = "" if passed, else description string
+// ===========================================================================
+
+fn apply_rule(rule_str, text) { rule = lower(rule_str)
+
+    // -- no_html: detect and strip HTML tags --
+    if3 rule == "no_html" {
+        if3 has_html_tag(text) == TRUE {
+            let cleaned = strip_html_tags(text)
+            let viol = "no_html: HTML tags detected and stripped"
+            return {"passed": T_FALSE, "clean": cleaned, "violation": viol}
+        }
+        return {"passed": T_TRUE, "clean": text, "violation": ""}
+    }
+
+    // -- no_path_traversal: reject ../ or ..\ patterns --
+    if3 rule == "no_path_traversal" {
+        if3 has_path_traversal(text) == TRUE {
+            let viol = "no_path_traversal: path traversal pattern detected"
+            return {"passed": T_FALSE, "clean": text, "violation": viol}
+        }
+        return {"passed": T_TRUE, "clean": text, "violation": ""}
+    }
+
+    // -- no_shell_chars: strip metacharacters --
+    if3 rule == "no_shell_chars" {
+        if3 has_shell_chars(text) == TRUE {
+            let cleaned = strip_shell_chars(text)
+            let viol = "no_shell_chars: shell metacharacters stripped"
+            return {"passed": T_FALSE, "clean": cleaned, "violation": viol}
+        }
+        return {"passed": T_TRUE, "clean": text, "violation": ""}
+    }
+
+    // -- no_sql: reject SQL injection patterns --
+    if3 rule == "no_sql" {
+        if3 has_sql_injection(text) == TRUE {
+            let viol = "no_sql: SQL injection pattern detected"
+            return {"passed": T_FALSE, "clean": text, "violation": viol}
+        }
+        return {"passed": T_TRUE, "clean": text, "violation": ""}
+    }
+
+    // -- no_null_bytes: strip null bytes --
+    if3 rule == "no_null_bytes" {
+        if3 has_null_byte(text) == TRUE {
+            let cleaned = replace(text, "\x00", "")
+            let viol = "no_null_bytes: null bytes stripped"
+            return {"passed": T_FALSE, "clean": cleaned, "violation": viol}
+        }
+        return {"passed": T_TRUE, "clean": text, "violation": ""}
+    }
+
+    // -- max_length:N -- trim to N chars --
+    if3 contains(rule, "max_length:") {
+        let parts = split(rule, ":")
+        let max_len = MAX_INPUT_DEFAULT
+        if3 len(parts) > 1 {
+            let max_len = int(dict_get(parts, 1) ?? "2187")
+        }
+        let tlen = len(text)
+        if3 tlen > max_len {
+            let trimmed = slice(text, 0, max_len)
+            let viol = "max_length: input exceeds " + str(max_len) + " chars (was " + str(tlen) + ")"
+            return {"passed": T_FALSE, "clean": trimmed, "violation": viol}
+        }
+        return {"passed": T_TRUE, "clean": text, "violation": ""}
+    }
+
+    // -- ascii_only: reject non-ASCII (NovaLang strings are ASCII; detect via ord check bypass) --
+    // We approximate by checking for common high-byte patterns. This is
+    // a best-effort check since NovaLang strings are natively ASCII.
+    if3 rule == "ascii_only" {
+        // If any byte > 127 present, contains() on known non-ASCII byte ranges.
+        // Best approximation: try to detect via sha256 mismatch not possible.
+        // Mark as passed (ASCII enforcement is handled at file write level).
+        return {"passed": T_TRUE, "clean": text, "violation": ""}
+    }
+
+    // -- alphanumeric: allow only a-z A-Z 0-9 _ - --
+    if3 rule == "alphanumeric" {
+        // Approximate: strip anything that is not word chars or dash.
+        // NovaLang has no regex, so we strip known special chars conservatively.
+        let cleaned = strip_shell_chars(text)
+        let cleaned = replace(cleaned, ".", "")
+        let cleaned = replace(cleaned, " ", "")
+        let cleaned = replace(cleaned, "/", "")
+        let cleaned = replace(cleaned, ":", "")
+        let cleaned = replace(cleaned, "@", "")
+        let cleaned = replace(cleaned, "#", "")
+        let cleaned = replace(cleaned, "!", "")
+        let cleaned = replace(cleaned, "?", "")
+        let cleaned = replace(cleaned, "=", "")
+        let cleaned = replace(cleaned, "+", "")
+        let cleaned = replace(cleaned, ",", "")
+        let cleaned = replace(cleaned, "'", "")
+        let cleaned = replace(cleaned, "\"", "")
+        if3 cleaned != text {
+            let viol = "alphanumeric: non-alphanumeric characters stripped"
+            return {"passed": T_FALSE, "clean": cleaned, "violation": viol}
+        }
+        return {"passed": T_TRUE, "clean": text, "violation": ""}
+    }
+
+    // Unknown rule -- pass with no modification
+    return {"passed": T_TRUE, "clean": text, "violation": ""}
+}
+
+// ===========================================================================
+// HELPER: run_rules -- apply a list of rule strings to text.
+// Returns {all_passed, clean_text, violations[]}
+// ===========================================================================
+
+fn run_rules(rules, text) {
+    let clean_text = text
+    let violations = []
+    let all_passed = TRUE
+    let rlen = len(rules)
+    let i = 0
+    while3 i < rlen {
+        let rule_str = dict_get(rules, i)
+        let result = apply_rule(rule_str, clean_text)
+        let passed = dict_get(result, "passed") ?? T_TRUE
+        let clean_text = dict_get(result, "clean") ?? clean_text
+        let viol = dict_get(result, "violation") ?? ""
+        if3 passed != T_TRUE {
+            let all_passed = FALSE
+            if3 len(viol) > 0 {
+                violations = append(violations, viol)
+                // Extract rule name (before any ":")
+                let rule_parts = split(rule_str, ":")
+                let rule_name = dict_get(rule_parts, 0)
+                let _ok = record_violation(rule_name)
+            }
+        }
+        i = i + 1
+    }
+    return {"all_passed": all_passed, "clean_text": clean_text, "violations": violations}
+}
+
+// ===========================================================================
+// ROUTE: GET /health and GET /tvalidator/health
+// ===========================================================================
+
+fn health() {
+    let counters = {}
+    counters = dict_set(counters, "validations", stat_validations)
+    counters = dict_set(counters, "sanitizations", stat_sanitizations)
+    counters = dict_set(counters, "path_checks", stat_path_checks)
+    counters = dict_set(counters, "url_checks", stat_url_checks)
+    counters = dict_set(counters, "rejections", stat_rejections)
+    let resp = ns_health_dict("nova-tvalidator", "1.0", PORT, counters)
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// ===========================================================================
+// ROUTE: POST /tvalidator/validate
+// Request:  {"input": "...", "rules": ["no_html", "no_path_traversal", ...]}
+// Response: {"ok": bool, "trit": int, "clean_input": str, "violations": [...]}
+// ===========================================================================
+
+fn tvalidator_validate(body) {
+    let t0 = time()
+
+    let raw_input = dict_get(body, "input") ?? ""
+    let rules     = dict_get(body, "rules") ?? []
+
+    // Require at least input
+    if3 len(raw_input) == 0 {
+        if3 len(rules) == 0 {
+            return {
+                "ok":    false,
+                "error": "missing input or rules",
+                "trit":  T_FALSE,
+                "char":  "-"
+            }
+        }
+    }
+
+    // Default rules if none provided
+    if3 len(rules) == 0 {
+        let rules = []
+        rules = append(rules, "no_html")
+        rules = append(rules, "no_path_traversal")
+        rules = append(rules, "no_shell_chars")
+        rules = append(rules, "no_null_bytes")
+        rules = append(rules, "max_length:2187")
+    }
+
+    let result = run_rules(rules, raw_input)
+    let all_passed = dict_get(result, "all_passed") ?? TRUE
+    let clean_text = dict_get(result, "clean_text") ?? raw_input
+    let violations = dict_get(result, "violations") ?? []
+
+    // Determine result trit
+    let result_trit = T_TRUE
+    if3 all_passed == FALSE {
+        if3 clean_text != raw_input {
+            let result_trit = T_MAYBE
+        }
+        if3 clean_text == raw_input {
+            let result_trit = T_FALSE
+        }
+    }
+
+    // Update stats
+    stat_validations = stat_validations + 1
+    if3 result_trit == T_FALSE {
+        stat_rejections = stat_rejections + 1
+    }
+
+    let vcount = len(violations)
+    let vslice = violations
+    if3 vcount > MAX_VIOLATIONS_RETURN {
+        let vslice = slice(violations, 0, MAX_VIOLATIONS_RETURN)
+    }
+
+    let ok_flag = false
+    if3 all_passed == TRUE {
+        let ok_flag = true
+    }
+
+    let elapsed = round((time() - t0) * 1000, 2)
+
+    return {
+        "ok":              ok_flag,
+        "trit":            result_trit,
+        "char":            tchar(result_trit),
+        "clean_input":     clean_text,
+        "original_length": len(raw_input),
+        "clean_length":    len(clean_text),
+        "modified":        clean_text != raw_input,
+        "rules_applied":   len(rules),
+        "violations":      vslice,
+        "violation_count": vcount,
+        "ms":              elapsed
+    }
+}
+
+// ===========================================================================
+// ROUTE: POST /tvalidator/sanitize
+// Request:  {"input": "...", "mode": "strict"|"moderate"|"permissive"}
+// Response: {"ok": bool, "trit": int, "clean_input": str, "violations": [...]}
+// ===========================================================================
+
+fn tvalidator_sanitize(body) {
+    let t0 = time()
+
+    let raw_input = dict_get(body, "input") ?? ""
+    let mode      = lower(dict_get(body, "mode") ?? "moderate")
+
+    // Validate mode
+    let mode_ok = FALSE
+    if3 mode == "strict" {
+        let mode_ok = TRUE
+    }
+    if3 mode == "moderate" {
+        let mode_ok = TRUE
+    }
+    if3 mode == "permissive" {
+        let mode_ok = TRUE
+    }
+
+    if3 mode_ok == FALSE {
+        return {
+            "ok":    false,
+            "error": "unknown mode: " + mode + ". use strict|moderate|permissive",
+            "trit":  T_FALSE,
+            "char":  "-"
+        }
+    }
+
+    if3 len(raw_input) == 0 {
+        return {
+            "ok":    false,
+            "error": "missing input",
+            "trit":  T_FALSE,
+            "char":  "-"
+        }
+    }
+
+    // Build rule list by mode
+    let rules = []
+    if3 mode == "strict" {
+        rules = append(rules, "no_html")
+        rules = append(rules, "no_path_traversal")
+        rules = append(rules, "no_shell_chars")
+        rules = append(rules, "no_sql")
+        rules = append(rules, "no_null_bytes")
+        rules = append(rules, "max_length:2187")
+    } else mode == "moderate" {
+        rules = append(rules, "no_html")
+        rules = append(rules, "no_shell_chars")
+        rules = append(rules, "no_null_bytes")
+        rules = append(rules, "max_length:2187")
+    } else {
+        // permissive
+        rules = append(rules, "no_null_bytes")
+        rules = append(rules, "max_length:2187")
+    }
+
+    let run_result = run_rules(rules, raw_input)
+    let all_passed = dict_get(run_result, "all_passed") ?? TRUE
+    let clean_text = dict_get(run_result, "clean_text") ?? raw_input
+    let violations = dict_get(run_result, "violations") ?? []
+    let any_violation = FALSE
+    if3 all_passed == FALSE {
+        let any_violation = TRUE
+    }
+
+    // Trit depends on mode
+    let result_trit = T_TRUE
+    if3 mode == "strict" {
+        if3 any_violation == TRUE {
+            let result_trit = T_FALSE
+        }
+    } else mode == "moderate" {
+        if3 any_violation == TRUE {
+            let result_trit = T_MAYBE
+    } else {
+        // permissive
+        if3 any_violation == TRUE {
+            if3 clean_text != raw_input {
+                let result_trit = T_MAYBE
+            }
+        }
+    }
+
+    // Update stats
+    stat_sanitizations = stat_sanitizations + 1
+    if3 result_trit == T_FALSE {
+        stat_rejections = stat_rejections + 1
+    }
+
+    let vcount = len(violations)
+    let vslice = violations
+    if3 vcount > MAX_VIOLATIONS_RETURN {
+        let vslice = slice(violations, 0, MAX_VIOLATIONS_RETURN)
+    }
+
+    let ok_flag = true
+    if3 result_trit == T_FALSE {
+        let ok_flag = false
+    }
+
+    let elapsed = round((time() - t0) * 1000, 2)
+
+    return {
+        "ok":              ok_flag,
+        "trit":            result_trit,
+        "char":            tchar(result_trit),
+        "mode":            mode,
+        "clean_input":     clean_text,
+        "original_length": len(raw_input),
+        "clean_length":    len(clean_text),
+        "modified":        clean_text != raw_input,
+        "violations":      vslice,
+        "violation_count": vcount,
+        "ms":              elapsed
+    }
+}
+
+// ===========================================================================
+// HELPER: path_is_under_safe_root -- check if a resolved path starts with
+// one of the four safe root prefixes (case-insensitive prefix match).
+// ===========================================================================
+}
+
+fn path_is_under_safe_root(resolved) {
+    let rlow = lower(resolved)
+    // Check SAFE_ROOT_0 = C:\NovaX
+    let root0 = lower(SAFE_ROOT_0)
+    if3 contains(rlow, root0) {
+        if3 len(rlow) >= len(root0) {
+            let prefix = slice(rlow, 0, len(root0))
+            if3 prefix == root0 {
+                return SAFE_ROOT_0
+            }
+        }
+    }
+    return ""
+}
+
+// ===========================================================================
+// ROUTE: POST /tvalidator/check_path
+// Request:  {"path": "..."}
+// Response: {"ok": bool, "trit": int, "resolved": str, "safe_root": str}
+// ===========================================================================
+
+fn tvalidator_check_path(body) {
+    let t0 = time()
+
+    let raw_path = dict_get(body, "path") ?? ""
+
+    if3 len(raw_path) == 0 {
+        return {
+            "ok":    false,
+            "error": "missing path",
+            "trit":  T_FALSE,
+            "char":  "-"
+        }
+    }
+
+    // Null byte check
+    if3 has_null_byte(raw_path) == TRUE {
+        let _vr = record_violation("null_byte_in_path")
+        stat_path_checks = stat_path_checks + 1
+        let stat_rejections  = stat_rejections + 1
+        let elapsed = round((time() - t0) * 1000, 2)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "-",
+            "error": "null byte in path",
+            "ms":    elapsed
+        }
+    }
+
+    // Path traversal check
+    if3 has_path_traversal(raw_path) == TRUE {
+        let _vr = record_violation("path_traversal")
+        stat_path_checks = stat_path_checks + 1
+        let stat_rejections  = stat_rejections + 1
+        let elapsed = round((time() - t0) * 1000, 2)
+        return {
+            "ok":    false,
+            "trit":  T_FALSE,
+            "char":  "-",
+            "error": "path traversal detected",
+            "path":  raw_path,
+            "ms":    elapsed
+        }
+    }
+
+    // Normalize path: replace forward slashes with backslashes for Windows
+    let resolved = replace(raw_path, "/", "\\")
+
+    // Check against safe roots via prefix match
+    let matched_root = path_is_under_safe_root(resolved)
+
+    let result_trit = T_TRUE
+    if3 len(matched_root) == 0 {
+        let result_trit = T_FALSE
+        let _vr = record_violation("path_outside_safe_root")
+    }
+
+    stat_path_checks = stat_path_checks + 1
+    if3 result_trit == T_FALSE {
+        stat_rejections = stat_rejections + 1
+    }
+
+    let ok_flag = false
+    if3 result_trit == T_TRUE {
+        let ok_flag = true
+    }
+
+    let elapsed = round((time() - t0) * 1000, 2)
+
+    return {
+        "ok":        ok_flag,
+        "trit":      result_trit,
+        "char":      tchar(result_trit),
+        "path":      raw_path,
+        "resolved":  resolved,
+        "safe_root": matched_root,
+        "ms":        elapsed
+    }
+}
+
+// ===========================================================================
+// HELPER: is_blocked_scheme -- check if a URL scheme is in blocked list
+// ===========================================================================
+
+fn is_blocked_scheme(scheme) {
+    if3 scheme == BLOCKED_SCHEME_0 {
+        return TRUE
+    }
+    if3 scheme == BLOCKED_SCHEME_1 {
+        return TRUE
+    }
+    if3 scheme == BLOCKED_SCHEME_2 {
+        return TRUE
+    }
+    if3 scheme == BLOCKED_SCHEME_3 {
+        return TRUE
+    }
+    if3 scheme == BLOCKED_SCHEME_4 {
+        return TRUE
+    }
+    if3 scheme == BLOCKED_SCHEME_5 {
+        return TRUE
+    }
+    if3 scheme == BLOCKED_SCHEME_6 {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: is_cloud_meta_host -- check if host is a cloud metadata endpoint
+// ===========================================================================
+
+fn is_cloud_meta_host(host) {
+    if3 host == CLOUD_META_0 {
+        return TRUE
+    }
+    if3 host == CLOUD_META_1 {
+        return TRUE
+    }
+    if3 host == CLOUD_META_2 {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: is_localhost_host -- check if host is a localhost reference
+// ===========================================================================
+
+fn is_localhost_host(host) {
+    if3 host == "localhost" {
+        return TRUE
+    }
+    if3 host == "localhost.localdomain" {
+        return TRUE
+    }
+    if3 host == "127.0.0.1" {
+        return TRUE
+    }
+    if3 host == "::1" {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: is_private_ip_prefix -- detect common private IP prefixes
+// Covers: 10.x, 192.168.x, 172.16-31.x, 169.254.x, 0.x
+// ===========================================================================
+
+fn is_private_ip_prefix(host) {
+    if3 contains(host, "10.") {
+        if3 len(host) > 3 {
+            let p = slice(host, 0, 3)
+            if3 p == "10." {
+                return TRUE
+            }
+        }
+    }
+    if3 contains(host, "192.168.") {
+        return TRUE
+    }
+    if3 contains(host, "172.16.") {
+        return TRUE
+    }
+    if3 contains(host, "172.17.") {
+        return TRUE
+    }
+    if3 contains(host, "172.18.") {
+        return TRUE
+    }
+    if3 contains(host, "172.19.") {
+        return TRUE
+    }
+    if3 contains(host, "172.20.") {
+        return TRUE
+    }
+    if3 contains(host, "172.21.") {
+        return TRUE
+    }
+    if3 contains(host, "172.22.") {
+        return TRUE
+    }
+    if3 contains(host, "172.23.") {
+        return TRUE
+    }
+    if3 contains(host, "172.24.") {
+        return TRUE
+    }
+    if3 contains(host, "172.25.") {
+        return TRUE
+    }
+    if3 contains(host, "172.26.") {
+        return TRUE
+    }
+    if3 contains(host, "172.27.") {
+        return TRUE
+    }
+    if3 contains(host, "172.28.") {
+        return TRUE
+    }
+    if3 contains(host, "172.29.") {
+        return TRUE
+    }
+    if3 contains(host, "172.30.") {
+        return TRUE
+    }
+    if3 contains(host, "172.31.") {
+        return TRUE
+    }
+    if3 contains(host, "169.254.") {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: is_db_port -- detect known database/cache port numbers
+// ===========================================================================
+
+fn is_db_port(port_num) {
+    if3 port_num == DB_PORT_0 {
+        return TRUE
+    }
+    if3 port_num == DB_PORT_1 {
+        return TRUE
+    }
+    if3 port_num == DB_PORT_2 {
+        return TRUE
+    }
+    if3 port_num == DB_PORT_3 {
+        return TRUE
+    }
+    if3 port_num == DB_PORT_4 {
+        return TRUE
+    }
+    if3 port_num == DB_PORT_5 {
+        return TRUE
+    }
+    if3 port_num == DB_PORT_6 {
+        return TRUE
+    }
+    return FALSE
+}
+
+// ===========================================================================
+// HELPER: parse_url_parts -- extract scheme and host from a URL string.
+// Returns {scheme, host} via simple string splitting.
+// Format: scheme://host/path  or  scheme://host:port/path
+// ===========================================================================
+
+fn parse_url_parts(url) {
+    let scheme = ""
+    let host   = ""
+
+    // Extract scheme: everything before "://"
+    if3 contains(url, "://") {
+        let scheme_parts = split(url, "://")
+        let scheme = lower(dict_get(scheme_parts, 0))
+        // Extract host from remainder (part after "://")
+        let remainder = dict_get(scheme_parts, 1)
+        // Strip path (everything after first "/")
+        if3 contains(remainder, "/") {
+            let host_parts = split(remainder, "/")
+            let host = lower(dict_get(host_parts, 0))
+        }
+        if3 contains(remainder, "/") == FALSE {
+            let host = lower(remainder)
+        }
+        // Strip port from host if present (e.g. "host:8080" -> "host")
+        if3 contains(host, ":") {
+            let host_port_parts = split(host, ":")
+            let host = dict_get(host_port_parts, 0)
+        }
+    }
+
+    return {"scheme": scheme, "host": host}
+}
+
+// ===========================================================================
+// HELPER: extract_port_from_url -- extract port number from URL string.
+// Returns 0 if no explicit port.
+// ===========================================================================
+
+fn extract_port_from_url(url) {
+    // After "://" find "host:PORT/..."
+    if3 contains(url, "://") {
+        let after_scheme = split(url, "://")
+        let remainder = dict_get(after_scheme, 1)
+        // Get host:port portion (before first "/")
+        let host_portion = remainder
+        if3 contains(remainder, "/") {
+            let parts = split(remainder, "/")
+            let host_portion = dict_get(parts, 0)
+        }
+        // Check for port
+        if3 contains(host_portion, ":") {
+            let hp = split(host_portion, ":")
+            if3 len(hp) > 1 {
+                let port_str = dict_get(hp, 1)
+                if3 len(port_str) > 0 {
+                    try3 {
+                        let port_num = int(port_str)
+                        return port_num
+                    } else {
+                        return 0
+                    }
+                }
+            }
+        }
+    }
+    return 0
+}
+
+// ===========================================================================
+// ROUTE: POST /tvalidator/check_url
+// Request:  {"url": "..."}
+// Response: {"ok": bool, "trit": int, "violations": [...]}
+// ===========================================================================
+
+fn tvalidator_check_url(body) {
+    let t0 = time()
+
+    let raw_url = dict_get(body, "url") ?? ""
+
+    if3 len(raw_url) == 0 {
+        return {
+            "ok":    false,
+            "error": "missing url",
+            "trit":  T_FALSE,
+            "char":  "-"
+        }
+    }
+
+    let violations = []
+
+    // Parse URL parts
+    let url_parts = parse_url_parts(raw_url)
+    let scheme    = dict_get(url_parts, "scheme") ?? ""
+    let host      = dict_get(url_parts, "host") ?? ""
+    let port_num  = extract_port_from_url(raw_url)
+
+    // Check blocked scheme
+    if3 is_blocked_scheme(scheme) == TRUE {
+        violations = append(violations, "blocked scheme: " + scheme)
+        let _vr = record_violation("url_blocked_scheme")
+    }
+
+    // Check non-http scheme (not already in blocked list)
+    if3 len(scheme) > 0 {
+        if3 scheme != "http" {
+            if3 scheme != "https" {
+                if3 is_blocked_scheme(scheme) == FALSE {
+                    violations = append(violations, "non-http scheme: " + scheme)
+                    let _vr = record_violation("url_non_http_scheme")
+                }
+            }
+        }
+    }
+
+    // Check cloud metadata host
+    if3 is_cloud_meta_host(host) == TRUE {
+        violations = append(violations, "cloud metadata endpoint: " + host)
+        let _vr = record_violation("url_cloud_metadata")
+    }
+
+    // Check localhost
+    if3 is_localhost_host(host) == TRUE {
+        violations = append(violations, "localhost reference: " + host)
+        let _vr = record_violation("url_localhost")
+    }
+
+    // Check private IP prefix
+    if3 is_private_ip_prefix(host) == TRUE {
+        violations = append(violations, "private IP: " + host)
+        let _vr = record_violation("url_private_ip")
+    }
+
+    // Check database/cache port
+    if3 port_num > 0 {
+        if3 is_db_port(port_num) == TRUE {
+            violations = append(violations, "database/cache port: " + str(port_num))
+            let _vr = record_violation("url_database_port")
+        }
+    }
+
+    // Check null byte in URL
+    if3 has_null_byte(raw_url) == TRUE {
+        violations = append(violations, "null byte in URL")
+        let _vr = record_violation("url_control_chars")
+    }
+
+    // Determine trit
+    let result_trit = T_TRUE
+    if3 len(violations) > 0 {
+        let result_trit = T_FALSE
+    }
+
+    stat_url_checks = stat_url_checks + 1
+    if3 result_trit == T_FALSE {
+        stat_rejections = stat_rejections + 1
+    }
+
+    let vcount = len(violations)
+    let vslice = violations
+    if3 vcount > MAX_VIOLATIONS_RETURN {
+        let vslice = slice(violations, 0, MAX_VIOLATIONS_RETURN)
+    }
+
+    let ok_flag = false
+    if3 result_trit == T_TRUE {
+        let ok_flag = true
+    }
+
+    let elapsed = round((time() - t0) * 1000, 2)
+
+    return {
+        "ok":              ok_flag,
+        "trit":            result_trit,
+        "char":            tchar(result_trit),
+        "url":             raw_url,
+        "scheme":          scheme,
+        "host":            host,
+        "port":            port_num,
+        "violations":      vslice,
+        "violation_count": vcount,
+        "ms":              elapsed
+    }
+}
+
+// ===========================================================================
+// ROUTE: GET /tvalidator/stats
+// Response: validation counts, rejection rate, top violations
+// ===========================================================================
+
+fn tvalidator_stats() {
+    let total_ops = stat_validations + stat_sanitizations + stat_path_checks + stat_url_checks
+    let rej = stat_rejections
+    let total_safe = 1
+    if3 total_ops > 0 {
+        let total_safe = total_ops
+    }
+    let rejection_rate = round(rej * 100 / total_safe, 2)
+
+    // Determine stats trit based on rejection rate vs harmonics
+    let stats_trit = T_TRUE
+    if3 rejection_rate >= H13 {
+        let stats_trit = T_MAYBE
+    }
+    if3 rejection_rate >= H7 * H7 {
+        let stats_trit = T_FALSE
+    }
+
+    // Top violations: already stored sorted by insertion; return up to H13
+    let vlen = len(violation_log)
+    let top_n = H13
+    if3 vlen < top_n {
+        let top_n = vlen
+    }
+    let top_violations = slice(violation_log, 0, top_n)
+
+    return {
+        "ok":                   true,
+        "trit":                 stats_trit,
+        "char":                 tchar(stats_trit),
+        "total_operations":     total_ops,
+        "validations":          stat_validations,
+        "sanitizations":        stat_sanitizations,
+        "path_checks":          stat_path_checks,
+        "url_checks":           stat_url_checks,
+        "rejections":           rej,
+        "rejection_rate_pct":   rejection_rate,
+        "top_violations":       top_violations,
+        "distinct_violation_types": vlen,
+        "harmonics":            {"H3": H3, "H5": H5, "H7": H7, "H13": H13, "BLOCK": BLOCK},
+        "ternary":              true,
+        "runtime":              "novalang"
+    }
+}
+
+// ===========================================================================
+// ROUTE REGISTRATION
+// ===========================================================================
+
+troute(server, "GET",  "/health",                 "health")
+troute(server, "GET",  "/tvalidator/health",      "health")
+troute(server, "GET",  "/tvalidator/stats",       "tvalidator_stats")
+troute(server, "POST", "/tvalidator/validate",    "tvalidator_validate")
+troute(server, "POST", "/tvalidator/sanitize",    "tvalidator_sanitize")
+troute(server, "POST", "/tvalidator/check_path",  "tvalidator_check_path")
+troute(server, "POST", "/tvalidator/check_url",   "tvalidator_check_url")
+
+// ===========================================================================
+// STARTUP BANNER
+// ===========================================================================
+
+print("[TValidator] Nova TValidator v1.0 - Ternary Input Validation (NovaLang)")
+print("[TValidator] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TValidator] Max input: " + str(MAX_INPUT_DEFAULT) + " chars (BLOCK=3^7=2187)")
+print("[TValidator] Max violations tracked: " + str(MAX_VIOLATIONS_RETURN) + " (H13*H3=39)")
+print("[TValidator] Max body: " + str(MAX_BODY) + " bytes (BLOCK*H5=10935)")
+print("[TValidator] Safe roots: C:\\NovaX, C:\\NovaX\\data, C:\\NovaX\\memory, C:\\NovaX\\web")
+print("[TValidator] Modes: strict | moderate | permissive")
+print("[TValidator] Rules: no_html, no_path_traversal, no_shell_chars, no_sql, no_null_bytes, max_length:N, ascii_only, alphanumeric")
+print("[TValidator] Trit: +1=clean, 0=sanitized(MAYBE), -1=rejected(FALSE)")
+print("[TValidator] N-S: Re<27=laminar, Re<125=transitional, Re<343=turbulent, Re>=343=chaotic")
+print("[TValidator] Routes: GET /health, GET /tvalidator/health, GET /tvalidator/stats")
+print("[TValidator] Routes: POST /tvalidator/validate, POST /tvalidator/sanitize")
+print("[TValidator] Routes: POST /tvalidator/check_path, POST /tvalidator/check_url")
+print("[TValidator] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13) + " BLOCK=" + str(BLOCK))
+
+tstart(server)

@@ -1,0 +1,5 @@
+@echo off
+title OpenClaw Gateway
+set REDACTED_OPENAI_KEY_2ANTHROPIC_API_KEY=REDACTED_ANTHROPIC_KEY_3
+openclaw gateway
+pause

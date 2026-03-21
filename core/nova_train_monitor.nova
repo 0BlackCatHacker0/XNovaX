@@ -1,0 +1,167 @@
+// NovaX Training Monitor Service — Port 9801
+// Live training status for NovaX LLM via ternary HTTP service.
+// Reads training_log.json and serves real-time stats.
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9801
+let LOG_PATH = "C:/NovaX/nova_llm/training_log.json"
+let TRUE = 1
+let FALSE = -1
+let TOTAL_STEPS = 20000
+let START_TIME = time_ms()
+
+fn read_training_log() {
+    let content = try3 { file_read(LOG_PATH) } fail { "[]" }
+    let log = try3 { json_decode(content) } fail { [] }
+    return log
+}
+
+fn handle_health(req) {
+    let log = read_training_log()
+    let count = len(log)
+    let uptime_s = (time_ms() - START_TIME) / 1000
+    return {
+        "status": "ok",
+        "trit": 1,
+        "service": "nova-train-monitor",
+        "version": "1.0.0",
+        "port": PORT,
+        "log_entries": count,
+        "uptime": uptime_s
+    }
+}
+
+fn handle_status(req) {
+    let log = read_training_log()
+    let count = len(log)
+
+    if3 count == 0 {
+        return {
+            "trit": 0,
+            "status": "waiting",
+            "message": "No training data yet"
+        }
+    }
+
+    let last = log[count - 1]
+    let step = dict_get(last, "step") ?? 0
+    let loss = dict_get(last, "loss") ?? 0
+    let ppl = dict_get(last, "perplexity") ?? 0
+    let sps = dict_get(last, "steps_per_sec") ?? 0
+    let epoch = dict_get(last, "epoch") ?? 0
+    let lr = dict_get(last, "lr") ?? 0
+    let elapsed = dict_get(last, "elapsed_sec") ?? 0
+
+    let pct = (step * 100) / TOTAL_STEPS
+    let tok_s = sps * 12 * 512
+    let eta_sec = 0
+    if3 sps > 0 {
+        eta_sec = (TOTAL_STEPS - step) / sps
+    }
+    let eta_h = eta_sec / 3600
+    let eta_m = (eta_sec - (eta_h * 3600)) / 60
+
+    // Loss trend — last 5 entries
+    let trend = []
+    let start_idx = count - 5
+    if3 start_idx < 0 {
+        start_idx = 0
+    }
+    let i = start_idx
+    while3 i < count {
+        let entry = log[i]
+        let l = dict_get(entry, "loss") ?? 0
+        let s = dict_get(entry, "step") ?? 0
+        trend = append(trend, {"step": s, "loss": l})
+        i = i + 1
+    }
+
+    // Best loss
+    let best_loss = 999
+    let best_step = 0
+    let j = 0
+    while3 j < count {
+        let entry = log[j]
+        let l = dict_get(entry, "loss") ?? 999
+        if3 l < best_loss {
+            best_loss = l
+            best_step = dict_get(entry, "step") ?? 0
+        }
+        j = j + 1
+    }
+
+    let done = FALSE
+    if3 step >= TOTAL_STEPS {
+        done = TRUE
+    }
+
+    return {
+        "trit": 1,
+        "status": "training",
+        "done": done,
+        "step": step,
+        "total_steps": TOTAL_STEPS,
+        "percent": pct,
+        "loss": loss,
+        "perplexity": ppl,
+        "steps_per_sec": sps,
+        "tokens_per_sec": tok_s,
+        "epoch": epoch,
+        "lr": lr,
+        "elapsed_sec": elapsed,
+        "eta_hours": eta_h,
+        "eta_minutes": eta_m,
+        "best_loss": best_loss,
+        "best_step": best_step,
+        "trend": trend,
+        "log_entries": count
+    }
+}
+
+fn handle_history(req) {
+    let log = read_training_log()
+    let count = len(log)
+
+    // Return every 10th entry for charting
+    let points = []
+    let i = 0
+    while3 i < count {
+        let entry = log[i]
+        points = append(points, {
+            "step": dict_get(entry, "step") ?? 0,
+            "loss": dict_get(entry, "loss") ?? 0,
+            "ppl": dict_get(entry, "perplexity") ?? 0,
+            "lr": dict_get(entry, "lr") ?? 0
+        })
+        i = i + 10
+    }
+    // Always include last entry
+    if3 count > 0 {
+        let last = log[count - 1]
+        points = append(points, {
+            "step": dict_get(last, "step") ?? 0,
+            "loss": dict_get(last, "loss") ?? 0,
+            "ppl": dict_get(last, "perplexity") ?? 0,
+            "lr": dict_get(last, "lr") ?? 0
+        })
+    }
+    return {"trit": 1, "points": points, "total": count}
+}
+
+// Server startup
+let server = tserve(PORT, "NovaX Training Monitor v1.0")
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/status", "handle_health")
+troute(server, "GET", "/train/status", "handle_status")
+troute(server, "GET", "/train/history", "handle_history")
+
+print("NovaX Training Monitor v1.0")
+print("  Port: " + to_str(PORT))
+print("  Log:  " + LOG_PATH)
+print("  GET /train/status  -- live training stats")
+print("  GET /train/history -- loss curve data")
+
+tstart(server)

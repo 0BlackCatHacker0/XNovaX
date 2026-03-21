@@ -1,0 +1,200 @@
+// ============================================================================
+// nova_deep_research_service.nova — AI-Powered Deep Research Engine
+// ============================================================================
+// Fans out research queries to ALL available providers via HiveMind swarm,
+// then synthesizes results using multi-model consensus.
+//
+// Capabilities:
+//   - Code audit: analyze .nova files for bugs and improvements
+//   - Architecture review: evaluate service design and suggest upgrades
+//   - Research synthesis: gather answers from 20+ models, score and merge
+//   - Upgrade planner: generate v1.4 migration plans for v1.3 services
+//
+// Uses v1.4 features: ??, default params, in operator
+// Port: 9939 | Ternary Micro-Tool
+// ============================================================================
+
+import3 "C:\\NovaX\\stdlib\\retry3.nova"
+import3 "C:\\NovaX\\stdlib\\cache3.nova"
+import3 "C:\\NovaX\\stdlib\\metrics3.nova"
+
+let PORT = 9939
+let SERVICE = "nova-deep-research"
+let VERSION = "1.0.0"
+let HIVEMIND_URL = "http://127.0.0.1:9881"
+let CLOUD_ROUTER_URL = "http://127.0.0.1:9878"
+let server = tserve(PORT, SERVICE)
+
+let _metrics = metrics3_new("deep-research")
+let _cache = cache3_new("research-cache", 50, 300000)
+
+// ── Research via HiveMind swarm ───────────────────────────────────
+fn research_query(topic, context = "", mode = "swarm") {
+    let sys_prompt = "You are a NovaX system analyst. Provide concise, actionable technical analysis. Focus on specific improvements with code examples when relevant."
+    let prompt = topic
+    if3 len(context) > 0 {
+        prompt = context + "\n\n" + topic
+    }
+
+    let body = json_encode({
+        "prompt": prompt,
+        "system": sys_prompt,
+        "mode": mode,
+        "max_tokens": 2048
+    })
+
+    let retry = retry3_new("research", 3, 1000, 10000)
+
+    // Try HiveMind first (fans out to ALL providers)
+    let result = try3 {
+        http_post(HIVEMIND_URL + "/hive/query", body)
+    } fail {
+        null
+    }
+
+    if3 result != null {
+        let resp_body = dict_get(result, "body") ?? ""
+        let parsed = try3 { json_decode(resp_body) } fail { {} }
+        let consensus = dict_get(parsed, "consensus") ?? ""
+        if3 len(consensus) > 10 {
+            _metrics = metrics3_inc(_metrics, "hivemind_success")
+            return {
+                "ok": 1,
+                "trit": 1,
+                "source": "hivemind",
+                "mode": mode,
+                "response": consensus,
+                "model": dict_get(parsed, "fastest_model") ?? "unknown",
+                "models_fired": dict_get(parsed, "models_fired") ?? 0,
+                "time_ms": dict_get(parsed, "time_ms") ?? 0
+            }
+        }
+    }
+
+    // Fallback to Cloud Router (single provider cascade)
+    let cr_body = json_encode({"prompt": prompt, "system": sys_prompt})
+    let cr_result = try3 {
+        http_post(CLOUD_ROUTER_URL + "/query", cr_body)
+    } fail {
+        null
+    }
+
+    if3 cr_result != null {
+        let cr_resp = dict_get(cr_result, "body") ?? ""
+        let cr_parsed = try3 { json_decode(cr_resp) } fail { {} }
+        let cr_text = dict_get(cr_parsed, "response") ?? ""
+        if3 len(cr_text) > 10 {
+            _metrics = metrics3_inc(_metrics, "cloud_router_success")
+            return {
+                "ok": 1,
+                "trit": 0,
+                "source": "cloud-router",
+                "response": cr_text,
+                "model": dict_get(cr_parsed, "provider") ?? "unknown"
+            }
+        }
+    }
+
+    _metrics = metrics3_inc(_metrics, "research_failures")
+    return {"ok": 0, "trit": -1, "error": "all providers failed"}
+}
+
+// ── Code audit via AI ─────────────────────────────────────────────
+fn ai_audit_file(filepath) {
+    let content = try3 { read_file(filepath) } fail { "" }
+    if3 len(content) == 0 {
+        return {"ok": 0, "error": "cannot read file"}
+    }
+
+    // Truncate if too long for API
+    if3 len(content) > 8000 {
+        content = substr(content, 0, 8000) + "\n// ... (truncated)"
+    }
+
+    let prompt = "Analyze this NovaLang service file for bugs, v1.4 upgrade opportunities (use ?? instead of dict_get with defaults, use 'in' operator, default params, spread, range), and architectural improvements. Be specific with line-level suggestions:\n\n" + content
+
+    return research_query(prompt, "File: " + filepath, "speed")
+}
+
+// ── Architecture review ───────────────────────────────────────────
+fn ai_architecture_review(service_desc = "NovaX OS") {
+    let prompt = "Review the NovaX AI OS architecture. It has 97 services on a Rust VM (novalang.exe), ternary logic (+1/0/-1), 3-5-7-13 harmonic constants, Navier-Stokes flow dynamics for routing, HiveMind swarm for multi-model AI. Suggest the top 5 architectural improvements for: reliability, performance, developer experience, and AI intelligence."
+    return research_query(prompt, service_desc, "swarm")
+}
+
+// ── v1.4 migration planner ────────────────────────────────────────
+fn ai_migration_plan(filepath) {
+    let content = try3 { read_file(filepath) } fail { "" }
+    if3 len(content) == 0 {
+        return {"ok": 0, "error": "cannot read file"}
+    }
+
+    if3 len(content) > 6000 {
+        content = substr(content, 0, 6000)
+    }
+
+    let prompt = "Generate a v1.3 to v1.4 migration plan for this NovaLang file. v1.4 adds: ?? (null coalesce), .. (range), ... (spread), 'in' operator, default params, list/dict destructuring. Show specific before/after code snippets:\n\n" + content
+    return research_query(prompt, "Migration: " + filepath, "speed")
+}
+
+// ── HTTP Endpoints ────────────────────────────────────────────────
+
+troute(server, "GET", "/health", "handle_health")
+fn handle_health(req) {
+    return {"ok": true, "service": SERVICE, "version": VERSION, "port": PORT}
+}
+
+troute(server, "POST", "/research/query", "handle_query")
+fn handle_query(req) {
+    let body = json_decode(req["body"])
+    let topic = dict_get(body, "topic") ?? dict_get(body, "prompt") ?? ""
+    let context = dict_get(body, "context") ?? ""
+    let mode = dict_get(body, "mode") ?? "swarm"
+    if3 len(topic) == 0 {
+        return {"ok": 0, "error": "provide 'topic' or 'prompt'"}
+    }
+    _metrics = metrics3_inc(_metrics, "queries")
+    return research_query(topic, context, mode)
+}
+
+troute(server, "POST", "/research/audit", "handle_audit")
+fn handle_audit(req) {
+    let body = json_decode(req["body"])
+    let filepath = dict_get(body, "file") ?? ""
+    if3 len(filepath) == 0 {
+        return {"ok": 0, "error": "provide 'file' path"}
+    }
+    _metrics = metrics3_inc(_metrics, "audits")
+    return ai_audit_file(filepath)
+}
+
+troute(server, "POST", "/research/architecture", "handle_arch")
+fn handle_arch(req) {
+    let body = json_decode(req["body"])
+    let desc = dict_get(body, "description") ?? "NovaX OS"
+    _metrics = metrics3_inc(_metrics, "arch_reviews")
+    return ai_architecture_review(desc)
+}
+
+troute(server, "POST", "/research/migrate", "handle_migrate")
+fn handle_migrate(req) {
+    let body = json_decode(req["body"])
+    let filepath = dict_get(body, "file") ?? ""
+    if3 len(filepath) == 0 {
+        return {"ok": 0, "error": "provide 'file' path"}
+    }
+    _metrics = metrics3_inc(_metrics, "migrations")
+    return ai_migration_plan(filepath)
+}
+
+troute(server, "GET", "/research/stats", "handle_stats")
+fn handle_stats(req) {
+    return metrics3_report(_metrics)
+}
+
+// ── Startup ──
+print("[RESEARCH] Nova Deep Research Engine v" + VERSION + " starting on :" + str(PORT))
+print("[RESEARCH] HiveMind: " + HIVEMIND_URL)
+print("[RESEARCH] Cloud Router: " + CLOUD_ROUTER_URL)
+print("[RESEARCH] Mode: swarm (fan-out to ALL providers)")
+tstart(server)

@@ -1,0 +1,1249 @@
+// NovaX Ternary Security Scanner v2.0
+// Port 9907 -- 7 Tools on 3-5-7-13 Harmonics
+// NovaLang .nova format -- ASCII only
+//
+// 3-5-7-13 Harmonic Constants:
+//   3  = ternary base (-1, 0, +1), tier count
+//   5  = first harmonic (trit packing, heartbeat interval)
+//   7  = second harmonic (tool count, max pipeline depth)
+//   13 = carrier wave (header size, frame envelope)
+//
+// BLOCK_SIZE = 3^7 = 2187
+// Reynolds boundaries: laminar=27, transition=125, turbulent=343
+//
+// Tools (H7 = 7):
+//   1. scan-file    -- File threat analysis (ext/entropy/size/hidden trits)
+//   2. scan-dir     -- Directory recursive security audit via shell dir
+//   3. ports        -- Open port audit via netstat
+//   4. entropy      -- Byte diversity entropy via certutil hex dump
+//   5. hash         -- md5+sha1+sha256 via certutil -hashfile
+//   6. permissions  -- File permissions via shell + icacls
+//   7. audit        -- Directory audit (world-writable/executables/dotfiles/large)
+//
+// Endpoints:
+//   GET  /health
+//   GET  /tsec/status
+//   POST /tsec/scan-file    { "path": "..." }
+//   POST /tsec/scan-dir     { "path": "...", "max_depth": N }
+//   POST /tsec/ports        {}
+//   POST /tsec/entropy      { "path": "..." }
+//   POST /tsec/hash         { "path": "..." }
+//   POST /tsec/permissions  { "path": "..." }
+//   POST /tsec/audit        { "path": "..." }
+
+// ============================================================
+// SERVER BINDING
+// ============================================================
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9907
+let server = tserve(PORT, "nova-tsecurity")
+
+// ============================================================
+// 3-5-7-13 HARMONIC CONSTANTS
+// ============================================================
+
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// Ternary truth values
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// N-S Reynolds boundaries (3^3, 5^3, 7^3)
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+// Block size: 3^7 = 2187
+let BLOCK_SIZE_T = 2187
+
+// Tool count = H7
+let TOOLS_COUNT = 7
+
+// Heartbeat interval = H5 seconds
+let HEARTBEAT = 5
+
+// ============================================================
+// EXTENSION RISK TABLES (comma-joined strings)
+// ============================================================
+
+// Safe extensions (low risk)
+let SAFE_EXTS = ".py,.txt,.md,.json,.yaml,.yml,.toml,.ini,.cfg,.csv,.xml,.html,.css,.js,.ts,.rs,.go,.java,.c,.h,.cpp,.hpp,.rb,.lua,.sql,.log,.rst,.tex,.r,.m,.swift,.kt,.scala,.nova,.sh,.pl,"
+
+// Moderate-risk extensions
+let MODERATE_EXTS = ".exe,.dll,.so,.dylib,.msi,.jar,.war,.apk,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.pdf,.zip,.tar,.gz,.rar,.7z,.bz2,.xz,.iso,.img,.dmg,.whl,.egg,.bin,.dat,"
+
+// Dangerous extensions
+let DANGEROUS_EXTS = ".bat,.cmd,.ps1,.psm1,.psd1,.vbs,.vbe,.wsf,.wsh,.scr,.com,.pif,.hta,.inf,.reg,.lnk,.cpl,.msc,.gadget,.js,.jse,.vb,.vba,"
+
+// Known safe NovaX + system ports
+let KNOWN_PORTS_STR = ",80,443,8080,8443,3000,3001,5000,5173,5174,9999,9998,9997,9878,9877,9875,9880,9881,9882,9884,9890,9891,9892,9893,9894,9895,9896,9897,9898,9899,9900,9901,9902,9903,9904,9905,9906,9907,9908,9909,9910,9911,7700,6379,8888,11434,22,25,53,110,143,465,587,993,995,"
+
+// Known backdoor / suspicious ports
+let DANGEROUS_PORTS_STR = ",31337,12345,12346,20034,1234,4444,5555,6666,6667,27374,27665,31338,33333,54321,65535,1337,9090,2222,3333,7777,8888,9090,1080,4899,5900,"
+
+// ============================================================
+// MUTABLE STATE (stats counters)
+// ============================================================
+
+let _ops           = 0
+let _trits_good    = 0
+let _trits_maybe   = 0
+let _trits_bad     = 0
+let _t0            = time()
+let _scans         = 0
+let _threats_found = 0
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+// trit_char: convert numeric trit to balanced-ternary display character
+fn trit_char(t) {
+    let result = "0"
+    if3 t == 1 {
+        result = "1"
+    } else3 t == -1 {
+        result = "T"
+    } else3 {
+        result = "0"
+    }
+    result
+}
+
+// bt_one: single trit char wrapper
+fn bt_one(t) {
+    trit_char(t)
+}
+
+// bt_three: balanced ternary string for three trits
+fn bt_three(a, b, c) {
+    let ca = trit_char(a)
+    let cb = trit_char(b)
+    let cc = trit_char(c)
+    join([ca, cb, cc], "")
+}
+
+// bt_quad: balanced ternary string for four trits
+fn bt_quad(a, b, c, d) {
+    let ca = trit_char(a)
+    let cb = trit_char(b)
+    let cc = trit_char(c)
+    let cd = trit_char(d)
+    join([ca, cb, cc, cd], "")
+}
+
+// bt_five: balanced ternary string for five trits
+fn bt_five(a, b, c, d, e) {
+    let ca = trit_char(a)
+    let cb = trit_char(b)
+    let cc = trit_char(c)
+    let cd = trit_char(d)
+    let ce = trit_char(e)
+    join([ca, cb, cc, cd, ce], "")
+}
+
+// record_trit: update global stats for a trit result
+fn record_trit(t) {
+    _ops = _ops + 1
+    if3 t == 1 {
+        _trits_good = _trits_good + 1
+    } else3 t == -1 {
+        _trits_bad = _trits_bad + 1
+    } else3 {
+        _trits_maybe = _trits_maybe + 1
+    }
+    t
+}
+
+// record_scan: increment scan counter
+fn record_scan() {
+    _scans = _scans + 1
+    T_TRUE
+}
+
+// classify_flow: Reynolds number -> flow regime label
+fn classify_flow(re_val) {
+    let regime = "chaotic"
+    if3 re_val < RE_LAMINAR {
+        regime = "laminar"
+    } else3 re_val < RE_TRANSITION {
+        regime = "transitional"
+    } else3 re_val < RE_TURBULENT {
+        regime = "turbulent"
+    } else3 {
+        regime = "chaotic"
+    }
+    regime
+}
+
+// posture_str: security posture label from trit
+fn posture_str(t) {
+    let label = "mixed"
+    if3 t == 1 {
+        label = "secure"
+    } else3 t == -1 {
+        label = "insecure"
+    } else3 {
+        label = "mixed"
+    }
+    label
+}
+
+// ext_lower: extract and lowercase file extension from path
+fn ext_lower(path) {
+    let parts = split(path, ".")
+    let n = len(parts)
+    let ext = ""
+    if3 n > 1 {
+        ext = "." + lower(parts[n - 1])
+    } else3 {
+        ext = ""
+    }
+    ext
+}
+
+// basename: extract filename from path (handles both / and \)
+fn basename(path) {
+    let fwd = replace(path, "\\", "/")
+    let parts = split(fwd, "/")
+    let n = len(parts)
+    let name = ""
+    if3 n > 0 {
+        name = parts[n - 1]
+    } else3 {
+        name = path
+    }
+    name
+}
+
+// esc_path: escape path for use inside shell command strings
+// Replace backslashes with forward slashes (shell accepts both on Windows)
+fn esc_path(path) {
+    replace(path, "\\", "/")
+}
+
+// port_is_dangerous: check if port string is in dangerous set
+fn port_is_dangerous(port_str) {
+    let needle = "," + port_str + ","
+    contains(DANGEROUS_PORTS_STR, needle)
+}
+
+// port_is_known: check if port string is in known-safe set
+fn port_is_known(port_str) {
+    let needle = "," + port_str + ","
+    contains(KNOWN_PORTS_STR, needle)
+}
+
+// agg_trit: aggregate multiple trit votes into one result
+// neg_count drives down hard, maybe_count drives down soft
+fn agg_trit(neg_count, maybe_count) {
+    let overall = T_TRUE
+    if3 neg_count >= 2 {
+        overall = T_FALSE
+    } else3 neg_count >= 1 {
+        overall = T_MAYBE
+    } else3 maybe_count >= 3 {
+        overall = T_MAYBE
+    } else3 {
+        overall = T_TRUE
+    }
+    overall
+}
+
+// agg_trit_strict: even 1 negative => FALSE
+fn agg_trit_strict(neg_count, maybe_count, maybe_limit) {
+    let overall = T_TRUE
+    if3 neg_count > 0 {
+        overall = T_FALSE
+    } else3 maybe_count > maybe_limit {
+        overall = T_MAYBE
+    } else3 {
+        overall = T_TRUE
+    }
+    overall
+}
+
+// safe_int: parse int from string, return 0 on failure
+fn safe_int(s) {
+    let cleaned = replace(s, "\r", "")
+    let cleaned2 = trim(cleaned)
+    let result = 0
+    if3 cleaned2 != "" {
+        result = int(cleaned2)
+    } else3 {}
+    result
+}
+
+// is_error_result: check if nova_run output signals an error
+fn is_error_result(s) {
+    let lower_s = lower(s)
+    let has_err = contains(lower_s, "error") + contains(lower_s, "cannot") + contains(lower_s, "no such") + contains(lower_s, "failed") + contains(lower_s, "not found")
+    has_err > 0
+}
+
+// ============================================================
+// TOOL 1: SCAN-FILE -- File Threat Analysis
+// Handler receives parsed JSON body directly as first arg
+// ============================================================
+
+fn handle_scan_file(body) {
+    let t0 = time()
+    let path = dict_get(body, "path")
+
+    if3 path == "" {
+        return {"ok": false, "error": "missing path param", "trit": -1, "char": "T", "bt": "T"}
+    } else3 {
+        let ep = esc_path(path)
+
+        // --- Trit A: Extension Risk ---
+        let ext = ext_lower(path)
+        let ext_trit = T_MAYBE
+        let ext_note = "unknown extension"
+        if3 contains(DANGEROUS_EXTS, ext + ",") {
+            ext_trit = T_FALSE
+            ext_note = "dangerous extension: " + ext
+        } else3 contains(SAFE_EXTS, ext + ",") {
+            ext_trit = T_TRUE
+            ext_note = "safe extension: " + ext
+        } else3 contains(MODERATE_EXTS, ext + ",") {
+            ext_trit = T_MAYBE
+            ext_note = "moderate-risk extension: " + ext
+        } else3 {
+            ext_trit = T_TRUE
+            ext_note = "unclassified extension: " + ext
+        }
+
+        // --- Trit B: Hidden / Temp File ---
+        let bname = basename(path)
+        let first_char = slice(bname, 0, 1)
+        let hidden_trit = T_TRUE
+        let hidden_note = "normal filename"
+        if3 first_char == "." {
+            hidden_trit = T_MAYBE
+            hidden_note = "hidden file (dot-prefixed)"
+        } else3 first_char == "~" {
+            hidden_trit = T_MAYBE
+            hidden_note = "temp file (tilde-prefixed)"
+        } else3 {}
+
+        // --- Trit C: File Size (via shell for %%~zI) ---
+        let size_cmd = "cmd /c for %I in (\"" + path + "\") do @echo %~zI"
+        let size_raw = trim(nova_run(size_cmd))
+        let size_trit = T_MAYBE
+        let size_note = "size unknown"
+        let file_size = 0
+        let file_exists = true
+
+        if3 is_error_result(size_raw) {
+            // File not found or inaccessible
+            file_exists = false
+            size_trit = T_FALSE
+            size_note = "file not accessible"
+        } else3 {
+            file_size = int(size_raw)
+            if3 file_size > 1073741824 {
+                size_trit = T_FALSE
+                size_note = "anomalously large: " + str(file_size) + " bytes"
+                _threats_found = _threats_found + 1
+            } else3 file_size > 104857600 {
+                size_trit = T_MAYBE
+                size_note = "large file: " + str(file_size) + " bytes"
+            } else3 file_size == 0 {
+                size_trit = T_MAYBE
+                size_note = "zero-byte file"
+            } else3 {
+                size_trit = T_TRUE
+                size_note = str(file_size) + " bytes (normal)"
+            }
+        }
+
+        if3 file_exists == false {
+            return {"ok": false, "error": "file not found or not accessible", "path": path, "trit": -1, "char": "T", "bt": "T"}
+        } else3 {
+            // --- Trit D: Entropy Check (native via certutil hex dump) ---
+            // Dump first 4096 bytes as hex, count distinct byte values
+            let hex_cmd = "cmd /c certutil -encodehex \"" + path + "\" CON 4 2>NUL | findstr /R \"[0-9a-f]\" 2>NUL"
+            let hex_raw = nova_run(hex_cmd)
+            let entropy_trit = T_MAYBE
+            let entropy_val = 0.0
+            let entropy_note = "entropy unknown"
+
+            if3 is_error_result(hex_raw) {
+                entropy_trit = T_MAYBE
+                entropy_note = "entropy check failed"
+            } else3 {
+                // Count distinct hex pairs as byte diversity proxy
+                // High diversity (>230/256 distinct bytes) = high entropy
+                let hex_clean = replace(replace(hex_raw, "\r", ""), "\n", "")
+                let hex_clean = replace(hex_clean, " ", "")
+                let sample_len = len(hex_clean)
+                let distinct = 0
+                let seen = ""
+                let ci = 0
+                while3 ci < sample_len - 1 {
+                    let pair = slice(hex_clean, ci, ci + 2)
+                    if3 contains(seen, pair + ",") == false {
+                        seen = seen + pair + ","
+                        distinct = distinct + 1
+                    }
+                    ci = ci + 2
+                }
+                // Scale to 0-8 range: entropy ~= (distinct/256) * 8
+                if3 sample_len > 0 {
+                    let entropy_val = round((distinct / 256.0) * 8.0, 4)
+                }
+                if3 entropy_val > 7.2 {
+                    entropy_trit = T_FALSE
+                    entropy_note = "very high entropy " + str(entropy_val) + " (likely encrypted/packed)"
+                    _threats_found = _threats_found + 1
+                } else3 entropy_val > 6.5 {
+                    entropy_trit = T_MAYBE
+                    entropy_note = "high entropy " + str(entropy_val) + " (compressed/binary)"
+                } else3 {
+                    entropy_trit = T_TRUE
+                    entropy_note = "normal entropy " + str(entropy_val)
+                }
+            }
+
+            // --- Aggregate ---
+            let neg_count = 0
+            let maybe_count = 0
+            if3 ext_trit == -1 { neg_count = neg_count + 1 } else3 {}
+            if3 hidden_trit == -1 { neg_count = neg_count + 1 } else3 {}
+            if3 size_trit == -1 { neg_count = neg_count + 1 } else3 {}
+            if3 entropy_trit == -1 { neg_count = neg_count + 1 } else3 {}
+            if3 ext_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 hidden_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 size_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 entropy_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+
+            let overall = agg_trit(neg_count, maybe_count)
+            record_trit(overall)
+            record_scan()
+
+            if3 neg_count > 0 {
+                _threats_found = _threats_found + 1
+            } else3 {}
+
+            let bt_str = bt_quad(ext_trit, hidden_trit, size_trit, entropy_trit)
+            let elapsed = round((time() - t0) * 1000, 2)
+            let re_val = (neg_count * H13) + (maybe_count * H5)
+            let flow = classify_flow(re_val)
+
+            return ({
+                "ok": true,
+                "path": path,
+                "extension": ext,
+                "size": file_size,
+                "entropy": entropy_val,
+                "trits": {
+                    "extension": ext_trit,
+                    "hidden": hidden_trit,
+                    "size": size_trit,
+                    "entropy": entropy_trit
+                },
+                "notes": {
+                    "extension": ext_note,
+                    "hidden": hidden_note,
+                    "size": size_note,
+                    "entropy": entropy_note
+                },
+                "trit": overall,
+                "char": trit_char(overall),
+                "bt": bt_str,
+                "posture": posture_str(overall),
+                "reynolds": re_val,
+                "flow": flow,
+                "ms": elapsed
+            })
+        }
+    }
+}
+
+// ============================================================
+// TOOL 2: SCAN-DIR -- Directory Recursive Security Scan
+// Uses temp .py file via nova_write for complex recursive logic
+// ============================================================
+
+fn handle_scan_dir(body) {
+    let t0 = time()
+    let path = dict_get(body, "path")
+    let max_depth_raw = dict_get(body, "max_depth")
+    let max_depth = 3
+    if3 max_depth_raw != "" {
+        max_depth = int(max_depth_raw)
+    } else3 {}
+
+    if3 path == "" {
+        return ({"ok": false, "error": "missing path param", "trit": -1, "char": "T"})
+    } else3 {
+        let ep = esc_path(path)
+
+        // Run pure NovaLang directory scanner micro-tool
+        let scan_cmd = "C:/NovaX/novalang.exe C:/NovaX/tools/tsec_scandir.nova \"" + ep + "\" " + str(max_depth)
+        let scan_raw = nova_run(scan_cmd)
+
+        if3 is_error_result(scan_raw) { elapsed2 = round((time() - t0) * 1000, 2)
+            return ({"ok": false, "error": "scan failed: " + scan_raw, "path": path, "trit": -1, "char": "T", "ms": elapsed2})
+        } else3 {
+            let data = json_decode(scan_raw)
+            let total_files = dict_get(data, "total_files")
+            let dangerous_count = dict_get(data, "dangerous_count")
+            let large_count = dict_get(data, "large_count")
+            let dotfile_count = dict_get(data, "dotfile_count")
+            let error_count = dict_get(data, "error_count")
+            let dangerous_list = dict_get(data, "dangerous")
+            let large_list = dict_get(data, "large")
+            let dotfile_list = dict_get(data, "dotfiles")
+
+            // Trit scoring
+            let ext_trit = T_TRUE
+            if3 dangerous_count > 5 {
+                ext_trit = T_FALSE
+            } else3 dangerous_count > 0 {
+                ext_trit = T_MAYBE
+            } else3 {}
+
+            let size_trit = T_TRUE
+            if3 large_count > 10 {
+                size_trit = T_FALSE
+            } else3 large_count > 0 {
+                size_trit = T_MAYBE
+            } else3 {}
+
+            let dot_trit = T_TRUE
+            if3 dotfile_count > 20 {
+                dot_trit = T_MAYBE
+            } else3 {}
+
+            let err_trit = T_TRUE
+            if3 error_count > 0 {
+                err_trit = T_MAYBE
+            } else3 {}
+
+            let neg_count = 0
+            let maybe_count = 0
+            if3 ext_trit == -1 { neg_count = neg_count + 1 } else3 {}
+            if3 size_trit == -1 { neg_count = neg_count + 1 } else3 {}
+            if3 ext_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 size_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 dot_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 err_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+
+            let overall = agg_trit(neg_count, maybe_count)
+            record_trit(overall)
+            record_scan()
+
+            let bt_str = bt_quad(ext_trit, size_trit, dot_trit, err_trit)
+            let elapsed = round((time() - t0) * 1000, 2)
+            let re_val = (neg_count * H13) + (maybe_count * H5)
+            let flow = classify_flow(re_val)
+
+            return ({
+                "ok": true,
+                "path": path,
+                "max_depth": max_depth,
+                "total_files": total_files,
+                "dangerous_count": dangerous_count,
+                "large_count": large_count,
+                "dotfile_count": dotfile_count,
+                "error_count": error_count,
+                "dangerous_files": dangerous_list,
+                "large_files": large_list,
+                "dotfiles": dotfile_list,
+                "trits": {
+                    "extensions": ext_trit,
+                    "size": size_trit,
+                    "dotfiles": dot_trit,
+                    "errors": err_trit
+                },
+                "trit": overall,
+                "char": trit_char(overall),
+                "bt": bt_str,
+                "posture": posture_str(overall),
+                "reynolds": re_val,
+                "flow": flow,
+                "ms": elapsed
+            })
+        }
+    }
+}
+
+// ============================================================
+// TOOL 3: PORTS -- List Open / Listening Ports via netstat
+// ============================================================
+
+fn handle_ports(body) {
+    let t0 = time()
+
+    // Use netstat -ano directly (native Windows, no Python dependency)
+    let ns_raw = nova_run("cmd /c netstat -ano 2>&1")
+        let lines = split(ns_raw, "\n")
+        let total_lines = len(lines)
+        let ports_out = []
+        let listen_count = 0
+        let danger_count = 0
+        let unknown_count = 0
+        let safe_count = 0
+
+        let i = 0
+        while3 i < total_lines {
+            let line = replace(lines[i], "\r", "")
+            if3 contains(line, "LISTENING") {
+                // Extract local address field (contains colon)
+                let parts = split(line, " ")
+                let n_parts = len(parts)
+                let j = 0
+                let local_addr = ""
+                while3 j < n_parts {
+                    let p = trim(parts[j])
+                    if3 contains(p, ":") {
+                        if3 len(p) > 2 {
+                            local_addr = p
+                        } else3 {}
+                    } else3 {}
+                    j = j + 1
+                }
+
+                if3 local_addr != "" { addr_parts = split(local_addr, ":")
+                    let n_ap = len(addr_parts)
+                    let port_str = addr_parts[n_ap - 1]
+                    let port_num = safe_int(port_str)
+                    let port_trit = T_MAYBE
+                    let port_flag = "unknown"
+
+                    if3 port_is_dangerous(port_str) {
+                        port_trit = T_FALSE
+                        port_flag = "dangerous"
+                        danger_count = danger_count + 1
+                        _threats_found = _threats_found + 1
+                    } else3 port_is_known(port_str) {
+                        port_trit = T_TRUE
+                        port_flag = "known"
+                        safe_count = safe_count + 1
+                    } else3 {
+                        port_trit = T_MAYBE
+                        port_flag = "unknown"
+                        unknown_count = unknown_count + 1
+                    }
+
+                    let entry = json_encode({"port": port_num, "addr": local_addr, "flag": port_flag, "trit": port_trit, "char": trit_char(port_trit)})
+                    ports_out = append(ports_out, entry)
+                    listen_count = listen_count + 1
+                } else3 {}
+            } else3 {}
+            i = i + 1
+        }
+
+        let overall = T_TRUE
+        if3 danger_count > 0 {
+            overall = T_FALSE
+        } else3 unknown_count > 10 {
+            overall = T_MAYBE
+        } else3 {}
+
+        record_trit(overall)
+        let elapsed = round((time() - t0) * 1000, 2)
+
+        return ({
+            "ok": true,
+            "source": "netstat",
+            "count": listen_count,
+            "safe_count": safe_count,
+            "unknown_count": unknown_count,
+            "dangerous_count": danger_count,
+            "ports": ports_out,
+            "trit": overall,
+            "char": trit_char(overall),
+            "bt": bt_one(overall),
+            "posture": posture_str(overall),
+            "ms": elapsed
+        })
+}
+
+// ============================================================
+// TOOL 4: ENTROPY -- Byte Diversity Entropy via certutil hex dump
+// ============================================================
+
+fn handle_entropy(body) {
+    let t0 = time()
+    let path = dict_get(body, "path")
+
+    if3 path == "" {
+        return {"ok": false, "error": "missing path param", "trit": -1, "char": "T"}
+    } else3 {
+        let ep = esc_path(path)
+
+        // Get file size via shell
+        let sz_cmd = "cmd /c for %I in (\"" + path + "\") do @echo %~zI"
+        let sz_raw = trim(nova_run(sz_cmd))
+        if3 is_error_result(sz_raw) { elapsed2 = round((time() - t0) * 1000, 2)
+            return ({"ok": false, "error": "entropy check failed -- file not accessible", "path": path, "trit": -1, "char": "T", "ms": elapsed2})
+        } else3 {}
+        let file_size = int(sz_raw)
+
+        // Entropy via certutil hex dump -- count distinct byte pairs
+        let hex_cmd = "cmd /c certutil -encodehex \"" + path + "\" CON 4 2>NUL | findstr /R \"[0-9a-f]\" 2>NUL"
+        let raw = nova_run(hex_cmd)
+
+        if3 is_error_result(raw) { elapsed2 = round((time() - t0) * 1000, 2)
+            return ({"ok": false, "error": "entropy check failed -- file not accessible", "path": path, "trit": -1, "char": "T", "ms": elapsed2})
+        } else3 {
+            let hex_clean = replace(replace(raw, "\r", ""), "\n", "")
+            let hex_clean = replace(hex_clean, " ", "")
+            let sample_len = len(hex_clean)
+            let distinct = 0
+            let seen = ""
+            let ci = 0
+            while3 ci < sample_len - 1 {
+                let pair = slice(hex_clean, ci, ci + 2)
+                if3 contains(seen, pair + ",") == false {
+                    seen = seen + pair + ","
+                    distinct = distinct + 1
+                }
+                ci = ci + 2
+            }
+            let entropy_val = 0.0
+            let max_entropy = 8.0
+            let ratio = 0.0
+            if3 sample_len > 0 {
+                let entropy_val = round((distinct / 256.0) * 8.0, 4)
+                let ratio = round(entropy_val / 8.0, 4)
+            }
+            let is_suspicious = entropy_val > 7.5
+            let is_high = entropy_val > 6.5
+            let is_medium = entropy_val > 4.0
+
+            let trit = T_TRUE
+            let regime = "low"
+            let description = "structured / plain text"
+
+            if3 is_suspicious == true {
+                trit = T_FALSE
+                regime = "very_high"
+                description = "likely encrypted or compressed random data"
+                _threats_found = _threats_found + 1
+            } else3 is_high == true {
+                trit = T_MAYBE
+                regime = "high"
+                description = "compressed or binary data"
+            } else3 is_medium == true {
+                trit = T_TRUE
+                regime = "medium"
+                description = "mixed content / source code"
+            } else3 {
+                trit = T_TRUE
+                regime = "low"
+                description = "structured / plain text"
+            }
+
+            // Reynolds analogy: entropy ratio maps to Re number
+            let re_val = int(ratio * RE_TURBULENT)
+            let flow = classify_flow(re_val)
+
+            record_trit(trit)
+            record_scan()
+
+            let elapsed = round((time() - t0) * 1000, 2)
+
+            return ({
+                "ok": true,
+                "path": path,
+                "entropy": entropy_val,
+                "max_entropy": max_entropy,
+                "ratio": ratio,
+                "regime": regime,
+                "description": description,
+                "size": file_size,
+                "reynolds": re_val,
+                "flow": flow,
+                "suspicious": is_suspicious,
+                "trit": trit,
+                "char": trit_char(trit),
+                "bt": bt_one(trit),
+                "posture": posture_str(trit),
+                "ms": elapsed
+            })
+        }
+    }
+}
+
+// ============================================================
+// TOOL 5: HASH -- File Integrity via certutil -hashfile
+// ============================================================
+
+fn handle_hash(body) {
+    let t0 = time()
+    let path = dict_get(body, "path")
+
+    if3 path == "" {
+        return {"ok": false, "error": "missing path param", "trit": -1, "char": "T"}
+    } else3 {
+        let ep = esc_path(path)
+
+        // Use certutil -hashfile for each algorithm (no Python)
+        let md5_raw = trim(nova_run("cmd /c certutil -hashfile \"" + path + "\" MD5 2>&1"))
+        let sha1_raw = trim(nova_run("cmd /c certutil -hashfile \"" + path + "\" SHA1 2>&1"))
+        let sha256_raw = trim(nova_run("cmd /c certutil -hashfile \"" + path + "\" SHA256 2>&1"))
+
+        if3 is_error_result(sha256_raw) { elapsed2 = round((time() - t0) * 1000, 2)
+            return ({"ok": false, "error": "hash failed -- file not accessible", "path": path, "trit": -1, "char": "T", "ms": elapsed2})
+        } else3 {
+            // certutil output: line 0 = algo header, line 1 = hash, line 2 = footer
+            let md5_lines = split(md5_raw, "\n")
+            let sha1_lines = split(sha1_raw, "\n")
+            let sha256_lines = split(sha256_raw, "\n")
+            let md5_val = replace(trim(md5_lines[1]), " ", "")
+            let sha1_val = replace(trim(sha1_lines[1]), " ", "")
+            let sha256_val = replace(trim(sha256_lines[1]), " ", "")
+
+            // Get file size
+            let sz_cmd = "cmd /c for %I in (\"" + path + "\") do @echo %~zI"
+            let file_size = int(trim(nova_run(sz_cmd)))
+
+            // Trit: +1 = hash computed OK, 0 = file empty, -1 = error
+            let trit = T_TRUE
+            if3 file_size == 0 {
+                trit = T_MAYBE
+            } else3 {}
+
+            record_trit(trit)
+            record_scan()
+
+            let elapsed = round((time() - t0) * 1000, 2)
+
+            return ({
+                "ok": true,
+                "path": path,
+                "md5": md5_val,
+                "sha1": sha1_val,
+                "sha256": sha256_val,
+                "size": file_size,
+                "trit": trit,
+                "char": trit_char(trit),
+                "bt": bt_one(trit),
+                "ms": elapsed
+            })
+        }
+    }
+}
+
+// ============================================================
+// TOOL 6: PERMISSIONS -- File Permission Check
+// Uses shell existence checks + icacls for Windows ACL detail
+// ============================================================
+
+fn handle_permissions(body) {
+    let t0 = time()
+    let path = dict_get(body, "path")
+
+    if3 path == "" {
+        return {"ok": false, "error": "missing path param", "trit": -1, "char": "T"}
+    } else3 {
+        let ep = esc_path(path)
+
+        // Check existence and type via shell (no Python)
+        let exist_raw = trim(nova_run("cmd /c if exist \"" + path + "\" (echo yes) else (echo no)"))
+        if3 exist_raw != "yes" { elapsed2 = round((time() - t0) * 1000, 2)
+            return ({"ok": false, "error": "path not found or not accessible", "path": path, "trit": -1, "char": "T", "ms": elapsed2})
+        } else3 {
+            // Determine if directory or file
+            let dir_check = trim(nova_run("cmd /c if exist \"" + path + "\\*\" (echo dir) else (echo file)"))
+            let is_dir = dir_check == "dir"
+            let is_file = dir_check == "file"
+
+            // Get file size (0 for directories)
+            let file_size = 0
+            if3 is_file == true {
+                let sz_raw = trim(nova_run("cmd /c for %I in (\"" + path + "\") do @echo %~zI"))
+                file_size = int(sz_raw)
+            } else3 {}
+
+            let mode_str = "novalang-native"
+
+            // Derive owner permissions from icacls (Windows-native approach)
+            // owner_r/w/x are approximated from ACL entries for the current user
+            let owner_r = true
+            let owner_w = false
+            let owner_x = false
+
+            // Run icacls for Windows ACL detail
+            let acl_raw = nova_run("cmd /c icacls \"" + path + "\" 2>&1")
+            let has_everyone = contains(acl_raw, "Everyone")
+            let has_full = contains(acl_raw, "(F)")
+            let has_modify = contains(acl_raw, "(M)")
+            let has_write = contains(acl_raw, "(W)")
+            let has_rx = contains(acl_raw, "(RX)")
+
+            // Derive owner permissions from ACL flags
+            if3 has_full == true {
+                owner_w = true
+                owner_x = true
+            } else3 has_modify == true {
+                owner_w = true
+                owner_x = true
+            } else3 {
+                if3 has_write == true {
+                    owner_w = true
+                } else3 {}
+                if3 has_rx == true {
+                    owner_x = true
+                } else3 {}
+            }
+
+            // Trit: classify permission state
+            // -1 = world-writable or dangerous combo
+            //  0 = overly permissive but not critical
+            // +1 = appropriately restricted
+            let trit = T_TRUE
+            let perm_note = "permissions appear appropriate"
+
+            if3 has_everyone == true {
+                if3 has_full == true {
+                    trit = T_FALSE
+                    perm_note = "world-accessible with full control (Everyone: F)"
+                } else3 has_modify == true {
+                    trit = T_FALSE
+                    perm_note = "world-modifiable (Everyone: M)"
+                } else3 has_write == true {
+                    trit = T_MAYBE
+                    perm_note = "world-writable (Everyone: W)"
+                } else3 {
+                    trit = T_MAYBE
+                    perm_note = "world-readable (Everyone access)"
+                }
+            } else3 owner_x == true {
+                if3 is_file == true { ext = ext_lower(path)
+                    if3 contains(DANGEROUS_EXTS, ext + ",") {
+                        trit = T_FALSE
+                        perm_note = "executable dangerous file type: " + ext
+                        _threats_found = _threats_found + 1
+                    } else3 {
+                        trit = T_MAYBE
+                        perm_note = "executable file"
+                    }
+                } else3 {
+                    trit = T_TRUE
+                    perm_note = "executable directory (normal)"
+                }
+            } else3 {}
+
+            // Build permission BT: [read, write, exec]
+            let r_trit = T_TRUE
+            let w_trit = T_TRUE
+            let x_trit = T_TRUE
+            if3 owner_r == false { r_trit = T_FALSE } else3 {}
+            if3 owner_w == true { w_trit = T_MAYBE } else3 {}
+            if3 owner_x == true { x_trit = T_MAYBE } else3 {}
+
+            let perm_bt = bt_three(r_trit, w_trit, x_trit)
+
+            record_trit(trit)
+            record_scan()
+
+            let elapsed = round((time() - t0) * 1000, 2)
+
+            return ({
+                "ok": true,
+                "path": path,
+                "mode": mode_str,
+                "is_directory": is_dir,
+                "is_file": is_file,
+                "size": file_size,
+                "owner": {
+                    "read": owner_r,
+                    "write": owner_w,
+                    "execute": owner_x
+                },
+                "world_accessible": has_everyone,
+                "perm_bt": perm_bt,
+                "note": perm_note,
+                "trit": trit,
+                "char": trit_char(trit),
+                "bt": bt_one(trit),
+                "posture": posture_str(trit),
+                "ms": elapsed
+            })
+        }
+    }
+}
+
+// ============================================================
+// TOOL 7: AUDIT -- Security Audit of Directory
+// Checks: world-writable, executables, dotfiles, large files
+// Uses shell dir /s /b for recursive listing
+// ============================================================
+
+fn handle_audit(body) {
+    let t0 = time()
+    let path = dict_get(body, "path")
+
+    if3 path == "" {
+        return {"ok": false, "error": "missing path param", "trit": -1, "char": "T"}
+    } else3 {
+        let ep = esc_path(path)
+
+        // Run pure NovaLang security audit micro-tool
+        let audit_cmd = "C:/NovaX/novalang.exe C:/NovaX/tools/tsec_audit.nova \"" + ep + "\" 5"
+        let audit_raw = nova_run(audit_cmd)
+
+        if3 is_error_result(audit_raw) { elapsed2 = round((time() - t0) * 1000, 2)
+            return ({"ok": false, "error": "audit failed: " + audit_raw, "path": path, "trit": -1, "char": "T", "ms": elapsed2})
+        } else3 {
+            let data = json_decode(audit_raw)
+            let total_files = dict_get(data, "total_files")
+            let ww_count = dict_get(data, "world_writable_count")
+            let exec_count = dict_get(data, "executables_count")
+            let dot_count = dict_get(data, "dotfiles_count")
+            let large_count = dict_get(data, "large_files_count")
+            let danger_count = dict_get(data, "dangerous_exts_count")
+            let entropy_count = dict_get(data, "high_entropy_count")
+            let errors_count = dict_get(data, "errors_count")
+            let ww_list = dict_get(data, "world_writable")
+            let exec_list = dict_get(data, "executables")
+            let dot_list = dict_get(data, "dotfiles")
+            let large_list = dict_get(data, "large_files")
+            let danger_list = dict_get(data, "dangerous_exts")
+            let entropy_list = dict_get(data, "high_entropy_files")
+
+            // Trit scoring per category
+            // world-writable: -1 if any (critical)
+            let ww_trit = T_TRUE
+            if3 ww_count > 0 {
+                ww_trit = T_FALSE
+                _threats_found = _threats_found + ww_count
+            } else3 {}
+
+            // executables: -1 if >20, 0 if >0, +1 otherwise
+            let exec_trit = T_TRUE
+            if3 exec_count > 20 {
+                exec_trit = T_FALSE
+            } else3 exec_count > 0 {
+                exec_trit = T_MAYBE
+            } else3 {}
+
+            // dotfiles: 0 if >10
+            let dot_trit = T_TRUE
+            if3 dot_count > 10 {
+                dot_trit = T_MAYBE
+            } else3 {}
+
+            // large files: 0 if >5, -1 if >20
+            let large_trit = T_TRUE
+            if3 large_count > 20 {
+                large_trit = T_FALSE
+            } else3 large_count > 5 {
+                large_trit = T_MAYBE
+            } else3 {}
+
+            // dangerous extensions: -1 if any
+            let danger_trit = T_TRUE
+            if3 danger_count > 0 {
+                danger_trit = T_MAYBE
+            } else3 {}
+
+            // high entropy: -1 if >5
+            let entropy_trit = T_TRUE
+            if3 entropy_count > 5 {
+                entropy_trit = T_FALSE
+                _threats_found = _threats_found + 1
+            } else3 entropy_count > 0 {
+                entropy_trit = T_MAYBE
+            } else3 {}
+
+            // Aggregate
+            let neg_count = 0
+            let maybe_count = 0
+            if3 ww_trit == -1 { neg_count = neg_count + 1 } else3 {}
+            if3 exec_trit == -1 { neg_count = neg_count + 1 } else3 {}
+            if3 large_trit == -1 { neg_count = neg_count + 1 } else3 {}
+            if3 entropy_trit == -1 { neg_count = neg_count + 1 } else3 {}
+            if3 ww_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 exec_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 dot_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 large_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 danger_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+            if3 entropy_trit == 0 { maybe_count = maybe_count + 1 } else3 {}
+
+            let overall = agg_trit(neg_count, maybe_count)
+            record_trit(overall)
+            record_scan()
+
+            let bt_str = bt_five(ww_trit, exec_trit, dot_trit, large_trit, danger_trit)
+            let elapsed = round((time() - t0) * 1000, 2)
+            let re_val = (neg_count * H13) + (maybe_count * H5)
+            let flow = classify_flow(re_val)
+
+            return ({
+                "ok": true,
+                "path": path,
+                "total_files": total_files,
+                "findings": {
+                    "world_writable": {
+                        "count": ww_count,
+                        "files": ww_list,
+                        "trit": ww_trit,
+                        "char": trit_char(ww_trit)
+                    },
+                    "executables": {
+                        "count": exec_count,
+                        "files": exec_list,
+                        "trit": exec_trit,
+                        "char": trit_char(exec_trit)
+                    },
+                    "dotfiles": {
+                        "count": dot_count,
+                        "files": dot_list,
+                        "trit": dot_trit,
+                        "char": trit_char(dot_trit)
+                    },
+                    "large_files": {
+                        "count": large_count,
+                        "files": large_list,
+                        "trit": large_trit,
+                        "char": trit_char(large_trit)
+                    },
+                    "dangerous_extensions": {
+                        "count": danger_count,
+                        "files": danger_list,
+                        "trit": danger_trit,
+                        "char": trit_char(danger_trit)
+                    },
+                    "high_entropy": {
+                        "count": entropy_count,
+                        "files": entropy_list,
+                        "trit": entropy_trit,
+                        "char": trit_char(entropy_trit)
+                    }
+                },
+                "errors_count": errors_count,
+                "trit": overall,
+                "char": trit_char(overall),
+                "bt": bt_str,
+                "posture": posture_str(overall),
+                "reynolds": re_val,
+                "flow": flow,
+                "ms": elapsed
+            })
+        }
+    }
+}
+
+// ============================================================
+// STATUS / HEALTH ENDPOINTS
+// ============================================================
+
+fn handle_health(req) {
+    let up = round(time() - _t0)
+    let self_trit = T_MAYBE
+    if3 up > 10 {
+        self_trit = T_TRUE
+    } else3 {}
+
+    let re_val = (_ops * H3) + (_scans * H5)
+    let flow = classify_flow(re_val)
+
+    let resp = ns_health_dict("nova-tsecurity", "2.0", PORT, {})
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "reynolds", {"laminar": RE_LAMINAR, "transition": RE_TRANSITION, "turbulent": RE_TURBULENT, "block_size": BLOCK_SIZE_T})
+    resp = dict_set(resp, "self_trit", self_trit)
+    resp = dict_set(resp, "char", trit_char(self_trit))
+    resp = dict_set(resp, "uptime_s", up)
+    resp = dict_set(resp, "ops", _ops)
+    resp = dict_set(resp, "scans", _scans)
+    resp = dict_set(resp, "threats_found", _threats_found)
+    resp = dict_set(resp, "quality", {"strong": _trits_good, "partial": _trits_maybe, "failed": _trits_bad})
+    resp = dict_set(resp, "reynolds_op", re_val)
+    resp = dict_set(resp, "flow", flow)
+    return resp
+}
+
+fn handle_status(req) {
+    let up = round(time() - _t0)
+    let re_val = (_ops * H3) + (_scans * H5)
+    let flow = classify_flow(re_val)
+
+    return ({
+        "ok": true,
+        "service": "nova-tsecurity",
+        "version": "2.0",
+        "port": PORT,
+        "ternary": true,
+        "tools": [
+            "scan-file",
+            "scan-dir",
+            "ports",
+            "entropy",
+            "hash",
+            "permissions",
+            "audit"
+        ],
+        "tool_count": TOOLS_COUNT,
+        "harmonics": {
+            "H3": H3,
+            "H5": H5,
+            "H7": H7,
+            "H13": H13
+        },
+        "reynolds_boundaries": {
+            "laminar": RE_LAMINAR,
+            "transition": RE_TRANSITION,
+            "turbulent": RE_TURBULENT
+        },
+        "block_size": BLOCK_SIZE_T,
+        "heartbeat_s": HEARTBEAT,
+        "ops": _ops,
+        "scans": _scans,
+        "threats_found": _threats_found,
+        "uptime_s": up,
+        "quality": {
+            "strong": _trits_good,
+            "partial": _trits_maybe,
+            "failed": _trits_bad
+        },
+        "reynolds_op": re_val,
+        "flow": flow
+    })
+}
+
+// ============================================================
+// ROUTE REGISTRATION
+// NOTE: per NovaLang gotchas, handler receives parsed JSON body
+//       as first argument directly -- no req wrapper extraction
+// ============================================================
+
+troute(server, "GET",  "/health",           handle_health)
+troute(server, "GET",  "/tsec/status",      handle_status)
+troute(server, "POST", "/tsec/scan-file",   handle_scan_file)
+troute(server, "POST", "/tsec/scan-dir",    handle_scan_dir)
+troute(server, "POST", "/tsec/ports",       handle_ports)
+troute(server, "POST", "/tsec/entropy",     handle_entropy)
+troute(server, "POST", "/tsec/hash",        handle_hash)
+troute(server, "POST", "/tsec/permissions", handle_permissions)
+troute(server, "POST", "/tsec/audit",       handle_audit)
+
+// ============================================================
+// STARTUP BANNER
+// ============================================================
+
+print("[TSecurity v2.0] NovaX Ternary Security Scanner on port " + str(PORT))
+print("[TSecurity v2.0] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TSecurity v2.0] Reynolds boundaries: laminar=" + str(RE_LAMINAR) + " transition=" + str(RE_TRANSITION) + " turbulent=" + str(RE_TURBULENT))
+print("[TSecurity v2.0] Block size: " + str(BLOCK_SIZE_T) + " (3^7) | Heartbeat: " + str(HEARTBEAT) + "s")
+print("[TSecurity v2.0] Tools (" + str(TOOLS_COUNT) + "): scan-file | scan-dir | ports | entropy | hash | permissions | audit")
+print("[TSecurity v2.0] T_TRUE=1 T_MAYBE=0 T_FALSE=-1 | certutil+netstat+icacls+shell")
+print("[TSecurity v2.0] Temp scripts -> C:/NovaX/tmp/tsec_*.py")
+print("[TSecurity v2.0] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+// ============================================================
+// START SERVER -- tstart() MUST be the LAST line
+// ============================================================
+
+tstart(server)

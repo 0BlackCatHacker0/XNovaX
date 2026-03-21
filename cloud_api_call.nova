@@ -1,0 +1,245 @@
+// cloud_api_call.nova - Thin bridge for NovaX cloud-router to call AI APIs
+// Replaces cloud_api_call.py
+// Called via: novalang cloud_api_call.nova '<json_payload>'
+// Payload: {"provider":"openai","model":"gpt-4o-mini","prompt":"...","system":"..."}
+
+let CONFIG_PATH = "C:/NovaX/cloud_config.json"
+
+fn3 load_config() {
+    try3 {
+        let content = read_file(CONFIG_PATH)
+        return3 parse_json(content)
+    } catch3 {
+        return3 {}
+    }
+}
+
+fn3 call_openai(key, model, prompt, system_prompt, url, identity, max_tokens) {
+    let messages = []
+    if3 len(system_prompt) > 0 {
+        let sys_msg = {}
+        sys_msg = dict_set(sys_msg, "role", "system")
+        sys_msg = dict_set(sys_msg, "content", system_prompt)
+        messages = append(messages, sys_msg)
+    }
+    let user_msg = {}
+    user_msg = dict_set(user_msg, "role", "user")
+    user_msg = dict_set(user_msg, "content", prompt)
+    messages = append(messages, user_msg)
+
+    let body = {}
+    body = dict_set(body, "model", model)
+    body = dict_set(body, "messages", messages)
+    body = dict_set(body, "max_tokens", max_tokens)
+
+    let headers = {}
+    headers = dict_set(headers, "Content-Type", "application/json")
+    headers = dict_set(headers, "Authorization", "Bearer " + key)
+
+    try3 {
+        let resp = http_post(url + "/chat/completions", to_json(body), headers)
+        let data = parse_json(resp)
+        let choices = dict_get(data, "choices") ?? []
+        let first = choices[0]
+        let msg = dict_get(first, "message") ?? {}
+        let text = dict_get(msg, "content") ?? ""
+        return3 {"ok": true, "response": text, "model": model, "provider": "openai"}
+    } catch3 {
+        return3 {"ok": false, "error": "openai_request_failed"}
+    }
+}
+
+fn3 call_anthropic(key, model, prompt, system_prompt, max_tokens) {
+    let user_msg = {}
+    user_msg = dict_set(user_msg, "role", "user")
+    user_msg = dict_set(user_msg, "content", prompt)
+    let messages = [user_msg]
+
+    let body = {}
+    body = dict_set(body, "model", model)
+    body = dict_set(body, "messages", messages)
+    body = dict_set(body, "max_tokens", max_tokens)
+    if3 len(system_prompt) > 0 {
+        body = dict_set(body, "system", system_prompt)
+    }
+
+    let headers = {}
+    headers = dict_set(headers, "Content-Type", "application/json")
+    headers = dict_set(headers, "x-api-key", key)
+    headers = dict_set(headers, "anthropic-version", "2023-06-01")
+
+    try3 {
+        let resp = http_post("https://api.anthropic.com/v1/messages", to_json(body), headers)
+        let data = parse_json(resp)
+        let content_arr = dict_get(data, "content") ?? []
+        let first = content_arr[0]
+        let text = dict_get(first, "text") ?? ""
+        return3 {"ok": true, "response": text, "model": model, "provider": "anthropic"}
+    } catch3 {
+        return3 {"ok": false, "error": "anthropic_request_failed"}
+    }
+}
+
+fn3 call_openrouter(key, model, prompt, system_prompt, identity, max_tokens) {
+    let messages = []
+    if3 len(system_prompt) > 0 {
+        let sys_msg = {}
+        sys_msg = dict_set(sys_msg, "role", "system")
+        sys_msg = dict_set(sys_msg, "content", system_prompt)
+        messages = append(messages, sys_msg)
+    }
+    let user_msg = {}
+    user_msg = dict_set(user_msg, "role", "user")
+    user_msg = dict_set(user_msg, "content", prompt)
+    messages = append(messages, user_msg)
+
+    let body = {}
+    body = dict_set(body, "model", model)
+    body = dict_set(body, "messages", messages)
+    body = dict_set(body, "max_tokens", max_tokens)
+
+    let referer = "https://novax.local"
+    let x_title = "NovaX Cloud Router"
+    if3 identity != null {
+        referer = dict_get(identity, "referer") ?? "https://novax.local"
+        x_title = dict_get(identity, "x_title") ?? "NovaX Cloud Router"
+    }
+
+    let headers = {}
+    headers = dict_set(headers, "Content-Type", "application/json")
+    headers = dict_set(headers, "Authorization", "Bearer " + key)
+    headers = dict_set(headers, "HTTP-Referer", referer)
+    headers = dict_set(headers, "X-Title", x_title)
+
+    try3 {
+        let resp = http_post("https://openrouter.ai/api/v1/chat/completions", to_json(body), headers)
+        let data = parse_json(resp)
+        let choices = dict_get(data, "choices") ?? []
+        let first = choices[0]
+        let msg = dict_get(first, "message") ?? {}
+        let text = dict_get(msg, "content") ?? ""
+        return3 {"ok": true, "response": text, "model": model, "provider": "openrouter"}
+    } catch3 {
+        return3 {"ok": false, "error": "openrouter_request_failed"}
+    }
+}
+
+fn3 main() {
+    let args = sys_args()
+    if3 len(args) < 1 {
+        print(to_json({"ok": false, "error": "no payload"}))
+        return3 null
+    }
+
+    let payload = {}
+    // Support --file mode
+    if3 args[0] == "--file" {
+        try3 {
+            let content = read_file(args[1])
+            payload = parse_json(content)
+        } catch3 {
+            print(to_json({"ok": false, "error": "file_read_error"}))
+            return3 null
+        }
+    } else3 {
+        try3 {
+            payload = parse_json(args[0])
+        } catch3 {
+            print(to_json({"ok": false, "error": "invalid json"}))
+            return3 null
+        }
+    }
+
+    let provider = dict_get(payload, "provider") ?? ""
+    let model = dict_get(payload, "model") ?? ""
+    let prompt = dict_get(payload, "prompt") ?? ""
+    let system_prompt = dict_get(payload, "system") ?? ""
+    let max_tokens = dict_get(payload, "max_tokens") ?? 8192
+
+    // Identity headers (optional)
+    let identity = null
+    let ua = dict_get(payload, "user_agent") ?? ""
+    let ref = dict_get(payload, "referer") ?? ""
+    let xt = dict_get(payload, "x_title") ?? ""
+    if3 len(ua) > 0 {
+        identity = {"user_agent": ua, "referer": ref, "x_title": xt}
+    } else3 {
+        if3 len(ref) > 0 {
+            identity = {"user_agent": ua, "referer": ref, "x_title": xt}
+        } else3 {
+            if3 len(xt) > 0 {
+                identity = {"user_agent": ua, "referer": ref, "x_title": xt}
+            }
+        }
+    }
+
+    if3 len(prompt) == 0 {
+        print(to_json({"ok": false, "error": "missing prompt"}))
+        return3 null
+    }
+
+    let config = load_config()
+    let provider_cfg = dict_get(config, provider) ?? {}
+    let key = dict_get(provider_cfg, "key") ?? ""
+
+    // Env var fallback
+    if3 len(key) == 0 {
+        if3 provider == "openai" { key = env_get("OPENAI_API_KEY") ?? "" }
+        else3 {
+            if3 provider == "anthropic" { key = env_get("ANTHROPIC_API_KEY") ?? "" }
+        }
+    }
+
+    if3 len(key) == 0 {
+        print(to_json({"ok": false, "error": "no_key_for_" + provider}))
+        return3 null
+    }
+
+    if3 len(model) == 0 {
+        let models = dict_get(provider_cfg, "models") ?? []
+        if3 len(models) > 0 { model = models[0] }
+    }
+    if3 len(model) == 0 {
+        print(to_json({"ok": false, "error": "no_model_for_" + provider}))
+        return3 null
+    }
+
+    let via = dict_get(provider_cfg, "via") ?? ""
+    let t0 = time_ms()
+    let result = {}
+
+    if3 via == "openrouter" {
+        let or_cfg = dict_get(config, "openrouter") ?? {}
+        let or_key = dict_get(or_cfg, "key") ?? key
+        result = call_openrouter(or_key, model, prompt, system_prompt, identity, max_tokens)
+        result = dict_set(result, "provider", provider)
+        result = dict_set(result, "via", "openrouter")
+    } else3 {
+        if3 provider == "openai" {
+            let url = dict_get(provider_cfg, "url") ?? "https://api.openai.com/v1"
+            result = call_openai(key, model, prompt, system_prompt, url, identity, max_tokens)
+        } else3 {
+            if3 provider == "anthropic" {
+                result = call_anthropic(key, model, prompt, system_prompt, max_tokens)
+            } else3 {
+                if3 provider == "openrouter" {
+                    result = call_openrouter(key, model, prompt, system_prompt, identity, max_tokens)
+                } else3 {
+                    // Generic OpenAI-compatible
+                    let url = dict_get(provider_cfg, "url") ?? ""
+                    if3 len(url) > 0 {
+                        result = call_openai(key, model, prompt, system_prompt, url, identity, max_tokens)
+                    } else3 {
+                        result = {"ok": false, "error": "unsupported_provider_" + provider}
+                    }
+                }
+            }
+        }
+    }
+
+    let elapsed = time_ms() - t0
+    result = dict_set(result, "time_ms", int(elapsed))
+    print(to_json(result))
+}
+
+main()

@@ -1,0 +1,1790 @@
+// nova_tbuild_service.nova -- NovaX TBuild v2.0 -- Ternary Build System (port 9909)
+//
+// 7 ternary-native build tools on 3-5-7-13 harmonic constants:
+//   1. /tbuild/deps     -- List project dependencies (package.json, requirements.txt, Cargo.toml, etc.)
+//   2. /tbuild/order    -- Determine build order from file dependencies (topological sort)
+//   3. /tbuild/diff     -- Show changed files since last build (mtime/git-based)
+//   4. /tbuild/status   -- Project build status (artifacts, lock files, build dirs)
+//   5. /tbuild/lint     -- Basic linting: bracket balance, long lines, style checks
+//   6. /tbuild/vcs      -- Version control status (git branch, changes, recent commits)
+//   7. /tbuild/compile  -- Run a build command (params: path, command, timeout)
+//
+// N-S Mapping:
+//   source files = flow field; dependencies = pressure gradient
+//   build order  = streamline integration; lint score = viscous dissipation
+//   Reynolds boundaries: 27 (laminar), 125 (transitional), 343 (turbulent)
+//
+// Harmonics:
+//   H3=3  H5=5  H7=7  H13=13  BLOCK=3^7=2187
+//   RE_LAMINAR=3^3=27  RE_TRANSITION=5^3=125  RE_TURBULENT=7^3=343
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9909
+let server = tserve(PORT, "TBuild v2.0 - Ternary Build System")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let BLOCK = 2187
+
+// -- Service Identity --
+let VERSION = "2.0.0"
+let SERVICE_NAME = "nova-tbuild"
+let TOOLS_COUNT = 7
+
+// -- Ternary Truth Values --
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// -- N-S Reynolds Boundaries --
+let RE_LAMINAR = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT = 343
+
+// -- Temp file base (all temp files go here) --
+let TMP_BASE = "C:\\NovaX\\data"
+
+// -- Stats State --
+let stat_ops = 0
+let stat_t0 = time()
+let stat_trit_true = 0
+let stat_trit_maybe = 0
+let stat_trit_false = 0
+let stat_deps = 0
+let stat_order = 0
+let stat_diff = 0
+let stat_status = 0
+let stat_lint = 0
+let stat_vcs = 0
+let stat_compile = 0
+
+// ============================================================================
+// HELPER: record_op -- update stats counters for a completed operation
+// ============================================================================
+
+fn record_op(tool_name, trit_val) {
+    stat_ops = stat_ops + 1
+    if3 trit_val == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    } else if3 trit_val == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    } else3 {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "deps" {
+        stat_deps = stat_deps + 1
+    } else if3 tool_name == "order" {
+        stat_order = stat_order + 1
+    } else if3 tool_name == "diff" {
+        stat_diff = stat_diff + 1
+    } else if3 tool_name == "status" {
+        stat_status = stat_status + 1
+    } else if3 tool_name == "lint" {
+        stat_lint = stat_lint + 1
+    } else if3 tool_name == "vcs" {
+        stat_vcs = stat_vcs + 1
+    } else3 {
+        stat_compile = stat_compile + 1
+    }
+    return T_TRUE
+}
+
+// ============================================================================
+// HELPER: trit_char -- ternary character symbol (+1->"1", 0->"0", -1->"T")
+// ============================================================================
+
+fn trit_char(t) {
+    if3 t == T_TRUE {
+        return "1"
+    } else if3 t == T_MAYBE {
+        return "0"
+    } else3 {
+        return "T"
+    }
+}
+
+// ============================================================================
+// HELPER: bt_from_trits -- balanced-ternary string from a list of trit values
+// ============================================================================
+
+fn bt_from_trits(trits) {
+    let out = ""
+    let i = 0
+    let n = len(trits)
+    while3 i < n {
+        let t = dict_get(trits, i) ?? 0
+        if3 t == T_TRUE { out = out + "1"
+        } else if3 t == T_FALSE { out = out + "T"
+        } else3 { out = out + "0"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ============================================================================
+// HELPER: flow_regime -- N-S Reynolds number to flow regime name
+// ============================================================================
+
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    } else if3 re_num < RE_TRANSITION {
+        return "transitional"
+    } else if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    } else3 {
+        return "chaotic"
+    }
+}
+
+// ============================================================================
+// HELPER: esc_path -- escape backslashes in a Windows path for embedding
+//         in shell command strings.
+//         Uses replace() which is a NovaLang builtin.
+// ============================================================================
+
+fn esc_path(p) {
+    return replace(p, "\\", "\\\\")
+}
+
+// ============================================================================
+// HELPER: ensure_tmp_dir -- make sure C:\NovaX\data exists
+// ============================================================================
+
+fn ensure_tmp_dir() {
+    let chk = shell("mkdir C:\\NovaX\\data 2>NUL")
+    return T_TRUE
+}
+
+// ============================================================================
+// TOOL 1: DEPENDENCY LISTER
+// POST /tbuild/deps
+// Body: {"path": "/abs/project/dir"}
+// Reads package.json, requirements.txt, Cargo.toml, go.mod, Pipfile, pyproject.toml
+// Returns: {deps: {file: [list]}, count: N, trit: 1/0/-1}
+// ============================================================================
+
+fn tbuild_deps(body) {
+    let t0 = time()
+    let path = str(dict_get(body, "path") ?? "")
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else3 {
+        // path provided
+    }
+
+    // Read dependency files directly via NovaLang builtins
+    let raw = "{}"
+    let pkg = try3 { read_file(path + "/package.json") } fail { "" }
+    let req = try3 { read_file(path + "/requirements.txt") } fail { "" }
+    raw = json_encode({"package_json": pkg, "requirements_txt": req})
+
+    let overall = T_MAYBE
+    let found_deps = {}
+    let dep_count = 0
+
+    if3 len(trim(raw)) == 0 { elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("deps", T_FALSE)
+        return {"ok": false, "error": "No output from deps scanner. Is path valid?", "path": path, "trit": T_FALSE, "ms": elapsed}
+    } else3 {
+        // have output
+    }
+
+    try3 {
+        let parsed = json_decode(raw)
+        let found_deps = dict_get(parsed, "deps") ?? {}
+        let dep_count = dict_get(parsed, "count") ?? 0
+        let trit_raw = dict_get(parsed, "trit") ?? T_MAYBE
+        let overall = trit_raw
+    } fail {
+        elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("deps", T_FALSE)
+        return {"ok": false, "error": "Deps parse failed: " + raw, "trit": T_FALSE, "ms": elapsed}
+    }
+
+    // Detect which manifest files were found
+    let manifests_found = keys(found_deps)
+
+    // Build Reynolds number: dep_count as "flow load"
+    let re_num = dep_count
+    let regime = flow_regime(re_num)
+
+    // Trit list from per-file dep presence
+    let mf_keys = keys(found_deps)
+    let trit_list = []
+    let mi = 0
+    let mn = len(mf_keys)
+    while3 mi < mn {
+        let mk = mf_keys[mi]
+        let mv = dict_get(found_deps, mk) ?? []
+        if3 len(mv) > 0 {
+            trit_list = append(trit_list, T_TRUE)
+        } else3 {
+            trit_list = append(trit_list, T_MAYBE)
+        }
+        mi = mi + 1
+    }
+
+    let bt_str = bt_from_trits(trit_list)
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    let _r = record_op("deps", overall)
+
+    return {
+        "ok":       true,
+        "path":     path,
+        "deps":     found_deps,
+        "count":    dep_count,
+        "manifests": manifests_found,
+        "reynolds": re_num,
+        "regime":   regime,
+        "bt":       bt_str,
+        "trit":     overall,
+        "ms":       elapsed
+    }
+}
+
+// ============================================================================
+// TOOL 2: BUILD ORDER
+// POST /tbuild/order
+// Body: {"path": "/abs/project/dir", "pattern": "*.py"}
+// Scans files matching pattern, reads import/require statements,
+// performs topological sort (Kahn's algorithm), returns build order.
+// Pure NovaLang: dir_walk + nova_read + string parsing for imports.
+// ============================================================================
+
+fn tbuild_order(body) {
+    let t0 = time()
+    let path = str(dict_get(body, "path") ?? "")
+    let pattern = str(dict_get(body, "pattern") ?? "*.py")
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else3 {
+        // path provided
+    }
+
+    // Derive extension from pattern (e.g. "*.py" -> ".py")
+    let pat_ext = ""
+    if3 contains(pattern, ".") == 1 {
+        let pat_parts = split(pattern, ".")
+        let pat_ext = "." + dict_get(pat_parts, len(pat_parts) - 1) ?? ""
+    } else3 {
+        // no extension filter
+    }
+
+    // Skip directories
+    let skip_dirs = [".git", "node_modules", "__pycache__", "ai_env", "venv", ".venv"]
+
+    // Gather matching files via dir_walk
+    let all_entries = dir_walk(path)
+    let all_files = []
+    let wi = 0
+    while3 wi < len(all_entries) {
+        let entry = dict_get(all_entries, wi) ?? {}
+        let fp = dict_get(entry, "path") ?? ""
+        let is_d = dict_get(entry, "is_dir") ?? -1
+        if3 is_d != 1 {
+            // Check if file matches pattern extension
+            let fname = path_filename(fp)
+            let fext = "." + path_ext(fp)
+            let skip_file = false
+            // Check if any parent contains a skip dir
+            let si = 0
+            while3 si < len(skip_dirs) {
+                let sd = dict_get(skip_dirs, si) ?? ""
+                if3 contains(fp, "\\" + sd + "\\") == 1 { skip_file = true
+                } else if3 contains(fp, "/" + sd + "/") == 1 { skip_file = true
+                } else3 {
+                    // not skipped
+                }
+                si = si + 1
+            }
+            if3 skip_file == false {
+                if3 len(pat_ext) == 0 {
+                    all_files = append(all_files, fp)
+                } else if3 fext == pat_ext {
+                    all_files = append(all_files, fp)
+                } else3 {
+                    // extension mismatch
+                }
+            } else3 {
+                // skipped dir
+            }
+        } else3 {
+            // directory entry
+        }
+        wi = wi + 1
+    }
+
+    // Build dependency graph: for each file, extract local imports
+    // Graph stored as parallel lists: graph_files[], graph_deps[] (each a list of indices)
+    let graph_files = all_files
+    let graph_deps = []
+    let edges = 0
+    let gi = 0
+    while3 gi < len(graph_files) {
+        let fp = dict_get(graph_files, gi) ?? ""
+        let deps = []
+        let src = try3 { nova_read(fp) } fail { "" }
+        let fext = "." + path_ext(fp)
+
+        if3 fext == ".py" {
+            // Parse .py imports: lines starting with "import " or "from "
+            let src_lines = split(src, "\n")
+            let li = 0
+            while3 li < len(src_lines) {
+                let line = trim(dict_get(src_lines, li) ?? "")
+                if3 starts_with(line, "from ") == 1 {
+                    // Extract module name: "from X import ..." -> X
+                    let rest = slice(line, 5, len(line))
+                    let parts = split(rest, " ")
+                    let mod_name = dict_get(parts, 0) ?? ""
+                    // Check for relative import (starts with .)
+                    if3 starts_with(mod_name, ".") == 1 {
+                        let rel_name = split(slice(mod_name, 1, len(mod_name)), ".")[0]
+                        if3 len(rel_name) > 0 {
+                            let candidate = path_join(path_parent(fp), rel_name + ".py")
+                            if3 file_exists(candidate) == 1 { deps = append(deps, candidate)
+                            } else3 {
+                                // candidate not found
+                            }
+                        } else3 {
+                            // empty relative import
+                        }
+                    } else3 {
+                        // Absolute import - check if module exists in project
+                        let candidate = path_join(path, mod_name + ".py")
+                        if3 file_exists(candidate) == 1 {
+                            if3 contains(all_files, candidate) == 1 { deps = append(deps, candidate)
+                            } else3 {
+                                // not in project files
+                            }
+                        } else3 {
+                            // external module
+                        }
+                    }
+                } else if3 starts_with(line, "import ") == 1 {
+                    let rest = slice(line, 7, len(line))
+                    let mod_name = split(rest, " ")[0]
+                    let mod_name = split(mod_name, ",")[0]
+                    if3 starts_with(mod_name, ".") == 1 {
+                        let rel_name = split(slice(mod_name, 1, len(mod_name)), ".")[0]
+                        if3 len(rel_name) > 0 {
+                            let candidate = path_join(path_parent(fp), rel_name + ".py")
+                            if3 file_exists(candidate) == 1 { deps = append(deps, candidate)
+                            } else3 {
+                                // not found
+                            }
+                        } else3 {
+                            // empty
+                        }
+                    } else3 {
+                        let candidate = path_join(path, mod_name + ".py")
+                        if3 file_exists(candidate) == 1 {
+                            if3 contains(all_files, candidate) == 1 { deps = append(deps, candidate)
+                            } else3 {
+                                // not in project
+                            }
+                        } else3 {
+                            // external
+                        }
+                    }
+                } else3 {
+                    // not an import line
+                }
+                li = li + 1
+            }
+        } else if3 contains(".js.ts.jsx.tsx", fext) == 1 {
+            // JS/TS: parse import/require lines for relative paths
+            let src_lines = split(src, "\n")
+            let li = 0
+            while3 li < len(src_lines) {
+                let line = trim(dict_get(src_lines, li) ?? "")
+                // Look for import ... from './...' or require('./...')
+                if3 contains(line, "from ") == 1 {
+                    // Extract path from quotes after "from"
+                    let after_from = split(line, "from ")
+                    let quote_part = dict_get(after_from, len(after_from) - 1) ?? ""
+                    let imp_path = ""
+                    if3 contains(quote_part, "'") == 1 {
+                        let qp = split(quote_part, "'")
+                        let imp_path = dict_get(qp, 1) ?? ""
+                    } else if3 contains(quote_part, "\"") == 1 {
+                        let qp = split(quote_part, "\"")
+                        let imp_path = dict_get(qp, 1) ?? ""
+                    } else3 {
+                        // no quotes found
+                    }
+                    if3 starts_with(imp_path, ".") == 1 {
+                        // Relative path - try extensions
+                        let try_exts = ["", ".js", ".ts", ".jsx", ".tsx"]
+                        let ei = 0
+                        let found = false
+                        while3 ei < len(try_exts) {
+                            let ext2 = dict_get(try_exts, ei) ?? ""
+                            let candidate = path_join(path_parent(fp), imp_path + ext2)
+                            if3 file_exists(candidate) == 1 {
+                                if3 contains(all_files, candidate) == 1 {
+                                    deps = append(deps, candidate)
+                                    let found = true
+                                } else3 {
+                                    // not in project
+                                }
+                            } else3 {
+                                // not found
+                            }
+                            ei = ei + 1
+                        }
+                    } else3 {
+                        // absolute/package import
+                    }
+                } else if3 contains(line, "require(") == 1 {
+                    // Extract path from require('...')
+                    let after_req = split(line, "require(")
+                    let rp = dict_get(after_req, 1) ?? ""
+                    let imp_path = ""
+                    if3 contains(rp, "'") == 1 {
+                        let qp = split(rp, "'")
+                        let imp_path = dict_get(qp, 1) ?? ""
+                    } else if3 contains(rp, "\"") == 1 {
+                        let qp = split(rp, "\"")
+                        let imp_path = dict_get(qp, 1) ?? ""
+                    } else3 {
+                        // no quotes
+                    }
+                    if3 starts_with(imp_path, ".") == 1 {
+                        let try_exts = ["", ".js", ".ts"]
+                        let ei = 0
+                        while3 ei < len(try_exts) {
+                            let ext2 = dict_get(try_exts, ei) ?? ""
+                            let candidate = path_join(path_parent(fp), imp_path + ext2)
+                            if3 file_exists(candidate) == 1 {
+                                if3 contains(all_files, candidate) == 1 {
+                                    deps = append(deps, candidate)
+                                } else3 {
+                                    // not in project
+                                }
+                            } else3 {
+                                // not found
+                            }
+                            ei = ei + 1
+                        }
+                    } else3 {
+                        // package require
+                    }
+                } else3 {
+                    // not an import/require line
+                }
+                li = li + 1
+            }
+        } else3 {
+            // unsupported extension for dep scanning
+        }
+
+        edges = edges + len(deps)
+        graph_deps = append(graph_deps, deps)
+        gi = gi + 1
+    }
+
+    let nodes_count = len(graph_files)
+
+    // Kahn's topological sort using parallel arrays
+    // Build in-degree counts
+    let in_deg = []
+    let ki = 0
+    while3 ki < nodes_count {
+        in_deg = append(in_deg, 0)
+        ki = ki + 1
+    }
+
+    // For each file's deps, increment in_deg of the file (not the dep)
+    let ki = 0
+    while3 ki < nodes_count {
+        let deps = dict_get(graph_deps, ki) ?? []
+        let di = 0
+        while3 di < len(deps) {
+            // dep -> ki means ki depends on dep, so in_deg[ki] += 1
+            // But for topo sort: dep must come before ki
+            // Actually: if ki imports dep, edge is dep->ki, in_deg[ki]++
+            // We already counted correctly: in_deg[ki] = number of deps
+            di = di + 1
+        }
+        in_deg = dict_set(in_deg, ki, len(deps))
+        ki = ki + 1
+    }
+
+    // Queue: start with nodes having in_deg == 0
+    let queue = []
+    let ki = 0
+    while3 ki < nodes_count {
+        if3 dict_get(in_deg, ki) ?? 0 == 0 {
+            queue = append(queue, ki)
+        } else3 {
+            // has dependencies
+        }
+        ki = ki + 1
+    }
+
+    let order = []
+    let visited = 0
+    while3 len(queue) > 0 {
+        // Dequeue first element
+        let node_idx = dict_get(queue, 0) ?? 0
+        queue = slice(queue, 1, len(queue))
+        order = append(order, node_idx)
+        visited = visited + 1
+
+        // For each file that depends on this node, decrement in_deg
+        let ni = 0
+        while3 ni < nodes_count {
+            let deps = dict_get(graph_deps, ni) ?? []
+            let node_file = dict_get(graph_files, node_idx) ?? ""
+            if3 contains(deps, node_file) == 1 {
+                let new_deg = (dict_get(in_deg, ni) ?? 0) - 1
+                in_deg = dict_set(in_deg, ni, new_deg)
+                if3 new_deg == 0 {
+                    queue = append(queue, ni)
+                } else3 {
+                    // still has deps
+                }
+            } else3 {
+                // not a dependent
+            }
+            ni = ni + 1
+        }
+    }
+
+    let has_cycle = visited < nodes_count
+
+    // Build relative order list and cycle nodes
+    let order_rel = []
+    let oi = 0
+    while3 oi < len(order) {
+        let idx = dict_get(order, oi) ?? 0
+        let fp = dict_get(graph_files, idx) ?? ""
+        // Make relative by removing base path prefix
+        let rel_path = fp
+        if3 starts_with(fp, path) == 1 {
+            let rel_path = slice(fp, len(path) + 1, len(fp))
+        } else3 {
+            // already relative or different root
+        }
+        order_rel = append(order_rel, rel_path)
+        oi = oi + 1
+    }
+
+    let cycle_nodes = []
+    if3 has_cycle == true {
+        let ci2 = 0
+        while3 ci2 < nodes_count {
+            if3 contains(order, ci2) != 1 {
+                let fp = dict_get(graph_files, ci2) ?? ""
+                let rel_path = fp
+                if3 starts_with(fp, path) == 1 {
+                    let rel_path = slice(fp, len(path) + 1, len(fp))
+                } else3 {
+                    // keep as is
+                }
+                cycle_nodes = append(cycle_nodes, rel_path)
+            } else3 {
+                // in order
+            }
+            ci2 = ci2 + 1
+        }
+    } else3 {
+        // no cycle
+    }
+
+    // N-S flow metrics
+    let re_num = round(edges * nodes_count / max(1, 3), 2)
+    let regime = flow_regime(re_num)
+    let trit_raw = -1
+    if3 has_cycle == true { trit_raw = -1
+    } else if3 edges == 0 { trit_raw = 0
+    } else3 { trit_raw = 1
+    }
+
+    let trit_list = [trit_raw]
+    let bt_str = bt_from_trits(trit_list)
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    let _r = record_op("order", trit_raw)
+
+    return {
+        "ok":          has_cycle == false,
+        "path":        path,
+        "pattern":     pattern,
+        "order":       order_rel,
+        "nodes":       nodes_count,
+        "edges":       edges,
+        "has_cycle":   has_cycle,
+        "cycle_nodes": cycle_nodes,
+        "reynolds":    re_num,
+        "regime":      regime,
+        "bt":          bt_str,
+        "trit":        trit_raw,
+        "ms":          elapsed
+    }
+}
+
+// ============================================================================
+// TOOL 3: DIFF (changed files since last build)
+// POST /tbuild/diff
+// Body: {"path": "/abs/project/dir", "since": <unix_timestamp>}
+//    OR {"path": "/abs/project/dir", "reference": "HEAD~1"}
+// Returns list of files modified after timestamp or since git ref.
+// ============================================================================
+
+fn tbuild_diff(body) {
+    let t0 = time()
+    let path = str(dict_get(body, "path") ?? "")
+    let since_ts = dict_get(body, "since") ?? 0
+    let reference = str(dict_get(body, "reference") ?? "")
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else3 {
+        // path provided
+    }
+
+    let ep = esc_path(path)
+
+    // Branch: git-based diff if reference given, else mtime-based
+    let use_git = false
+    if3 len(reference) > 0 { use_git = true
+    } else3 {
+        // mtime mode
+    }
+
+    let changes = []
+    let mode = "mtime"
+    let added = 0
+    let modified = 0
+    let deleted = 0
+
+    if3 use_git == true {
+        // Pure NovaLang: run git diff directly via shell()
+        let esc_ref = replace(reference, "\"", "")
+        let git_result = shell("cd /d \"" + ep + "\" && git diff --name-status " + esc_ref)
+        let _tmp_1 = try3 { dict_get(git_result, "stdout") } fail { "" }
+        let git_out = trim(_tmp_1)
+        let mode = "git"
+
+        if3 len(git_out) > 0 {
+            let diff_lines = split(git_out, "\n")
+            let dli = 0
+            while3 dli < len(diff_lines) {
+                let dline = trim(dict_get(diff_lines, dli) ?? "")
+                if3 len(dline) > 0 {
+                    // Format: "M\tfilename" or "A\tfilename" etc.
+                    // Split on tab
+                    if3 contains(dline, "\t") == 1 {
+                        let tab_parts = split(dline, "\t")
+                        let status_ch = trim(dict_get(tab_parts, 0) ?? "")
+                        let file_name = trim(dict_get(tab_parts, len(tab_parts) - 1) ?? "")
+                        let trit_val = 0
+                        if3 status_ch == "A" { trit_val = 1
+                            added = added + 1
+                        } else if3 status_ch == "D" { trit_val = -1
+                            deleted = deleted + 1
+                        } else3 {
+                            modified = modified + 1
+                        }
+                        changes = append(changes, {"status": status_ch, "file": file_name, "trit": trit_val})
+                    } else3 {
+                        // malformed line
+                    }
+                } else3 {
+                    // empty line
+                }
+                dli = dli + 1
+            }
+        } else3 {
+            // no diff output
+        }
+    } else3 {
+        // mtime-based: use dir_walk + file_mtime -- pure NovaLang
+        let mode = "mtime"
+        let skip_dirs = [".git", "node_modules", "__pycache__", "ai_env", "venv", ".venv"]
+        let now_ts = time()
+        let all_entries = dir_walk(path)
+        let mei = 0
+        while3 mei < len(all_entries) {
+            let entry = dict_get(all_entries, mei) ?? {}
+            let fp = dict_get(entry, "path") ?? ""
+            let is_d = dict_get(entry, "is_dir") ?? -1
+            if3 is_d != 1 {
+                // Check skip dirs
+                let skip_file = false
+                let si = 0
+                while3 si < len(skip_dirs) {
+                    let sd = dict_get(skip_dirs, si) ?? ""
+                    if3 contains(fp, "\\" + sd + "\\") == 1 { skip_file = true
+                    } else if3 contains(fp, "/" + sd + "/") == 1 { skip_file = true
+                    } else3 {
+                        // not skipped
+                    }
+                    si = si + 1
+                }
+                if3 skip_file == false {
+                    let mt = dict_get(entry, "mtime") ?? 0
+                    if3 since_ts == 0 {
+                        // Include all files
+                        let rel_path = fp
+                        if3 starts_with(fp, path) == 1 {
+                            let rel_path = slice(fp, len(path) + 1, len(fp))
+                        } else3 {
+                            // keep as-is
+                        }
+                        let age_s = round(now_ts - mt, 1)
+                        changes = append(changes, {"file": rel_path, "mtime": mt, "age_s": age_s, "trit": 1})
+                    } else if3 mt > since_ts {
+                        let rel_path = fp
+                        if3 starts_with(fp, path) == 1 {
+                            let rel_path = slice(fp, len(path) + 1, len(fp))
+                        } else3 {
+                            // keep as-is
+                        }
+                        let age_s = round(now_ts - mt, 1)
+                        changes = append(changes, {"file": rel_path, "mtime": mt, "age_s": age_s, "trit": 1})
+                    } else3 {
+                        // file older than since_ts
+                    }
+                } else3 {
+                    // skipped directory
+                }
+            } else3 {
+                // directory entry
+            }
+            mei = mei + 1
+        }
+    }
+
+    let total_ch = len(changes)
+    let truncated = total_ch > 343
+    // Truncate changes to 343 max
+    if3 truncated == true {
+        changes = slice(changes, 0, 343)
+    } else3 {
+        // fits
+    }
+
+    // Compute trit: no changes=1, <27=0, >=27=-1
+    let trit_raw = T_MAYBE
+    if3 total_ch == 0 { trit_raw = 1
+    } else if3 total_ch < RE_LAMINAR { trit_raw = 0
+    } else3 { trit_raw = -1
+    }
+
+    // Build bt from per-change trits (up to H13)
+    let trit_list = []
+    let ci = 0
+    let ct_max = H13
+    if3 total_ch < ct_max { ct_max = total_ch
+    } else3 {
+        // cap at H13
+    }
+    while3 ci < ct_max {
+        let ce = dict_get(changes, ci) ?? {}
+        let ct = dict_get(ce, "trit") ?? T_MAYBE
+        trit_list = append(trit_list, ct)
+        ci = ci + 1
+    }
+    let bt_str = bt_from_trits(trit_list)
+
+    // Reynolds: total change count as flow metric
+    let re_num = total_ch
+    let regime = flow_regime(re_num)
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    let _r = record_op("diff", trit_raw)
+
+    let result = {
+        "ok":       true,
+        "path":     path,
+        "mode":     mode,
+        "changes":  changes,
+        "total":    total_ch,
+        "truncated": truncated,
+        "reynolds": re_num,
+        "regime":   regime,
+        "bt":       bt_str,
+        "trit":     trit_raw,
+        "ms":       elapsed
+    }
+    if3 mode == "git" {
+        result = dict_set(result, "reference", reference)
+        result = dict_set(result, "added", added)
+        result = dict_set(result, "modified", modified)
+        result = dict_set(result, "deleted", deleted)
+    } else3 {
+        result = dict_set(result, "since", since_ts)
+    }
+    return result
+}
+
+// ============================================================================
+// TOOL 4: BUILD STATUS
+// POST /tbuild/status
+// Body: {"path": "/abs/project/dir"}
+// Checks for build artifacts, lock files, build directories, outdated build.
+// Returns: {has_build_dir, has_lock_file, artifacts, build_fresh, trit}
+// ============================================================================
+}
+
+fn tbuild_status(body) {
+    let t0 = time()
+    let path = str(dict_get(body, "path") ?? "")
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else3 {
+        // path provided
+    }
+
+    // Pure NovaLang: dir_walk + is_dir/is_file for build status analysis
+    let build_dir_names = ["dist", "build", "out", "target", "_build", ".next", ".nuxt", "__pycache__"]
+    let lock_file_names = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Pipfile.lock", "poetry.lock", "Cargo.lock", "go.sum", "composer.lock", "Gemfile.lock"]
+    let artifact_exts = [".pyc", ".pyo", ".o", ".obj", ".class", ".jar", ".war", ".egg", ".whl", ".so", ".dll", ".exe", ".node"]
+    let skip_dirs = [".git", "node_modules", "ai_env", "venv", ".venv"]
+
+    // Check for build directories at top level
+    let found_build_dirs = []
+    let bdi = 0
+    while3 bdi < len(build_dir_names) {
+        let bd = dict_get(build_dir_names, bdi) ?? ""
+        let bd_path = path + "\\" + bd
+        if3 is_dir(bd_path) == 1 {
+            found_build_dirs = append(found_build_dirs, bd)
+        } else3 {
+            // not found
+        }
+        bdi = bdi + 1
+    }
+
+    // Check for lock files at top level
+    let found_locks = []
+    let lfi = 0
+    while3 lfi < len(lock_file_names) {
+        let lf = dict_get(lock_file_names, lfi) ?? ""
+        let lf_path = path + "\\" + lf
+        if3 is_file(lf_path) == 1 {
+            found_locks = append(found_locks, lf)
+        } else3 {
+            // not found
+        }
+        lfi = lfi + 1
+    }
+
+    // Walk all entries to find artifacts and track mtimes
+    let all_entries = dir_walk(path)
+    let artifacts = []
+    let art_count = 0
+    let newest_src = 0
+    let newest_art = 0
+    let wei = 0
+    while3 wei < len(all_entries) {
+        let entry = dict_get(all_entries, wei) ?? {}
+        let fp = dict_get(entry, "path") ?? ""
+        let is_d = dict_get(entry, "is_dir") ?? -1
+        if3 is_d != 1 {
+            // Check skip dirs
+            let skip_file = false
+            let si = 0
+            while3 si < len(skip_dirs) {
+                let sd = dict_get(skip_dirs, si) ?? ""
+                if3 contains(fp, "\\" + sd + "\\") == 1 { skip_file = true
+                } else if3 contains(fp, "/" + sd + "/") == 1 { skip_file = true
+                } else3 {
+                    // not skipped
+                }
+                si = si + 1
+            }
+            if3 skip_file == false {
+                let ext = "." + lower(path_ext(fp))
+                let mt = dict_get(entry, "mtime") ?? 0
+                // Check if artifact extension
+                let is_artifact = false
+                let ai = 0
+                while3 ai < len(artifact_exts) {
+                    if3 ext == dict_get(artifact_exts, ai) ?? "" {
+                        is_artifact = true
+                    } else3 {
+                        // not this ext
+                    }
+                    ai = ai + 1
+                }
+                if3 is_artifact == true {
+                    if3 art_count < RE_LAMINAR {
+                        let rel_path = fp
+                        if3 starts_with(fp, path) == 1 {
+                            rel_path = slice(fp, len(path) + 1, len(fp))
+                        } else3 {
+                            // keep as-is
+                        }
+                        artifacts = append(artifacts, rel_path)
+                    } else3 {
+                        // cap at 27
+                    }
+                    art_count = art_count + 1
+                    if3 mt > newest_art { newest_art = mt
+                    } else3 {
+                        // not newest
+                    }
+                } else3 {
+                    // Source file -- track newest mtime
+                    if3 mt > newest_src { newest_src = mt
+                    } else3 {
+                        // not newest
+                    }
+                }
+            } else3 {
+                // skipped directory
+            }
+        } else3 {
+            // directory entry
+        }
+        wei = wei + 1
+    }
+
+    // Determine build freshness
+    let bfresh = false
+    let bfresh_known = false
+    if3 newest_art > 0 {
+        if3 newest_src > 0 {
+            bfresh_known = true
+            if3 newest_art >= newest_src { bfresh = true
+            } else3 {
+                // stale
+            }
+        } else3 {
+            // no source files
+        }
+    } else3 {
+        // no artifacts
+    }
+
+    // Health score: count of (has_build_dir, has_lock, has_artifacts, build_fresh)
+    let hbd = len(found_build_dirs) > 0
+    let hlf = len(found_locks) > 0
+    let has_arts = art_count > 0
+    let hscore = 0
+    if3 hbd == true { hscore = hscore + 1
+    } else3 {
+        // no build dir
+    }
+    if3 hlf == true { hscore = hscore + 1
+    } else3 {
+        // no lock
+    }
+    if3 has_arts == true { hscore = hscore + 1
+    } else3 {
+        // no arts
+    }
+    if3 bfresh == true { hscore = hscore + 1
+    } else3 {
+        // not fresh
+    }
+
+    // Trit: score>=3 -> 1, score>=1 -> 0, else -1
+    let trit_raw = T_FALSE
+    if3 hscore >= 3 { trit_raw = T_TRUE
+    } else if3 hscore >= 1 { trit_raw = T_MAYBE
+    } else3 {
+        // low score
+    }
+
+    // Health bt: has_build, has_lock, has_arts, build_fresh
+    let h0 = T_FALSE
+    if3 hbd == true { h0 = T_TRUE
+    } else3 {
+        // no build dir
+    }
+    let h1 = T_FALSE
+    if3 hlf == true { h1 = T_TRUE
+    } else3 {
+        // no lock file
+    }
+    let h2 = T_FALSE
+    if3 art_count > 0 { h2 = T_TRUE
+    } else3 {
+        // no artifacts
+    }
+    let h3 = T_MAYBE
+    if3 bfresh_known == true {
+        if3 bfresh == true { h3 = T_TRUE
+        } else3 { h3 = T_FALSE
+        }
+    } else3 {
+        // unknown freshness
+    }
+
+    let health_trits = [h0, h1, h2, h3]
+    let bt_str = bt_from_trits(health_trits)
+
+    // Reynolds: health score scaled
+    let re_num = hscore * H7
+    let regime = flow_regime(re_num)
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    let _r = record_op("status", trit_raw)
+
+    // Cap artifacts at H13=13
+    let capped_arts = artifacts
+    if3 len(artifacts) > H13 {
+        capped_arts = slice(artifacts, 0, H13)
+    } else3 {
+        // fits
+    }
+
+    return {
+        "ok":              true,
+        "path":            path,
+        "has_build_dir":   hbd,
+        "build_dirs":      found_build_dirs,
+        "has_lock_file":   hlf,
+        "lock_files":      found_locks,
+        "artifact_count":  art_count,
+        "artifacts":       capped_arts,
+        "build_fresh":     bfresh,
+        "newest_src":      round(newest_src, 2),
+        "newest_artifact": round(newest_art, 2),
+        "health_score":    hscore,
+        "reynolds":        re_num,
+        "regime":          regime,
+        "bt":              bt_str,
+        "trit":            trit_raw,
+        "ms":              elapsed
+    }
+}
+
+// ============================================================================
+// TOOL 5: LINT
+// POST /tbuild/lint
+// Body: {"path": "/abs/path", "language": "python"|"javascript"|"auto"}
+// Pure NovaLang: bracket balance + long-line checks via nova_read + string analysis.
+// Bracket balance + findstr for common issues. JS/TS: bracket balance + long lines.
+// Returns: {files_checked, errors, warnings, trit}
+// ============================================================================
+}
+
+fn tbuild_lint(body) {
+    let t0 = time()
+    let path = str(dict_get(body, "path") ?? "")
+    let lang = str(dict_get(body, "language") ?? "auto")
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else3 {
+        // path provided
+    }
+
+    let py_exts = [".py"]
+    let js_exts = [".js", ".ts", ".jsx", ".tsx", ".mjs"]
+    let skip_dirs = [".git", "node_modules", "__pycache__", "ai_env", "venv", ".venv"]
+
+    // Collect files to lint
+    let files = []
+    if3 is_file(path) == 1 {
+        files = [path]
+    } else if3 is_dir(path) == 1 {
+        let all_entries = dir_walk(path)
+        let fci = 0
+        while3 fci < len(all_entries) {
+            if3 len(files) >= RE_TURBULENT {
+                let fci = len(all_entries)
+            } else3 {
+                let entry = dict_get(all_entries, fci) ?? {}
+                let fp = dict_get(entry, "path") ?? ""
+                let is_d = dict_get(entry, "is_dir") ?? -1
+                if3 is_d != 1 {
+                    let ext = "." + path_ext(fp)
+                    // Check skip dirs
+                    let skip_file = false
+                    let si = 0
+                    while3 si < len(skip_dirs) {
+                        let sd = dict_get(skip_dirs, si) ?? ""
+                        if3 contains(fp, "\\" + sd + "\\") == 1 { skip_file = true
+                        } else if3 contains(fp, "/" + sd + "/") == 1 { skip_file = true
+                        } else3 {
+                            // ok
+                        }
+                        si = si + 1
+                    }
+                    if3 skip_file == false {
+                        if3 lang == "python" {
+                            if3 contains(py_exts, ext) == 1 { files = append(files, fp)
+                            } else3 {
+                                // wrong ext
+                            }
+                        } else if3 lang == "javascript" {
+                            if3 contains(js_exts, ext) == 1 { files = append(files, fp)
+                            } else3 {
+                                // wrong ext
+                            }
+                        } else3 {
+                            // auto: include both
+                            if3 contains(py_exts, ext) == 1 { files = append(files, fp)
+                            } else if3 contains(js_exts, ext) == 1 { files = append(files, fp)
+                            } else3 {
+                                // not a lintable ext
+                            }
+                        }
+                    } else3 {
+                        // skipped
+                    }
+                } else3 {
+                    // directory
+                }
+            }
+            fci = fci + 1
+        }
+    } else3 {
+        // path is neither file nor dir
+    }
+
+    // Lint each file using pure NovaLang string analysis
+    let results = []
+    let total_errors = 0
+    let total_warnings = 0
+    let fi = 0
+    let file_cap = RE_TURBULENT
+    if3 len(files) < file_cap { file_cap = len(files)
+    } else3 {
+        // cap at 343
+    }
+
+    while3 fi < file_cap {
+        let fp = dict_get(files, fi) ?? ""
+        let ext = "." + path_ext(fp)
+
+        // Build relative path
+        let rel_path = fp
+        if3 is_dir(path) == 1 {
+            if3 starts_with(fp, path) == 1 {
+                let rel_path = slice(fp, len(path) + 1, len(fp))
+            } else3 {
+                // keep as-is
+            }
+        } else3 {
+            // single file
+        }
+
+        let src = try3 { nova_read(fp) } fail { "" }
+        let file_errors = []
+        let file_warnings = []
+        let file_lang = "unknown"
+
+        if3 contains(py_exts, ext) == 1 {
+            let file_lang = "python"
+            // Bracket balance check
+            let src_lines = split(src, "\n")
+            let open_count = 0
+            let close_count = 0
+            let lni = 0
+            while3 lni < len(src_lines) {
+                let ln = dict_get(src_lines, lni) ?? ""
+                // Count brackets
+                let chi = 0
+                while3 chi < len(ln) {
+                    let ch = slice(ln, chi, chi + 1)
+                    if3 ch == "{" { open_count = open_count + 1
+                    } else if3 ch == "(" { open_count = open_count + 1
+                    } else if3 ch == "[" { open_count = open_count + 1
+                    } else if3 ch == "}" { close_count = close_count + 1
+                    } else if3 ch == ")" { close_count = close_count + 1
+                    } else if3 ch == "]" { close_count = close_count + 1
+                    } else3 {
+                        // normal char
+                    }
+                    chi = chi + 1
+                }
+                // Long line warning
+                if3 len(ln) > 120 {
+                    file_warnings = append(file_warnings, {"line": lni + 1, "col": 0, "msg": "Line too long (" + str(len(ln)) + " chars)", "type": "style"})
+                } else3 {
+                    // ok length
+                }
+                lni = lni + 1
+            }
+            if3 open_count != close_count {
+                file_errors = append(file_errors, {"line": 0, "col": 0, "msg": "Unbalanced brackets: " + str(open_count) + " opens, " + str(close_count) + " closes", "type": "syntax"})
+                total_errors = total_errors + 1
+            } else3 {
+                // balanced
+            }
+            // Use findstr for common .py style issues (tabs mixed with spaces)
+            let findstr_result = shell("findstr /n /c:\"	 \" \"" + fp + "\" 2>NUL")
+            let _tmp_2 = try3 { dict_get(findstr_result, "stdout") } fail { "" }
+            let findstr_out = trim(_tmp_2)
+            if3 len(findstr_out) > 0 {
+                let mix_lines = split(findstr_out, "\n")
+                let mli = 0
+                let mix_max = 3
+                if3 len(mix_lines) < mix_max { mix_max = len(mix_lines)
+                } else3 {
+                    // cap
+                }
+                while3 mli < mix_max {
+                    let ml = dict_get(mix_lines, mli) ?? ""
+                    let colon_parts = split(ml, ":")
+                    let line_num = try3 { int(dict_get(colon_parts, 0) ?? "0") } fail { 0 }
+                    file_warnings = append(file_warnings, {"line": line_num, "col": 0, "msg": "Mixed tabs and spaces", "type": "style"})
+                    mli = mli + 1
+                }
+            } else3 {
+                // no mixed indentation
+            }
+            total_warnings = total_warnings + len(file_warnings)
+        } else if3 contains(js_exts, ext) == 1 {
+            let file_lang = "javascript"
+            // Bracket balance + long lines
+            let src_lines = split(src, "\n")
+            let open_count = 0
+            let close_count = 0
+            let lni = 0
+            while3 lni < len(src_lines) {
+                let ln = dict_get(src_lines, lni) ?? ""
+                let chi = 0
+                while3 chi < len(ln) {
+                    let ch = slice(ln, chi, chi + 1)
+                    if3 ch == "{" { open_count = open_count + 1
+                    } else if3 ch == "(" { open_count = open_count + 1
+                    } else if3 ch == "[" { open_count = open_count + 1
+                    } else if3 ch == "}" { close_count = close_count + 1
+                    } else if3 ch == ")" { close_count = close_count + 1
+                    } else if3 ch == "]" { close_count = close_count + 1
+                    } else3 {
+                        // normal char
+                    }
+                    chi = chi + 1
+                }
+                if3 len(ln) > 120 {
+                    file_warnings = append(file_warnings, {"line": lni + 1, "col": 0, "msg": "Line too long (" + str(len(ln)) + " chars)", "type": "style"})
+                } else3 {
+                    // ok
+                }
+                lni = lni + 1
+            }
+            if3 open_count != close_count {
+                file_errors = append(file_errors, {"line": 0, "col": 0, "msg": "Unbalanced brackets: " + str(open_count) + " opens, " + str(close_count) + " closes", "type": "syntax"})
+                total_errors = total_errors + 1
+            } else3 {
+                // balanced
+            }
+            total_warnings = total_warnings + len(file_warnings)
+        } else3 {
+            // unsupported extension
+        }
+
+        // File trit: errors=-1, warnings only=0, clean=1
+        let file_trit = T_TRUE
+        if3 len(file_errors) > 0 { file_trit = T_FALSE
+        } else if3 len(file_warnings) > 0 { file_trit = T_MAYBE
+        } else3 {
+            // clean
+        }
+
+        // Cap warnings at 5 per file
+        let capped_warnings = file_warnings
+        if3 len(file_warnings) > 5 {
+            capped_warnings = slice(file_warnings, 0, 5)
+        } else3 {
+            // fits
+        }
+
+        results = append(results, {"file": rel_path, "language": file_lang, "errors": file_errors, "warnings": capped_warnings, "trit": file_trit})
+        fi = fi + 1
+    }
+
+    // Cap results at 27
+    let fc = len(results)
+    if3 fc > RE_LAMINAR {
+        results = slice(results, 0, RE_LAMINAR)
+    } else3 {
+        // fits
+    }
+
+    // Overall trit
+    let trit_raw = T_MAYBE
+    if3 fc == 0 { trit_raw = T_MAYBE
+    } else3 {
+        let has_error = false
+        let all_clean = true
+        let oi = 0
+        while3 oi < len(results) {
+            let r_entry = dict_get(results, oi) ?? {}
+            let r_trit = dict_get(r_entry, "trit") ?? 0
+            if3 r_trit == -1 { has_error = true
+                let all_clean = false
+            } else if3 r_trit == 0 { all_clean = false
+            } else3 {
+                // clean
+            }
+            oi = oi + 1
+        }
+        if3 has_error == true { trit_raw = T_FALSE
+        } else if3 all_clean == true { trit_raw = T_TRUE
+        } else3 { trit_raw = T_MAYBE
+        }
+    }
+
+    // Build bt from results trits (up to H13)
+    let trit_list = []
+    let ri = 0
+    let rn = len(results)
+    let rt_max = H13
+    if3 rn < rt_max { rt_max = rn
+    } else3 {
+        // cap
+    }
+    while3 ri < rt_max {
+        let re_e = dict_get(results, ri) ?? {}
+        let rt = dict_get(re_e, "trit") ?? T_MAYBE
+        trit_list = append(trit_list, rt)
+        ri = ri + 1
+    }
+    let bt_str = bt_from_trits(trit_list)
+
+    // Reynolds: error count as turbulence
+    let re_num = total_errors * H5
+    let regime = flow_regime(re_num)
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    let _r = record_op("lint", trit_raw)
+
+    return {
+        "ok":             trit_raw != T_FALSE,
+        "path":           path,
+        "language":       lang,
+        "files_checked":  fc,
+        "total_errors":   total_errors,
+        "total_warnings": total_warnings,
+        "results":        results,
+        "reynolds":       re_num,
+        "regime":         regime,
+        "bt":             bt_str,
+        "trit":           trit_raw,
+        "ms":             elapsed
+    }
+}
+
+// ============================================================================
+// TOOL 6: VCS STATUS
+// POST /tbuild/vcs
+// Body: {"path": "/abs/repo/dir"}
+// Returns: {branch, changes (count), recent_commits (list), staged, untracked, trit}
+// Pure NovaLang: direct git commands via shell() -- no Python subprocess.
+// ============================================================================
+}
+
+fn tbuild_vcs(body) {
+    let t0 = time()
+    let path = str(dict_get(body, "path") ?? "")
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else3 {
+        // path provided
+    }
+
+    let ep = esc_path(path)
+
+    // Check .git exists via file_exists builtin
+    if3 file_exists(path + "\\.git") != 1 { elapsed = round((time() - t0) * 1000, 2)
+        let _r = record_op("vcs", T_FALSE)
+        return {"ok": false, "error": "Not a git repository: " + path, "trit": T_FALSE, "ms": elapsed}
+    } else3 {
+        // has .git
+    }
+
+    // Run git commands directly via shell()
+    let branch_result = shell("cd /d \"" + ep + "\" && git branch --show-current")
+    let _tmp_3 = try3 { dict_get(branch_result, "stdout") } fail { "unknown" }
+    let branch = trim(_tmp_3)
+
+    let status_result = shell("cd /d \"" + ep + "\" && git status --porcelain")
+    let _tmp_4 = try3 { dict_get(status_result, "stdout") } fail { "" }
+    let status_out = trim(_tmp_4)
+
+    let log_result = shell("cd /d \"" + ep + "\" && git log --oneline -5")
+    let _tmp_5 = try3 { dict_get(log_result, "stdout") } fail { "" }
+    let log_out = trim(_tmp_5)
+
+    let ab_result = shell("cd /d \"" + ep + "\" && git rev-list --left-right --count HEAD...@{upstream} 2>NUL")
+    let _tmp_6 = try3 { dict_get(ab_result, "stdout") } fail { "" }
+    let ab_out = trim(_tmp_6)
+
+    // Parse status lines
+    let staged = []
+    let modified = []
+    let untracked = []
+    let changes = 0
+
+    if3 len(status_out) > 0 {
+        let st_lines = split(status_out, "\n")
+        let sli = 0
+        while3 sli < len(st_lines) {
+            let sl = dict_get(st_lines, sli) ?? ""
+            if3 len(sl) >= 3 {
+                changes = changes + 1
+                let x_char = slice(sl, 0, 1)
+                let y_char = slice(sl, 1, 2)
+                let file_part = slice(sl, 3, len(sl))
+
+                // Staged: first char is not space or ?
+                if3 x_char != " " {
+                    if3 x_char != "?" {
+                        if3 len(staged) < H13 {
+                            staged = append(staged, file_part)
+                        } else3 {
+                            // cap
+                        }
+                    } else3 {
+                        // untracked marker
+                    }
+                } else3 {
+                    // not staged
+                }
+
+                // Modified in worktree: second char is M or D and first is space
+                if3 x_char == " " {
+                    if3 y_char == "M" {
+                        if3 len(modified) < H13 {
+                            modified = append(modified, file_part)
+                        } else3 {
+                            // cap
+                        }
+                    } else if3 y_char == "D" {
+                        if3 len(modified) < H13 {
+                            modified = append(modified, file_part)
+                        } else3 {
+                            // cap
+                        }
+                    } else3 {
+                        // other status
+                    }
+                } else3 {
+                    // not worktree-only change
+                }
+
+                // Untracked: "??" prefix
+                if3 x_char == "?" {
+                    if3 y_char == "?" {
+                        if3 len(untracked) < H13 {
+                            untracked = append(untracked, file_part)
+                        } else3 {
+                            // cap
+                        }
+                    } else3 {
+                        // not untracked
+                    }
+                } else3 {
+                    // not untracked
+                }
+            } else3 {
+                // short/empty line
+            }
+            sli = sli + 1
+        }
+    } else3 {
+        // clean repo
+    }
+
+    // Parse commits
+    let commits = []
+    if3 len(log_out) > 0 {
+        let log_lines = split(log_out, "\n")
+        let cli = 0
+        let cl_max = 5
+        if3 len(log_lines) < cl_max { cl_max = len(log_lines)
+        } else3 {
+            // cap at 5
+        }
+        while3 cli < cl_max {
+            commits = append(commits, trim(dict_get(log_lines, cli) ?? ""))
+            cli = cli + 1
+        }
+    } else3 {
+        // no commits
+    }
+
+    // Parse ahead/behind
+    let ahead = 0
+    let behind = 0
+    if3 contains(ab_out, "\t") == 1 {
+        let ab_parts = split(ab_out, "\t")
+        let ahead = try3 { int(trim(dict_get(ab_parts, 0) ?? "0")) } fail { 0 }
+        let behind = try3 { int(trim(dict_get(ab_parts, 1) ?? "0")) } fail { 0 }
+    } fail {
+        // no upstream or parse failed
+    }
+
+    // Compute trit: clean=1, <27 changes=0, >=27=-1
+    let trit_raw = T_MAYBE
+    if3 changes == 0 { trit_raw = T_TRUE
+    } else if3 changes < RE_LAMINAR { trit_raw = T_MAYBE
+    } else3 { trit_raw = T_FALSE
+    }
+
+    // bt: clean=1, few changes=0, many changes=T
+    let trit_list = [trit_raw]
+    let bt_str = bt_from_trits(trit_list)
+
+    // Reynolds: change count as flow
+    let re_num = changes * H3
+    let regime = flow_regime(re_num)
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    let _r = record_op("vcs", trit_raw)
+
+    return {
+        "ok":             true,
+        "path":           path,
+        "branch":         branch,
+        "changes":        changes,
+        "staged":         staged,
+        "modified":       modified,
+        "untracked":      untracked,
+        "recent_commits": commits,
+        "ahead":          ahead,
+        "behind":         behind,
+        "clean":          changes == 0,
+        "reynolds":       re_num,
+        "regime":         regime,
+        "bt":             bt_str,
+        "trit":           trit_raw,
+        "ms":             elapsed
+    }
+}
+
+// ============================================================================
+// TOOL 7: COMPILE (run a build command)
+// POST /tbuild/compile
+// Body: {"path": "/abs/project/dir", "command": "npm run build", "timeout": 120}
+// Pure NovaLang: runs command directly via shell() -- no Python subprocess.
+// Returns: {exit_code, stdout, stderr, success, trit}
+// ============================================================================
+}
+
+fn tbuild_compile(body) {
+    let t0 = time()
+    let path = str(dict_get(body, "path") ?? "")
+    let command = str(dict_get(body, "command") ?? "")
+    let timeout = dict_get(body, "timeout") ?? 60
+
+    if3 len(path) == 0 {
+        return {"ok": false, "error": "path required", "trit": T_FALSE}
+    } else3 {
+        // path provided
+    }
+
+    if3 len(command) == 0 {
+        return {"ok": false, "error": "command required", "trit": T_FALSE}
+    } else3 {
+        // command provided
+    }
+
+    // Cap timeout at RE_TURBULENT=343 seconds for safety
+    let use_timeout = timeout
+    if3 use_timeout > RE_TURBULENT { use_timeout = RE_TURBULENT
+    } else if3 use_timeout < 1 { use_timeout = 1
+    } else3 {
+        // timeout in range
+    }
+
+    let ep = esc_path(path)
+
+    // Run command directly via shell() in the target directory
+    let shell_cmd = "cd /d \"" + ep + "\" && " + command
+    let run_result = shell(shell_cmd)
+
+    let exit_code = try3 { dict_get(run_result, "code") } fail { -1 }
+    let stdout_raw = try3 { dict_get(run_result, "stdout") } fail { "" }
+    let stderr_raw = try3 { dict_get(run_result, "stderr") } fail { "" }
+
+    let elapsed_s = round((time() - t0) / 1000, 3)
+
+    // Split into lines
+    let stdout_lines = []
+    if3 len(stdout_raw) > 0 {
+        stdout_lines = split(stdout_raw, "\n")
+    } else3 {
+        // no stdout
+    }
+    let stderr_lines = []
+    if3 len(stderr_raw) > 0 {
+        stderr_lines = split(stderr_raw, "\n")
+    } else3 {
+        // no stderr
+    }
+
+    let sout_cnt = len(stdout_lines)
+    let serr_cnt = len(stderr_lines)
+
+    // Tail last 50 lines
+    let stdout_tail = stdout_lines
+    if3 sout_cnt > 50 {
+        stdout_tail = slice(stdout_lines, sout_cnt - 50, sout_cnt)
+    } else3 {
+        // fits
+    }
+    let stderr_tail = stderr_lines
+    if3 serr_cnt > 50 {
+        stderr_tail = slice(stderr_lines, serr_cnt - 50, serr_cnt)
+    } else3 {
+        // fits
+    }
+
+    let success = exit_code == 0
+    let timed_out = false
+
+    let trit_raw = T_FALSE
+    if3 success == true { trit_raw = T_TRUE
+    } else3 {
+        // failed
+    }
+
+    // Build bt
+    let trit_list = [trit_raw]
+    let bt_str = bt_from_trits(trit_list)
+
+    // Reynolds: exit code as turbulence indicator
+    let re_num = 0
+    if3 success == true { re_num = RE_LAMINAR
+    } else if3 timed_out == true { re_num = RE_TRANSITION
+    } else3 { re_num = RE_TURBULENT
+    }
+    let regime = flow_regime(re_num)
+
+    let elapsed = round((time() - t0) * 1000, 2)
+    let _r = record_op("compile", trit_raw)
+
+    return {
+        "ok":           success,
+        "path":         path,
+        "command":      command,
+        "exit_code":    exit_code,
+        "stdout":       stdout_tail,
+        "stderr":       stderr_tail,
+        "stdout_lines": sout_cnt,
+        "stderr_lines": serr_cnt,
+        "success":      success,
+        "timed_out":    timed_out,
+        "elapsed_s":    elapsed_s,
+        "reynolds":     re_num,
+        "regime":       regime,
+        "bt":           bt_str,
+        "trit":         trit_raw,
+        "ms":           elapsed
+    }
+}
+
+// ============================================================================
+// ROUTE: GET /health
+// ============================================================================
+}
+
+fn tbuild_health() {
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "uptime_s", round(time() - stat_t0, 1))
+    resp = dict_set(resp, "harmonics", "3-5-7-13")
+    resp = dict_set(resp, "block", BLOCK)
+    resp = dict_set(resp, "reynolds", {"laminar": RE_LAMINAR, "transition": RE_TRANSITION, "turbulent": RE_TURBULENT})
+    return resp
+}
+
+// ============================================================================
+// ROUTE: GET /tbuild/stats
+// ============================================================================
+
+fn tbuild_stats() {
+    let uptime = round(time() - stat_t0, 1)
+
+    let trits_obj = {}
+    trits_obj = dict_set(trits_obj, "true",  stat_trit_true)
+    trits_obj = dict_set(trits_obj, "maybe", stat_trit_maybe)
+    trits_obj = dict_set(trits_obj, "false", stat_trit_false)
+
+    let by_tool = {}
+    by_tool = dict_set(by_tool, "deps",    stat_deps)
+    by_tool = dict_set(by_tool, "order",   stat_order)
+    by_tool = dict_set(by_tool, "diff",    stat_diff)
+    by_tool = dict_set(by_tool, "status",  stat_status)
+    by_tool = dict_set(by_tool, "lint",    stat_lint)
+    by_tool = dict_set(by_tool, "vcs",     stat_vcs)
+    by_tool = dict_set(by_tool, "compile", stat_compile)
+
+    let re_obj = {}
+    re_obj = dict_set(re_obj, "laminar",    RE_LAMINAR)
+    re_obj = dict_set(re_obj, "transition", RE_TRANSITION)
+    re_obj = dict_set(re_obj, "turbulent",  RE_TURBULENT)
+
+    let consts = {}
+    consts = dict_set(consts, "H3",         H3)
+    consts = dict_set(consts, "H5",         H5)
+    consts = dict_set(consts, "H7",         H7)
+    consts = dict_set(consts, "H13",        H13)
+    consts = dict_set(consts, "block_size", BLOCK)
+    consts = dict_set(consts, "reynolds",   re_obj)
+
+    return {
+        "ok":        true,
+        "service":   SERVICE_NAME,
+        "version":   VERSION,
+        "port":      PORT,
+        "tools":     TOOLS_COUNT,
+        "ops":       stat_ops,
+        "trits":     trits_obj,
+        "by_tool":   by_tool,
+        "uptime_s":  uptime,
+        "constants": consts,
+        "trit":      T_TRUE,
+        "runtime":   "novalang"
+    }
+}
+
+// ============================================================================
+// ROUTE REGISTRATION
+// ============================================================================
+
+troute(server, "GET",  "/health",         "tbuild_health")
+troute(server, "GET",  "/tbuild/stats",   "tbuild_stats")
+troute(server, "POST", "/tbuild/deps",    "tbuild_deps")
+troute(server, "POST", "/tbuild/order",   "tbuild_order")
+troute(server, "POST", "/tbuild/diff",    "tbuild_diff")
+troute(server, "POST", "/tbuild/status",  "tbuild_status")
+troute(server, "POST", "/tbuild/lint",    "tbuild_lint")
+troute(server, "POST", "/tbuild/vcs",     "tbuild_vcs")
+troute(server, "POST", "/tbuild/compile", "tbuild_compile")
+
+// ============================================================================
+// STARTUP BANNER
+// ============================================================================
+
+print("[TBuild] NovaX Ternary Build System v" + VERSION + " (NovaLang)")
+print("[TBuild] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TBuild] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TBuild] Block: " + str(BLOCK) + " (3^7) | Reynolds: " + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT))
+print("[TBuild] Tools (" + str(TOOLS_COUNT) + "): deps, order, diff, status, lint, vcs, compile")
+print("[TBuild] GET  /health | /tbuild/stats")
+print("[TBuild] POST /tbuild/deps   -- project dependency list (package.json, requirements.txt, Cargo.toml, go.mod, ...)")
+print("[TBuild] POST /tbuild/order  -- topological build order from file imports (params: path, pattern)")
+print("[TBuild] POST /tbuild/diff   -- changed files since last build (params: path, since|reference)")
+print("[TBuild] POST /tbuild/status -- build artifact status (params: path)")
+print("[TBuild] POST /tbuild/lint   -- bracket balance + style validation (params: path, language)")
+print("[TBuild] POST /tbuild/vcs    -- git status, branch, recent commits (params: path)")
+print("[TBuild] POST /tbuild/compile -- run a build command (params: path, command, timeout)")
+print("[TBuild] Trit: +1=success  0=partial/unknown  -1=failed")
+print("[TBuild] Ready at http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

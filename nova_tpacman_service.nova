@@ -1,0 +1,1068 @@
+// ================================================================
+// Nova TPacman v2.0 - NovaLang Package Manager Service
+// Port 9991: Language package management, VM builds, rolling deploys
+//
+// 3-5-7-13 Harmonic Design:
+//   H3=3  -- rolling restart batch size
+//   H5=5  -- max changelog entries returned
+//   H7=7  -- health check timeout multiplier
+//   H13=13 -- carrier frame, deploy window
+//
+// Ternary states:
+//   +1 (TRUE)  = operation succeeded
+//    0 (MAYBE) = partial success / in progress
+//   -1 (FALSE) = operation failed
+// ================================================================
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+import3("C:/NovaX/lib/nova_http_utils.nova")
+import3("C:/NovaX/lib/nova_version.nova")
+
+let PORT = 9991
+let VERSION = "2.0.0"
+let SERVICE_NAME = "nova-tpacman"
+let VERSION_JSON_PATH = "C:/NovaX/nova_version.json"
+let LIB_PATH = "C:/NovaX/lib/"
+let NOVALANG_EXE = "C:/NovaX/novalang.exe"
+let NOVALANG_NEW_EXE = "C:/NovaX/novalang_new.exe"
+let NOVALANG_OLD_EXE = "C:/NovaX/novalang_old.exe"
+let VM_SOURCE_DIR = "C:\\NovaX\\novalang-vm"
+let CARGO_BIN = "C:\\Users\\Jupit\\.cargo\\bin\\cargo"
+let ORCHESTRATOR_URL = "http://127.0.0.1:9999"
+
+// -- State --
+let _ns = ns_init_counters()
+let _changelog = []
+let _last_update = 0
+let _started_at = time()
+
+// ================================================================
+// Helper functions (defined BEFORE use, extracted from loops)
+// ================================================================
+
+fn _read_version_json() {
+    let raw = try3 { read_file(VERSION_JSON_PATH) } fail { "" }
+    if3 len(raw) == 0 { return {} }
+    let data = try3 { json_decode(raw) } fail { {} }
+    return data
+}
+
+fn _write_version_json(data) {
+    let json_str = json_encode(data)
+    write_file(VERSION_JSON_PATH, json_str)
+    return 1
+}
+
+fn _fetch_fleet_health() {
+    let url = ORCHESTRATOR_URL + "/api/services/health"
+    let raw = try3 { http_get(url) } fail { "" }
+    if3 len(raw) == 0 { return {} }
+    let data = try3 { json_decode(raw) } fail { {} }
+    return data
+}
+
+fn _check_service_health(svc_name) {
+    let url = ORCHESTRATOR_URL + "/api/services/health"
+    let raw = try3 { http_get(url) } fail { "" }
+    if3 len(raw) == 0 { return -1 }
+    let data = try3 { json_decode(raw) } fail { {} }
+    let services = dict_get(data, "services") ?? {}
+    let svc = dict_get(services, svc_name) ?? {}
+    let status = dict_get(svc, "status") ?? "unknown"
+    if3 status == "healthy" { return 1 }
+    if3 status == "ok" { return 1 }
+    return -1
+}
+
+fn _restart_service(svc_name) {
+    let url = ORCHESTRATOR_URL + "/api/services/" + svc_name + "/restart"
+    let result = try3 { http_post(url, "{}") } { "" }
+    if3 len(result) == 0 { return -1 }
+    return 1
+}
+
+fn _file_exists(path) {
+    let content = try3 { read_file(path) } fail { "__NOFILE__" }
+    if3 content == "__NOFILE__" { return false }
+    return true
+}
+
+fn _build_service_entry(name, status, trit_val) {
+    return {
+        "name": name,
+        "status": status,
+        "trit": trit_val
+    }
+}
+
+fn _update_changelog(vdata, change_entry) {
+    let cl = dict_get(vdata, "changelog") ?? []
+    cl = append(cl, change_entry)
+    vdata = dict_set(vdata, "changelog", cl)
+    vdata = dict_set(vdata, "updated_at", str(time()))
+    return vdata
+}
+
+// ================================================================
+// Route Handlers
+// ================================================================
+
+// GET /health
+fn handle_health(req) {
+    let t0 = time()
+    let health = ns_health_dict(SERVICE_NAME, VERSION, PORT, _ns)
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+    return health
+}
+
+// GET /pacman/status
+fn handle_status(req) {
+    let t0 = time()
+    let vdata = _read_version_json()
+    let vm_info = dict_get(vdata, "vm") ?? {}
+    let stdlib_info = dict_get(vdata, "stdlib") ?? {}
+    let fleet_info = dict_get(vdata, "fleet") ?? {}
+    let fleet_health = _fetch_fleet_health()
+
+    let fleet_services = dict_get(fleet_health, "services") ?? {}
+    let total_svc = dict_get(fleet_health, "total") ?? 0
+    let healthy_svc = dict_get(fleet_health, "healthy") ?? 0
+
+    let result = {
+        "ok": true,
+        "trit": 1,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "vm": vm_info,
+        "stdlib": stdlib_info,
+        "fleet": fleet_info,
+        "fleet_health": {
+            "total": total_svc,
+            "healthy": healthy_svc
+        },
+        "last_update": _last_update,
+        "uptime": floor(time() - _started_at)
+    }
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+    return result
+}
+
+// GET /pacman/changelog
+fn handle_changelog(req) {
+    let t0 = time()
+    let vdata = _read_version_json()
+    let cl = dict_get(vdata, "changelog") ?? []
+
+    let result = {
+        "ok": true,
+        "trit": 1,
+        "changelog": cl,
+        "count": len(cl)
+    }
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+    return result
+}
+
+// POST /pacman/update/stdlib
+// Body: {"module": "name", "version": "x.y.z", "content": "..."}
+fn handle_update_stdlib(req) {
+    let t0 = time()
+    let body = parse_body(req)
+
+    let mod_check = require_field(body, "module")
+    if3 (dict_get(mod_check, "ok") ?? false) == false { _ns = ns_record(_ns, time() - t0, true)
+        return mod_check
+    }
+    let mod_name = dict_get(mod_check, "data") ?? ""
+
+    let ver_check = require_field(body, "version")
+    if3 (dict_get(ver_check, "ok") ?? false) == false { _ns = ns_record(_ns, time() - t0, true)
+        return ver_check
+    }
+    let mod_version = dict_get(ver_check, "data") ?? ""
+
+    let content_check = require_field(body, "content")
+    if3 (dict_get(content_check, "ok") ?? false) == false { _ns = ns_record(_ns, time() - t0, true)
+        return content_check
+    }
+    let mod_content = dict_get(content_check, "data") ?? ""
+
+    // Write module file
+    let file_path = LIB_PATH + mod_name + ".nova"
+    let write_ok = try3 { write_file(file_path, mod_content) } fail { -1 }
+    if3 write_ok == -1 { _ns = ns_record(_ns, time() - t0, true)
+        return make_err("failed to write module file: " + file_path)
+    }
+
+    // Update nova_version.json
+    let vdata = _read_version_json()
+    let stdlib = dict_get(vdata, "stdlib") ?? {}
+    let modules = dict_get(stdlib, "modules") ?? {}
+    let mod_entry = {"version": mod_version, "description": mod_name + " module"}
+    modules = dict_set(modules, mod_name, mod_entry)
+    stdlib = dict_set(stdlib, "modules", modules)
+    stdlib = dict_set(stdlib, "version", mod_version)
+    vdata = dict_set(vdata, "stdlib", stdlib)
+
+    let change = {
+        "version": mod_version,
+        "date": str(time()),
+        "changes": ["updated stdlib module: " + mod_name + " to v" + mod_version]
+    }
+    let vdata = _update_changelog(vdata, change)
+    _write_version_json(vdata)
+
+    _last_update = time()
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+    return {
+        "ok": true,
+        "trit": 1,
+        "module": mod_name,
+        "version": mod_version,
+        "path": file_path,
+        "msg": "stdlib module updated successfully"
+    }
+}
+
+// POST /pacman/update/vm
+// Triggers cargo build of novalang-vm
+fn handle_update_vm(req) {
+    let t0 = time()
+    let body = parse_body(req)
+
+    // Run cargo build
+    let build_cmd = "cmd /C \"cd " + VM_SOURCE_DIR + " && " + CARGO_BIN + " build --release 2>&1\""
+    let build_output = try3 { shell(build_cmd) } fail { "__BUILD_FAILED__" }
+
+    if3 build_output == "__BUILD_FAILED__" { _ns = ns_record(_ns, time() - t0, true)
+        return {
+            "ok": false,
+            "trit": -1,
+            "error": "cargo build failed to execute",
+            "build_output": ""
+        }
+    }
+
+    // Check for compilation errors in output
+    let has_error = try3 { contains(build_output, "error[E") } fail { false }
+    if3 has_error == true { _ns = ns_record(_ns, time() - t0, true)
+        return {
+            "ok": false,
+            "trit": -1,
+            "error": "cargo build had compilation errors",
+            "build_output": build_output
+        }
+    }
+
+    // Copy built binary to staging location
+    let copy_cmd = "cmd /C \"copy /Y C:\\NovaX\\novalang-vm\\target\\release\\novalang.exe C:\\NovaX\\novalang_new.exe\""
+    let copy_result = try3 { shell(copy_cmd) } fail { "__COPY_FAILED__" }
+
+    if3 copy_result == "__COPY_FAILED__" { _ns = ns_record(_ns, time() - t0, true)
+        return {
+            "ok": false,
+            "trit": -1,
+            "error": "failed to copy built binary to staging",
+            "build_output": build_output
+        }
+    }
+
+    // Update nova_version.json vm section
+    let vdata = _read_version_json()
+    let vm = dict_get(vdata, "vm") ?? {}
+    let old_version = dict_get(vm, "version") ?? "unknown"
+
+    // Increment patch version if possible
+    let new_version = dict_get(body, "version") ?? old_version
+    vm = dict_set(vm, "version", new_version)
+    vdata = dict_set(vdata, "vm", vm)
+
+    let change = {
+        "version": new_version,
+        "date": str(time()),
+        "changes": ["VM build completed, staged as novalang_new.exe"]
+    }
+    let vdata = _update_changelog(vdata, change)
+    _write_version_json(vdata)
+
+    _last_update = time()
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+    return {
+        "ok": true,
+        "trit": 1,
+        "msg": "VM built and staged successfully",
+        "old_version": old_version,
+        "new_version": new_version,
+        "staged_binary": NOVALANG_NEW_EXE,
+        "build_output": build_output
+    }
+}
+
+// POST /pacman/deploy/rolling
+// Rolling fleet restart with optional binary swap
+fn handle_deploy_rolling(req) {
+    let t0 = time()
+
+    // Step 1: Check if novalang_new.exe exists for binary swap
+    let has_new_binary = _file_exists(NOVALANG_NEW_EXE)
+    let swap_performed = false
+
+    if3 has_new_binary == true {
+        // Backup current binary
+        let backup_cmd = "cmd /C \"copy /Y C:\\NovaX\\novalang.exe C:\\NovaX\\novalang_old.exe\""
+        let backup_result = try3 { shell(backup_cmd) } fail { "__FAILED__" }
+
+        if3 backup_result == "__FAILED__" { _ns = ns_record(_ns, time() - t0, true)
+            return make_err("failed to backup current novalang.exe")
+        }
+
+        // Swap in new binary
+        let swap_cmd = "cmd /C \"copy /Y C:\\NovaX\\novalang_new.exe C:\\NovaX\\novalang.exe\""
+        let swap_result = try3 { shell(swap_cmd) } fail { "__FAILED__" }
+
+        if3 swap_result == "__FAILED__" {
+            // Rollback
+            let rollback_cmd = "cmd /C \"copy /Y C:\\NovaX\\novalang_old.exe C:\\NovaX\\novalang.exe\""
+            try3 { shell(rollback_cmd) } fail { "" }
+            _ns = ns_record(_ns, time() - t0, true)
+            return make_err("failed to swap binary, rolled back to old version")
+        }
+
+        // Remove staged binary
+        let del_cmd = "cmd /C \"del /Q C:\\NovaX\\novalang_new.exe\""
+        try3 { shell(del_cmd) } fail { "" }
+        let swap_performed = true
+    }
+
+    // Step 2: Get fleet service list
+    let fleet_health = _fetch_fleet_health()
+    let services = dict_get(fleet_health, "services") ?? {}
+    let svc_names = try3 { keys(services) } fail { [] }
+    let svc_count = len(svc_names)
+
+    // Step 3: Restart in batches of H3=3
+    let batch_size = H3
+    let results = []
+    let success_count = 0
+    let fail_count = 0
+    let batch_idx = 0
+
+    while3 batch_idx < svc_count {
+        // Process one batch
+        let batch_end = batch_idx + batch_size
+        if3 batch_end > svc_count { batch_end = svc_count
+        }
+
+        let inner_idx = batch_idx
+        while3 inner_idx < batch_end {
+            let svc = svc_names[inner_idx]
+            // Skip tpacman -- restart self last
+            if3 svc == SERVICE_NAME { inner_idx = inner_idx + 1
+                continue3
+            }
+            if3 svc == "nova-tpacman" { inner_idx = inner_idx + 1
+                continue3
+            }
+
+            let restart_ok = _restart_service(svc)
+            let entry = _handle_restart_result(svc, restart_ok)
+            results = append(results, entry)
+            let entry_trit = dict_get(entry, "trit") ?? -1
+            if3 entry_trit == 1 { success_count = success_count + 1
+            } else3 { fail_count = fail_count + 1
+            }
+            inner_idx = inner_idx + 1
+        }
+
+        // Brief pause between batches (343ms = H7^3)
+        try3 { sleep(343) } fail { 0 }
+        let batch_idx = batch_end
+    }
+
+    // Step 4: Determine overall trit
+    let overall_trit = 1
+    if3 fail_count > 0 { overall_trit = 0
+    }
+    if3 success_count == 0 { overall_trit = -1
+    }
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+
+    return {
+        "ok": true,
+        "trit": overall_trit,
+        "swap_performed": swap_performed,
+        "services_restarted": success_count,
+        "services_failed": fail_count,
+        "results": results,
+        "msg": "rolling deploy complete, tpacman will restart last",
+        "elapsed_ms": floor(elapsed)
+    }
+}
+
+fn _handle_restart_result(svc, restart_ok) {
+    if3 restart_ok == 1 {
+        // Health check after restart
+        try3 { sleep(343) } fail { 0 }
+        let health_ok = _check_service_health(svc)
+        if3 health_ok == 1 {
+            return _build_service_entry(svc, "restarted", 1)
+        }
+        return _build_service_entry(svc, "restarted_unhealthy", 0)
+    }
+    return _build_service_entry(svc, "restart_failed", -1)
+}
+
+// POST /pacman/validate
+// Pre-flight checks before update/deploy
+fn handle_validate(req) {
+    let t0 = time()
+    let checks = []
+    let pass_count = 0
+    let fail_count = 0
+
+    // Check 1: cargo available
+    let cargo_check = _validate_cargo()
+    checks = append(checks, cargo_check)
+    let cargo_trit = dict_get(cargo_check, "trit") ?? -1
+    if3 cargo_trit == 1 { pass_count = pass_count + 1
+    } else3 { fail_count = fail_count + 1
+    }
+
+    // Check 2: nova_version.json readable
+    let version_check = _validate_version_json()
+    checks = append(checks, version_check)
+    let ver_trit = dict_get(version_check, "trit") ?? -1
+    if3 ver_trit == 1 { pass_count = pass_count + 1
+    } else3 { fail_count = fail_count + 1
+    }
+
+    // Check 3: novalang.exe syntax check
+    let syntax_check = _validate_syntax()
+    checks = append(checks, syntax_check)
+    let syn_trit = dict_get(syntax_check, "trit") ?? -1
+    if3 syn_trit == 1 { pass_count = pass_count + 1
+    } else3 { fail_count = fail_count + 1
+    }
+
+    // Check 4: lib directory accessible
+    let lib_check = _validate_lib_dir()
+    checks = append(checks, lib_check)
+    let lib_trit = dict_get(lib_check, "trit") ?? -1
+    if3 lib_trit == 1 { pass_count = pass_count + 1
+    } else3 { fail_count = fail_count + 1
+    }
+
+    let overall_trit = 1
+    if3 fail_count > 0 { overall_trit = 0
+    }
+    if3 pass_count == 0 { overall_trit = -1
+    }
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+
+    return {
+        "ok": true,
+        "trit": overall_trit,
+        "checks": checks,
+        "passed": pass_count,
+        "failed": fail_count,
+        "total": pass_count + fail_count,
+        "elapsed_ms": floor(elapsed)
+    }
+}
+
+fn _validate_cargo() {
+    let exists = file_exists(CARGO_BIN)
+    if3 exists != true {
+        return {"check": "cargo", "trit": -1, "status": "not_found", "detail": "cargo binary not accessible"}
+    }
+    return {"check": "cargo", "trit": 1, "status": "ok", "detail": "cargo found at " + CARGO_BIN}
+}
+
+fn _validate_version_json() {
+    let vdata = _read_version_json()
+    let kcount = try3 { len(keys(vdata)) } fail { 0 }
+    if3 kcount == 0 {
+        return {"check": "version_json", "trit": -1, "status": "unreadable", "detail": "cannot read or parse nova_version.json"}
+    }
+    let vm_ver = dict_get(dict_get(vdata, "vm") ?? {}, "version") ?? "unknown"
+    return {"check": "version_json", "trit": 1, "status": "ok", "detail": "vm=" + vm_ver}
+}
+
+fn _validate_syntax() {
+    // Write a minimal test file and run novalang on it
+    let test_path = "C:/NovaX/lib/_pacman_test.nova"
+    let test_code = "let _test = 1 + 1\nprint(str(_test))"
+    try3 { write_file(test_path, test_code) } fail { "" }
+
+    let run_out = try3 { shell(NOVALANG_EXE + " " + test_path) } fail { "__SYNTAX_FAIL__" }
+
+    // Cleanup test file
+    try3 { delete_file(test_path) } fail { "" }
+
+    if3 run_out == "__SYNTAX_FAIL__" {
+        return {"check": "syntax", "trit": -1, "status": "failed", "detail": "novalang.exe could not execute test file"}
+    }
+    return {"check": "syntax", "trit": 1, "status": "ok", "detail": "novalang.exe syntax check passed"}
+}
+
+fn _validate_lib_dir() {
+    let ns_core_exists = _file_exists(LIB_PATH + "nova_ns_core.nova")
+    let stdlib_exists = _file_exists(LIB_PATH + "nova_stdlib.nova")
+
+    if3 ns_core_exists == false {
+        return {"check": "lib_dir", "trit": -1, "status": "missing", "detail": "nova_ns_core.nova not found"}
+    }
+    if3 stdlib_exists == false {
+        return {"check": "lib_dir", "trit": -1, "status": "missing", "detail": "nova_stdlib.nova not found"}
+    }
+    return {"check": "lib_dir", "trit": 1, "status": "ok", "detail": "core libraries present"}
+}
+
+// ================================================================
+// Section 6: Purification Engine — Native NovaLang Conversion
+// ================================================================
+// Every model/ability/skill/territory discovered by Tripple gets
+// checked for purity. If the handler code uses Python bridges,
+// Pacman flags it for conversion to pure NovaLang.
+// ALL results are PERMANENTLY LOCKED — can never regress.
+// ================================================================
+
+let PURITY_REGISTRY_PATH = "C:/NovaX/data/purity_registry.json"
+let SWARM_RESULTS_PATH = "C:/NovaX/swarm_results/purify"
+
+// ── Purity Registry I/O ──────────────────────────────────────────
+
+fn _read_purity_registry() {
+    let raw = try3 { read_file(PURITY_REGISTRY_PATH) } fail { "" }
+    if3 len(raw) == 0 {
+        return {
+            "version": "1.0.0",
+            "services": {},
+            "abilities": {},
+            "territories": {},
+            "locks": {},
+            "stats": {"pure": 0, "impure": 0, "converting": 0, "locked": 0}
+        }
+    }
+    let data = try3 { json_decode(raw) } fail { {} }
+    return data
+}
+
+fn _write_purity_registry(data) {
+    let json_str = json_encode(data)
+    try3 { write_file(PURITY_REGISTRY_PATH, json_str) } fail { -1 }
+    return 1
+}
+
+// ── Permanent Lock Functions ─────────────────────────────────────
+// Once locked, NEVER unlocked. Append-only. Ratchet effect.
+
+fn _is_locked(registry, key) {
+    let locks = dict_get(registry, "locks") ?? {}
+    let locked = dict_get(locks, key) ?? false
+    if3 locked == true { return 1 }
+    return -1
+}
+
+fn _permanent_lock(registry, key, value) {
+    // Check if already locked — locked items NEVER change
+    if3 _is_locked(registry, key) == 1 { return registry }
+
+    let locks = dict_get(registry, "locks") ?? {}
+    locks = dict_set(locks, key, true)
+    registry = dict_set(registry, "locks", locks)
+
+    // Store the locked value
+    let locked_values = dict_get(registry, "locked_values") ?? {}
+    locked_values = dict_set(locked_values, key, {
+        "value": value,
+        "locked_at": str(time()),
+        "permanent": true
+    })
+    registry = dict_set(registry, "locked_values", locked_values)
+    return registry
+}
+
+// ── Purity Scanner ───────────────────────────────────────────────
+// Scans a .nova file for Python bridge calls
+
+fn _scan_purity(file_path) {
+    let content = try3 { read_file(file_path) } fail { "" }
+    if3 len(content) == 0 {
+        return {"pure": false, "reason": "unreadable", "python_calls": -1}
+    }
+
+    // Count Python bridge patterns
+    let python_count = 0
+    let patterns = ["py_call(", "python_exec(", "run_python(", "shell(\"python"]
+
+    for3 pattern in patterns {
+        if3 contains(content, pattern) {
+            python_count = python_count + 1
+        }
+    }
+
+    // Also check for shell() calls that invoke Python indirectly
+    if3 contains(content, "shell(\"py ") {
+        python_count = python_count + 1
+    }
+    if3 contains(content, "shell(\"python3") {
+        python_count = python_count + 1
+    }
+
+    let is_pure = python_count == 0
+    return {
+        "pure": is_pure,
+        "python_calls": python_count,
+        "file": file_path,
+        "scanned_at": str(time())
+    }
+}
+
+// ── Full Fleet Purity Scan ───────────────────────────────────────
+
+fn _scan_all_services() {
+    let nova_dir = "C:/NovaX"
+    // Get list of .nova service files
+    let ls_cmd = "cmd /C \"dir /B C:\\NovaX\\nova_*_service.nova C:\\NovaX\\nova_*_engine.nova 2>NUL\""
+    let file_list = try3 { shell(ls_cmd) } fail { "" }
+
+    if3 len(file_list) == 0 {
+        return {"services": {}, "total": 0, "pure": 0, "impure": 0}
+    }
+
+    let files = split(trim(file_list), "\n")
+    let services = {}
+    let pure_count = 0
+    let impure_count = 0
+
+    for3 fname in files {
+        let clean_name = trim(fname)
+        if3 len(clean_name) == 0 { continue3 }
+        let full_path = nova_dir + "/" + clean_name
+        let scan = _scan_purity(full_path)
+        services = dict_set(services, clean_name, scan)
+
+        let is_pure = dict_get(scan, "pure") ?? false
+        if3 is_pure == true {
+            pure_count = pure_count + 1
+        } else3 {
+            impure_count = impure_count + 1
+        }
+    }
+
+    return {
+        "services": services,
+        "total": pure_count + impure_count,
+        "pure": pure_count,
+        "impure": impure_count,
+        "scanned_at": str(time())
+    }
+}
+
+// ── Ability Purity Check ─────────────────────────────────────────
+// When Tripple discovers an ability, check if the handler is pure
+
+fn _check_ability_purity(ability_name, service_name) {
+    let registry = _read_purity_registry()
+
+    // Already locked? Return cached result
+    let lock_key = "ability:" + ability_name
+    if3 _is_locked(registry, lock_key) == 1 {
+        let locked_values = dict_get(registry, "locked_values") ?? {}
+        let cached = dict_get(locked_values, lock_key) ?? {}
+        return dict_get(cached, "value") ?? {"pure": true, "locked": true}
+    }
+
+    // Scan the service file
+    let nova_dir = "C:/NovaX"
+    let file_path = nova_dir + "/" + service_name
+    let scan = _scan_purity(file_path)
+    let is_pure = dict_get(scan, "pure") ?? false
+
+    // Update registry
+    let abilities = dict_get(registry, "abilities") ?? {}
+    abilities = dict_set(abilities, ability_name, {
+        "pure": is_pure,
+        "service": service_name,
+        "checked_at": str(time())
+    })
+    registry = dict_set(registry, "abilities", abilities)
+
+    // If pure, PERMANENTLY LOCK IT
+    if3 is_pure == true {
+        let registry = _permanent_lock(registry, lock_key, {"pure": true, "ability": ability_name, "service": service_name})
+
+        // Update stats
+        let stats = dict_get(registry, "stats") ?? {}
+        let locked_count = dict_get(stats, "locked") ?? 0
+        stats = dict_set(stats, "locked", locked_count + 1)
+        registry = dict_set(registry, "stats", stats)
+    }
+
+    _write_purity_registry(registry)
+
+    return {
+        "ability": ability_name,
+        "service": service_name,
+        "pure": is_pure,
+        "python_calls": dict_get(scan, "python_calls") ?? 0,
+        "locked": is_pure
+    }
+}
+
+// ── Territory Purity Check ───────────────────────────────────────
+
+fn _check_territory_purity(territory_name) {
+    let registry = _read_purity_registry()
+
+    let lock_key = "territory:" + territory_name
+    if3 _is_locked(registry, lock_key) == 1 {
+        let locked_values = dict_get(registry, "locked_values") ?? {}
+        let cached = dict_get(locked_values, lock_key) ?? {}
+        return dict_get(cached, "value") ?? {"pure": true, "locked": true}
+    }
+
+    // Map territory → service file
+    let service_map = {
+        "chat": "nova_cloud_router_service.nova",
+        "code": "nova_tools_service.nova",
+        "reasoning": "nova_hivemind_service.nova",
+        "image": "nova_timage_service.nova",
+        "audio": "nova_tmedia_service.nova",
+        "embedding": "nova_hivemind_service.nova",
+        "fast": "nova_cloud_router_service.nova",
+        "system": "nova_novaxcore_engine.nova"
+    }
+
+    let service_file = dict_get(service_map, territory_name) ?? ""
+    if3 len(service_file) == 0 {
+        return {"territory": territory_name, "pure": false, "reason": "unmapped_territory"}
+    }
+
+    let scan = _scan_purity("C:/NovaX/" + service_file)
+    let is_pure = dict_get(scan, "pure") ?? false
+
+    let territories = dict_get(registry, "territories") ?? {}
+    territories = dict_set(territories, territory_name, {
+        "pure": is_pure,
+        "service": service_file,
+        "checked_at": str(time())
+    })
+    registry = dict_set(registry, "territories", territories)
+
+    if3 is_pure == true {
+        let registry = _permanent_lock(registry, lock_key, {"pure": true, "territory": territory_name})
+    }
+
+    _write_purity_registry(registry)
+
+    return {
+        "territory": territory_name,
+        "service": service_file,
+        "pure": is_pure,
+        "locked": is_pure
+    }
+}
+
+// ── Native Conversion Trigger ────────────────────────────────────
+// Triggers the purification swarm for a specific service
+
+fn _trigger_purification(service_file, phase) {
+    // Build the command to run the swarm for this specific service
+    let swarm_cmd = "cmd /C \"cd C:\\NovaX && python scripts/novalang_purify_swarm.py --phase " + str(phase) + " 2>&1\""
+    let result = try3 { shell(swarm_cmd) } fail { "__SWARM_FAILED__" }
+
+    if3 result == "__SWARM_FAILED__" {
+        return {"ok": false, "trit": -1, "error": "swarm execution failed", "service": service_file}
+    }
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "service": service_file,
+        "phase": phase,
+        "msg": "purification swarm triggered",
+        "output_preview": substr(result, 0, 500)
+    }
+}
+
+// ── Route Handlers for Purification ──────────────────────────────
+
+// GET /pacman/purity/scan — Full fleet purity scan
+fn handle_purity_scan(req) {
+    let t0 = time()
+    let scan = _scan_all_services()
+
+    // Update registry with scan results
+    let registry = _read_purity_registry()
+    let services = dict_get(scan, "services") ?? {}
+    let reg_services = dict_get(registry, "services") ?? {}
+
+    // Merge scan into registry, respecting permanent locks
+    for3 svc_name in dict_keys(services) {
+        let svc_scan = dict_get(services, svc_name) ?? {}
+        let lock_key = "service:" + svc_name
+        let is_pure = dict_get(svc_scan, "pure") ?? false
+
+        // Only update if NOT already locked
+        if3 _is_locked(registry, lock_key) == -1 {
+            reg_services = dict_set(reg_services, svc_name, svc_scan)
+
+            // If pure, permanently lock it
+            if3 is_pure == true {
+                let registry = _permanent_lock(registry, lock_key, {"pure": true, "service": svc_name})
+            }
+        }
+    }
+
+    registry = dict_set(registry, "services", reg_services)
+
+    // Update stats
+    let stats = {
+        "pure": dict_get(scan, "pure") ?? 0,
+        "impure": dict_get(scan, "impure") ?? 0,
+        "total": dict_get(scan, "total") ?? 0,
+        "locked": len(dict_keys(dict_get(registry, "locks") ?? {})),
+        "last_scan": str(time())
+    }
+    registry = dict_set(registry, "stats", stats)
+    _write_purity_registry(registry)
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "scan": scan,
+        "stats": stats,
+        "elapsed_ms": floor(elapsed)
+    }
+}
+
+// GET /pacman/purity/status — Current purity status from registry
+fn handle_purity_status(req) {
+    let t0 = time()
+    let registry = _read_purity_registry()
+
+    let stats = dict_get(registry, "stats") ?? {}
+    let lock_count = len(dict_keys(dict_get(registry, "locks") ?? {}))
+    let ability_count = len(dict_keys(dict_get(registry, "abilities") ?? {}))
+    let territory_count = len(dict_keys(dict_get(registry, "territories") ?? {}))
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "stats": stats,
+        "locks_total": lock_count,
+        "abilities_tracked": ability_count,
+        "territories_tracked": territory_count,
+        "registry_version": dict_get(registry, "version") ?? "unknown"
+    }
+}
+
+// POST /pacman/purity/check — Check purity of a specific ability or territory
+// Body: {"type": "ability"|"territory", "name": "...", "service": "..."}
+fn handle_purity_check(req) {
+    let t0 = time()
+    let body = parse_body(req)
+    let check_type = dict_get(body, "type") ?? ""
+    let check_name = dict_get(body, "name") ?? ""
+
+    if3 len(check_type) == 0 {
+        _ns = ns_record(_ns, time() - t0, true)
+        return make_err("missing 'type' field (ability|territory)")
+    }
+    if3 len(check_name) == 0 {
+        _ns = ns_record(_ns, time() - t0, true)
+        return make_err("missing 'name' field")
+    }
+
+    let result = {}
+    if3 check_type == "ability" {
+        let service = dict_get(body, "service") ?? ""
+        if3 len(service) == 0 {
+            _ns = ns_record(_ns, time() - t0, true)
+            return make_err("missing 'service' field for ability check")
+        }
+        let result = _check_ability_purity(check_name, service)
+    } else3 {
+        if3 check_type == "territory" {
+            let result = _check_territory_purity(check_name)
+        } else3 {
+            _ns = ns_record(_ns, time() - t0, true)
+            return make_err("invalid type: " + check_type + " (use ability|territory)")
+        }
+    }
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "check": result,
+        "elapsed_ms": floor(elapsed)
+    }
+}
+
+// POST /pacman/purity/convert — Trigger native conversion for a phase
+// Body: {"phase": 1|2|3}
+fn handle_purity_convert(req) {
+    let t0 = time()
+    let body = parse_body(req)
+    let phase = dict_get(body, "phase") ?? 0
+
+    if3 phase == 0 {
+        _ns = ns_record(_ns, time() - t0, true)
+        return make_err("missing 'phase' field (1=core, 2=services, 3=microsoft)")
+    }
+
+    // Phase 3 (Microsoft) blocked until phases 1+2 are complete
+    if3 phase == 3 {
+        let registry = _read_purity_registry()
+        let stats = dict_get(registry, "stats") ?? {}
+        let impure = dict_get(stats, "impure") ?? 999
+        // Only allow Phase 3 if impure count is very low (just Microsoft itself)
+        if3 impure > 3 {
+            _ns = ns_record(_ns, time() - t0, true)
+            return {
+                "ok": false,
+                "trit": -1,
+                "error": "Phase 3 (Microsoft Engine) blocked — " + str(impure) + " services still impure. Complete Phase 1+2 first.",
+                "impure_count": impure
+            }
+        }
+    }
+
+    let result = _trigger_purification("phase_" + str(phase), phase)
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+
+    return {
+        "ok": dict_get(result, "ok") ?? false,
+        "trit": dict_get(result, "trit") ?? -1,
+        "phase": phase,
+        "result": result,
+        "elapsed_ms": floor(elapsed)
+    }
+}
+
+// POST /pacman/purity/lock — Manually lock a service/ability/territory as pure
+// Body: {"key": "service:nova_tools_service.nova", "value": {...}}
+fn handle_purity_lock(req) {
+    let t0 = time()
+    let body = parse_body(req)
+    let key = dict_get(body, "key") ?? ""
+    let value = dict_get(body, "value") ?? {}
+
+    if3 len(key) == 0 {
+        _ns = ns_record(_ns, time() - t0, true)
+        return make_err("missing 'key' field")
+    }
+
+    let registry = _read_purity_registry()
+
+    // Check if already locked
+    if3 _is_locked(registry, key) == 1 {
+        _ns = ns_record(_ns, time() - t0, false)
+        return {
+            "ok": true,
+            "trit": 1,
+            "msg": "already permanently locked",
+            "key": key,
+            "was_locked": true
+        }
+    }
+
+    // Apply permanent lock
+    let registry = _permanent_lock(registry, key, value)
+    _write_purity_registry(registry)
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "msg": "permanently locked",
+        "key": key,
+        "locked": true,
+        "permanent": true
+    }
+}
+
+// GET /pacman/purity/locks — List all permanent locks
+fn handle_purity_locks(req) {
+    let t0 = time()
+    let registry = _read_purity_registry()
+    let locks = dict_get(registry, "locks") ?? {}
+    let locked_values = dict_get(registry, "locked_values") ?? {}
+
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, false)
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "total_locks": len(dict_keys(locks)),
+        "locks": locked_values,
+        "msg": "all locks are PERMANENT — cannot be unlocked"
+    }
+}
+
+// ================================================================
+// Server setup
+// ================================================================
+
+let server = tserve(PORT, "NovaX TPacman v" + VERSION)
+
+troute(server, "GET",  "/health",               "handle_health")
+troute(server, "GET",  "/pacman/status",         "handle_status")
+troute(server, "GET",  "/pacman/changelog",      "handle_changelog")
+troute(server, "POST", "/pacman/update/stdlib",  "handle_update_stdlib")
+troute(server, "POST", "/pacman/update/vm",      "handle_update_vm")
+troute(server, "POST", "/pacman/deploy/rolling", "handle_deploy_rolling")
+troute(server, "POST", "/pacman/validate",       "handle_validate")
+
+// -- Purification Engine routes --
+troute(server, "GET",  "/pacman/purity/scan",    "handle_purity_scan")
+troute(server, "GET",  "/pacman/purity/status",  "handle_purity_status")
+troute(server, "GET",  "/pacman/purity/locks",   "handle_purity_locks")
+troute(server, "POST", "/pacman/purity/check",   "handle_purity_check")
+troute(server, "POST", "/pacman/purity/convert",  "handle_purity_convert")
+troute(server, "POST", "/pacman/purity/lock",    "handle_purity_lock")
+
+// -- Startup banner --
+print("========================================")
+print("[TPacman] NovaX Package Manager v" + VERSION)
+print("[TPacman] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TPacman] VM: " + get_vm_version() + " | NS-Core: " + NS_CORE_VERSION)
+print("[TPacman] Routes: GET  /health, /pacman/status, /pacman/changelog")
+print("[TPacman] Routes: POST /pacman/update/stdlib, /pacman/update/vm")
+print("[TPacman] Routes: POST /pacman/deploy/rolling, /pacman/validate")
+print("[TPacman] Purification Engine: GET /pacman/purity/scan, /status, /locks")
+print("[TPacman] Purification Engine: POST /pacman/purity/check, /convert, /lock")
+print("[TPacman] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("========================================")
+
+tstart(server)

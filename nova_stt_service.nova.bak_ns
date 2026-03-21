@@ -1,0 +1,446 @@
+// nova_stt_service.nova -- NovaX Speech-to-Text v1.0 - Ternary STT Service
+// Port 9875 | Pure NovaLang port of nova_stt.py
+//
+// Transcription engine: faster-whisper (delegated via nova_run -> stt_helper.py)
+// NovaLang cannot import ML libraries directly, so all heavy lifting
+// is delegated to C:/NovaX/stt_helper.py which loads faster-whisper,
+// transcribes a temp audio file, and prints JSON to stdout.
+//
+// N-S Mapping:
+//   audio_stream   = velocity_field (input data flow)
+//   audio_bytes    = flow_velocity (data throughput)
+//   quality_trit   = reynolds_number (transcription confidence)
+//   Re < 27 (H3^3)  = LAMINAR (high confidence, clean transcription)
+//   Re < 125 (H5^3) = TRANSITIONAL (partial, short text from long audio)
+//   Re < 343 (H7^3) = TURBULENT (failed or error)
+//
+// Endpoints:
+//   POST /transcribe   -- Transcribe audio (accepts JSON with path or audio_base64)
+//   GET  /health       -- Health check with stats
+//   GET  /stt/status   -- Extended status
+
+let PORT = 9875
+let server = tserve(PORT, "Nova STT v1.0 - Ternary Speech-to-Text")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK_SIZE = 2187     // 3^7
+let RE_LAMINAR = 27       // H3^3
+let RE_TRANSITION = 125   // H5^3
+let RE_TURBULENT = 343    // H7^3
+
+// -- Ternary Constants --
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// -- Model config --
+let MODEL_SIZE = "base.en"
+let HELPER_PATH = "C:/NovaX/stt_helper.py"
+
+// -- Stats tracking --
+let stats_transcriptions = 0
+let stats_strong = 0
+let stats_partial = 0
+let stats_failed = 0
+let stats_t0 = time()
+
+// ============================================================
+// Helper: trit character
+// ============================================================
+fn trit_char(t) {
+    if3 t == 1 {
+        return "1"
+    } else {
+        if3 t == 0 {
+            return "0"
+        } else {
+            return "T"
+        }
+    }
+}
+
+// ============================================================
+// Helper: record a trit into stats
+// ============================================================
+fn record_trit(t) {
+    if3 t == T_TRUE {
+        stats_strong = stats_strong + 1
+    } else {
+        if3 t == T_MAYBE {
+            stats_partial = stats_partial + 1
+        } else {
+            stats_failed = stats_failed + 1
+        }
+    }
+    return t
+}
+
+// ============================================================
+// Helper: transcription quality trit
+// +1 = confident, 0 = partial, -1 = failed
+// Only +1 transcriptions should feed into LLM training data.
+// ============================================================
+fn transcription_trit(text, duration) {
+    if3 text == "" {
+        return T_FALSE
+    } else {
+        let words = split(text, " ")
+        let wcount = len(words)
+        if3 wcount < 2 {
+            if3 duration > 3.0 {
+                return T_MAYBE
+            } else {
+                return T_TRUE
+            }
+        } else {
+            if3 duration > 30.0 {
+                return T_MAYBE
+            } else {
+                return T_TRUE
+            }
+        }
+    }
+}
+
+// ============================================================
+// Helper: check if stt_helper.py exists
+// ============================================================
+fn helper_exists() {
+    let raw = nova_run("cmd /c if exist \"" + HELPER_PATH + "\" (echo YES) else (echo NO)")
+    let trimmed = trim(raw)
+    if3 contains(trimmed, "YES") == true {
+        return true
+    } else {
+        return false
+    }
+}
+
+// ============================================================
+// Helper: check if faster-whisper is installed
+// ============================================================
+fn whisper_installed() {
+    let raw = nova_run("cmd /c python -c \"import faster_whisper; print('YES')\" 2>NUL")
+    let trimmed = trim(raw)
+    if3 contains(trimmed, "YES") == true {
+        return true
+    } else {
+        return false
+    }
+}
+
+// ============================================================
+// Helper: get temp directory
+// ============================================================
+fn get_temp_dir() {
+    let raw = nova_run("cmd /c echo %TEMP%")
+    let trimmed = trim(raw)
+    return trimmed
+}
+
+// ============================================================
+// Helper: detect file extension from content-type string
+// ============================================================
+fn detect_extension(ct) {
+    if3 contains(ct, "webm") == true {
+        return ".webm"
+    } else {
+        if3 contains(ct, "wav") == true {
+            return ".wav"
+        } else {
+            if3 contains(ct, "ogg") == true {
+                return ".ogg"
+            } else {
+                if3 contains(ct, "mp3") == true {
+                    return ".mp3"
+                } else {
+                    if3 contains(ct, "flac") == true {
+                        return ".flac"
+                    } else {
+                        if3 contains(ct, "m4a") == true {
+                            return ".m4a"
+                        } else {
+                            return ".webm"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// Helper: delete a temp file
+// ============================================================
+fn cleanup_temp(path) {
+    if3 path != "" {
+        let _ = nova_run("cmd /c del /q \"" + path + "\" 2>NUL")
+    }
+    return T_TRUE
+}
+
+// ============================================================
+// Route: GET /health
+// ============================================================
+fn health(body) {
+    let up = int(time() - stats_t0)
+    let has_helper = helper_exists()
+    let has_whisper = whisper_installed()
+
+    let status = "stub"
+    let engine = "none (install faster-whisper)"
+    let model_trit = T_FALSE
+
+    if3 has_whisper == true {
+        if3 has_helper == true {
+            let status = "ok"
+            let engine = "faster-whisper"
+            let model_trit = T_TRUE
+        } else {
+            let status = "no-helper"
+            let engine = "faster-whisper (helper missing)"
+            let model_trit = T_MAYBE
+        }
+    } else {
+        if3 has_helper == true {
+            let status = "no-whisper"
+            let engine = "none (faster-whisper not installed)"
+            let model_trit = T_FALSE
+        } else {
+            let status = "stub"
+            let engine = "none (install faster-whisper + stt_helper.py)"
+            let model_trit = T_FALSE
+        }
+    }
+
+    let self_trit = T_MAYBE
+    if3 up > 10 {
+        let self_trit = T_TRUE
+    }
+
+    return {
+        "ok": true,
+        "service": "nova-stt",
+        "status": status,
+        "model": MODEL_SIZE,
+        "port": PORT,
+        "engine": engine,
+        "ternary": true,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "model_trit": model_trit,
+        "model_char": trit_char(model_trit),
+        "self_trit": self_trit,
+        "char": trit_char(self_trit),
+        "uptime": up,
+        "transcriptions": stats_transcriptions,
+        "quality": {
+            "strong": stats_strong,
+            "partial": stats_partial,
+            "failed": stats_failed
+        }
+    }
+}
+
+// ============================================================
+// Route: GET /stt/status
+// ============================================================
+}
+fn stt_status(body) {
+    let up = int(time() - stats_t0)
+    let total = stats_strong + stats_partial + stats_failed
+    let success_rate = 0.0
+    if3 total > 0 {
+        let success_rate = round(float(stats_strong) / float(total) * 100.0, 1)
+    }
+    return {
+        "ok": true,
+        "service": "nova-stt",
+        "version": "1.0",
+        "port": PORT,
+        "model": MODEL_SIZE,
+        "uptime": up,
+        "transcriptions": stats_transcriptions,
+        "success_rate_pct": success_rate,
+        "quality": {
+            "strong": stats_strong,
+            "partial": stats_partial,
+            "failed": stats_failed
+        },
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "ternary": true
+    }
+}
+
+// ============================================================
+// Route: POST /transcribe
+//
+// Accepts JSON body with:
+//   "path": string          -- path to an existing audio file on disk
+//   OR
+//   "audio_base64": string  -- base64-encoded audio data
+//   "content_type": string  -- MIME type hint (e.g. "audio/webm")
+//   "language": string      -- language code (default "en")
+//
+// If "path" is provided, transcribes that file directly.
+// If "audio_base64" is provided, decodes to temp file first.
+//
+// Returns JSON:
+//   "text": transcribed text
+//   "language": language used
+//   "duration": processing time in seconds
+//   "trit": quality trit (+1/0/-1)
+//   "char": trit character
+// ============================================================
+fn transcribe(body) {
+    let t0 = time()
+
+    // Check helper + whisper availability
+    let has_helper = helper_exists()
+    if3 has_helper == false {
+        let _ = record_trit(T_FALSE)
+        return {
+            "ok": false,
+            "text": "",
+            "error": "stt_helper.py not found at " + HELPER_PATH,
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    }
+
+    let has_whisper = whisper_installed()
+    if3 has_whisper == false {
+        let _ = record_trit(T_FALSE)
+        return {
+            "ok": false,
+            "text": "",
+            "error": "faster-whisper not installed. Run: pip install faster-whisper",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    }
+
+    // Determine audio source
+    let audio_path = dict_get(body, "path", "")
+    let audio_b64 = dict_get(body, "audio_base64", "")
+    let content_type = dict_get(body, "content_type", "audio/webm")
+    let language = dict_get(body, "language", "en")
+    let temp_file = ""
+
+    if3 audio_path == "" {
+        if3 audio_b64 == "" {
+            let _ = record_trit(T_FALSE)
+            return {
+                "ok": false,
+                "text": "",
+                "error": "No audio provided. Send 'path' or 'audio_base64' in JSON body.",
+                "trit": T_FALSE,
+                "char": "T"
+            }
+        } else {
+            // Decode base64 audio to temp file
+            let ext = detect_extension(content_type)
+            let tmpdir = get_temp_dir()
+            let fname = "nova_stt_" + uuid_hex() + ext
+            let temp_file = tmpdir + "\\" + fname
+
+            // Use python one-liner to decode base64 and write binary file
+            let decode_cmd = "cmd /c python -c \"import base64,sys; d=base64.b64decode('" + audio_b64 + "'); f=open(r'" + temp_file + "','wb'); f.write(d); f.close(); print('OK')\""
+            let decode_result = nova_run(decode_cmd)
+            let decode_ok = contains(trim(decode_result), "OK")
+
+            if3 decode_ok == false {
+                let _ = record_trit(T_FALSE)
+                return {
+                    "ok": false,
+                    "text": "",
+                    "error": "Failed to decode audio_base64 to temp file",
+                    "trit": T_FALSE,
+                    "char": "T"
+                }
+            }
+            let audio_path = temp_file
+        }
+    }
+
+    // Run transcription via helper
+    let cmd = "cmd /c python \"" + HELPER_PATH + "\" \"" + audio_path + "\" \"" + language + "\""
+    let raw_result = nova_run(cmd)
+    let trimmed = trim(raw_result)
+
+    // Clean up temp file if we created one
+    if3 temp_file != "" {
+        let _ = cleanup_temp(temp_file)
+    }
+
+    // Parse result JSON from helper
+    if3 trimmed == "" {
+        let _ = record_trit(T_FALSE)
+        stats_transcriptions = stats_transcriptions + 1
+        return {
+            "ok": false,
+            "text": "",
+            "error": "Helper returned empty output",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    }
+
+    let result = json_decode(trimmed)
+
+    // Check for helper-level errors
+    let helper_error = dict_get(result, "error", "")
+    if3 helper_error != "" {
+        let _ = record_trit(T_FALSE)
+        stats_transcriptions = stats_transcriptions + 1
+        return {
+            "ok": false,
+            "text": "",
+            "error": helper_error,
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    }
+
+    // Extract transcription results
+    let text = dict_get(result, "text", "")
+    let helper_duration = dict_get(result, "duration", 0.0)
+    let total_duration = round(time() - t0, 2)
+
+    // Calculate quality trit
+    let trit = transcription_trit(text, total_duration)
+    let _ = record_trit(trit)
+    stats_transcriptions = stats_transcriptions + 1
+
+    if3 text != "" {
+        print("[Nova STT] '" + text + "' (" + str(total_duration) + "s) trit=" + trit_char(trit))
+    }
+
+    return {
+        "ok": true,
+        "text": text,
+        "language": language,
+        "duration": total_duration,
+        "whisper_duration": helper_duration,
+        "model": MODEL_SIZE,
+        "trit": trit,
+        "char": trit_char(trit)
+    }
+}
+
+// ============================================================
+// Route Registration
+// ============================================================
+troute(server, "GET",  "/health",      "health")
+troute(server, "GET",  "/stt/status",  "stt_status")
+troute(server, "POST", "/transcribe",  "transcribe")
+
+print("[Nova STT] NovaX Speech-to-Text v1.0 on port " + str(PORT))
+print("[Nova STT] Model: " + MODEL_SIZE + " | Engine: faster-whisper (delegated)")
+print("[Nova STT] Harmonics: 3-5-7-13 | Re=" + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT))
+print("[Nova STT] Helper: " + HELPER_PATH)
+print("[Nova STT] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

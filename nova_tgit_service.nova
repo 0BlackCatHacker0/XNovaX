@@ -1,0 +1,1799 @@
+// NovaX TGit Service v1.0 - Ternary Git Wrapper (NovaLang)
+// Port 9913: Git operations through ternary-native micro-tools
+//
+// 7 ternary-native git tools on 3-5-7-13 harmonic constants:
+//   1. /tgit/status  -- Repo status (clean/dirty/error)
+//   2. /tgit/log     -- Commit log (last N entries, default H13=13)
+//   3. /tgit/commit  -- Stage + commit (all or specific files, amend)
+//   4. /tgit/branch  -- Branch ops (list/create/switch/delete)
+//   5. /tgit/merge   -- Merge branch (with conflict detection)
+//   6. /tgit/stash   -- Stash ops (save/pop/list/drop)
+//   7. /tgit/remote  -- Remote ops (push/pull/fetch/status)
+//
+// N-S Mapping:
+//   commit_stream    = velocity_field (commits flowing through repo)
+//   conflict_count   = turbulent_energy (merge conflict pressure)
+//   Reynolds(repo)   = conflict_ops * H5
+//   RE_LAMINAR=27    = clean repo (few conflicts)
+//   RE_TRANSITION=125= repo under moderate churn
+//   RE_TURBULENT=343 = repo in heavy conflict state
+//
+// Endpoints:
+//   GET  /health              -- Health check
+//   GET  /tgit/service-status -- Full service status with stats
+//   POST /tgit/status         -- Repo status
+//   POST /tgit/log            -- Commit log
+//   POST /tgit/commit         -- Stage and commit
+//   POST /tgit/branch         -- Branch operations
+//   POST /tgit/merge          -- Merge branch
+//   POST /tgit/stash          -- Stash operations
+//   POST /tgit/remote         -- Remote operations
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9913
+let server = tserve(PORT, "TGit v1.0 - Ternary Git Wrapper")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE     = 2187
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+let TOOLS_COUNT    = 11
+let VERSION        = "1.0.0"
+let SERVICE_NAME   = "nova-tgit"
+let GIT_TIMEOUT    = 13
+let DEFAULT_PATH   = "C:\\NovaX"
+
+// -- TCI Hook Integration --
+let TCI_URL          = "http://127.0.0.1:9927"
+let hook_precommit   = true
+let hook_pipeline    = "lint"
+let hook_block_fail  = true
+let hook_runs        = 0
+let hook_passes      = 0
+let hook_fails       = 0
+let hook_bypasses    = 0
+
+// -- Global Stats --
+let stat_ops         = 0
+let stat_trit_true   = 0
+let stat_trit_maybe  = 0
+let stat_trit_false  = 0
+let stat_t0          = time()
+
+// by_tool counters (one per tool)
+let by_tool_status   = 0
+let by_tool_log      = 0
+let by_tool_commit   = 0
+let by_tool_branch   = 0
+let by_tool_merge    = 0
+let by_tool_stash    = 0
+let by_tool_remote   = 0
+let by_tool_diff     = 0
+let by_tool_tag      = 0
+
+// -- Repo cache (path -> last known info) --
+let _repo_cache = {}
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_stat(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "status" {
+        by_tool_status = by_tool_status + 1
+    }
+    if3 tool_name == "log" {
+        by_tool_log = by_tool_log + 1
+    }
+    if3 tool_name == "commit" {
+        by_tool_commit = by_tool_commit + 1
+    }
+    if3 tool_name == "branch" {
+        by_tool_branch = by_tool_branch + 1
+    }
+    if3 tool_name == "merge" {
+        by_tool_merge = by_tool_merge + 1
+    }
+    if3 tool_name == "stash" {
+        by_tool_stash = by_tool_stash + 1
+    }
+    if3 tool_name == "remote" {
+        by_tool_remote = by_tool_remote + 1
+    }
+    if3 tool_name == "diff" {
+        by_tool_diff = by_tool_diff + 1
+    }
+    if3 tool_name == "tag" {
+        by_tool_tag = by_tool_tag + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: run a git command with standard timeout
+// Returns stripped output string
+// ===========================================================================
+fn run_git(cmd) {
+    let raw = nova_run(cmd, GIT_TIMEOUT)
+    let output = strip(str(raw))
+    return output
+}
+
+// ===========================================================================
+// HELPER: check if output indicates a git error
+// ===========================================================================
+fn is_git_error(output) {
+    let lc = lower(output)
+    if3 contains(lc, "fatal:") {
+        return true
+    }
+    if3 contains(lc, "error:") {
+        return true
+    }
+    if3 contains(lc, "not a git repository") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: get current branch name from git output
+// ===========================================================================
+fn get_current_branch(path) {
+    let cmd = "git -C \"" + path + "\" branch --show-current 2>&1"
+    let output = run_git(cmd)
+    if3 is_git_error(output) == true {
+        return ""
+    }
+    return output
+}
+
+// ===========================================================================
+// HELPER: count lines in output that match a prefix
+// ===========================================================================
+fn count_lines_with_prefix(output, prefix) {
+    let count = 0
+    if3 len(output) == 0 {
+        return 0
+    }
+    let lines = split(output, "\n")
+    let i = 0
+    while3 i < len(lines) {
+        let line = strip(lines[i])
+        if3 len(line) > 0 {
+            if3 len(prefix) == 0 {
+                count = count + 1
+            }
+            if3 len(prefix) > 0 {
+                if3 contains(line, prefix) {
+                    count = count + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ===========================================================================
+// TOOL 1: POST /tgit/status
+// Repo status: clean/dirty/error
+// Body: {path: "C:\\path\\to\\repo"}
+// Trit: +1=clean, 0=dirty, -1=not a git repo or error
+// ===========================================================================
+fn handle_status(body) {
+    let path = dict_get(body, "path") ?? DEFAULT_PATH
+
+    // Run git status --porcelain
+    let cmd = "git -C \"" + path + "\" status --porcelain 2>&1"
+    let output = run_git(cmd)
+
+    // Check for error (not a git repo)
+    if3 is_git_error(output) == true {
+        record_stat("status", T_FALSE)
+        return {
+            "ok": false,
+            "path": path,
+            "clean": false,
+            "modified_count": 0,
+            "untracked_count": 0,
+            "staged_count": 0,
+            "branch": "",
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Get current branch
+    let branch = get_current_branch(path)
+
+    // Parse porcelain output
+    // Each line: XY filename
+    // X = staged status, Y = working tree status
+    // M = modified, A = added, D = deleted, R = renamed, ? = untracked
+    let modified_count = 0
+    let untracked_count = 0
+    let staged_count = 0
+
+    if3 len(output) > 0 { lines = split(output, "\n")
+        let i = 0
+        while3 i < len(lines) {
+            let line = lines[i]
+            if3 len(line) >= 2 { first_char = slice(line, 0, 1)
+                let second_char = slice(line, 1, 2)
+
+                // Untracked files start with ??
+                if3 first_char == "?" {
+                    untracked_count = untracked_count + 1
+                }
+
+                // Staged changes: first char is not space and not ?
+                if3 first_char != " " {
+                    if3 first_char != "?" {
+                        staged_count = staged_count + 1
+                    }
+                }
+
+                // Working tree modifications: second char is not space
+                if3 second_char != " " {
+                    if3 second_char != "?" {
+                        modified_count = modified_count + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // Determine trit
+    let clean = len(output) == 0
+    let status_trit = T_TRUE
+    if3 clean == false {
+        status_trit = T_MAYBE
+    }
+
+    // Cache repo info
+    let cache_entry = {}
+    cache_entry = dict_set(cache_entry, "branch", branch)
+    cache_entry = dict_set(cache_entry, "clean", clean)
+    cache_entry = dict_set(cache_entry, "last_check", time())
+    _repo_cache = dict_set(_repo_cache, path, cache_entry)
+
+    record_stat("status", status_trit)
+    return {
+        "ok": true,
+        "path": path,
+        "clean": clean,
+        "modified_count": modified_count,
+        "untracked_count": untracked_count,
+        "staged_count": staged_count,
+        "branch": branch,
+        "trit": status_trit,
+        "char": bt_one(status_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 2: POST /tgit/log
+// Commit log (last N entries)
+// Body: {path, count: 13}
+// ===========================================================================
+fn handle_log(body) {
+    let path = dict_get(body, "path") ?? DEFAULT_PATH
+    let count = dict_get(body, "count") ?? H13
+
+    // Clamp count
+    if3 count < 1 {
+        count = 1
+    }
+    if3 count > 343 {
+        count = 343
+    }
+
+    let cmd = "git -C \"" + path + "\" log --oneline -" + str(count) + " 2>&1"
+    let output = run_git(cmd)
+
+    // Check for error
+    if3 is_git_error(output) == true {
+        record_stat("log", T_FALSE)
+        return {
+            "ok": false,
+            "path": path,
+            "entries": [],
+            "count": 0,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse log entries: each line is "hash message"
+    let entries = []
+    if3 len(output) > 0 { lines = split(output, "\n")
+        let i = 0
+        while3 i < len(lines) {
+            let line = strip(lines[i])
+            if3 len(line) > 0 {
+                // Split on first space to get hash and message
+                let parts = split(line, " ")
+                let hash = parts[0]
+                // Reconstruct message from remaining parts
+                let message = ""
+                let pi = 1
+                while3 pi < len(parts) {
+                    if3 pi > 1 {
+                        message = message + " "
+                    }
+                    message = message + parts[pi]
+                    pi = pi + 1
+                }
+                let entry = {}
+                entry = dict_set(entry, "hash", hash)
+                entry = dict_set(entry, "message", message)
+                entries = append(entries, entry)
+            }
+            i = i + 1
+        }
+    }
+
+    // Trit: +1 if entries found, 0 if empty (no commits yet), -1 handled above
+    let log_trit = T_TRUE
+    if3 len(entries) == 0 {
+        log_trit = T_MAYBE
+    }
+
+    record_stat("log", log_trit)
+    return {
+        "ok": true,
+        "path": path,
+        "entries": entries,
+        "count": len(entries),
+        "trit": log_trit,
+        "char": bt_one(log_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 3: POST /tgit/commit
+// Stage + commit
+// Body: {path, message, files: [], amend: false}
+// Trit: +1=committed, 0=nothing to commit, -1=error
+// ===========================================================================
+fn handle_commit(body) {
+    let path = dict_get(body, "path") ?? DEFAULT_PATH
+    let message = dict_get(body, "message") ?? ""
+    let files = dict_get(body, "files") ?? []
+    let amend = dict_get(body, "amend") ?? false
+
+    // Message required (unless amend)
+    if3 len(message) == 0 {
+        if3 amend == false {
+            record_stat("commit", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "error": "commit message required",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+    }
+
+    // Stage files
+    let add_cmd = ""
+    if3 len(files) == 0 {
+        // Stage all
+        add_cmd = "git -C \"" + path + "\" add -A 2>&1"
+    }
+    if3 len(files) > 0 {
+        // Stage specific files
+        let file_list = ""
+        let fi = 0
+        while3 fi < len(files) {
+            let f = dict_get(files, fi) ?? ""
+            if3 fi > 0 {
+                file_list = file_list + " "
+            }
+            file_list = file_list + "\"" + f + "\""
+            fi = fi + 1
+        }
+        add_cmd = "git -C \"" + path + "\" add " + file_list + " 2>&1"
+    }
+
+    let add_output = run_git(add_cmd)
+    if3 is_git_error(add_output) == true {
+        record_stat("commit", T_FALSE)
+        return {
+            "ok": false,
+            "path": path,
+            "message": message,
+            "files_staged": 0,
+            "commit_hash": "",
+            "error": "git add failed: " + add_output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Count staged files
+    let diff_cmd = "git -C \"" + path + "\" diff --cached --name-only 2>&1"
+    let staged_output = run_git(diff_cmd)
+    let files_staged = 0
+    if3 len(staged_output) > 0 {
+        if3 is_git_error(staged_output) == false { staged_lines = split(staged_output, "\n")
+            let si = 0
+            while3 si < len(staged_lines) {
+                let sline = strip(staged_lines[si])
+                if3 len(sline) > 0 {
+                    files_staged = files_staged + 1
+                }
+                si = si + 1
+            }
+        }
+    }
+
+    // ---- TCI Pre-Commit Hook Gate ----
+    let skip_hooks = dict_get(body, "skip_hooks") ?? false
+    let hook_result = {}
+    if3 hook_precommit == true {
+        if3 skip_hooks == false { hook_result = run_precommit_hook(path)
+            let hook_pass = dict_get(hook_result, "pass") ?? true
+            if3 hook_pass == false {
+                if3 hook_block_fail == true {
+                    record_stat("commit", T_FALSE)
+                    return {
+                        "ok": false,
+                        "path": path,
+                        "message": message,
+                        "files_staged": files_staged,
+                        "commit_hash": "",
+                        "error": "pre-commit hook failed -- commit blocked",
+                        "hook_result": hook_result,
+                        "trit": T_FALSE,
+                        "char": bt_one(T_FALSE),
+                        "runtime": "novalang"
+                    }
+                }
+            }
+        }
+    }
+
+    // Build commit command
+    let commit_cmd = "git -C \"" + path + "\" commit"
+    if3 amend == true {
+        commit_cmd = commit_cmd + " --amend"
+    }
+    if3 len(message) > 0 {
+        commit_cmd = commit_cmd + " -m \"" + message + "\""
+    }
+    if3 amend == true {
+        if3 len(message) == 0 {
+            commit_cmd = commit_cmd + " --no-edit"
+        }
+    }
+    commit_cmd = commit_cmd + " 2>&1"
+
+    let commit_output = run_git(commit_cmd)
+
+    // Check for "nothing to commit"
+    let lc_commit = lower(commit_output)
+    if3 contains(lc_commit, "nothing to commit") {
+        record_stat("commit", T_MAYBE)
+        return {
+            "ok": true,
+            "path": path,
+            "message": message,
+            "files_staged": 0,
+            "commit_hash": "",
+            "note": "nothing to commit",
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Check for error
+    if3 is_git_error(commit_output) == true {
+        record_stat("commit", T_FALSE)
+        return {
+            "ok": false,
+            "path": path,
+            "message": message,
+            "files_staged": files_staged,
+            "commit_hash": "",
+            "error": commit_output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract commit hash from output
+    // Typical output: "[branch hash] message"
+    let commit_hash = ""
+    if3 len(commit_output) > 0 {
+        // Try to find hash in the first line
+        let first_line = ""
+        let cl = split(commit_output, "\n")
+        first_line = strip(cl[0])
+        // Look for pattern like "[main abc1234]"
+        if3 contains(first_line, " ") { fparts = split(first_line, " ")
+            let pi = 0
+            while3 pi < len(fparts) {
+                let part = fparts[pi]
+                // Hash is typically the part after branch name, ends with ]
+                if3 contains(part, "]") {
+                    // Remove trailing ]
+                    let clean = split(part, "]")
+                    commit_hash = clean[0]
+                }
+                pi = pi + 1
+            }
+        }
+    }
+
+    record_stat("commit", T_TRUE)
+    return {
+        "ok": true,
+        "path": path,
+        "message": message,
+        "files_staged": files_staged,
+        "commit_hash": commit_hash,
+        "output": commit_output,
+        "hook_result": hook_result,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 4: POST /tgit/branch
+// Branch operations: list/create/switch/delete
+// Body: {path, action: "list"|"create"|"switch"|"delete", name: ""}
+// ===========================================================================
+fn handle_branch(body) {
+    let path = dict_get(body, "path") ?? DEFAULT_PATH
+    let action = dict_get(body, "action") ?? "list"
+    let name = dict_get(body, "name") ?? ""
+
+    // Get current branch for all actions
+    let current = get_current_branch(path)
+
+    if3 action == "list" { cmd = "git -C \"" + path + "\" branch -a 2>&1"
+        let output = run_git(cmd)
+
+        if3 is_git_error(output) == true {
+            record_stat("branch", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "list",
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Parse branch list
+        let branches = []
+        if3 len(output) > 0 { lines = split(output, "\n")
+            let i = 0
+            while3 i < len(lines) {
+                let line = strip(lines[i])
+                if3 len(line) > 0 {
+                    // Remove leading * and whitespace for current branch
+                    let bname = line
+                    if3 contains(line, "* ") { bparts = split(line, "* ")
+                        if3 len(bparts) > 1 {
+                            bname = strip(bparts[1])
+                        }
+                    }
+                    branches = append(branches, bname)
+                }
+                i = i + 1
+            }
+        }
+
+        let list_trit = T_TRUE
+        if3 len(branches) == 0 {
+            list_trit = T_MAYBE
+        }
+
+        record_stat("branch", list_trit)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "list",
+            "branches": branches,
+            "current": current,
+            "count": len(branches),
+            "trit": list_trit,
+            "char": bt_one(list_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 action == "create" {
+        if3 len(name) == 0 {
+            record_stat("branch", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "create",
+                "error": "branch name required",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "git -C \"" + path + "\" branch " + name + " 2>&1"
+        let output = run_git(cmd)
+
+        if3 is_git_error(output) == true {
+            record_stat("branch", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "create",
+                "name": name,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        record_stat("branch", T_TRUE)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "create",
+            "name": name,
+            "current": current,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 action == "switch" {
+        if3 len(name) == 0 {
+            record_stat("branch", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "switch",
+                "error": "branch name required",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "git -C \"" + path + "\" checkout " + name + " 2>&1"
+        let output = run_git(cmd)
+
+        if3 is_git_error(output) == true {
+            record_stat("branch", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "switch",
+                "name": name,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Verify we switched
+        let new_current = get_current_branch(path)
+
+        record_stat("branch", T_TRUE)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "switch",
+            "name": name,
+            "current": new_current,
+            "previous": current,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 action == "delete" {
+        if3 len(name) == 0 {
+            record_stat("branch", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "delete",
+                "error": "branch name required",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Prevent deleting current branch
+        if3 name == current {
+            record_stat("branch", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "delete",
+                "name": name,
+                "error": "cannot delete the currently checked out branch",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "git -C \"" + path + "\" branch -d " + name + " 2>&1"
+        let output = run_git(cmd)
+
+        if3 is_git_error(output) == true {
+            record_stat("branch", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "delete",
+                "name": name,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        record_stat("branch", T_TRUE)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "delete",
+            "name": name,
+            "current": current,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Unknown action
+    record_stat("branch", T_FALSE)
+    return {
+        "ok": false,
+        "path": path,
+        "action": action,
+        "error": "unknown action: " + action + " (use list/create/switch/delete)",
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 5: POST /tgit/merge
+// Merge a branch
+// Body: {path, branch, no_ff: false}
+// Trit: +1=clean merge, 0=merge with conflicts, -1=error
+// ===========================================================================
+fn handle_merge(body) {
+    let path = dict_get(body, "path") ?? DEFAULT_PATH
+    let branch = dict_get(body, "branch") ?? ""
+    let no_ff = dict_get(body, "no_ff") ?? false
+
+    if3 len(branch) == 0 {
+        record_stat("merge", T_FALSE)
+        return {
+            "ok": false,
+            "path": path,
+            "branch": "",
+            "conflicts": 0,
+            "error": "branch name required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Build merge command
+    let cmd = "git -C \"" + path + "\" merge"
+    if3 no_ff == true {
+        cmd = cmd + " --no-ff"
+    }
+    cmd = cmd + " " + branch + " 2>&1"
+
+    let output = run_git(cmd)
+    let lc_output = lower(output)
+
+    // Check for conflicts
+    let conflicts = 0
+    let has_conflict = false
+    if3 contains(lc_output, "conflict") {
+        has_conflict = true
+        // Try to count conflict markers
+        let conflict_cmd = "git -C \"" + path + "\" diff --name-only --diff-filter=U 2>&1"
+        let conflict_output = run_git(conflict_cmd)
+        if3 len(conflict_output) > 0 {
+            if3 is_git_error(conflict_output) == false { clines = split(conflict_output, "\n")
+                let ci = 0
+                while3 ci < len(clines) {
+                    let cline = strip(clines[ci])
+                    if3 len(cline) > 0 {
+                        conflicts = conflicts + 1
+                    }
+                    ci = ci + 1
+                }
+            }
+        }
+    }
+
+    // Check for "already up to date"
+    let already_up_to_date = false
+    if3 contains(lc_output, "already up to date") {
+        already_up_to_date = true
+    }
+    if3 contains(lc_output, "already up-to-date") {
+        already_up_to_date = true
+    }
+
+    // Check for fatal error
+    if3 is_git_error(output) == true {
+        if3 has_conflict == false {
+            record_stat("merge", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "branch": branch,
+                "conflicts": 0,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+    }
+
+    // Determine trit
+    let merge_trit = T_TRUE
+    if3 has_conflict == true {
+        merge_trit = T_MAYBE
+    }
+    if3 already_up_to_date == true {
+        merge_trit = T_TRUE
+    }
+
+    // Reynolds from conflict count (N-S: conflict_count = turbulent_energy)
+    let re = conflicts * H5
+    let regime = flow_regime(re)
+
+    record_stat("merge", merge_trit)
+    return {
+        "ok": true,
+        "path": path,
+        "branch": branch,
+        "conflicts": conflicts,
+        "has_conflict": has_conflict,
+        "already_up_to_date": already_up_to_date,
+        "output": output,
+        "reynolds": re,
+        "regime": regime,
+        "trit": merge_trit,
+        "char": bt_one(merge_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 6: POST /tgit/stash
+// Stash operations: save/pop/list/drop
+// Body: {path, action: "save"|"pop"|"list"|"drop", message: ""}
+// ===========================================================================
+fn handle_stash(body) {
+    let path = dict_get(body, "path") ?? DEFAULT_PATH
+    let action = dict_get(body, "action") ?? "save"
+    let message = dict_get(body, "message") ?? ""
+
+    if3 action == "save" { cmd = "git -C \"" + path + "\" stash push"
+        if3 len(message) > 0 {
+            cmd = cmd + " -m \"" + message + "\""
+        }
+        cmd = cmd + " 2>&1"
+
+        let output = run_git(cmd)
+        let lc_output = lower(output)
+
+        // Check for "no local changes to save"
+        if3 contains(lc_output, "no local changes") {
+            record_stat("stash", T_MAYBE)
+            return {
+                "ok": true,
+                "path": path,
+                "action": "save",
+                "message": message,
+                "note": "no local changes to save",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "runtime": "novalang"
+            }
+        }
+
+        if3 is_git_error(output) == true {
+            record_stat("stash", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "save",
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Get stash count after saving
+        let count_cmd = "git -C \"" + path + "\" stash list 2>&1"
+        let count_output = run_git(count_cmd)
+        let stash_count = count_lines_with_prefix(count_output, "")
+
+        record_stat("stash", T_TRUE)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "save",
+            "message": message,
+            "stash_count": stash_count,
+            "output": output,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 action == "pop" { cmd = "git -C \"" + path + "\" stash pop 2>&1"
+        let output = run_git(cmd)
+        let lc_output = lower(output)
+
+        // Check for empty stash
+        if3 contains(lc_output, "no stash entries") {
+            record_stat("stash", T_MAYBE)
+            return {
+                "ok": true,
+                "path": path,
+                "action": "pop",
+                "note": "no stash entries found",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "runtime": "novalang"
+            }
+        }
+
+        if3 is_git_error(output) == true {
+            record_stat("stash", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "pop",
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Check for conflicts during pop
+        let pop_trit = T_TRUE
+        if3 contains(lc_output, "conflict") {
+            pop_trit = T_MAYBE
+        }
+
+        // Get remaining stash count
+        let count_cmd = "git -C \"" + path + "\" stash list 2>&1"
+        let count_output = run_git(count_cmd)
+        let stash_count = count_lines_with_prefix(count_output, "")
+
+        record_stat("stash", pop_trit)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "pop",
+            "stash_count": stash_count,
+            "output": output,
+            "trit": pop_trit,
+            "char": bt_one(pop_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 action == "list" { cmd = "git -C \"" + path + "\" stash list 2>&1"
+        let output = run_git(cmd)
+
+        if3 is_git_error(output) == true {
+            record_stat("stash", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "list",
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Parse stash entries
+        let stashes = []
+        if3 len(output) > 0 { lines = split(output, "\n")
+            let i = 0
+            while3 i < len(lines) {
+                let line = strip(lines[i])
+                if3 len(line) > 0 { entry = {}
+                    entry = dict_set(entry, "index", i)
+                    entry = dict_set(entry, "description", line)
+                    stashes = append(stashes, entry)
+                }
+                i = i + 1
+            }
+        }
+
+        let list_trit = T_TRUE
+        if3 len(stashes) == 0 {
+            list_trit = T_MAYBE
+        }
+
+        record_stat("stash", list_trit)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "list",
+            "stashes": stashes,
+            "stash_count": len(stashes),
+            "trit": list_trit,
+            "char": bt_one(list_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 action == "drop" { cmd = "git -C \"" + path + "\" stash drop 2>&1"
+        let output = run_git(cmd)
+        let lc_output = lower(output)
+
+        if3 contains(lc_output, "no stash entries") {
+            record_stat("stash", T_MAYBE)
+            return {
+                "ok": true,
+                "path": path,
+                "action": "drop",
+                "note": "no stash entries to drop",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "runtime": "novalang"
+            }
+        }
+
+        if3 is_git_error(output) == true {
+            record_stat("stash", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "drop",
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Get remaining count
+        let count_cmd = "git -C \"" + path + "\" stash list 2>&1"
+        let count_output = run_git(count_cmd)
+        let stash_count = count_lines_with_prefix(count_output, "")
+
+        record_stat("stash", T_TRUE)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "drop",
+            "stash_count": stash_count,
+            "output": output,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Unknown action
+    record_stat("stash", T_FALSE)
+    return {
+        "ok": false,
+        "path": path,
+        "action": action,
+        "error": "unknown action: " + action + " (use save/pop/list/drop)",
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 7: POST /tgit/remote
+// Remote operations: push/pull/fetch/status
+// Body: {path, action: "push"|"pull"|"fetch"|"status", remote: "origin", branch: ""}
+// ===========================================================================
+fn handle_remote(body) {
+    let path = dict_get(body, "path") ?? DEFAULT_PATH
+    let action = dict_get(body, "action") ?? "status"
+    let remote = dict_get(body, "remote") ?? "origin"
+    let branch = dict_get(body, "branch") ?? ""
+
+    // If no branch specified, get current branch
+    if3 len(branch) == 0 {
+        branch = get_current_branch(path)
+    }
+
+    if3 action == "push" { cmd = "git -C \"" + path + "\" push " + remote + " " + branch + " 2>&1"
+        let output = run_git(cmd)
+        let lc_output = lower(output)
+
+        // Check for errors
+        if3 is_git_error(output) == true {
+            record_stat("remote", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "push",
+                "remote": remote,
+                "branch": branch,
+                "output": output,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Check for "rejected" (needs pull first)
+        let push_trit = T_TRUE
+        if3 contains(lc_output, "rejected") {
+            push_trit = T_MAYBE
+        }
+        if3 contains(lc_output, "everything up-to-date") {
+            push_trit = T_TRUE
+        }
+
+        record_stat("remote", push_trit)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "push",
+            "remote": remote,
+            "branch": branch,
+            "output": output,
+            "trit": push_trit,
+            "char": bt_one(push_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 action == "pull" { cmd = "git -C \"" + path + "\" pull " + remote + " " + branch + " 2>&1"
+        let output = run_git(cmd)
+        let lc_output = lower(output)
+
+        if3 is_git_error(output) == true {
+            record_stat("remote", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "pull",
+                "remote": remote,
+                "branch": branch,
+                "output": output,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Determine trit
+        let pull_trit = T_TRUE
+        if3 contains(lc_output, "conflict") {
+            pull_trit = T_MAYBE
+        }
+        if3 contains(lc_output, "already up to date") {
+            pull_trit = T_TRUE
+        }
+        if3 contains(lc_output, "already up-to-date") {
+            pull_trit = T_TRUE
+        }
+
+        record_stat("remote", pull_trit)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "pull",
+            "remote": remote,
+            "branch": branch,
+            "output": output,
+            "trit": pull_trit,
+            "char": bt_one(pull_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 action == "fetch" { cmd = "git -C \"" + path + "\" fetch " + remote + " 2>&1"
+        let output = run_git(cmd)
+
+        if3 is_git_error(output) == true {
+            record_stat("remote", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "fetch",
+                "remote": remote,
+                "output": output,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Fetch usually has no output on success or shows updates
+        let fetch_trit = T_TRUE
+        if3 len(output) > 0 {
+            fetch_trit = T_TRUE
+        }
+
+        record_stat("remote", fetch_trit)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "fetch",
+            "remote": remote,
+            "output": output,
+            "trit": fetch_trit,
+            "char": bt_one(fetch_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 action == "status" { cmd = "git -C \"" + path + "\" remote -v 2>&1"
+        let output = run_git(cmd)
+
+        if3 is_git_error(output) == true {
+            record_stat("remote", T_FALSE)
+            return {
+                "ok": false,
+                "path": path,
+                "action": "status",
+                "remote": remote,
+                "output": output,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Parse remote entries
+        let remotes = []
+        if3 len(output) > 0 { lines = split(output, "\n")
+            let i = 0
+            while3 i < len(lines) {
+                let line = strip(lines[i])
+                if3 len(line) > 0 { entry = {}
+                    entry = dict_set(entry, "line", line)
+                    // Parse: name\turl (direction)
+                    let tab_parts = split(line, "\t")
+                    if3 len(tab_parts) >= 2 {
+                        entry = dict_set(entry, "name", tab_parts[0])
+                        entry = dict_set(entry, "url_info", tab_parts[1])
+                    }
+                    remotes = append(remotes, entry)
+                }
+                i = i + 1
+            }
+        }
+
+        let status_trit = T_TRUE
+        if3 len(remotes) == 0 {
+            status_trit = T_MAYBE
+        }
+
+        record_stat("remote", status_trit)
+        return {
+            "ok": true,
+            "path": path,
+            "action": "status",
+            "remote": remote,
+            "remotes": remotes,
+            "output": output,
+            "trit": status_trit,
+            "char": bt_one(status_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // Unknown action
+    record_stat("remote", T_FALSE)
+    return {
+        "ok": false,
+        "path": path,
+        "action": action,
+        "error": "unknown action: " + action + " (use push/pull/fetch/status)",
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 8: POST /tgit/diff
+// Compare branches, commits, or files (git diff wrapper)
+// Body: {path, target: "branch/commit/HEAD~N", file: "", stat_only: false}
+// Trit: +1=clean(no diff), 0=changes exist, -1=error
+// ===========================================================================
+fn handle_diff(body) {
+    let path = dict_get(body, "path") ?? DEFAULT_PATH
+    let target = dict_get(body, "target") ?? ""
+    let file = dict_get(body, "file") ?? ""
+    let stat_only = dict_get(body, "stat_only") ?? false
+
+    if3 len(path) == 0 {
+        record_stat("diff", T_FALSE)
+        return {"ok": false, "error": "path required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+    }
+
+    let stat_flag = ""
+    if3 stat_only == true {
+        stat_flag = " --stat"
+    }
+
+    let file_arg = ""
+    if3 len(file) > 0 {
+        file_arg = " -- \"" + file + "\""
+    }
+
+    let target_arg = ""
+    if3 len(target) > 0 {
+        target_arg = " " + target
+    }
+
+    let cmd = "git -C \"" + path + "\" diff" + stat_flag + target_arg + file_arg + " 2>&1"
+    let output = run_git(cmd)
+
+    if3 is_git_error(output) == true {
+        record_stat("diff", T_FALSE)
+        return {"ok": false, "path": path, "error": output, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+    }
+
+    let diff_trit = T_TRUE
+    if3 len(output) > 0 {
+        diff_trit = T_MAYBE
+    }
+
+    let lines_added = 0
+    let lines_removed = 0
+    let diff_lines = split(output, "\n")
+    let idx = 0
+    while3 idx < len(diff_lines) {
+        let dl = diff_lines[idx]
+        if3 starts_with(dl, "+") == true {
+            if3 starts_with(dl, "+++") == false {
+                lines_added = lines_added + 1
+            }
+        }
+        if3 starts_with(dl, "-") == true {
+            if3 starts_with(dl, "---") == false {
+                lines_removed = lines_removed + 1
+            }
+        }
+        idx = idx + 1
+    }
+
+    let flow = compute_flow_metrics("diff", diff_trit, len(output))
+    record_stat("diff", diff_trit)
+    return {
+        "ok": true,
+        "path": path,
+        "target": target,
+        "file": file,
+        "diff": output,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "has_changes": len(output) > 0,
+        "trit": diff_trit,
+        "char": bt_one(diff_trit),
+        "flow": flow,
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 9: POST /tgit/tag
+// Create, list, delete, push tags (semantic versioning support)
+// Body: {path, action: "list|create|delete|push", name: "", message: ""}
+// Trit: +1=success, 0=partial, -1=error
+// ===========================================================================
+fn handle_tag(body) {
+    let path = dict_get(body, "path") ?? DEFAULT_PATH
+    let action = dict_get(body, "action") ?? "list"
+    let name = dict_get(body, "name") ?? ""
+    let message = dict_get(body, "message") ?? ""
+
+    if3 len(path) == 0 {
+        record_stat("tag", T_FALSE)
+        return {"ok": false, "error": "path required", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+    }
+
+    if3 action == "list" { cmd = "git -C \"" + path + "\" tag --sort=-creatordate 2>&1"
+        let output = run_git(cmd)
+        if3 is_git_error(output) == true {
+            record_stat("tag", T_FALSE)
+            return {"ok": false, "error": output, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let tags = split(trim(output), "\n")
+        let tag_count = len(tags)
+        if3 trim(output) == "" {
+            tag_count = 0
+            tags = []
+        }
+        record_stat("tag", T_TRUE)
+        return {"ok": true, "path": path, "action": "list", "tags": tags, "count": tag_count, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "create" {
+        if3 len(name) == 0 {
+            record_stat("tag", T_FALSE)
+            return {"ok": false, "error": "name required for create", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let msg_flag = ""
+        if3 len(message) > 0 {
+            msg_flag = " -a -m \"" + message + "\""
+        }
+        let cmd = "git -C \"" + path + "\" tag" + msg_flag + " " + name + " 2>&1"
+        let output = run_git(cmd)
+        if3 is_git_error(output) == true {
+            record_stat("tag", T_FALSE)
+            return {"ok": false, "error": output, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("tag", T_TRUE)
+        return {"ok": true, "path": path, "action": "create", "tag": name, "annotated": len(message) > 0, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "delete" {
+        if3 len(name) == 0 {
+            record_stat("tag", T_FALSE)
+            return {"ok": false, "error": "name required for delete", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        let cmd = "git -C \"" + path + "\" tag -d " + name + " 2>&1"
+        let output = run_git(cmd)
+        if3 is_git_error(output) == true {
+            record_stat("tag", T_FALSE)
+            return {"ok": false, "error": output, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("tag", T_TRUE)
+        return {"ok": true, "path": path, "action": "delete", "tag": name, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    if3 action == "push" { push_arg = "--tags"
+        if3 len(name) > 0 {
+            push_arg = name
+        }
+        let cmd = "git -C \"" + path + "\" push origin " + push_arg + " 2>&1"
+        let output = run_git(cmd)
+        if3 is_git_error(output) == true {
+            record_stat("tag", T_FALSE)
+            return {"ok": false, "error": output, "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+        }
+        record_stat("tag", T_TRUE)
+        return {"ok": true, "path": path, "action": "push", "pushed": push_arg, "trit": T_TRUE, "char": bt_one(T_TRUE), "runtime": "novalang"}
+    }
+
+    record_stat("tag", T_FALSE)
+    return {"ok": false, "error": "unknown action: " + action + " (use list/create/delete/push)", "trit": T_FALSE, "char": bt_one(T_FALSE), "runtime": "novalang"}
+}
+
+// ===========================================================================
+// GET /health -- Standard health endpoint
+// ===========================================================================
+fn health() {
+    let uptime = time() - stat_t0
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        self_trit = T_TRUE
+    }
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "harmonics", {"H3": H3, "H5": H5, "H7": H7, "H13": H13})
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "self_trit", self_trit)
+    resp = dict_set(resp, "char", bt_one(self_trit))
+    resp = dict_set(resp, "uptime_s", uptime)
+    resp = dict_set(resp, "quality", {"strong": stat_trit_true, "partial": stat_trit_maybe, "failed": stat_trit_false})
+    return resp
+}
+
+// ===========================================================================
+// GET /tgit/service-status -- Full service status with stats
+// ===========================================================================
+fn tgit_service_status() {
+    let uptime = time() - stat_t0
+
+    // Service Reynolds from total false ops
+    let re = stat_trit_false * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    // System trit
+    let sys_trit = T_TRUE
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    let by_tool = {}
+    by_tool = dict_set(by_tool, "status", by_tool_status)
+    by_tool = dict_set(by_tool, "log", by_tool_log)
+    by_tool = dict_set(by_tool, "commit", by_tool_commit)
+    by_tool = dict_set(by_tool, "branch", by_tool_branch)
+    by_tool = dict_set(by_tool, "merge", by_tool_merge)
+    by_tool = dict_set(by_tool, "stash", by_tool_stash)
+    by_tool = dict_set(by_tool, "remote", by_tool_remote)
+    by_tool = dict_set(by_tool, "diff", by_tool_diff)
+    by_tool = dict_set(by_tool, "tag", by_tool_tag)
+
+    // Cached repos
+    let cached_repos = keys(_repo_cache)
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "total_ops": stat_ops,
+        "by_tool": by_tool,
+        "trits": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        },
+        "cached_repos": len(cached_repos),
+        "reynolds": re,
+        "regime": regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE
+    }
+}
+
+// ===========================================================================
+// TCI Pre-Commit Hook
+// ===========================================================================
+
+fn run_precommit_hook(path) {
+    // Runs TCI lint pipeline against the repo path
+    // Returns { "pass": bool, "trit": int, "stages": [...], "elapsed_ms": num }
+    let t0 = time() * 1000
+    hook_runs = hook_runs + 1
+
+    try3 {
+        let tci_endpoint = TCI_URL + "/tci/" + hook_pipeline
+        let payload = { "path": path }
+        let resp = http_post(tci_endpoint, payload)
+        let elapsed = time() * 1000 - t0
+
+        let overall = dict_get(resp, "overall_trit") ?? 0
+        let stages = dict_get(resp, "stages") ?? []
+
+        if3 overall == 1 { hook_passes = hook_passes + 1
+            return {
+                "pass": true,
+                "trit": 1,
+                "char": "+",
+                "pipeline": hook_pipeline,
+                "stages": stages,
+                "elapsed_ms": elapsed
+            }
+        } else {
+            // Partial -- allow commit but warn
+            hook_passes = hook_passes + 1
+            return {
+                "pass": true,
+                "trit": 0,
+                "char": "~",
+                "pipeline": hook_pipeline,
+                "stages": stages,
+                "elapsed_ms": elapsed,
+                "warning": "pre-commit passed with partial results"
+            }
+        } else3 {
+            hook_fails = hook_fails + 1
+            return {
+                "pass": false,
+                "trit": -1,
+                "char": "-",
+                "pipeline": hook_pipeline,
+                "stages": stages,
+                "elapsed_ms": elapsed,
+                "error": "pre-commit hook failed"
+            }
+        }
+    } else {
+        // TCI uncertain -- allow commit
+        hook_bypasses = hook_bypasses + 1
+        let elapsed = time() * 1000 - t0
+        return {
+            "pass": true,
+            "trit": 0,
+            "char": "~",
+            "pipeline": hook_pipeline,
+            "elapsed_ms": elapsed,
+            "warning": "TCI returned uncertain, commit allowed"
+        }
+    } fail {
+        // TCI unreachable -- allow commit with warning
+        hook_bypasses = hook_bypasses + 1
+        let elapsed = time() * 1000 - t0
+        return {
+            "pass": true,
+            "trit": 0,
+            "char": "~",
+            "pipeline": hook_pipeline,
+            "elapsed_ms": elapsed,
+            "warning": "TCI unreachable, commit allowed (bypass)"
+        }
+    }
+}
+
+fn handle_precommit(body) {
+    // Manual pre-commit hook trigger endpoint
+    let path = dict_get(body, "path") ?? DEFAULT_PATH
+    let result = run_precommit_hook(path)
+    result = dict_set(result, "ok", dict_get(result, "pass") ?? false)
+    result = dict_set(result, "hook", "pre-commit")
+    result = dict_set(result, "path", path)
+    result = dict_set(result, "runtime", "novalang")
+    return result
+}
+
+fn handle_hook_config(body) {
+    // GET: return config; POST with fields: update config
+    let action = dict_get(body, "action") ?? "get"
+
+    if3 action == "set" { new_enabled = dict_get(body, "enabled") ?? hook_precommit
+        let new_pipeline = dict_get(body, "pipeline") ?? hook_pipeline
+        let new_block = dict_get(body, "block_on_fail") ?? hook_block_fail
+        let hook_precommit = new_enabled
+        let hook_pipeline = new_pipeline
+        let hook_block_fail = new_block
+    }
+
+    return {
+        "ok": true,
+        "hook": "pre-commit",
+        "enabled": hook_precommit,
+        "pipeline": hook_pipeline,
+        "block_on_fail": hook_block_fail,
+        "tci_url": TCI_URL,
+        "stats": {
+            "runs": hook_runs,
+            "passes": hook_passes,
+            "fails": hook_fails,
+            "bypasses": hook_bypasses
+        },
+        "trit": 1,
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+troute(server, "GET",  "/health",              "health")
+troute(server, "GET",  "/tgit/service-status",  "tgit_service_status")
+troute(server, "POST", "/tgit/status",          "handle_status")
+troute(server, "POST", "/tgit/log",             "handle_log")
+troute(server, "POST", "/tgit/commit",          "handle_commit")
+troute(server, "POST", "/tgit/branch",          "handle_branch")
+troute(server, "POST", "/tgit/merge",           "handle_merge")
+troute(server, "POST", "/tgit/stash",           "handle_stash")
+troute(server, "POST", "/tgit/remote",          "handle_remote")
+troute(server, "POST", "/tgit/diff",            "handle_diff")
+troute(server, "POST", "/tgit/tag",             "handle_tag")
+troute(server, "POST", "/tgit/hooks/pre-commit", "handle_precommit")
+troute(server, "POST", "/tgit/hooks/config",     "handle_hook_config")
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[TGit] NovaX Ternary Git Wrapper v" + VERSION + " on port " + str(PORT))
+print("[TGit] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[TGit] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TGit] Re boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TGit] N-S: commit_stream=velocity_field | conflict_count=turbulent_energy | Re=conflicts*H5")
+print("[TGit] Default repo path: " + DEFAULT_PATH)
+print("[TGit] Git timeout: " + str(GIT_TIMEOUT) + "s (H13)")
+print("[TGit] Routes: /health, /tgit/service-status")
+print("[TGit]         /tgit/status, /tgit/log, /tgit/commit, /tgit/branch")
+print("[TGit]         /tgit/merge, /tgit/stash, /tgit/remote")
+print("[TGit] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

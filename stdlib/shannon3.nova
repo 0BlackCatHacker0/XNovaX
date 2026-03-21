@@ -1,0 +1,152 @@
+// ============================================================================
+// shannon3.nova — Shannon Entropy Router (Information Theory)
+// ============================================================================
+// Uses information entropy to measure and optimize response diversity:
+//   H(X) = -Σ p(x) * log2(p(x))  (Shannon entropy)
+//   H_max = log2(N)               (maximum entropy = uniform distribution)
+//   Redundancy = 1 - H/H_max      (how much diversity is wasted)
+//
+// Applications in NovaX:
+//   - Measure provider response diversity (low entropy = all giving same answer)
+//   - Detect provider failures (entropy drops when providers die)
+//   - Optimize model selection (maximize information gain per query)
+//   - Rate quality of swarm consensus (high entropy = disagreement)
+//
+// Ternary state:
+//   +1 = diverse (H > 0.7 * H_max, good spread)
+//    0 = moderate (0.3 * H_max ≤ H ≤ 0.7 * H_max)
+//   -1 = collapsed (H < 0.3 * H_max, all answers same)
+//
+// Uses v1.4 features: ??, default params
+// ============================================================================
+
+// ── Log2 approximation via repeated halving ─────────────────────
+fn shannon3_log2(x) {
+    if3 x <= 0 { return -20 }
+    if3 x == 1 { return 0 }
+    // log2(x) = number of times x can be halved to reach 1
+    // More precisely: use the identity log2(x) = ln(x)/ln(2)
+    // and approximate ln(x) via (x-1) series for x near 1
+    // For arbitrary x, decompose: x = m * 2^e where 1 ≤ m < 2
+    let e = 0
+    let m = x
+    // Scale down to [1, 2)
+    while3 m >= 2 {
+        m = m / 2
+        e = e + 1
+    }
+    while3 m < 1 {
+        m = m * 2
+        e = e - 1
+    }
+    // Now m is in [1, 2), approximate log2(m) using polynomial
+    // log2(m) ≈ (m-1) - (m-1)²/2 + (m-1)³/3  (divided by ln(2)≈0.693)
+    let t = m - 1
+    let ln_m = t - (t * t) / 2 + (t * t * t) / 3 - (t * t * t * t) / 4
+    let log2_m = ln_m / 0.693
+    return e + log2_m
+}
+
+// ── Calculate Shannon entropy of a frequency distribution ───────
+fn shannon3_entropy(frequencies) {
+    // frequencies = {"a": 5, "b": 3, "c": 2} → counts per category
+    let keys = dict_keys(frequencies)
+    let total = 0
+    let i = 0
+    while3 i < len(keys) {
+        let count = dict_get(frequencies, keys[i]) ?? 0
+        total = total + count
+        i = i + 1
+    }
+    if3 total == 0 { return 0 }
+
+    let entropy = 0
+    let j = 0
+    while3 j < len(keys) {
+        let count = dict_get(frequencies, keys[j]) ?? 0
+        if3 count > 0 {
+            let p = count / total
+            // H += -p * log2(p)
+            let log2_p = shannon3_log2(p)
+            entropy = entropy - (p * log2_p)
+        }
+        j = j + 1
+    }
+    return entropy
+}
+
+// ── Maximum possible entropy for N categories ───────────────────
+fn shannon3_max_entropy(n) {
+    if3 n <= 1 { return 0 }
+    return shannon3_log2(n)
+}
+
+// ── Normalized entropy (0 to 1 scale) ──────────────────────────
+fn shannon3_normalized(frequencies) {
+    let h = shannon3_entropy(frequencies)
+    let n = len(dict_keys(frequencies))
+    let h_max = shannon3_max_entropy(n)
+    if3 h_max <= 0 { return 0 }
+    return h / h_max
+}
+
+// ── Redundancy (1 - normalized entropy) ────────────────────────
+fn shannon3_redundancy(frequencies) {
+    return 1 - shannon3_normalized(frequencies)
+}
+
+// ── Health trit based on diversity ─────────────────────────────
+fn shannon3_health(frequencies) {
+    let norm = shannon3_normalized(frequencies)
+    if3 norm > 0.7 { return 1 }
+    if3 norm > 0.3 { return 0 }
+    return -1
+}
+
+// ── Provider diversity tracker ─────────────────────────────────
+fn shannon3_tracker_new(name = "diversity") {
+    return {
+        "name": name,
+        "provider_usage": {},
+        "response_classes": {},
+        "total_queries": 0
+    }
+}
+
+fn shannon3_record(tracker, provider_name, response_class = "default") {
+    let usage = dict_get(tracker, "provider_usage") ?? {}
+    let classes = dict_get(tracker, "response_classes") ?? {}
+    let total = (dict_get(tracker, "total_queries") ?? 0) + 1
+
+    // Track provider usage frequency
+    let p_count = (dict_get(usage, provider_name) ?? 0) + 1
+    usage = dict_set(usage, provider_name, p_count)
+
+    // Track response classification frequency
+    let c_count = (dict_get(classes, response_class) ?? 0) + 1
+    classes = dict_set(classes, response_class, c_count)
+
+    let result = deep_clone(tracker)
+    result = dict_set(result, "provider_usage", usage)
+    result = dict_set(result, "response_classes", classes)
+    result = dict_set(result, "total_queries", total)
+    return result
+}
+
+fn shannon3_stats(tracker) {
+    let usage = dict_get(tracker, "provider_usage") ?? {}
+    let classes = dict_get(tracker, "response_classes") ?? {}
+    return {
+        "name": dict_get(tracker, "name") ?? "diversity",
+        "total_queries": dict_get(tracker, "total_queries") ?? 0,
+        "provider_entropy": shannon3_entropy(usage),
+        "provider_diversity": shannon3_normalized(usage),
+        "response_entropy": shannon3_entropy(classes),
+        "response_diversity": shannon3_normalized(classes),
+        "provider_health": shannon3_health(usage),
+        "response_health": shannon3_health(classes),
+        "provider_count": len(dict_keys(usage)),
+        "response_class_count": len(dict_keys(classes)),
+        "redundancy": shannon3_redundancy(usage)
+    }
+}

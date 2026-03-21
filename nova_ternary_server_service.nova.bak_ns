@@ -1,0 +1,766 @@
+// Nova Ternary Server v2.0.0 - Full Implementation
+// Port 9885 | TResource + Reynolds + Ternary Engine + Modulation + NovaLang Gateway
+// 3-5-7-13 Harmonic Architecture
+
+let PORT = 9885
+let SERVICE_NAME = "nova-ternary-server"
+let VERSION = "2.0.0"
+
+// ── 3-5-7-13 Harmonic Constants ──
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK_SIZE = 2187
+let RE_LAMINAR = 27
+let RE_TRANSITIONAL = 125
+let RE_TURBULENT = 343
+let MAX_HOT = 39
+
+// ── Global State ──
+let _stats = {"queries": 0, "t0": time(), "errors": 0}
+let _tresource = {"hot": {}, "warm": {}, "cold": {}}
+let _sessions = {}
+let _history = []
+let _trace_log = []
+
+// ── Always-hot service list ──
+let ALWAYS_HOT = ["orchestrator", "ternary-server", "tspin", "brain", "exec-server", "hivemind", "nova-cli"]
+
+// ══════════════════════════════════════════
+// 1. TResource (Ternary Resource Virtualization)
+// ══════════════════════════════════════════
+
+fn is_always_hot(name) {
+    let i = 0
+    let found = 0
+    while3 i < len(ALWAYS_HOT) {
+        if3 ALWAYS_HOT[i] == name {
+            found = 1
+        }
+        i = i + 1
+    }
+    return found
+}
+
+fn tresource_hot_count() {
+    let hot = dict_get(_tresource, "hot", {})
+    return len(keys(hot))
+}
+
+fn tresource_warm_count() {
+    let warm = dict_get(_tresource, "warm", {})
+    return len(keys(warm))
+}
+
+fn tresource_cold_count() {
+    let cold = dict_get(_tresource, "cold", {})
+    return len(keys(cold))
+}
+
+fn handle_tresource_gate(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let name = dict_get(req, "service", "")
+    if3 name == "" {
+        return {"ok": false, "error": "missing service name", "trit": -1}
+    }
+    let always = is_always_hot(name)
+    if3 always == 1 {
+        let hot = dict_get(_tresource, "hot", {})
+        hot = dict_set(hot, name, time())
+        _tresource = dict_set(_tresource, "hot", hot)
+        return {"ok": true, "trit": 1, "gate": "allowed", "reason": "always-hot"}
+    }
+    let hcount = tresource_hot_count()
+    if3 hcount >= MAX_HOT {
+        let cold = dict_get(_tresource, "cold", {})
+        cold = dict_set(cold, name, time())
+        _tresource = dict_set(_tresource, "cold", cold)
+        return {"ok": true, "trit": -1, "gate": "blocked", "reason": "max_hot reached (" + str(MAX_HOT) + ")"}
+    } else3 {
+        let hot = dict_get(_tresource, "hot", {})
+        hot = dict_set(hot, name, time())
+        _tresource = dict_set(_tresource, "hot", hot)
+        return {"ok": true, "trit": 1, "gate": "allowed", "reason": "under capacity"}
+    }
+}
+
+fn handle_tresource_status(req) {
+    return {
+        "ok": true,
+        "trit": 1,
+        "hot": tresource_hot_count(),
+        "warm": tresource_warm_count(),
+        "cold": tresource_cold_count(),
+        "max_hot": MAX_HOT,
+        "always_hot": ALWAYS_HOT
+    }
+}
+
+fn handle_tresource_sweep(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let threshold = dict_get(req, "idle_seconds", 300)
+    let now = time()
+    let hot = dict_get(_tresource, "hot", {})
+    let warm = dict_get(_tresource, "warm", {})
+    let cold = dict_get(_tresource, "cold", {})
+    let swept = 0
+    let hkeys = keys(hot)
+    let i = 0
+    while3 i < len(hkeys) {
+        let sname = hkeys[i]
+        let last_seen = dict_get(hot, sname, now)
+        let idle = now - last_seen
+        if3 idle > threshold {
+            if3 is_always_hot(sname) == 0 {
+                hot = dict_set(hot, sname, nil)
+                warm = dict_set(warm, sname, now)
+                swept = swept + 1
+            }
+        }
+        i = i + 1
+    }
+    let wkeys = keys(warm)
+    let j = 0
+    while3 j < len(wkeys) {
+        let wname = wkeys[j]
+        let wlast = dict_get(warm, wname, now)
+        let widle = now - wlast
+        if3 widle > threshold * 2 {
+            warm = dict_set(warm, wname, nil)
+            cold = dict_set(cold, wname, now)
+            swept = swept + 1
+        }
+        j = j + 1
+    }
+    _tresource = dict_set(_tresource, "hot", hot)
+    _tresource = dict_set(_tresource, "warm", warm)
+    _tresource = dict_set(_tresource, "cold", cold)
+    return {"ok": true, "trit": 1, "swept": swept, "hot": tresource_hot_count(), "warm": tresource_warm_count(), "cold": tresource_cold_count()}
+}
+
+// ══════════════════════════════════════════
+// 2. Reynolds Calculation
+// ══════════════════════════════════════════
+
+fn count_words(text) {
+    let words = split(text, " ")
+    return len(words)
+}
+
+fn calc_reynolds(text) {
+    let tlen = len(text)
+    let wcount = count_words(text)
+    let re = (tlen * wcount) / (H7 * H13)
+    return re
+}
+
+fn classify_regime(re) {
+    if3 re < RE_LAMINAR {
+        return "laminar"
+    } else3 re < RE_TRANSITIONAL {
+        return "transitional"
+    } else3 re < RE_TURBULENT {
+        return "turbulent"
+    } else3 {
+        return "chaotic"
+    }
+}
+
+fn regime_trit(regime) {
+    if3 regime == "laminar" {
+        return 1
+    } else3 regime == "transitional" {
+        return 0
+    } else3 regime == "turbulent" {
+        return -1
+    } else3 {
+        return -1
+    }
+}
+
+fn handle_reynolds(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let text = dict_get(req, "text", "")
+    if3 text == "" {
+        return {"ok": false, "error": "missing text", "trit": -1}
+    }
+    let re = calc_reynolds(text)
+    let regime = classify_regime(re)
+    let trit = regime_trit(regime)
+    return {
+        "ok": true,
+        "reynolds": round(re, 2),
+        "regime": regime,
+        "trit": trit,
+        "thresholds": {"laminar": RE_LAMINAR, "transitional": RE_TRANSITIONAL, "turbulent": RE_TURBULENT},
+        "text_length": len(text),
+        "word_count": count_words(text)
+    }
+}
+
+// ══════════════════════════════════════════
+// 3. Ternary Engine
+// ══════════════════════════════════════════
+
+fn handle_ternary_route(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let prompt = dict_get(req, "prompt", "")
+    if3 prompt == "" {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    }
+    let model = dict_get(req, "model", "")
+    let channel = dict_get(req, "channel", "general")
+    let body = {"prompt": prompt}
+    if3 model != "" {
+        body = dict_set(body, "model", model)
+    }
+    body = dict_set(body, "channel", channel)
+    let result = try3 { http_post("http://127.0.0.1:9881/query", body) } { {"error": "hivemind unreachable", "trit": -1} }
+    let trace_entry = {"ts": time(), "endpoint": "/ternary/route", "prompt_len": len(prompt), "channel": channel}
+    push(_trace_log, trace_entry)
+    return {"ok": true, "reply": result, "trit": 1, "channel": channel}
+}
+
+fn handle_ternary_vote(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let prompt = dict_get(req, "prompt", "")
+    let models = dict_get(req, "models", [])
+    if3 prompt == "" {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    }
+    if3 len(models) == 0 {
+        models = ["llama3", "mistral", "phi3"]
+    }
+    let votes = []
+    let i = 0
+    while3 i < len(models) {
+        let body = {"prompt": prompt, "model": models[i]}
+        let resp = try3 { http_post("http://127.0.0.1:9881/query", body) } { {"error": "unreachable", "model": models[i]} }
+        let vote = {"model": models[i], "response": resp}
+        push(votes, vote)
+        i = i + 1
+    }
+    let pos = 0
+    let neg = 0
+    let neu = 0
+    let vi = 0
+    while3 vi < len(votes) {
+        let v = votes[vi]
+        let vresp = dict_get(v, "response", {})
+        let vtrit = dict_get(vresp, "trit", 0)
+        if3 vtrit > 0 {
+            pos = pos + 1
+        } else3 vtrit < 0 {
+            neg = neg + 1
+        } else3 {
+            neu = neu + 1
+        }
+        vi = vi + 1
+    }
+    let consensus = 0
+    if3 pos > neg {
+        consensus = 1
+    } else3 neg > pos {
+        consensus = -1
+    }
+    return {"ok": true, "trit": consensus, "votes": votes, "tally": {"positive": pos, "negative": neg, "neutral": neu}, "model_count": len(models)}
+}
+
+fn handle_ternary_synthesize(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let results = dict_get(req, "results", [])
+    if3 len(results) == 0 {
+        return {"ok": false, "error": "missing results array", "trit": -1}
+    }
+    let sum = 0
+    let i = 0
+    while3 i < len(results) {
+        let r = results[i]
+        let t = dict_get(r, "trit", 0)
+        sum = sum + t
+        i = i + 1
+    }
+    let synth_trit = 0
+    if3 sum > 0 {
+        synth_trit = 1
+    } else3 sum < 0 {
+        synth_trit = -1
+    }
+    let avg = 0
+    if3 len(results) > 0 {
+        avg = round(sum / len(results), 3)
+    }
+    return {"ok": true, "trit": synth_trit, "sum": sum, "average": avg, "count": len(results)}
+}
+
+fn handle_ternary_quantize(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let vals = dict_get(req, "values", [])
+    if3 len(vals) == 0 {
+        return {"ok": false, "error": "missing values array", "trit": -1}
+    }
+    let trits = []
+    let i = 0
+    while3 i < len(vals) {
+        let v = float(vals[i])
+        if3 v > 0.33 {
+            push(trits, 1)
+        } else3 v < -0.33 {
+            push(trits, -1)
+        } else3 {
+            push(trits, 0)
+        }
+        i = i + 1
+    }
+    let pos = 0
+    let neg = 0
+    let neu = 0
+    let qi = 0
+    while3 qi < len(trits) {
+        if3 trits[qi] == 1 {
+            pos = pos + 1
+        } else3 trits[qi] == -1 {
+            neg = neg + 1
+        } else3 {
+            neu = neu + 1
+        }
+        qi = qi + 1
+    }
+    return {"ok": true, "trit": 1, "trits": trits, "distribution": {"positive": pos, "negative": neg, "neutral": neu}, "count": len(trits)}
+}
+
+fn handle_ternary_classify(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let text = dict_get(req, "text", "")
+    if3 text == "" {
+        return {"ok": false, "error": "missing text", "trit": -1}
+    }
+    let re = calc_reynolds(text)
+    let regime = classify_regime(re)
+    let channel = "general"
+    if3 contains(text, "code") == true {
+        channel = "code"
+    } else3 contains(text, "math") == true {
+        channel = "math"
+    } else3 contains(text, "image") == true {
+        channel = "vision"
+    } else3 contains(text, "music") == true {
+        channel = "audio"
+    } else3 contains(text, "translate") == true {
+        channel = "language"
+    } else3 contains(text, "search") == true {
+        channel = "search"
+    } else3 contains(text, "file") == true {
+        channel = "filesystem"
+    }
+    let trit = regime_trit(regime)
+    return {"ok": true, "trit": trit, "channel": channel, "regime": regime, "reynolds": round(re, 2)}
+}
+
+fn handle_ternary_status(req) {
+    return {
+        "ok": true,
+        "trit": 1,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "queries": dict_get(_stats, "queries", 0),
+        "uptime": int(time() - dict_get(_stats, "t0", 0)),
+        "trace_count": len(_trace_log),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13, "block": BLOCK_SIZE}
+    }
+}
+
+fn handle_ternary_adjacency(req) {
+    return {
+        "ok": true, "trit": 1,
+        "matrix": {
+            "laminar": {"code": 1, "math": 1, "general": 1, "vision": 0, "audio": 0},
+            "transitional": {"code": 1, "math": 1, "general": 1, "vision": 1, "audio": 0},
+            "turbulent": {"code": 1, "math": 1, "general": 1, "vision": 1, "audio": 1},
+            "chaotic": {"code": 1, "math": 1, "general": 1, "vision": 1, "audio": 1}
+        },
+        "thresholds": {"laminar": RE_LAMINAR, "transitional": RE_TRANSITIONAL, "turbulent": RE_TURBULENT}
+    }
+}
+
+fn handle_ternary_stream(req) {
+    let recent = []
+    let start = 0
+    if3 len(_trace_log) > H13 {
+        start = len(_trace_log) - H13
+    }
+    let i = start
+    while3 i < len(_trace_log) {
+        push(recent, _trace_log[i])
+        i = i + 1
+    }
+    return {"ok": true, "trit": 1, "stream": recent, "total": len(_trace_log)}
+}
+
+fn handle_ternary_trace(req) {
+    return {"ok": true, "trit": 1, "trace": _trace_log, "count": len(_trace_log)}
+}
+
+fn handle_ternary_layer_status(req) {
+    return {
+        "ok": true, "trit": 1,
+        "layers": {
+            "tresource": {"active": true, "hot": tresource_hot_count(), "warm": tresource_warm_count(), "cold": tresource_cold_count()},
+            "reynolds": {"active": true, "boundaries": [RE_LAMINAR, RE_TRANSITIONAL, RE_TURBULENT]},
+            "ternary_engine": {"active": true, "queries": dict_get(_stats, "queries", 0)},
+            "modulation": {"active": true, "schemes": ["bpsk", "qpsk", "t8psk", "tqam"]},
+            "novalang": {"active": true, "sessions": len(keys(_sessions))}
+        }
+    }
+}
+
+// ══════════════════════════════════════════
+// 4. Modulation Engine
+// ══════════════════════════════════════════
+
+fn handle_modulation_modulate(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let data = dict_get(req, "data", "")
+    let scheme = dict_get(req, "scheme", "bpsk")
+    if3 data == "" {
+        return {"ok": false, "error": "missing data", "trit": -1}
+    }
+    let symbols = []
+    let i = 0
+    while3 i < len(data) {
+        let ch = slice(data, i, i + 1)
+        let code = len(ch) * (i + 1)
+        let trit = 0
+        if3 code % H3 == 0 {
+            trit = 1
+        } else3 code % H3 == 1 {
+            trit = 0
+        } else3 {
+            trit = -1
+        }
+        push(symbols, trit)
+        i = i + 1
+    }
+    return {"ok": true, "trit": 1, "scheme": scheme, "symbols": symbols, "symbol_count": len(symbols), "block_size": BLOCK_SIZE}
+}
+
+fn handle_modulation_spread(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let data = dict_get(req, "data", "")
+    let chips = dict_get(req, "chips", H13)
+    if3 data == "" {
+        return {"ok": false, "error": "missing data", "trit": -1}
+    }
+    let spread_seq = []
+    let i = 0
+    while3 i < len(data) {
+        let ch = slice(data, i, i + 1)
+        let j = 0
+        while3 j < chips {
+            let chip = ((i + j) % H3) - 1
+            push(spread_seq, chip)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return {"ok": true, "trit": 1, "spread_length": len(spread_seq), "chips_per_symbol": chips, "input_length": len(data), "spread": spread_seq}
+}
+
+fn handle_modulation_chirp(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let duration = dict_get(req, "duration", H7)
+    let steps = dict_get(req, "steps", H13)
+    let chirp = []
+    let i = 0
+    while3 i < steps {
+        let phase = (i * H3) % H7
+        let trit = 0
+        if3 phase < H3 {
+            trit = 1
+        } else3 phase < H5 {
+            trit = 0
+        } else3 {
+            trit = -1
+        }
+        push(chirp, {"step": i, "phase": phase, "trit": trit})
+        i = i + 1
+    }
+    return {"ok": true, "trit": 1, "chirp": chirp, "steps": steps, "duration": duration}
+}
+
+fn handle_modulation_constellation(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let symbols = dict_get(req, "symbols", [])
+    if3 len(symbols) == 0 {
+        return {"ok": false, "error": "missing symbols array", "trit": -1}
+    }
+    let points = []
+    let i = 0
+    while3 i < len(symbols) {
+        let s = int(symbols[i])
+        let real_part = s
+        let imag_part = 0
+        if3 i % 2 == 0 {
+            imag_part = s
+        } else3 {
+            imag_part = 0 - s
+        }
+        push(points, {"symbol": s, "I": real_part, "Q": imag_part})
+        i = i + 1
+    }
+    return {"ok": true, "trit": 1, "constellation": points, "count": len(points), "type": "ternary-qam"}
+}
+
+fn handle_modulation_status(req) {
+    return {"ok": true, "trit": 1, "engine": "modulation", "active": true, "schemes": ["bpsk", "qpsk", "t8psk", "tqam"], "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}}
+}
+
+fn handle_modulation_schemes(req) {
+    return {
+        "ok": true, "trit": 1,
+        "schemes": [
+            {"name": "bpsk", "description": "Binary Phase Shift Keying (ternary)", "trits_per_symbol": 1},
+            {"name": "qpsk", "description": "Quadrature PSK (ternary pairs)", "trits_per_symbol": 2},
+            {"name": "t8psk", "description": "Ternary 8-PSK", "trits_per_symbol": H3},
+            {"name": "tqam", "description": "Ternary QAM constellation", "trits_per_symbol": H3}
+        ]
+    }
+}
+
+// ══════════════════════════════════════════
+// 5. NovaLang Gateway
+// ══════════════════════════════════════════
+
+fn handle_nova_exec(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let code = dict_get(req, "code", "")
+    if3 code == "" {
+        return {"ok": false, "error": "missing code", "trit": -1}
+    }
+    let result = try3 { http_post("http://127.0.0.1:9999/api/nova/exec", {"code": code}) } { {"error": "novalang exec unreachable"} }
+    let err = dict_get(result, "error", "")
+    if3 err != "" {
+        return {"ok": false, "error": err, "trit": -1}
+    }
+    return {"ok": true, "trit": 1, "result": result}
+}
+
+fn handle_nova_run_file(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let filepath = dict_get(req, "file", "")
+    if3 filepath == "" {
+        return {"ok": false, "error": "missing file path", "trit": -1}
+    }
+    let result = try3 { http_post("http://127.0.0.1:9999/api/nova/run-file", {"file": filepath}) } { {"error": "novalang run-file unreachable"} }
+    return {"ok": true, "trit": 1, "result": result, "file": filepath}
+}
+
+fn handle_nova_compile(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let code = dict_get(req, "code", "")
+    if3 code == "" {
+        return {"ok": false, "error": "missing code", "trit": -1}
+    }
+    let lines = split(code, "\n")
+    let fn_count = 0
+    let let_count = 0
+    let i = 0
+    while3 i < len(lines) {
+        let line = lines[i]
+        if3 contains(line, "fn ") == true {
+            fn_count = fn_count + 1
+        }
+        if3 contains(line, "let ") == true {
+            let_count = let_count + 1
+        }
+        i = i + 1
+    }
+    return {"ok": true, "trit": 1, "stats": {"lines": len(lines), "functions": fn_count, "variables": let_count, "chars": len(code)}}
+}
+
+fn handle_nova_ast(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let code = dict_get(req, "code", "")
+    if3 code == "" {
+        return {"ok": false, "error": "missing code", "trit": -1}
+    }
+    let lines = split(code, "\n")
+    let fns = []
+    let i = 0
+    while3 i < len(lines) {
+        let line = lines[i]
+        if3 contains(line, "fn ") == true {
+            let parts = split(line, "(")
+            let name_part = parts[0]
+            let name_tokens = split(name_part, " ")
+            let fname = ""
+            if3 len(name_tokens) >= 2 {
+                fname = name_tokens[1]
+            }
+            push(fns, {"name": fname, "line": i + 1})
+        }
+        i = i + 1
+    }
+    return {"ok": true, "trit": 1, "functions": fns, "count": len(fns)}
+}
+
+fn handle_nova_sessions(req) {
+    return {"ok": true, "trit": 1, "sessions": _sessions, "count": len(keys(_sessions))}
+}
+
+fn handle_nova_history(req) {
+    let limit = H13
+    let start = 0
+    if3 len(_history) > limit {
+        start = len(_history) - limit
+    }
+    let recent = []
+    let i = start
+    while3 i < len(_history) {
+        push(recent, _history[i])
+        i = i + 1
+    }
+    return {"ok": true, "trit": 1, "history": recent, "total": len(_history)}
+}
+
+fn handle_nova_reset(req) {
+    _sessions = {}
+    _history = []
+    return {"ok": true, "trit": 1, "message": "sessions and history cleared"}
+}
+
+fn handle_nova_run_bytecode(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let bytecode = dict_get(req, "bytecode", "")
+    if3 bytecode == "" {
+        return {"ok": false, "error": "missing bytecode", "trit": -1}
+    }
+    let result = try3 { http_post("http://127.0.0.1:9999/api/nova/run-bytecode", {"bytecode": bytecode}) } { {"error": "bytecode exec unreachable"} }
+    return {"ok": true, "trit": 1, "result": result}
+}
+
+// ══════════════════════════════════════════
+// 6. Pipeline / Classify
+// ══════════════════════════════════════════
+
+fn handle_pipeline(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let prompt = dict_get(req, "prompt", "")
+    if3 prompt == "" {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    }
+    let channel = dict_get(req, "channel", "general")
+    let body = {"prompt": prompt, "channel": channel}
+    let result = try3 { http_post("http://127.0.0.1:9881/pipeline", body) } { {"error": "hivemind pipeline unreachable"} }
+    let trace_entry = {"ts": time(), "endpoint": "/pipeline", "prompt_len": len(prompt), "channel": channel}
+    push(_trace_log, trace_entry)
+    return {"ok": true, "trit": 1, "result": result, "channel": channel}
+}
+
+fn handle_classify(req) {
+    _stats = dict_set(_stats, "queries", dict_get(_stats, "queries", 0) + 1)
+    let text = dict_get(req, "text", "")
+    let prompt = dict_get(req, "prompt", "")
+    if3 text == "" {
+        text = prompt
+    }
+    if3 text == "" {
+        return {"ok": false, "error": "missing text or prompt", "trit": -1}
+    }
+    let re = calc_reynolds(text)
+    let regime = classify_regime(re)
+    let channel = "general"
+    if3 contains(text, "code") == true {
+        channel = "code"
+    } else3 contains(text, "math") == true {
+        channel = "math"
+    } else3 contains(text, "image") == true {
+        channel = "vision"
+    } else3 contains(text, "search") == true {
+        channel = "search"
+    }
+    return {"ok": true, "trit": regime_trit(regime), "channel": channel, "regime": regime, "reynolds": round(re, 2)}
+}
+
+// ══════════════════════════════════════════
+// 7. Health
+// ══════════════════════════════════════════
+
+fn handle_health(req) {
+    let up = int(time() - dict_get(_stats, "t0", 0))
+    let qcount = dict_get(_stats, "queries", 0)
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "ternary": true,
+        "self_trit": 1,
+        "char": "1",
+        "uptime": up,
+        "queries": qcount,
+        "tresource": {"hot": tresource_hot_count(), "warm": tresource_warm_count(), "cold": tresource_cold_count(), "max_hot": MAX_HOT},
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13, "block": BLOCK_SIZE},
+        "trace_count": len(_trace_log),
+        "stub": false
+    }
+}
+
+// ══════════════════════════════════════════
+// Server Setup + Route Registration
+// ══════════════════════════════════════════
+
+let server = tserve(PORT, SERVICE_NAME)
+
+// Health
+troute(server, "GET", "/health", "handle_health")
+
+// TResource
+troute(server, "POST", "/tresource/gate", "handle_tresource_gate")
+troute(server, "GET", "/tresource/status", "handle_tresource_status")
+troute(server, "POST", "/tresource/sweep", "handle_tresource_sweep")
+
+// Reynolds
+troute(server, "POST", "/reynolds", "handle_reynolds")
+
+// Ternary Engine
+troute(server, "POST", "/ternary/route", "handle_ternary_route")
+troute(server, "POST", "/ternary/vote", "handle_ternary_vote")
+troute(server, "POST", "/ternary/synthesize", "handle_ternary_synthesize")
+troute(server, "POST", "/ternary/quantize", "handle_ternary_quantize")
+troute(server, "POST", "/ternary/classify", "handle_ternary_classify")
+troute(server, "GET", "/ternary/status", "handle_ternary_status")
+troute(server, "GET", "/ternary/adjacency", "handle_ternary_adjacency")
+troute(server, "GET", "/ternary/stream", "handle_ternary_stream")
+troute(server, "GET", "/ternary/trace", "handle_ternary_trace")
+troute(server, "GET", "/ternary/layer/status", "handle_ternary_layer_status")
+
+// Modulation Engine
+troute(server, "POST", "/modulation/modulate", "handle_modulation_modulate")
+troute(server, "POST", "/modulation/spread", "handle_modulation_spread")
+troute(server, "POST", "/modulation/chirp", "handle_modulation_chirp")
+troute(server, "POST", "/modulation/constellation", "handle_modulation_constellation")
+troute(server, "GET", "/modulation/status", "handle_modulation_status")
+troute(server, "GET", "/modulation/schemes", "handle_modulation_schemes")
+
+// NovaLang Gateway
+troute(server, "POST", "/nova/exec", "handle_nova_exec")
+troute(server, "POST", "/nova/run-file", "handle_nova_run_file")
+troute(server, "POST", "/nova/compile", "handle_nova_compile")
+troute(server, "POST", "/nova/ast", "handle_nova_ast")
+troute(server, "GET", "/nova/sessions", "handle_nova_sessions")
+troute(server, "GET", "/nova/history", "handle_nova_history")
+troute(server, "POST", "/nova/reset", "handle_nova_reset")
+troute(server, "POST", "/nova/run-bytecode", "handle_nova_run_bytecode")
+
+// Pipeline / Classify
+troute(server, "POST", "/pipeline", "handle_pipeline")
+troute(server, "POST", "/classify", "handle_classify")
+
+print("[TERNARY-SERVER] v" + VERSION + " on port " + str(PORT))
+print("[TERNARY-SERVER] 7 subsystems: TResource | Reynolds | Ternary | Modulation | NovaLang | Pipeline | Health")
+print("[TERNARY-SERVER] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13) + " BLOCK=" + str(BLOCK_SIZE))
+print("[TERNARY-SERVER] MAX_HOT=" + str(MAX_HOT) + " | Re boundaries: " + str(RE_LAMINAR) + "/" + str(RE_TRANSITIONAL) + "/" + str(RE_TURBULENT))
+
+tstart(server)

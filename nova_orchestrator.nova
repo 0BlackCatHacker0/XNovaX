@@ -1,0 +1,540 @@
+// ============================================================================
+// NovaX Orchestrator — The Complete AI OS Gateway
+// Port: 9999 | 100% Ternary Native | Zero Python
+// ============================================================================
+// The orchestrator is the single gateway for all NovaX services.
+// It boots services, monitors health, proxies requests, and serves the UI.
+//
+// Ternary states:
+//   +1 = all services healthy, fleet running
+//    0 = partial — some services degraded
+//   -1 = critical — fleet failure
+//
+// 3-5-7-13 Harmonics:
+//   Health check interval: H3 seconds (3s)
+//   Service boot delay: H5 * 100ms (500ms between services)
+//   Max retry count: H7 (7 retries)
+//   Fleet timeout: H13 seconds (13s)
+// ============================================================================
+
+let VERSION = "6.0.0"
+let PORT = 9999
+let SERVICE = "nova-orchestrator"
+let server = tserve(PORT, SERVICE)
+
+// ── Paths ──
+let _NV = "C:\\NovaX\\novalang.exe"
+let _WEB = "C:\\NovaX\\web"
+let _DATA = "C:\\NovaX\\data"
+let _CORE = "C:\\NovaX\\core"
+
+// ── Static file serving ──
+let __static_dir__ = _WEB
+
+// ── Service State ──
+let _services = {}
+let _boot_time = time()
+let _fleet_state = MAYBE
+let _boot_complete = FALSE_
+
+// ── 3-5-7-13 Constants ──
+let HEALTH_INTERVAL = H3
+let BOOT_DELAY_MS = 500
+let MAX_RETRIES = H7
+let FLEET_TIMEOUT = H13
+
+// ============================================================================
+// BOOT ORDER — 97 services, all on novalang.exe
+// ============================================================================
+let BOOT_ORDER = [
+    {"name": "tspin",               "file": "C:\\NovaX\\nova_tspin_service.nova",          "port": 9970},
+    {"name": "tscale",              "file": "C:\\NovaX\\nova_tscale_service.nova",         "port": 9986},
+    {"name": "tshield",             "file": "C:\\NovaX\\nova_tshield_service.nova",        "port": 9987},
+    {"name": "thunter",             "file": "C:\\NovaX\\nova_thunter_service.nova",        "port": 9988},
+    {"name": "exec-server",         "file": "C:\\NovaX\\launchers\\exec_server.nova",      "port": 9877},
+    {"name": "cloud-router",        "file": "C:\\NovaX\\nova_cloud_router_service.nova",   "port": 9878},
+    {"name": "brain",               "file": "C:\\NovaX\\core\\server.nova",                "port": 9990},
+    {"name": "vpn-core",            "file": "C:\\NovaX\\nova_vpn_core_service.nova",       "port": 9880},
+    {"name": "hivemind",            "file": "C:\\NovaX\\nova_hivemind_service.nova",       "port": 9881},
+    {"name": "nexus",               "file": "C:\\NovaX\\nova_nexus_service.nova",          "port": 9882},
+    {"name": "stt",                 "file": "C:\\NovaX\\nova_stt_service.nova",            "port": 9875},
+    {"name": "websocket",           "file": "C:\\NovaX\\ws_server_standalone.nova",        "port": 9998},
+    {"name": "ternary-server",      "file": "C:\\NovaX\\nova_ternary_server_service.nova", "port": 9885},
+    {"name": "nova-cli",            "file": "C:\\NovaX\\nova_cli_server_service.nova",     "port": 9961},
+    {"name": "closed-loop",         "file": "C:\\NovaX\\nova_closed_loop_service.nova",    "port": 9888},
+    {"name": "max-patch",           "file": "C:\\NovaX\\nova_max_patch_service.nova",      "port": 9889},
+    {"name": "tshell",              "file": "C:\\NovaX\\nova_tshell_service.nova",         "port": 9890},
+    {"name": "nova-cortex",         "file": "C:\\NovaX\\nova_cortex_service.nova",         "port": 9896},
+    {"name": "nova-tfetch",         "file": "C:\\NovaX\\nova_tfetch_service.nova",         "port": 9897},
+    {"name": "nova-tools",          "file": "C:\\NovaX\\nova_tools_service.nova",          "port": 9891},
+    {"name": "nova-vault",          "file": "C:\\NovaX\\nova_vault_service.nova",          "port": 9892},
+    {"name": "nova-deepstorage",    "file": "C:\\NovaX\\nova_deepstorage_service.nova",    "port": 9893},
+    {"name": "nova-ttools",         "file": "C:\\NovaX\\nova_ternary_tools_service.nova",  "port": 9894},
+    {"name": "nova-tspeak",         "file": "C:\\NovaX\\nova_tspeak_service.nova",         "port": 9895},
+    {"name": "nova-tkill",          "file": "C:\\NovaX\\nova_tkill_service.nova",          "port": 9901},
+    {"name": "nova-tbuffer",        "file": "C:\\NovaX\\nova_tbuffer_service.nova",        "port": 9886},
+    {"name": "skiptrace",           "file": "C:\\NovaX\\nova_skiptrace_service.nova",      "port": 9903},
+    {"name": "nova-tsysmon",        "file": "C:\\NovaX\\nova_tsysmon_service.nova",        "port": 9905},
+    {"name": "nova-tnet",           "file": "C:\\NovaX\\nova_tnet_service.nova",           "port": 9906},
+    {"name": "nova-tsecurity",      "file": "C:\\NovaX\\nova_tsecurity_service.nova",      "port": 9907},
+    {"name": "nova-tmedia",         "file": "C:\\NovaX\\nova_tmedia_service.nova",         "port": 9908},
+    {"name": "nova-tbuild",         "file": "C:\\NovaX\\nova_tbuild_service.nova",         "port": 9909},
+    {"name": "nova-tcron",          "file": "C:\\NovaX\\nova_tcron_service.nova",          "port": 9910},
+    {"name": "nova-tquery",         "file": "C:\\NovaX\\nova_tquery_service.nova",         "port": 9911},
+    {"name": "nova-tbus",           "file": "C:\\NovaX\\nova_tbus_service.nova",           "port": 9945},
+    {"name": "nova-tresilience",    "file": "C:\\NovaX\\nova_tresilience_service.nova",    "port": 9948},
+    {"name": "nova-tintelligence",  "file": "C:\\NovaX\\nova_tintelligence_service.nova",  "port": 9924},
+    {"name": "nova-twatch",         "file": "C:\\NovaX\\nova_twatch_service.nova",         "port": 9950},
+    {"name": "nova-tmesh",          "file": "C:\\NovaX\\nova_tmesh_service.nova",          "port": 9951},
+    {"name": "nova-tauth",          "file": "C:\\NovaX\\nova_tauth_service.nova",          "port": 9952},
+    {"name": "nova-tmetrics",       "file": "C:\\NovaX\\nova_tmetrics_service.nova",       "port": 9953},
+    {"name": "nova-tstream",        "file": "C:\\NovaX\\nova_tstream_service.nova",        "port": 9955},
+    {"name": "nova-tcache",         "file": "C:\\NovaX\\nova_tcache_service.nova",         "port": 9956},
+    {"name": "nova-tqueue",         "file": "C:\\NovaX\\nova_tqueue_service.nova",         "port": 9957},
+    {"name": "nova-tgraph",         "file": "C:\\NovaX\\nova_tgraph_service.nova",         "port": 9958},
+    {"name": "nova-tscheduler",     "file": "C:\\NovaX\\nova_tscheduler_service.nova",     "port": 9959},
+    {"name": "nova-tembed",         "file": "C:\\NovaX\\nova_tembed_service.nova",         "port": 9960},
+    {"name": "nova-tlog",           "file": "C:\\NovaX\\nova_tlog.nova",                   "port": 9942},
+    {"name": "nova-tconfig",        "file": "C:\\NovaX\\nova_tconfig.nova",                "port": 9941},
+    {"name": "nova-trouter",        "file": "C:\\NovaX\\nova_trouter_service.nova",        "port": 9963},
+    {"name": "nova-tvalidator",     "file": "C:\\NovaX\\nova_tvalidator_service.nova",     "port": 9964},
+    {"name": "nova-tsnapshot",      "file": "C:\\NovaX\\nova_tsnapshot_service.nova",      "port": 9965},
+    {"name": "nova-tpipeline",      "file": "C:\\NovaX\\nova_tpipeline_service.nova",      "port": 9966},
+    {"name": "nova-tmatrix",        "file": "C:\\NovaX\\nova_tmatrix_service.nova",        "port": 9967},
+    {"name": "nova-talchemy",       "file": "C:\\NovaX\\nova_talchemy_service.nova",       "port": 9928},
+    {"name": "nova-thealth",        "file": "C:\\NovaX\\nova_thealth.nova",                "port": 9940},
+    {"name": "nova-treplay",        "file": "C:\\NovaX\\nova_treplay_service.nova",        "port": 9937},
+    {"name": "nova-tcluster",       "file": "C:\\NovaX\\nova_tcluster_service.nova",       "port": 9971},
+    {"name": "nova-tcompress",      "file": "C:\\NovaX\\nova_tcompress_service.nova",      "port": 9972},
+    {"name": "nova-tdiff",          "file": "C:\\NovaX\\nova_tdiff_service.nova",          "port": 9973},
+    {"name": "nova-taudit",         "file": "C:\\NovaX\\nova_taudit_service.nova",         "port": 9974},
+    {"name": "nova-tnotify",        "file": "C:\\NovaX\\nova_tnotify_service.nova",        "port": 9975},
+    {"name": "nova-tsync",          "file": "C:\\NovaX\\nova_tsync_service.nova",          "port": 9976},
+    {"name": "nova-tprompt",        "file": "C:\\NovaX\\nova_tprompt_service.nova",        "port": 9977},
+    {"name": "nova-tmemory",        "file": "C:\\NovaX\\nova_tmemory_service.nova",        "port": 9978},
+    {"name": "nova-tgateway",       "file": "C:\\NovaX\\nova_tgateway_service.nova",       "port": 9979},
+    {"name": "nova-tprofile",       "file": "C:\\NovaX\\nova_tprofile_service.nova",       "port": 9980},
+    {"name": "nova-tlock",          "file": "C:\\NovaX\\nova_tlock_service.nova",          "port": 9981},
+    {"name": "nova-tflow",          "file": "C:\\NovaX\\nova_tflow_service.nova",          "port": 9982},
+    {"name": "nova-tdigest",        "file": "C:\\NovaX\\nova_tdigest_service.nova",        "port": 9983},
+    {"name": "nova-tbalance",       "file": "C:\\NovaX\\nova_tbalance_service.nova",       "port": 9984},
+    {"name": "nova-trelay",         "file": "C:\\NovaX\\nova_trelay_service.nova",         "port": 9985},
+    {"name": "nova-tsession",       "file": "C:\\NovaX\\nova_tsession_service.nova",       "port": 9912},
+    {"name": "nova-tgit",           "file": "C:\\NovaX\\nova_tgit_service.nova",           "port": 9913},
+    {"name": "nova-tdocker",        "file": "C:\\NovaX\\nova_tdocker_service.nova",        "port": 9914},
+    {"name": "nova-tterraform",     "file": "C:\\NovaX\\nova_tterraform_service.nova",     "port": 9915},
+    {"name": "nova-tsqlite",        "file": "C:\\NovaX\\nova_tsqlite_service.nova",        "port": 9916},
+    {"name": "nova-tredis",         "file": "C:\\NovaX\\nova_tredis_service.nova",         "port": 9917},
+    {"name": "nova-timage",         "file": "C:\\NovaX\\nova_timage_service.nova",         "port": 9918},
+    {"name": "nova-thttp",          "file": "C:\\NovaX\\nova_thttp_service.nova",          "port": 9919},
+    {"name": "nova-tmarkdown",      "file": "C:\\NovaX\\nova_tmarkdown_service.nova",      "port": 9920},
+    {"name": "nova-tyaml",          "file": "C:\\NovaX\\nova_tyaml_service.nova",          "port": 9921},
+    {"name": "nova-tffmpeg",        "file": "C:\\NovaX\\nova_tffmpeg_service.nova",        "port": 9922},
+    {"name": "nova-ttext",          "file": "C:\\NovaX\\nova_ttext_service.nova",          "port": 9923},
+    {"name": "nova-bitnet-fleet",   "file": "C:\\NovaX\\nova_bitnet_fleet_service.nova",   "port": 9926},
+    {"name": "nova-tci",            "file": "C:\\NovaX\\nova_tci_service.nova",            "port": 9927},
+    {"name": "nova-tconfig2",       "file": "C:\\NovaX\\nova_tconfig_service.nova",        "port": 9932},
+    {"name": "nova-tbenchmark",     "file": "C:\\NovaX\\nova_tbenchmark_service.nova",     "port": 9933},
+    {"name": "nova-ttest",          "file": "C:\\NovaX\\nova_ttest_service.nova",          "port": 9934},
+    {"name": "nova-tdocs",          "file": "C:\\NovaX\\nova_tdocs_service.nova",          "port": 9935},
+    {"name": "nova-tmicro",         "file": "C:\\NovaX\\nova_tmicro_service.nova",         "port": 9936},
+    {"name": "nova-uia-bridge",    "file": "C:\\NovaX\\nova_uia_bridge_service.nova",    "port": 9902},
+    {"name": "nova-sentinel",      "file": "C:\\NovaX\\nova_sentinel_service.nova",      "port": 9884},
+    {"name": "nova-tdebug",        "file": "C:\\NovaX\\nova_tdebug_service.nova",        "port": 9992},
+    {"name": "nova-tmapper",       "file": "C:\\NovaX\\nova_tmapper_service.nova",       "port": 9994},
+    {"name": "nova-tpacman",       "file": "C:\\NovaX\\nova_tpacman_service.nova",       "port": 9991},
+    {"name": "nova-ttimeout",      "file": "C:\\NovaX\\nova_ttimeout_service.nova",      "port": 9995},
+    {"name": "nova-audit",        "file": "C:\\NovaX\\nova_audit_engine.nova",           "port": 9938},
+    {"name": "nova-research",     "file": "C:\\NovaX\\nova_deep_research_service.nova",  "port": 9939},
+    {"name": "nova-selector",    "file": "C:\\NovaX\\nova_model_selector_service.nova", "port": 9931},
+    {"name": "nova-llm",         "file": "C:\\NovaX\\nova_llm\\inference.nova",          "port": 9800},
+    {"name": "nova-quantizer",   "file": "C:\\NovaX\\nova_quantizer_service.nova",      "port": 9802}
+]
+
+// ── Service registry (name -> {port, pid, state}) ──
+let _registry = {}
+
+// ============================================================================
+// BOOT SEQUENCE
+// ============================================================================
+fn boot_service(svc) {
+    let name = svc["name"]
+    let file = svc["file"]
+    let port = svc["port"]
+    print("[BOOT] " + name + " (" + str(port) + ")...")
+    let pid = spawn(_NV, file)
+    if3 pid > 0 {
+        _registry[name] = {"port": port, "pid": pid, "state": TRUE, "file": file}
+        print("[BOOT] " + name + " started (PID " + str(pid) + ")")
+        return TRUE
+    } else3 {
+        _registry[name] = {"port": port, "pid": 0, "state": FALSE_, "file": file}
+        print("[BOOT] " + name + " FAILED")
+        return FALSE_
+    }
+}
+
+fn boot_fleet() {
+    print("=== NovaX Orchestrator v" + VERSION + " ===")
+    print("Booting " + str(len(BOOT_ORDER)) + " services...")
+    let ok = 0
+    let fails = 0
+    for3 svc in BOOT_ORDER {
+        let result = boot_service(svc)
+        if3 result == TRUE {
+            ok += 1
+        } else3 {
+            fails += 1
+        }
+        sleep(BOOT_DELAY_MS)
+    }
+    // ── Retry wave: health-verify all services after full spawn ──
+    print("[RETRY] Settling " + str(H5) + "s before health verification...")
+    sleep(H5 * 1000)  // 5s settle
+    let verified = 0
+    let unverified = 0
+    let critical = ["hivemind", "ternary-server"]
+    for3 svc in BOOT_ORDER {
+        let name = svc["name"]
+        let port = svc["port"]
+        let resp = try3 { http_get("http://127.0.0.1:" + str(port) + "/health") } fail { null }
+        if3 resp != null { svc_ok = dict_get(resp, "ok") ?? false
+            let svc_trit = dict_get(resp, "self_trit") ?? -1
+            if3 svc_ok == true || svc_trit >= 0 {
+                _registry[name] = dict_set(dict_get(_registry, name) ?? {}, "state", TRUE)
+                verified = verified + 1
+            } else3 {
+                unverified = unverified + 1
+            }
+        } else3 {
+            unverified = unverified + 1
+        }
+    }
+    print("[RETRY] Pass 1: " + str(verified) + " verified, " + str(unverified) + " unverified")
+    // Pass 2: retry critical services only
+    if3 unverified > 0 {
+        sleep(H3 * 1000)  // 3s between passes
+        let ci = 0
+        while3 ci < len(critical) {
+            let cname = critical[ci]
+            let cinfo = dict_get(_registry, cname) ?? null
+            if3 cinfo != null { cstate = dict_get(cinfo, "state") ?? FALSE_
+                if3 cstate != TRUE { cport = dict_get(cinfo, "port") ?? 0
+                    let cresp = try3 { http_get("http://127.0.0.1:" + str(cport) + "/health") } fail { null }
+                    if3 cresp != null {
+                        _registry[cname] = dict_set(cinfo, "state", TRUE)
+                        verified = verified + 1
+                        unverified = unverified - 1
+                        print("[RETRY] " + cname + " recovered on pass 2")
+                    }
+                }
+            }
+            ci = ci + 1
+        }
+        print("[RETRY] Pass 2: " + str(verified) + " verified, " + str(unverified) + " unverified")
+    }
+    ok = verified
+    fails = len(BOOT_ORDER) - verified
+    _boot_complete = TRUE
+    print("=== Boot complete: " + str(ok) + " ok, " + str(fails) + " failed ===")
+    if3 fails == 0 {
+        _fleet_state = TRUE
+    } else3 ok > 0 {
+        _fleet_state = MAYBE
+    } else3 {
+        _fleet_state = FALSE_
+    }
+}
+
+// ============================================================================
+// HEALTH CHECK
+// ============================================================================
+fn check_health(name) {
+    let info = _registry[name]
+    if3 info == null {
+        return {"name": name, "status": "unknown", "state": FALSE_}
+    }
+    let port = info["port"]
+    let url = "http://127.0.0.1:" + str(port) + "/health"
+    let resp = try3 { http_get(url) } fail { null }
+    if3 resp == null {
+        return {"name": name, "status": "down", "port": port, "state": FALSE_}
+    }
+    if3 resp["ok"] == TRUE {
+        return {"name": name, "status": "ok", "port": port, "state": TRUE}
+    } else3 {
+        return {"name": name, "status": "down", "port": port, "state": FALSE_}
+    }
+}
+
+fn check_all_health() {
+    let results = []
+    let up = 0
+    let down = 0
+    for3 svc in BOOT_ORDER {
+        let name = svc["name"]
+        let h = check_health(name)
+        results = push(results, h)
+        if3 h["state"] == TRUE {
+            up += 1
+        } else3 {
+            down += 1
+        }
+    }
+    return {
+        "total": len(BOOT_ORDER),
+        "up": up,
+        "down": down,
+        "state": bool3(up - down),
+        "services": results
+    }
+}
+
+// ============================================================================
+// PROXY — Forward requests to services
+// ============================================================================
+fn proxy_get(port, path) {
+    let url = "http://127.0.0.1:" + str(port) + path
+    return http_get(url)
+}
+
+fn proxy_post(port, path, body) {
+    let url = "http://127.0.0.1:" + str(port) + path
+    return http_post(url, body)
+}
+
+// ============================================================================
+// ROUTE HANDLERS
+// ============================================================================
+
+// -- Health --
+troute(server, "GET", "/health", "handle_health")
+fn handle_health(req) {
+    let uptime = time() - _boot_time
+    return {
+        "status": "ok",
+        "service": SERVICE,
+        "version": VERSION,
+        "port": PORT,
+        "uptime": uptime,
+        "fleet_state": _fleet_state,
+        "boot_complete": _boot_complete,
+        "ternary": "native",
+        "python": FALSE_
+    }
+}
+
+// -- Fleet health (all services) --
+troute(server, "GET", "/api/services/health", "handle_fleet_health")
+fn handle_fleet_health(req) {
+    return check_all_health()
+}
+
+// -- Service list --
+troute(server, "GET", "/api/services", "handle_services")
+fn handle_services(req) {
+    let services = []
+    for3 svc in BOOT_ORDER {
+        let name = svc["name"]
+        let info = _registry[name]
+        if3 info != null {
+            services = push(services, {
+                "name": name,
+                "port": svc["port"],
+                "pid": info["pid"],
+                "state": info["state"]
+            })
+        } else3 {
+            services = push(services, {
+                "name": name,
+                "port": svc["port"],
+                "pid": 0,
+                "state": MAYBE
+            })
+        }
+    }
+    return {"services": services, "count": len(services)}
+}
+
+// -- Boot/restart a service --
+troute(server, "POST", "/api/services/boot", "handle_boot_service")
+fn handle_boot_service(req) {
+    let body = json_decode(req["body"])
+    let name = body["name"]
+    // Find in BOOT_ORDER
+    for3 svc in BOOT_ORDER {
+        if3 svc["name"] == name { result = boot_service(svc)
+            return {"ok": result, "name": name}
+        }
+    }
+    return {"ok": FALSE_, "error": "service not found: " + str(name)}
+}
+
+// -- Version info --
+troute(server, "GET", "/api/version", "handle_version")
+fn handle_version(req) {
+    return {
+        "version": VERSION,
+        "runtime": "novalang.exe",
+        "python": FALSE_,
+        "ternary_native": TRUE,
+        "services": len(BOOT_ORDER),
+        "uptime": time() - _boot_time
+    }
+}
+
+// -- Fleet status (summary) --
+troute(server, "GET", "/api/status", "handle_status")
+fn handle_status(req) {
+    return {
+        "ok": TRUE,
+        "fleet_state": _fleet_state,
+        "boot_complete": _boot_complete,
+        "services_count": len(BOOT_ORDER),
+        "uptime": time() - _boot_time,
+        "version": VERSION
+    }
+}
+
+// -- Proxy to service by name --
+troute(server, "GET", "/api/proxy", "handle_proxy_get")
+fn handle_proxy_get(req) {
+    let path = req["path"]
+    // Parse query params: /api/proxy?service=name&path=/health
+    // For now, return instructions
+    return {"info": "Use POST /api/proxy with {service, path, method, body}"}
+}
+
+troute(server, "POST", "/api/proxy", "handle_proxy_post")
+fn handle_proxy_post(req) {
+    let body = json_decode(req["body"])
+    let svc_name = body["service"]
+    let svc_path = body["path"]
+    let method = body["method"]
+    let payload = body["body"]
+    // Look up port
+    let info = _registry[svc_name]
+    if3 info == null {
+        return {"ok": FALSE_, "error": "unknown service: " + str(svc_name)}
+    }
+    let port = info["port"]
+    if3 method == "POST" {
+        return proxy_post(port, svc_path, str(payload))
+    } else3 {
+        return proxy_get(port, svc_path)
+    }
+}
+
+// -- NovaLang eval --
+troute(server, "POST", "/api/novalang/run", "handle_novalang_run")
+fn handle_novalang_run(req) {
+    let body = json_decode(req["body"])
+    let code = body["code"]
+    if3 code == null { file = body["file"]
+        if3 file != null { result = shell(_NV + " " + str(file))
+            return result
+        }
+        return {"ok": FALSE_, "error": "provide code or file"}
+    }
+    let result = shell(_NV + " -e \"" + str(code) + "\"")
+    return result
+}
+
+// -- File operations --
+troute(server, "GET", "/api/files/list", "handle_files_list")
+fn handle_files_list(req) {
+    let files = dir_list("C:\\NovaX")
+    return {"files": files, "count": len(files)}
+}
+
+troute(server, "POST", "/api/files/read", "handle_files_read")
+fn handle_files_read(req) {
+    let body = json_decode(req["body"])
+    let path = body["path"]
+    let content = read_file(str(path))
+    if3 content != null {
+        return {"ok": TRUE, "content": content}
+    } else3 {
+        return {"ok": FALSE_, "error": "file not found"}
+    }
+}
+
+troute(server, "POST", "/api/files/write", "handle_files_write")
+fn handle_files_write(req) {
+    let body = json_decode(req["body"])
+    let path = body["path"]
+    let content = body["content"]
+    // Path validation: restrict writes to within C:\NovaX\
+    let resolved = str(path)
+    let norm_path = replace(resolved, "/", "\\")
+    if3 starts_with(norm_path, "C:\\NovaX\\") == false {
+        if3 starts_with(resolved, "C:/NovaX/") == false {
+            return {"ok": FALSE_, "error": "path must be within C:\\NovaX\\"}
+        }
+    }
+    // Block path traversal attempts
+    if3 contains(resolved, "..") == true {
+        return {"ok": FALSE_, "error": "path traversal not allowed"}
+    }
+    let result = write_file(resolved, str(content))
+    return {"ok": result}
+}
+
+// -- Shell exec (localhost-only, used internally by NovaX services) --
+// SECURITY NOTE: This endpoint is bound to 127.0.0.1 only via tserve().
+// It is NOT exposed to the network. Internal services use it for orchestration.
+troute(server, "POST", "/api/shell", "handle_shell")
+fn handle_shell(req) {
+    let body = json_decode(req["body"])
+    let cmd = body["command"]
+    // Basic safety: reject commands that could damage the system
+    let cmd_str = str(cmd)
+    if3 contains(cmd_str, "format ") == true {
+        return {"ok": FALSE_, "error": "blocked: dangerous command"}
+    }
+    if3 contains(cmd_str, "rd /s") == true {
+        return {"ok": FALSE_, "error": "blocked: dangerous command"}
+    }
+    if3 contains(cmd_str, "rmdir /s") == true {
+        return {"ok": FALSE_, "error": "blocked: dangerous command"}
+    }
+    if3 contains(cmd_str, "rm -rf /") == true {
+        return {"ok": FALSE_, "error": "blocked: dangerous command"}
+    }
+    let result = shell(cmd_str)
+    return result
+}
+
+// -- Hivemind proxy --
+troute(server, "POST", "/api/hivemind/query", "handle_hivemind_query")
+fn handle_hivemind_query(req) {
+    let body = req["body"]
+    return proxy_post(9881, "/hive/query", body)
+}
+
+// -- Cloud router proxy --
+troute(server, "POST", "/api/cloud/query", "handle_cloud_query")
+fn handle_cloud_query(req) {
+    let body = req["body"]
+    return proxy_post(9878, "/query", body)
+}
+
+// -- Static page routes --
+troute(server, "GET", "/nova_desktop.html", "handle_desktop")
+fn handle_desktop(req) {
+    let content = read_file("C:\\NovaX\\web\\nova_desktop.html")
+    return content
+}
+
+// ============================================================================
+// STARTUP
+// ============================================================================
+print("NovaX Orchestrator v" + VERSION + " — 100% Ternary Native")
+print("Zero Python. Pure NovaLang on Rust VM.")
+print("Booting fleet...")
+
+// Boot all services
+boot_fleet()
+
+print("Starting HTTP gateway on port " + str(PORT) + "...")
+tstart(server)

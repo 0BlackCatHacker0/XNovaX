@@ -1,0 +1,182 @@
+// =================================================================
+// nova_fractal_service.nova — Fractal Task Engine Service
+// Port 9874 — Fractalizes tasks across thousands of models
+// =================================================================
+// Exposes the Fractal Engine as an HTTP service so any NovaX
+// component can dispatch fractal tasks for massive token output.
+//
+// Endpoints:
+//   POST /fractal/run     — Run full fractal pipeline
+//   POST /fractal/split   — Just split a prompt (no dispatch)
+//   GET  /fractal/status  — Engine status
+//   GET  /health          — Health check
+//   POST /fractal/amplify — Run amplification round
+// =================================================================
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+import3("C:/NovaX/lib/nova_fractal.nova")
+
+let PORT = 9874
+let SERVICE_NAME = "nova-fractal-engine"
+let VERSION = "1.0.0"
+
+// Active provider list (providers with keys that are working)
+let ACTIVE_PROVIDERS = [
+    "cerebras_direct",
+    "ollama",
+    "openai",
+    "anthropic",
+    "openrouter"
+]
+
+// ── Health ─────────────────────────────────────────────────────────
+fn handle_health(req) {
+    return {
+        "ok": 1,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "ternary": 1,
+        "trit": 1,
+        "reynolds": 0,
+        "regime": "laminar",
+        "flow": {"requests": 0, "errors": 0, "window_requests": 0, "window_errors": 0, "queue_depth": 0},
+        "harmonics": {"H3": 3, "H5": 5, "H7": 7, "H13": 13},
+        "ns_version": "0.1.0",
+        "uptime": 0,
+        "providers": len(ACTIVE_PROVIDERS),
+        "fractal_version": FRACTAL_VERSION
+    }
+}
+
+// ── POST /fractal/run ─────────────────────────────────────────────
+// Body: {"prompt": "...", "max_rounds": 1, "providers": [...]}
+fn handle_fractal_run(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let prompt = dict_get(body, "prompt") ?? ""
+    if3 len(prompt) == 0 {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    }
+
+    let max_rounds = dict_get(body, "max_rounds") ?? 1
+    let providers = dict_get(body, "providers") ?? ACTIVE_PROVIDERS
+
+    print("[FRACTAL] Running: " + slice(prompt, 0, 80) + "...")
+    print("[FRACTAL] Providers: " + str(len(providers)) + ", Max rounds: " + str(max_rounds))
+
+    let result = fractal_run(prompt, providers, max_rounds)
+
+    let ok = dict_get(result, "ok") ?? false
+    let tokens = dict_get(result, "output_tokens") ?? 0
+    let sources = dict_get(result, "sources") ?? 0
+    print("[FRACTAL] Done: ok=" + str(ok) + " tokens=" + str(tokens) + " sources=" + str(sources))
+
+    return result
+}
+
+// ── POST /fractal/split ───────────────────────────────────────────
+// Body: {"prompt": "..."}
+// Returns domain classification and sub-tasks without dispatching
+fn handle_fractal_split(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let prompt = dict_get(body, "prompt") ?? ""
+    if3 len(prompt) == 0 {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    }
+
+    let domains = fractal_classify_prompt(prompt)
+    let sub_tasks = fractal_split(prompt, domains)
+
+    return {
+        "ok": 1,
+        "trit": 1,
+        "domains": domains,
+        "sub_tasks": sub_tasks,
+        "count": len(sub_tasks)
+    }
+}
+
+// ── POST /fractal/amplify ─────────────────────────────────────────
+// Body: {"prompt": "...", "previous_output": "...", "round": N}
+fn handle_fractal_amplify(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let prompt = dict_get(body, "prompt") ?? ""
+    let previous = dict_get(body, "previous_output") ?? ""
+    let round_num = dict_get(body, "round") ?? 0
+
+    if3 len(prompt) == 0 {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    }
+
+    // Build amplification prompt
+    let amp_prompt = prompt
+    if3 len(previous) > 0 {
+        amp_prompt = "Given this analysis:\n" + slice(previous, 0, 2000) + "\n\nGo deeper: expand on the key points, add more detail, and explore edge cases. Original: " + prompt
+    }
+
+    let providers = dict_get(body, "providers") ?? ACTIVE_PROVIDERS
+    let result = fractal_run(amp_prompt, providers, 1)
+    result = dict_set(result, "round", round_num + 1)
+
+    return result
+}
+
+// ── GET /fractal/status ───────────────────────────────────────────
+fn handle_fractal_status(req) {
+    let status = fractal_status()
+    status = dict_set(status, "active_providers", ACTIVE_PROVIDERS)
+    status = dict_set(status, "service", SERVICE_NAME)
+    return status
+}
+
+// ── POST /swarm/run ──────────────────────────────────────────────
+// Body: {"prompt": "...", "system_prompt": "...", "providers": [...]}
+// Dispatches to ALL providers, collects and synthesizes
+fn handle_swarm_run(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let prompt = dict_get(body, "prompt") ?? ""
+    if3 len(prompt) == 0 {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    }
+    let sys_prompt = dict_get(body, "system_prompt") ?? ""
+    let providers = dict_get(body, "providers") ?? []
+    print("[SWARM] Running: " + slice(prompt, 0, 80) + "...")
+    let result = swarm_run(prompt, sys_prompt, providers)
+    return result
+}
+
+// ── POST /swarm/fractal ─────────────────────────────────────────
+// Body: {"prompt": "...", "max_rounds": 3}
+// Fractalizes THEN swarms — maximum output mode
+fn handle_swarm_fractal(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let prompt = dict_get(body, "prompt") ?? ""
+    if3 len(prompt) == 0 {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    }
+    let max_rounds = dict_get(body, "max_rounds") ?? 1
+    print("[SWARM-FRACTAL] Running: " + slice(prompt, 0, 80) + "...")
+    let result = swarm_fractal_run(prompt, max_rounds)
+    return result
+}
+
+// ── Server Setup ──────────────────────────────────────────────────
+let server = tserve(PORT, SERVICE_NAME)
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "POST", "/fractal/run", "handle_fractal_run")
+troute(server, "POST", "/fractal/split", "handle_fractal_split")
+troute(server, "POST", "/fractal/amplify", "handle_fractal_amplify")
+troute(server, "GET", "/fractal/status", "handle_fractal_status")
+troute(server, "POST", "/swarm/run", "handle_swarm_run")
+troute(server, "POST", "/swarm/fractal", "handle_swarm_fractal")
+
+print("[FRACTAL ENGINE] v" + VERSION + " starting on port " + str(PORT))
+print("[FRACTAL ENGINE] Providers: " + join(ACTIVE_PROVIDERS, ", "))
+print("[FRACTAL ENGINE] Domains: code, reasoning, chat, search, vision, system, math")
+print("[FRACTAL ENGINE] Max splits: " + str(FRACTAL_MAX_SPLITS) + " | Max rounds: " + str(FRACTAL_MAX_ROUNDS))
+print("[FRACTAL ENGINE] Swarm: max " + str(SWARM_MAX_PROVIDERS) + " providers")
+print("[FRACTAL ENGINE] Routes: /health /fractal/* /swarm/run /swarm/fractal")
+
+tstart(server)

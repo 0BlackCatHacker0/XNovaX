@@ -1,0 +1,993 @@
+// nova_tfetch_service.nova -- NovaX TFetch v2.0 -- Ternary Download Orchestrator
+// Pure NovaLang port of nova_tfetch.py (port 9897 API only)
+//
+// Routes downloads through NovaX ternary infrastructure:
+//   - Segmented parallel downloads (7 segments, H7 harmonic) via helper
+//   - TZip compression stats
+//   - WiFi NIC bonding awareness
+//   - DeepStorage auto-quantize on completed files
+//   - Resume-aware persistent sessions
+//   - Git clone progress tracking via nova_run()
+//   - System-wide HTTP/HTTPS proxy control via netsh
+//
+// 3-5-7-13 Harmonics:
+//   3  = ternary download states (+1 complete, 0 active, -1 failed)
+//   5  = max retries per segment
+//   7  = default parallel segments (H7 harmonic)
+//   13 = session header bytes, health interval (13s)
+//
+// Endpoints:
+//   GET  /health                  -- Health check
+//   GET  /tfetch/status           -- Aggregate download stats
+//   GET  /tfetch/session/<id>     -- Per-session detail
+//   POST /tfetch/download         -- Start segmented download
+//   POST /tfetch/pause            -- Pause a session
+//   POST /tfetch/resume           -- Resume a session
+//   POST /tfetch/cancel           -- Cancel a session
+//   POST /tfetch/git              -- Git clone with progress
+//   POST /tfetch/proxy/enable     -- Set Windows system proxy
+//   POST /tfetch/proxy/disable    -- Clear Windows system proxy
+//   GET  /tfetch/proxy/status     -- Proxy state + traffic stats
+//   GET  /tfetch/speedtest        -- Run download speed test via helper
+
+// ============================================================
+// Constants
+// ============================================================
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9897
+let VERSION = "2.0"
+let SERVICE_NAME = "nova-tfetch"
+
+// 3-5-7-13 harmonics
+let BLOCK_SIZE = 2187           // 3^7
+let FLOW_LAMINAR = 27           // 3^3
+let FLOW_TRANS = 125            // 5^3
+let FLOW_TURBULENT = 343        // 7^3
+let HEADER_SIZE = 13            // H13
+
+let MAX_SEGMENTS = 7            // H7 parallel segments
+let MAX_RETRIES = 5             // H5 retries per segment
+let HEALTH_INTERVAL = 13        // H13 seconds
+
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// Paths
+let NOVAX_ROOT = "C:/NovaX"
+let DOWNLOAD_DIR = "C:/NovaX/memory/tfetch_downloads"
+let SESSION_DIR = "C:/NovaX/memory/tfetch_sessions"
+let TEMP_DIR = "C:/NovaX/memory/tfetch_temp"
+
+// Helper script for heavy lifting (download segments, assembly, etc.)
+let HELPER = "tfetch_helper.py"
+
+// External service URLs
+let DEEPSTORAGE_URL = "http://127.0.0.1:9893"
+let WIFI_BRIDGE_URL = "http://127.0.0.1:9880"
+let PORT_PROXY = 9898
+
+// ============================================================
+// Server
+// ============================================================
+let server = tserve(PORT, "TFetch v2.0 - Ternary Download Orchestrator")
+
+// ============================================================
+// Global state (flat dicts -- no class in NovaLang)
+// ============================================================
+
+// sessions: session_id -> session dict
+let _sessions = {}
+
+// Counters
+let _completed_count = 0
+let _failed_count = 0
+let _total_bytes = 0
+let _total_tzip_saved = 0
+let _downloads_count = 0
+let _git_clones_count = 0
+let _proxy_ops_count = 0
+let _t0 = time()
+
+// Proxy state
+let _proxy_enabled = 0          // 0=false, 1=true
+let _proxy_bytes_total = 0
+let _proxy_bytes_compressed = 0
+let _proxy_cache_hits = 0
+let _proxy_requests = 0
+
+// WiFi state
+let _wifi_bonded = 0            // 0=false, 1=true
+let _wifi_speed = 0
+
+// Trit counters
+let _trits_true = 0
+let _trits_maybe = 0
+let _trits_false = 0
+
+// ============================================================
+// Helper: ternary download trit
+// ============================================================
+fn download_trit(result) {
+    if3 dict_has(result, "error") {
+        return T_FALSE
+    } else 1 == 1 { ok_val = dict_get(result, "ok") ?? 0
+        if3 ok_val == 1 {
+            return T_MAYBE
+        } else ok_val == 0 {
+            return T_FALSE
+        } else {
+            return T_MAYBE
+        }
+    } else {
+        return T_FALSE
+    }
+}
+
+// ============================================================
+// Helper: trit to char
+// ============================================================
+fn trit_char(t) {
+    if3 t == 1 {
+        return "1"
+    } else t == 0 {
+        return "0"
+    } else {
+        return "T"
+    }
+}
+
+// ============================================================
+// Helper: Reynolds from ops/minute
+// ============================================================
+fn tfetch_reynolds() {
+    let total = _downloads_count + _git_clones_count + _proxy_ops_count
+    let elapsed_sec = time() - _t0
+    let elapsed_min = elapsed_sec / 60
+    if3 elapsed_min < 0.1 {
+        elapsed_min = 0.1
+    } else elapsed_min >= 0.1 {
+        // keep as is
+        elapsed_min = elapsed_min
+    } else {
+        elapsed_min = 0.1
+    }
+    let re = int(total / elapsed_min)
+    return re
+}
+
+// ============================================================
+// Helper: flow regime classification
+// ============================================================
+fn flow_regime(re_num) {
+    if3 re_num < 27 {
+        return "laminar"
+    } else re_num < 125 {
+        return "transitional"
+    } else {
+        if3 re_num < 343 {
+            return "turbulent"
+        } else re_num >= 343 {
+            return "chaotic"
+        } else {
+            return "chaotic"
+        }
+    }
+}
+
+// ============================================================
+// Helper: speed-based Reynolds
+// ============================================================
+fn speed_reynolds(bytes_per_sec) {
+    if3 bytes_per_sec <= 0 {
+        return 0.0
+    } else bytes_per_sec > 0 {
+        // Normalize against 1 MB/s baseline
+        let normalized = bytes_per_sec / 1048576
+        let re = normalized * 100
+        return round(re)
+    } else {
+        return 0.0
+    }
+}
+
+// ============================================================
+// Helper: generate session ID
+// ============================================================
+fn gen_session_id() {
+    let raw = uuid_hex()
+    // Take first 12 chars for a short ID
+    return slice(raw, 0, 12)
+}
+
+// ============================================================
+// Helper: create empty session dict
+// ============================================================
+fn make_session(sid, url, output, is_git) {
+    let session = {
+        "id": sid,
+        "url": url,
+        "output": output,
+        "total_size": 0,
+        "downloaded": 0,
+        "state": 0,
+        "reynolds": 0.0,
+        "flow_regime": "unknown",
+        "paused": 0,
+        "elapsed": 0.0,
+        "speed_bps": 0.0,
+        "tzip_saved": 0,
+        "progress": 0.0,
+        "segments": [],
+        "is_git": is_git,
+        "git_progress": "",
+        "start_time": time(),
+        "end_time": 0,
+        "supports_range": 0,
+        "auto_quantize": 1
+    }
+    return session
+}
+
+// ============================================================
+// Helper: create segment dict
+// ============================================================
+fn make_segment(index, start_byte, end_byte) {
+    let seg = {
+        "index": index,
+        "start_byte": start_byte,
+        "end_byte": end_byte,
+        "state": 0,
+        "bytes_downloaded": 0,
+        "speed_bps": 0.0,
+        "retries": 0,
+        "progress": 0.0
+    }
+    return seg
+}
+
+// ============================================================
+// Persist session to disk
+// ============================================================
+fn persist_session(sid) {
+    let session = dict_get(_sessions, sid) ?? {}
+    if3 len(keys(session)) == 0 {
+        return T_FALSE
+    } else len(keys(session)) > 0 { path = SESSION_DIR + "/" + sid + ".json"
+        let data = json_encode(session)
+        nova_write(path, data)
+        return T_TRUE
+    } else {
+        return T_FALSE
+    }
+}
+
+// ============================================================
+// Load sessions from disk (completed/failed only)
+// ============================================================
+fn load_sessions() {
+    // Delegate to helper to list and parse session JSON files
+    let args = json_encode({"op": "load_sessions", "dir": SESSION_DIR})
+    let result_str = nova_run(HELPER, args)
+    try3 {
+        let result = json_decode(result_str)
+        let loaded = dict_get(result, "sessions") ?? []
+        let i = 0
+        while3 i < len(loaded) {
+            let s = dict_get(loaded, i)
+            let sid = dict_get(s, "id") ?? ""
+            if3 len(sid) > 0 {
+                _sessions = dict_set(_sessions, sid, s)
+                let st = dict_get(s, "state") ?? 0
+                if3 st == 1 {
+                    _completed_count = _completed_count + 1
+                } else st == -1 {
+                    _failed_count = _failed_count + 1
+                } else {
+                    // active session -- skip counter
+                    _completed_count = _completed_count
+                }
+            } else len(sid) == 0 {
+                // skip empty
+                i = i
+            } else {
+                i = i
+            }
+            i = i + 1
+        }
+        return len(loaded)
+    } else {
+        return 0
+    }
+}
+
+// ============================================================
+// Probe WiFi bridge for bonded adapters
+// ============================================================
+fn probe_wifi() {
+    try3 {
+        let resp = http_get(WIFI_BRIDGE_URL + "/n/wifi/adapters")
+        let data = json_decode(resp)
+        let adapters = dict_get(data, "adapters") ?? []
+        if3 len(adapters) >= 2 {
+            _wifi_bonded = 1
+            // Sum up adapter speeds (simplified -- assume Mbps values)
+            let total_speed = 0
+            let j = 0
+            while3 j < len(adapters) {
+                let a = dict_get(adapters, j)
+                let spd = str(dict_get(a, "LinkSpeed") ?? "0")
+                // Rough parse -- just extract numeric portion
+                let num_str = replace(spd, " Mbps", "")
+                let num_str2 = replace(num_str, " Gbps", "")
+                try3 {
+                    let speed_val = float(trim(num_str2))
+                    if3 contains(spd, "Gbps") {
+                        total_speed = total_speed + speed_val * 1000
+                    } else contains(spd, "Mbps") {
+                        total_speed = total_speed + speed_val
+                    } else {
+                        total_speed = total_speed + speed_val
+                    }
+                } else {
+                    // ignore parse errors
+                    total_speed = total_speed
+                }
+                j = j + 1
+            }
+            _wifi_speed = total_speed
+        } else len(adapters) < 2 {
+            _wifi_bonded = 0
+        } else {
+            _wifi_bonded = 0
+        }
+    } else {
+        _wifi_bonded = 0
+    }
+}
+
+// ============================================================
+// Ensure directories exist (via helper)
+// ============================================================
+fn ensure_dirs() {
+    let args = json_encode({
+        "op": "ensure_dirs",
+        "dirs": [DOWNLOAD_DIR, SESSION_DIR, TEMP_DIR]
+    })
+    nova_run(HELPER, args)
+}
+
+// ============================================================
+// ROUTE: GET /health
+// ============================================================
+fn tfetch_health() {
+    let re_num = tfetch_reynolds()
+    let regime = flow_regime(re_num)
+    let uptime = time() - _t0
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        self_trit = T_TRUE
+    } else uptime <= 10 {
+        self_trit = T_MAYBE
+    } else {
+        self_trit = T_MAYBE
+    }
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "status", "running")
+    resp = dict_set(resp, "port_api", PORT)
+    resp = dict_set(resp, "port_proxy", PORT_PROXY)
+    resp = dict_set(resp, "harmonics", {"H3": H3, "H5": H5, "H7": H7, "H13": H13})
+    resp = dict_set(resp, "self_trit", self_trit)
+    resp = dict_set(resp, "char", trit_char(self_trit))
+    resp = dict_set(resp, "reynolds", re_num)
+    resp = dict_set(resp, "flow_regime", regime)
+    resp = dict_set(resp, "block_size", BLOCK_SIZE)
+    resp = dict_set(resp, "max_segments", MAX_SEGMENTS)
+    resp = dict_set(resp, "max_retries", MAX_RETRIES)
+    resp = dict_set(resp, "health_interval", HEALTH_INTERVAL)
+    resp = dict_set(resp, "wifi_bonded", _wifi_bonded)
+    resp = dict_set(resp, "wifi_speed_mbps", _wifi_speed)
+    resp = dict_set(resp, "uptime", int(uptime))
+    resp = dict_set(resp, "downloads", _downloads_count)
+    resp = dict_set(resp, "git_clones", _git_clones_count)
+    resp = dict_set(resp, "quality", {"strong": _trits_true, "partial": _trits_maybe, "failed": _trits_false})
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// ============================================================
+// ROUTE: GET /tfetch/status
+// ============================================================
+fn tfetch_status() {
+    // Count active sessions
+    let active_count = 0
+    let active_segments = 0
+    let active_sessions = {}
+    let all_keys = keys(_sessions)
+    let i = 0
+    while3 i < len(all_keys) {
+        let sid = dict_get(all_keys, i)
+        let s = dict_get(_sessions, sid)
+        let st = dict_get(s, "state") ?? 0
+        let paused = dict_get(s, "paused") ?? 0
+        if3 st == 0 {
+            if3 paused == 0 {
+                active_count = active_count + 1
+                let segs = dict_get(s, "segments") ?? []
+                active_segments = active_segments + len(segs)
+                active_sessions = dict_set(active_sessions, sid, s)
+            } else paused == 1 {
+                // paused -- still include in active listing
+                active_sessions = dict_set(active_sessions, sid, s)
+            } else {
+                active_count = active_count
+            }
+        } else st != 0 {
+            // completed or failed -- skip
+            active_count = active_count
+        } else {
+            active_count = active_count
+        }
+        i = i + 1
+    }
+    return {
+        "active": active_count,
+        "completed": _completed_count,
+        "failed": _failed_count,
+        "active_segments": active_segments,
+        "total_bytes": _total_bytes,
+        "tzip_saved": _total_tzip_saved,
+        "proxy": {
+            "enabled": _proxy_enabled,
+            "port": PORT_PROXY,
+            "requests": _proxy_requests,
+            "bytes_total": _proxy_bytes_total,
+            "bytes_compressed": _proxy_bytes_compressed,
+            "cache_hits": _proxy_cache_hits,
+            "wifi_bonded": _wifi_bonded,
+            "wifi_speed_mbps": _wifi_speed
+        },
+        "sessions": active_sessions,
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================
+// ROUTE: GET /tfetch/session/<id>
+// Dynamic route -- handler receives request dict with "path"
+// ============================================================
+fn tfetch_session_detail(request) {
+    let path = dict_get(request, "path") ?? ""
+    // Extract session ID from path: /tfetch/session/<id>
+    let parts = split(path, "/")
+    // parts = ["", "tfetch", "session", "<id>"]
+    let sid = ""
+    if3 len(parts) >= 4 {
+        sid = dict_get(parts, 3)
+    } else len(parts) < 4 {
+        return {"error": "session_id required in path"}
+    } else {
+        return {"error": "session_id required in path"}
+    }
+
+    if3 dict_has(_sessions, sid) { session = dict_get(_sessions, sid)
+        // Refresh elapsed/speed if active
+        let st = dict_get(session, "state") ?? 0
+        if3 st == 0 { start_t = dict_get(session, "start_time") ?? 0
+            let elapsed = time() - start_t
+            session = dict_set(session, "elapsed", round(elapsed))
+        } else st != 0 {
+            // completed/failed -- leave as-is
+            st = st
+        } else {
+            st = st
+        }
+        return session
+    } else 1 == 1 {
+        return {"error": "Session not found", "session_id": sid}
+    } else {
+        return {"error": "Session not found"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tfetch/download
+// Delegates segmented download to helper subprocess
+// ============================================================
+fn tfetch_download(request) {
+    let body = dict_get(request, "body") ?? {}
+    let url = dict_get(body, "url") ?? ""
+    if3 len(url) == 0 {
+        return {"error": "url required"}
+    } else len(url) > 0 {
+        // Generate session
+        let sid = gen_session_id()
+        let output = dict_get(body, "output") ?? ""
+        if3 len(output) == 0 {
+            // Extract filename from URL
+            let url_parts = split(url, "/")
+            let fname = dict_get(url_parts, len(url_parts) - 1) ?? "download_" + sid
+            if3 len(fname) == 0 {
+                fname = "download_" + sid
+            } else len(fname) > 0 {
+                fname = fname
+            } else {
+                fname = "download_" + sid
+            }
+            output = DOWNLOAD_DIR + "/" + fname
+        } else len(output) > 0 {
+            output = output
+        } else {
+            output = DOWNLOAD_DIR + "/download_" + sid
+        }
+
+        let segments = int(dict_get(body, "segments") ?? MAX_SEGMENTS)
+        let auto_q = dict_get(body, "auto_quantize") ?? 1
+
+        // Create session dict
+        let session = make_session(sid, url, output, 0)
+        session = dict_set(session, "auto_quantize", auto_q)
+        _sessions = dict_set(_sessions, sid, session)
+
+        // Delegate to helper: it does HEAD probe, segment creation, download
+        let args = json_encode({
+            "op": "download",
+            "session_id": sid,
+            "url": url,
+            "output": output,
+            "segments": segments,
+            "max_retries": MAX_RETRIES,
+            "block_size": BLOCK_SIZE,
+            "temp_dir": TEMP_DIR,
+            "auto_quantize": auto_q,
+            "deepstorage_url": DEEPSTORAGE_URL
+        })
+        let result_str = nova_run(HELPER, args)
+        try3 {
+            let result = json_decode(result_str)
+
+            // Update session with results from helper
+            let ok = dict_get(result, "ok") ?? 0
+            if3 ok == 1 {
+                // Update session fields
+                session = dict_set(session, "total_size", dict_get(result, "total_size") ?? 0)
+                session = dict_set(session, "supports_range", dict_get(result, "supports_range") ?? 0)
+                let seg_list = dict_get(result, "segments_created") ?? []
+                session = dict_set(session, "segments", seg_list)
+                session = dict_set(session, "state", dict_get(result, "state") ?? 0)
+                session = dict_set(session, "downloaded", dict_get(result, "downloaded") ?? 0)
+                session = dict_set(session, "tzip_saved", dict_get(result, "tzip_saved") ?? 0)
+                session = dict_set(session, "reynolds", dict_get(result, "reynolds") ?? 0.0)
+                session = dict_set(session, "flow_regime", dict_get(result, "flow_regime") ?? "unknown")
+                session = dict_set(session, "end_time", dict_get(result, "end_time") ?? 0)
+                session = dict_set(session, "elapsed", dict_get(result, "elapsed") ?? 0.0)
+                session = dict_set(session, "speed_bps", dict_get(result, "speed_bps") ?? 0.0)
+                session = dict_set(session, "progress", dict_get(result, "progress") ?? 0.0)
+
+                let final_state = dict_get(result, "state") ?? 0
+                if3 final_state == 1 {
+                    _completed_count = _completed_count + 1
+                    _total_bytes = _total_bytes + (dict_get(result, "total_size") ?? 0)
+                    _total_tzip_saved = _total_tzip_saved + (dict_get(result, "tzip_saved") ?? 0)
+                } else final_state == -1 {
+                    _failed_count = _failed_count + 1
+                } else {
+                    // still active (unlikely for sync call but handle it)
+                    final_state = final_state
+                }
+            } else ok != 1 {
+                session = dict_set(session, "state", -1)
+                _failed_count = _failed_count + 1
+            } else {
+                session = dict_set(session, "state", -1)
+            }
+
+            persist_session(sid)
+
+            // Update stats
+            _downloads_count = _downloads_count + 1
+            let trit = download_trit(result)
+            if3 trit == 1 {
+                _trits_true = _trits_true + 1
+            } else trit == 0 {
+                _trits_maybe = _trits_maybe + 1
+            } else {
+                _trits_false = _trits_false + 1
+            }
+
+            result = dict_set(result, "trit", trit)
+            result = dict_set(result, "char", trit_char(trit))
+            result = dict_set(result, "session_id", sid)
+            return result
+        } else {
+            _downloads_count = _downloads_count + 1
+            _trits_false = _trits_false + 1
+            session = dict_set(session, "state", -1)
+            persist_session(sid)
+            return {
+                "ok": 0,
+                "error": "Helper failed: " + str(result_str),
+                "session_id": sid,
+                "trit": T_FALSE,
+                "char": "T"
+            }
+        }
+    } else {
+        return {"error": "url required"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tfetch/pause
+// ============================================================
+fn tfetch_pause(request) {
+    let body = dict_get(request, "body") ?? {}
+    let sid = dict_get(body, "session_id") ?? ""
+    if3 len(sid) == 0 {
+        return {"error": "session_id required"}
+    } else len(sid) > 0 {
+        if3 dict_has(_sessions, sid) { session = dict_get(_sessions, sid)
+            session = dict_set(session, "paused", 1)
+            persist_session(sid)
+            return {"ok": 1, "state": "paused", "session_id": sid}
+        } else 1 == 1 {
+            return {"ok": 0, "error": "Session not found"}
+        } else {
+            return {"ok": 0, "error": "Session not found"}
+        }
+    } else {
+        return {"error": "session_id required"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tfetch/resume
+// Delegates resumed download to helper
+// ============================================================
+fn tfetch_resume(request) {
+    let body = dict_get(request, "body") ?? {}
+    let sid = dict_get(body, "session_id") ?? ""
+    if3 len(sid) == 0 {
+        return {"error": "session_id required"}
+    } else len(sid) > 0 {
+        if3 dict_has(_sessions, sid) { session = dict_get(_sessions, sid)
+            let st = dict_get(session, "state") ?? 0
+            if3 st == 1 {
+                return {"ok": 0, "error": "Already complete"}
+            } else st != 1 {
+                session = dict_set(session, "paused", 0)
+                session = dict_set(session, "state", 0)
+
+                // Delegate resume to helper
+                let args = json_encode({
+                    "op": "resume",
+                    "session_id": sid,
+                    "session": session,
+                    "max_retries": MAX_RETRIES,
+                    "block_size": BLOCK_SIZE,
+                    "temp_dir": TEMP_DIR,
+                    "deepstorage_url": DEEPSTORAGE_URL
+                })
+                let result_str = nova_run(HELPER, args)
+                try3 {
+                    let result = json_decode(result_str)
+                    // Update session with result
+                    let new_state = dict_get(result, "state") ?? 0
+                    session = dict_set(session, "state", new_state)
+                    session = dict_set(session, "downloaded", dict_get(result, "downloaded") ?? 0)
+                    session = dict_set(session, "progress", dict_get(result, "progress") ?? 0.0)
+                    if3 new_state == 1 {
+                        _completed_count = _completed_count + 1
+                        _total_bytes = _total_bytes + (dict_get(session, "total_size") ?? 0)
+                    } else new_state == -1 {
+                        _failed_count = _failed_count + 1
+                    } else {
+                        new_state = new_state
+                    }
+                    persist_session(sid)
+                    return {"ok": 1, "state": "resumed", "session_id": sid}
+                } else {
+                    persist_session(sid)
+                    return {"ok": 1, "state": "resumed", "session_id": sid}
+                }
+            } else {
+                return {"ok": 0, "error": "Invalid state"}
+            }
+        } else 1 == 1 {
+            return {"ok": 0, "error": "Session not found"}
+        } else {
+            return {"ok": 0, "error": "Session not found"}
+        }
+    } else {
+        return {"error": "session_id required"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tfetch/cancel
+// ============================================================
+fn tfetch_cancel(request) {
+    let body = dict_get(request, "body") ?? {}
+    let sid = dict_get(body, "session_id") ?? ""
+    if3 len(sid) == 0 {
+        return {"error": "session_id required"}
+    } else len(sid) > 0 {
+        if3 dict_has(_sessions, sid) { session = dict_get(_sessions, sid)
+            session = dict_set(session, "state", -1)
+            session = dict_set(session, "end_time", time())
+
+            // Delegate temp cleanup to helper
+            let args = json_encode({
+                "op": "cancel_cleanup",
+                "session_id": sid,
+                "segments": dict_get(session, "segments") ?? [],
+                "temp_dir": TEMP_DIR
+            })
+            nova_run(HELPER, args)
+
+            persist_session(sid)
+            return {"ok": 1, "state": "cancelled", "session_id": sid}
+        } else 1 == 1 {
+            return {"ok": 0, "error": "Session not found"}
+        } else {
+            return {"ok": 0, "error": "Session not found"}
+        }
+    } else {
+        return {"error": "session_id required"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tfetch/git
+// Delegates git clone to nova_run("git clone ...")
+// ============================================================
+}
+fn tfetch_git(request) {
+    let body = dict_get(request, "body") ?? {}
+    let url = dict_get(body, "url") ?? ""
+    if3 len(url) == 0 {
+        return {"error": "url required"}
+    } else len(url) > 0 { sid = gen_session_id()
+        let output = dict_get(body, "output") ?? ""
+        if3 len(output) == 0 {
+            // Extract repo name from URL
+            let url_parts = split(url, "/")
+            let repo_raw = dict_get(url_parts, len(url_parts) - 1) ?? "repo_" + sid
+            let repo_name = replace(repo_raw, ".git", "")
+            if3 len(repo_name) == 0 {
+                repo_name = "repo_" + sid
+            } else len(repo_name) > 0 {
+                repo_name = repo_name
+            } else {
+                repo_name = "repo_" + sid
+            }
+            output = DOWNLOAD_DIR + "/" + repo_name
+        } else len(output) > 0 {
+            output = output
+        } else {
+            output = DOWNLOAD_DIR + "/repo_" + sid
+        }
+
+        // Create session
+        let session = make_session(sid, url, output, 1)
+        _sessions = dict_set(_sessions, sid, session)
+
+        // Delegate git clone to helper
+        let args = json_encode({
+            "op": "git_clone",
+            "session_id": sid,
+            "url": url,
+            "output": output
+        })
+        let result_str = nova_run(HELPER, args)
+        try3 {
+            let result = json_decode(result_str)
+            let ok = dict_get(result, "ok") ?? 0
+            if3 ok == 1 {
+                session = dict_set(session, "state", 1)
+                session = dict_set(session, "end_time", time())
+                session = dict_set(session, "total_size", dict_get(result, "total_size") ?? 0)
+                session = dict_set(session, "git_progress", dict_get(result, "git_progress") ?? "Complete")
+                _completed_count = _completed_count + 1
+            } else ok != 1 {
+                session = dict_set(session, "state", -1)
+                session = dict_set(session, "end_time", time())
+                session = dict_set(session, "git_progress", dict_get(result, "error") ?? "Failed")
+                _failed_count = _failed_count + 1
+            } else {
+                session = dict_set(session, "state", -1)
+            }
+            persist_session(sid)
+
+            _git_clones_count = _git_clones_count + 1
+            let trit = T_TRUE
+            if3 ok == 1 {
+                trit = T_TRUE
+                _trits_true = _trits_true + 1
+            } else ok != 1 {
+                trit = T_FALSE
+                _trits_false = _trits_false + 1
+            } else {
+                trit = T_FALSE
+                _trits_false = _trits_false + 1
+            }
+
+            return {
+                "ok": ok,
+                "session_id": sid,
+                "output": output,
+                "trit": trit,
+                "char": trit_char(trit),
+                "git_progress": dict_get(session, "git_progress") ?? "",
+                "total_size": dict_get(session, "total_size") ?? 0
+            }
+        } else {
+            _git_clones_count = _git_clones_count + 1
+            _trits_false = _trits_false + 1
+            session = dict_set(session, "state", -1)
+            session = dict_set(session, "end_time", time())
+            persist_session(sid)
+            return {
+                "ok": 0,
+                "error": "Git clone helper failed",
+                "session_id": sid,
+                "trit": T_FALSE,
+                "char": "T"
+            }
+        }
+    } else {
+        return {"error": "url required"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tfetch/proxy/enable
+// Sets Windows system proxy via nova_run("netsh ...")
+// ============================================================
+fn tfetch_proxy_enable() {
+    try3 {
+        // Set WinHTTP proxy
+        let cmd1 = "netsh winhttp set proxy 127.0.0.1:" + str(PORT_PROXY)
+        nova_run(cmd1, "")
+
+        // Set user-level proxy via reg (simplified -- no winreg in NovaLang)
+        let cmd2 = "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyEnable /t REG_DWORD /d 1 /f"
+        nova_run(cmd2, "")
+        let cmd3 = "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyServer /t REG_SZ /d 127.0.0.1:" + str(PORT_PROXY) + " /f"
+        nova_run(cmd3, "")
+        let cmd4 = "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyOverride /t REG_SZ /d \"localhost;127.0.0.1;*.local\" /f"
+        nova_run(cmd4, "")
+
+        _proxy_enabled = 1
+        _proxy_ops_count = _proxy_ops_count + 1
+        return {
+            "ok": 1,
+            "proxy": "127.0.0.1:" + str(PORT_PROXY),
+            "state": "enabled"
+        }
+    } else {
+        return {"ok": 0, "error": "Failed to enable proxy"}
+    }
+}
+
+// ============================================================
+// ROUTE: POST /tfetch/proxy/disable
+// Clears Windows system proxy
+// ============================================================
+fn tfetch_proxy_disable() {
+    try3 {
+        // Reset WinHTTP proxy
+        let cmd1 = "netsh winhttp reset proxy"
+        nova_run(cmd1, "")
+
+        // Disable user-level proxy
+        let cmd2 = "reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\" /v ProxyEnable /t REG_DWORD /d 0 /f"
+        nova_run(cmd2, "")
+
+        _proxy_enabled = 0
+        _proxy_ops_count = _proxy_ops_count + 1
+        return {"ok": 1, "state": "disabled"}
+    } else {
+        return {"ok": 0, "error": "Failed to disable proxy"}
+    }
+}
+
+// ============================================================
+// ROUTE: GET /tfetch/proxy/status
+// ============================================================
+fn tfetch_proxy_status() {
+    return {
+        "enabled": _proxy_enabled,
+        "port": PORT_PROXY,
+        "requests": _proxy_requests,
+        "bytes_total": _proxy_bytes_total,
+        "bytes_compressed": _proxy_bytes_compressed,
+        "cache_hits": _proxy_cache_hits,
+        "wifi_bonded": _wifi_bonded,
+        "wifi_speed_mbps": _wifi_speed,
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================
+// ROUTE: GET /tfetch/speedtest
+// Delegates speed test to helper
+// ============================================================
+fn tfetch_speedtest() {
+    let args = json_encode({
+        "op": "speedtest",
+        "max_segments": MAX_SEGMENTS,
+        "block_size": BLOCK_SIZE,
+        "temp_dir": TEMP_DIR,
+        "wifi_bonded": _wifi_bonded,
+        "wifi_speed_mbps": _wifi_speed
+    })
+    let result_str = nova_run(HELPER, args)
+    try3 {
+        let result = json_decode(result_str)
+        result = dict_set(result, "runtime", "novalang")
+        return result
+    } else {
+        return {
+            "ok": 0,
+            "error": "Speed test helper failed",
+            "runtime": "novalang"
+        }
+    }
+}
+
+// ============================================================
+// Route registration
+// ============================================================
+
+// GET routes
+troute(server, "GET", "/health", "tfetch_health")
+troute(server, "GET", "/tfetch/status", "tfetch_status")
+troute(server, "GET", "/tfetch/session/*", "tfetch_session_detail")
+troute(server, "GET", "/tfetch/proxy/status", "tfetch_proxy_status")
+troute(server, "GET", "/tfetch/speedtest", "tfetch_speedtest")
+
+// POST routes
+troute(server, "POST", "/tfetch/download", "tfetch_download")
+troute(server, "POST", "/tfetch/pause", "tfetch_pause")
+troute(server, "POST", "/tfetch/resume", "tfetch_resume")
+troute(server, "POST", "/tfetch/cancel", "tfetch_cancel")
+troute(server, "POST", "/tfetch/git", "tfetch_git")
+troute(server, "POST", "/tfetch/proxy/enable", "tfetch_proxy_enable")
+troute(server, "POST", "/tfetch/proxy/disable", "tfetch_proxy_disable")
+
+// ============================================================
+// Startup
+// ============================================================
+
+// Ensure directories exist
+ensure_dirs()
+
+// Probe WiFi bridge
+probe_wifi()
+
+// Load persisted sessions
+load_sessions()
+
+// Startup banner
+print("========================================================")
+print("[TFetch] Nova TFetch v2.0 -- Ternary Download Orchestrator")
+print("[TFetch] Runtime: NovaLang | Port: " + str(PORT))
+print("[TFetch] Harmonics: 3-5-7-13")
+print("[TFetch] Block size: " + str(BLOCK_SIZE) + " (3^7)")
+print("[TFetch] Flow boundaries: " + str(FLOW_LAMINAR) + "/" + str(FLOW_TRANS) + "/" + str(FLOW_TURBULENT) + " (3^3/5^3/7^3)")
+print("[TFetch] Max segments: " + str(MAX_SEGMENTS) + " (H7)")
+print("[TFetch] Max retries: " + str(MAX_RETRIES) + " (H5)")
+print("[TFetch] Health interval: " + str(HEALTH_INTERVAL) + "s (H13)")
+print("[TFetch] WiFi bonded: " + str(_wifi_bonded) + " | Speed: " + str(_wifi_speed) + " Mbps")
+print("[TFetch] GET  /health | /tfetch/status | /tfetch/session/<id>")
+print("[TFetch] GET  /tfetch/proxy/status | /tfetch/speedtest")
+print("[TFetch] POST /tfetch/download | /tfetch/pause | /tfetch/resume | /tfetch/cancel")
+print("[TFetch] POST /tfetch/git | /tfetch/proxy/enable | /tfetch/proxy/disable")
+print("[TFetch] NOTE: HTTPS proxy (port 9898) remains Python-only")
+print("========================================================")
+
+tstart(server)

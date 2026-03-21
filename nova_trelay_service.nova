@@ -1,0 +1,239 @@
+// Nova TRelay Service v1.0 - Output Relay Micro-Tool (NovaLang)
+// Port 9985: Forwards output messages to orchestrator /nova/output
+// Ternary: +1 = relayed, 0 = filtered/skipped, -1 = relay failed
+//
+// N-S Mapping:
+//   message_flow = velocity_field
+//   rate_limit   = viscosity (laminar flow control)
+//   relay_success = +1 (downstream, fully transferred)
+//   filtered     =  0 (neutral, held back by viscosity)
+//   relay_error  = -1 (turbulent, upstream rejected)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9985
+let server = tserve(PORT, "TRelay v1.0 - Output Relay Micro-Tool")
+
+// -- 3-5-7-13 Harmonic Constants --
+
+// -- Orchestrator target --
+let ORCH_URL = "http://127.0.0.1:9999/nova/output"
+
+// -- Filter constants --
+let MIN_TEXT_LEN = 10
+let MAX_TEXT_LEN = 4000
+let RATE_LIMIT = 0.05
+
+// -- Global state --
+let stat_relayed = 0
+let stat_filtered = 0
+let stat_errors = 0
+let start_time = time()
+let last_relay_time = 0.0
+let recent_msgs = []
+
+// -- Relay core: forward one message to orchestrator --
+fn do_relay(text, label, level) {
+    let now = time()
+
+    // Rate limit check
+    let elapsed = now - last_relay_time
+    if3 elapsed < RATE_LIMIT {
+        stat_filtered = stat_filtered + 1
+        return 0
+    }
+
+    // Length filter: skip trivially short messages
+    let trimmed = strip(text)
+    let tlen = len(trimmed)
+    if3 tlen < MIN_TEXT_LEN {
+        stat_filtered = stat_filtered + 1
+        return 0
+    }
+
+    // Truncate oversized messages
+    let safe_text = text
+    if3 tlen > MAX_TEXT_LEN {
+        let safe_text = slice(text, 0, MAX_TEXT_LEN)
+    }
+
+    // Build payload and POST to orchestrator
+    let payload = {"text": safe_text, "label": label, "level": level}
+    let result = http_post(ORCH_URL, payload, 2)
+
+    if3 result == TRUE {
+        last_relay_time = now
+        stat_relayed = stat_relayed + 1
+
+        // Append to recent buffer (cap at 100)
+        let preview = slice(safe_text, 0, 200)
+        let entry = {"text": preview, "label": label, "level": level, "ts": str(round(now, 1))}
+        recent_msgs = append(recent_msgs, entry)
+        if3 len(recent_msgs) > 100 {
+            recent_msgs = slice(recent_msgs, len(recent_msgs) - 100, len(recent_msgs))
+        }
+        return 1
+    } else result == MAYBE {
+        stat_errors = stat_errors + 1
+        return -1
+    } else {
+        stat_errors = stat_errors + 1
+        return -1
+    }
+}
+
+// -- trit_char helper: map trit to display char --
+fn relay_char(trit) {
+    if3 trit == 1 {
+        return "1"
+    } else trit == 0 {
+        return "0"
+    } else {
+        return "T"
+    }
+}
+
+// -- Health: ternary health based on success rate --
+fn health() {
+    let total = stat_relayed + stat_filtered + stat_errors
+    let uptime = round(time() - start_time, 1)
+
+    let resp = ns_health_dict("trelay", "1.0", PORT, {})
+    resp = dict_set(resp, "char", relay_char(dict_get(resp, "trit") ?? 1))
+    resp = dict_set(resp, "uptime", uptime)
+    resp = dict_set(resp, "target", ORCH_URL)
+    return resp
+}
+
+// -- Stats: relay counters --
+fn relay_stats() {
+    let uptime = round(time() - start_time, 1)
+    let total = stat_relayed + stat_filtered + stat_errors
+    let success_rate = 0.0
+    if3 total > 0 {
+        let success_rate = round(stat_relayed / max(total, 1), 3)
+    }
+    return {
+        "ok": true,
+        "relayed": stat_relayed,
+        "filtered": stat_filtered,
+        "errors": stat_errors,
+        "total": total,
+        "success_rate": success_rate,
+        "uptime": uptime,
+        "rate_limit_sec": RATE_LIMIT,
+        "min_text_len": MIN_TEXT_LEN,
+        "max_text_len": MAX_TEXT_LEN,
+        "recent_count": len(recent_msgs),
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// -- Recent: last N relayed messages --
+fn relay_recent() {
+    let count = len(recent_msgs)
+    return {
+        "ok": true,
+        "recent": recent_msgs,
+        "count": count,
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// -- POST /relay: forward single message --
+fn relay_single(body) {
+    let text = dict_get(body, "text") ?? ""
+    let label = dict_get(body, "label") ?? "claude-code"
+    let level = dict_get(body, "level") ?? "info"
+
+    let trit = do_relay(text, label, level)
+    let ok = false
+    if3 trit == 1 {
+        let ok = true
+    }
+    return {
+        "ok": ok,
+        "trit": trit,
+        "char": relay_char(trit),
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// -- POST /relay/batch: forward list of messages (max 50) --
+fn relay_batch(body) {
+    let messages = dict_get(body, "messages") ?? []
+    let msg_count = len(messages)
+
+    // Cap batch at 50
+    let batch = messages
+    if3 msg_count > 50 {
+        let batch = slice(messages, 0, 50)
+    }
+
+    let count_relayed = 0
+    let count_filtered = 0
+    let count_errors = 0
+    let idx = 0
+
+    while3 idx < len(batch) {
+        let msg = batch[idx]
+        let text = dict_get(msg, "text") ?? ""
+        let label = dict_get(msg, "label") ?? "claude-code"
+        let level = dict_get(msg, "level") ?? "info"
+        let trit = do_relay(text, label, level)
+
+        if3 trit == 1 { count_relayed = count_relayed + 1
+        } else trit == 0 { count_filtered = count_filtered + 1
+        } else { count_errors = count_errors + 1
+        }
+
+        idx = idx + 1
+    }
+
+    let batch_trit = 1
+    if3 count_relayed < len(batch) {
+        let batch_trit = 0
+    }
+    if3 count_errors > 0 {
+        if3 count_relayed == 0 {
+            let batch_trit = -1
+        }
+    }
+
+    let ok = false
+    if3 count_relayed > 0 {
+        let ok = true
+    }
+
+    return {
+        "ok": ok,
+        "relayed": count_relayed,
+        "filtered": count_filtered,
+        "errors": count_errors,
+        "total": len(batch),
+        "trit": batch_trit,
+        "char": relay_char(batch_trit),
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// -- Register routes --
+troute(server, "GET",  "/health",       "health")
+troute(server, "GET",  "/relay/stats",  "relay_stats")
+troute(server, "GET",  "/relay/recent", "relay_recent")
+troute(server, "POST", "/relay",        "relay_single")
+troute(server, "POST", "/relay/batch",  "relay_batch")
+
+print("[TRelay] Nova TRelay Service v1.0 - Output Relay Micro-Tool")
+print("[TRelay] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TRelay] Target: " + ORCH_URL)
+print("[TRelay] Filters: min=" + str(MIN_TEXT_LEN) + " max=" + str(MAX_TEXT_LEN) + " rate=" + str(RATE_LIMIT) + "s")
+print("[TRelay] Routes: /health, /relay/stats, /relay/recent, /relay, /relay/batch")
+
+tstart(server)

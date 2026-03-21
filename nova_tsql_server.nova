@@ -1,0 +1,163 @@
+// ═══════════════════════════════════════════════════════════════════
+// nova_tsql_server.nova — Ternary SQL Service v1.0.0
+// ═══════════════════════════════════════════════════════════════════
+// HTTP endpoints for the ternary SQL engine.
+// POST /tsql with NovaLang ternary SQL commands.
+// ═══════════════════════════════════════════════════════════════════
+
+import3 "C:\\NovaX\\lib\\nova_stdlib.nova"
+import3 "C:\\NovaX\\lib\\nova_http_utils.nova"
+import3 "C:\\NovaX\\lib\\nova_ns_core.nova"
+import3 "C:\\NovaX\\lib\\nova_tsql.nova"
+
+let PORT = 9968
+let _ns = ns_init_counters()
+
+fn handle_health(req) {
+    return ns_health_dict("nova_tsql", "1.0.0", 9968, _ns)
+}
+
+// POST /tsql — Universal query endpoint
+// Body: {"action": "create|insert|select|update|delete|count|aggregate|tables|schema|drop",
+//        "table": "name", "data": {...}, "where": [...], "fields": [...], ...}
+fn handle_tsql(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let action = dict_get(body, "action") ?? ""
+    let table = dict_get(body, "table") ?? ""
+
+    if3 len(action) == 0 {
+        return json_ok(make_err("missing action"))
+    }
+
+    // CREATE
+    if3 action == "create" {
+        let columns = dict_get(body, "columns") ?? []
+        let result = tsql_create(table, columns)
+        return json_ok(result)
+    }
+
+    // INSERT
+    if3 action == "insert" {
+        let data = dict_get(body, "data") ?? {}
+        let result = tsql_insert(table, data)
+        return json_ok(result)
+    }
+
+    // SELECT
+    if3 action == "select" {
+        let where_conds = dict_get(body, "where") ?? []
+        let fields = dict_get(body, "fields") ?? []
+        let limit = to_num(dict_get(body, "limit") ?? 0)
+        let offset = to_num(dict_get(body, "offset") ?? 0)
+        let result = tsql_select(table, where_conds, fields, limit, offset)
+
+        // Optional ordering
+        let order_field = dict_get(body, "order_by") ?? ""
+        let order_dir = dict_get(body, "order") ?? "asc"
+        if3 len(order_field) > 0 {
+            let rows = dict_get(result, "rows") ?? []
+            let sorted = tsql_order(rows, order_field, order_dir)
+            result = dict_set(result, "rows", sorted)
+        }
+
+        return json_ok(result)
+    }
+
+    // UPDATE
+    if3 action == "update" {
+        let where_conds = dict_get(body, "where") ?? []
+        let updates = dict_get(body, "set") ?? {}
+        let result = tsql_update(table, where_conds, updates)
+        return json_ok(result)
+    }
+
+    // DELETE
+    if3 action == "delete" {
+        let where_conds = dict_get(body, "where") ?? []
+        let hard = to_num(dict_get(body, "hard") ?? 0)
+        let result = tsql_delete(table, where_conds, hard)
+        return json_ok(result)
+    }
+
+    // COUNT
+    if3 action == "count" {
+        let where_conds = dict_get(body, "where") ?? []
+        let result = tsql_count(table, where_conds)
+        return json_ok(result)
+    }
+
+    // AGGREGATE
+    if3 action == "aggregate" {
+        let where_conds = dict_get(body, "where") ?? []
+        let field = dict_get(body, "field") ?? ""
+        let op = dict_get(body, "op") ?? "count"
+        let result = tsql_aggregate(table, where_conds, field, op)
+        return json_ok(result)
+    }
+
+    // TABLES
+    if3 action == "tables" {
+        let result = tsql_tables()
+        return json_ok(result)
+    }
+
+    // SCHEMA
+    if3 action == "schema" {
+        let result = tsql_schema(table)
+        return json_ok(result)
+    }
+
+    // DROP
+    if3 action == "drop" {
+        let result = tsql_drop(table)
+        return json_ok(result)
+    }
+
+    return json_ok(make_err(join(["unknown action: ", action], "")))
+}
+
+// POST /tsql/batch — Run multiple queries in sequence
+fn handle_batch(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let queries = dict_get(body, "queries") ?? []
+    let results = []
+
+    for3 i in range(len(queries)) {
+        let q = queries[i]
+        let action = dict_get(q, "action") ?? ""
+        let table = dict_get(q, "table") ?? ""
+
+        let result = {"trit": -1, "error": "unknown"}
+
+        if3 action == "create" {
+            result = tsql_create(table, dict_get(q, "columns") ?? [])
+        }
+        if3 action == "insert" {
+            result = tsql_insert(table, dict_get(q, "data") ?? {})
+        }
+        if3 action == "select" {
+            result = tsql_select(table, dict_get(q, "where") ?? [], dict_get(q, "fields") ?? [], to_num(dict_get(q, "limit") ?? 0), to_num(dict_get(q, "offset") ?? 0))
+        }
+        if3 action == "count" {
+            result = tsql_count(table, dict_get(q, "where") ?? [])
+        }
+
+        results = append(results, result)
+    }
+
+    return json_ok({"trit": 1, "results": results, "count": len(results)})
+}
+
+// ── Routes ──
+let server = tserve(PORT, "nova_tsql")
+
+troute(server, "GET",  "/health",     "handle_health")
+troute(server, "POST", "/tsql",       "handle_tsql")
+troute(server, "POST", "/tsql/batch", "handle_batch")
+
+print(join(["[tsql_server] Ternary SQL on port ", to_str(PORT)], ""))
+print("[tsql_server] Actions: create, insert, select, update, delete, count, aggregate, tables, schema, drop")
+
+tstart(server)

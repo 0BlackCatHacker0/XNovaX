@@ -1,0 +1,72 @@
+## login_audit.nova — Checks Windows event log for failed login attempts
+## Requires elevated privileges for full results
+
+let max_events = 20
+let result = -1
+
+print("=== NovaX Login Audit ===")
+print("Checking Windows Security Event Log...")
+print("Looking for Event ID 4625 (failed logon)")
+print("")
+
+let ps_cmd = "powershell -NoProfile -Command \""
+let ps_cmd = ps_cmd + "try {"
+let ps_cmd = ps_cmd + "  $events = Get-WinEvent -FilterHashtable @{LogName='Security';ID=4625} -MaxEvents " + to_string(max_events) + " -ErrorAction Stop | "
+let ps_cmd = ps_cmd + "  ForEach-Object { @{time=$_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); msg=$_.Message.Substring(0, [Math]::Min(200, $_.Message.Length))} };"
+let ps_cmd = ps_cmd + "  ConvertTo-Json @($events)"
+let ps_cmd = ps_cmd + "} catch {"
+let ps_cmd = ps_cmd + "  if ($_.Exception.Message -match 'No events') {"
+let ps_cmd = ps_cmd + "    Write-Output '{\"none\": true}'"
+let ps_cmd = ps_cmd + "  } else {"
+let ps_cmd = ps_cmd + "    Write-Output ('{\"error\": \"' + $_.Exception.Message.Replace('\"','') + '\"}')"
+let ps_cmd = ps_cmd + "  }"
+let ps_cmd = ps_cmd + "}\""
+
+try3
+  let r = shell(ps_cmd)
+  let out = trim(r["stdout"])
+
+  if3 contains(out, "\"none\"")
+    print("No failed login attempts found. System is clean.")
+    let result = +1
+  else3 contains(out, "\"error\"")
+    let data = json_decode(out)
+    let err_msg = dict_get(data, "error") ?? "Unknown error"
+    print("Note: " + err_msg)
+    print("(Admin privileges may be needed to read Security log)")
+    let result = 0
+  else3
+    if3 len(out) > 5
+      let events = json_decode(out)
+      print("Found failed login attempts:")
+      print("")
+      let i = 0
+      while3 i < len(events)
+        let evt = events[i]
+        let t = dict_get(evt, "time") ?? "unknown"
+        let m = dict_get(evt, "msg") ?? ""
+        print("[" + to_string(i + 1) + "] " + t)
+        print("    " + m)
+        print("")
+        let i = i + 1
+      end3
+      let result = -1
+    else3
+      print("No events or unable to parse output.")
+      let result = 0
+    end3
+  end3
+
+fail3 err
+  print("ERROR: " + to_string(err))
+  let result = -1
+end3
+
+print("")
+if3 result == 1
+  print("[+1] No failed login attempts found")
+else3 result == 0
+  print("[0] Could not fully audit (may need admin)")
+else3
+  print("[-1] Failed login attempts detected")
+end3

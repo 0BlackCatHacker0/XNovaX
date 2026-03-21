@@ -1,0 +1,1318 @@
+// ============================================================================
+// TScale -- The Port Scale
+// NovaX Port Balancer + Conflict Resolver + Continuity Monitor
+// Port 9986 | Ternary Micro-Tool | 3-5-7-13 Harmonics | NovaLang
+// ============================================================================
+// A scale weighs things to find balance.
+// TScale continuously weighs every NovaX port:
+//   +1 = BALANCED (all ports healthy, no conflicts)
+//    0 = TILTING  (some ports down or conflicting, correcting)
+//   -1 = TIPPED   (critical services unreachable, emergency)
+//
+// TScale boots right after TSpin and stays live forever.
+// Together with TShield and THunter, they form the startup QUAD-GUARDIAN:
+//   TSpin spins, TScale balances, TShield cloaks, THunter hunts.
+//
+// GET:
+//   /health              -- standard ternary health
+//   /scale/status        -- balance state + stats
+//   /scale/weigh         -- trigger full weigh of all ports
+//   /scale/conflicts     -- detect active conflicts + resolution log
+//   /scale/continuity    -- rolling balance window + uptime %
+//   /scale/registry      -- full port registry dump
+//   /scale/reservations  -- active port reservations
+//   /triad               -- triad peer status + event logs
+//
+// POST:
+//   /scale/reserve       -- reserve a port for a service
+//   /scale/free          -- free a port reservation
+//   /scale/resolve       -- resolve conflict on a specific port
+//   /scale/rebalance     -- resolve ALL detected conflicts
+//   /scale/check         -- check if a specific port is available
+//   /scale/kill_port     -- kill everything on a port
+//   /triad/event         -- receive inbound triad event
+// ============================================================================
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let VERSION = "2.0"
+let PORT = 9986
+let SERVICE = "nova-tscale"
+
+// ============================================================================
+// 3-5-7-13 Harmonic Constants
+// ============================================================================
+let BLOCK_SIZE = 2187
+
+// ============================================================================
+// Ternary States
+// ============================================================================
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// Scale States
+let BALANCED = 1
+let TILTING = 0
+let TIPPED = -1
+
+// ============================================================================
+// Reynolds boundaries
+// ============================================================================
+let RE_LAMINAR = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT = 343
+
+// ============================================================================
+// Triad + Quad-Guardian peers
+// ============================================================================
+let TRIAD_PEERS = {
+    "tspin": "http://127.0.0.1:9970",
+    "tshield": "http://127.0.0.1:9987",
+    "thunter": "http://127.0.0.1:9988"
+}
+
+// ============================================================================
+// Thresholds (3-5-7-13 aligned)
+// ============================================================================
+let WEIGH_INTERVAL = 5
+let HEALTH_TIMEOUT = 3
+let CONFLICT_THRESHOLD = 3
+let CONTINUITY_WINDOW = 130
+
+// ============================================================================
+// PORT REGISTRY -- all known NovaX services
+// Every port TScale monitors. Add new services here.
+// ============================================================================
+let PORT_REGISTRY = {
+    "9970": {"name": "TSpin",        "critical": true,  "file": "nova_tspin.py"},
+    "9986": {"name": "TScale",       "critical": true,  "file": "nova_tscale.py"},
+    "9987": {"name": "TShield",      "critical": true,  "file": "nova_tshield.py"},
+    "9988": {"name": "THunter",      "critical": true,  "file": "nova_thunter.py"},
+    "9999": {"name": "Orchestrator", "critical": true,  "file": "core/orchestrator.py"},
+    "9998": {"name": "WebSocket",    "critical": false, "file": "websocket"},
+    "9990": {"name": "Nova Brain",   "critical": true,  "file": "nova_brain"},
+
+    "9878": {"name": "Cloud Router", "critical": false, "file": "nova_cloud_router.py"},
+    "9881": {"name": "Hivemind",     "critical": false, "file": "nova_hivemind.py"},
+    "9882": {"name": "Nexus",        "critical": false, "file": "nexus"},
+    "9884": {"name": "Sentinel",     "critical": false, "file": "sentinel"},
+    "9885": {"name": "Ternary Srv",  "critical": false, "file": "ternary_server"},
+    "9886": {"name": "TBuffer",      "critical": false, "file": "tbuffer"},
+    "9888": {"name": "Closed Loop",  "critical": false, "file": "nova_closed_loop.py"},
+    "9889": {"name": "Max Patch",    "critical": false, "file": "nova_max_patch.py"},
+    "9890": {"name": "TShell/Core",  "critical": false, "file": "nova_tshell.py"},
+    "9891": {"name": "Nova Tools",   "critical": false, "file": "nova_tools.py"},
+    "9892": {"name": "Nova Vault",   "critical": false, "file": "nova_vault.py"},
+    "9893": {"name": "DeepStorage",  "critical": false, "file": "nova_deepstorage.py"},
+    "9894": {"name": "TernaryTools", "critical": false, "file": "nova_ternary_tools.py"},
+    "9895": {"name": "TSpeak",       "critical": false, "file": "nova_tspeak.py"},
+    "9896": {"name": "Nova Cortex",  "critical": false, "file": "nova_cortex.py"},
+    "9897": {"name": "TFetch",       "critical": false, "file": "nova_tfetch.py"},
+    "9899": {"name": "TKill",        "critical": false, "file": "nova_tkill.py"},
+    "9903": {"name": "TSkipTrace",   "critical": false, "file": "nova_skiptrace.py"},
+
+    "9905": {"name": "TSysmon",      "critical": false, "file": "nova_tsysmon.py"},
+    "9906": {"name": "TNet",         "critical": false, "file": "nova_tnet.py"},
+    "9907": {"name": "TSecurity",    "critical": false, "file": "nova_tsecurity.py"},
+    "9908": {"name": "TMedia",       "critical": false, "file": "nova_tmedia.py"},
+    "9909": {"name": "TBuild",       "critical": false, "file": "nova_tbuild.py"},
+    "9910": {"name": "TCron",        "critical": false, "file": "nova_tcron.py"},
+    "9911": {"name": "TQuery",       "critical": false, "file": "nova_tquery.py"},
+
+    "9912": {"name": "TSession",     "critical": false, "file": "nova_tsession_service.nova"},
+    "9913": {"name": "TGit",         "critical": false, "file": "nova_tgit_service.nova"},
+    "9914": {"name": "TDocker",      "critical": false, "file": "nova_tdocker_service.nova"},
+    "9915": {"name": "TTerraform",   "critical": false, "file": "nova_tterraform_service.nova"},
+    "9916": {"name": "TSQLite",      "critical": false, "file": "nova_tsqlite_service.nova"},
+    "9917": {"name": "TRedis",       "critical": false, "file": "nova_tredis_service.nova"},
+    "9918": {"name": "TImage",       "critical": false, "file": "nova_timage_service.nova"},
+    "9919": {"name": "THTTP",        "critical": false, "file": "nova_thttp_service.nova"},
+    "9920": {"name": "TMarkdown",    "critical": false, "file": "nova_tmarkdown_service.nova"},
+    "9921": {"name": "TYAML",        "critical": false, "file": "nova_tyaml_service.nova"},
+
+    "9925": {"name": "BitNet",       "critical": false, "file": "bitnet.cpp"},
+    "9926": {"name": "BitNet Fleet", "critical": false, "file": "nova_bitnet_fleet.py"},
+    "9927": {"name": "TCI Pipeline", "critical": false, "file": "nova_tci_service.nova"},
+    "9928": {"name": "TAlchemy",     "critical": false, "file": "nova_talchemy_service.nova"},
+    "9932": {"name": "TConfig2",     "critical": false, "file": "nova_tconfig_service.nova"},
+    "9933": {"name": "TBenchmark",   "critical": false, "file": "nova_tbenchmark_service.nova"},
+    "9934": {"name": "TTest",        "critical": false, "file": "nova_ttest_service.nova"},
+    "9935": {"name": "TDocs",        "critical": false, "file": "nova_tdocs_service.nova"},
+
+    "8888": {"name": "Static",       "critical": false, "file": "system"}
+}
+
+// All port keys for iteration
+let PORT_KEYS = [
+    "9970", "9986", "9987", "9988", "9999", "9998", "9990",
+    "9878", "9881", "9882", "9884", "9885", "9886", "9888", "9889",
+    "9890", "9891", "9892", "9893", "9894", "9895", "9896", "9897",
+    "9899", "9903",
+    "9905", "9906", "9907", "9908", "9909", "9910", "9911",
+    "9912", "9913", "9914", "9915", "9916", "9917", "9918", "9919",
+    "9920", "9921",
+    "9925", "9926", "9927", "9928", "9932", "9933", "9934", "9935",
+    "8888"
+]
+
+// Triad peer names for iteration
+let TRIAD_NAMES = ["tspin", "tshield", "thunter"]
+
+// ============================================================================
+// STATE
+// ============================================================================
+let _scale_state = BALANCED
+let _weigh_count = 0
+let _conflicts_found = 0
+let _conflicts_resolved = 0
+let _last_weigh = {}
+let _port_weights = {}
+let _reservations = {}
+let _conflict_log = []
+let _continuity = []
+let _t0 = time()
+let _triad_events = []
+let _triad_log = []
+let _last_weigh_time = 0
+
+// Protected ports -- NEVER kill via /scale/kill_port
+let PROTECTED_PORTS = ["9986", "9970", "9999"]
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fn scale_label(s) {
+    if3 s == 1 {
+        return "BALANCED"
+    } maybe {
+        return "TILTING"
+    } else {
+        return "TIPPED"
+    }
+}
+
+fn trit_char(t) {
+    if t == 1 {
+        return "1"
+    }
+    if t == 0 {
+        return "0"
+    }
+    if t == -1 {
+        return "T"
+    }
+    return "?"
+}
+
+fn is_protected_port(port_str) {
+    let i = 0
+    while i < len(PROTECTED_PORTS) {
+        if PROTECTED_PORTS[i] == port_str {
+            return true
+        }
+        let i = i + 1
+    }
+    return false
+}
+
+// ============================================================================
+// TRIAD COMMUNICATION -- fire-and-forget to TSpin + TShield + THunter
+// ============================================================================
+
+fn notify_triad(event_type, data) {
+    // Build payload
+    let payload = {
+        "source": SERVICE,
+        "port": PORT,
+        "event": event_type,
+        "data": data,
+        "time": time(),
+        "weigh": _weigh_count
+    }
+
+    // Fire-and-forget to each peer
+    let i = 0
+    while i < len(TRIAD_NAMES) {
+        let peer_name = TRIAD_NAMES[i]
+        let peer_url = dict_get(TRIAD_PEERS, peer_name, "")
+        if len(peer_url) > 0 {
+            let target_url = peer_url + "/triad/event"
+            // http_post is fire-and-forget in NovaLang
+            try {
+                http_post(target_url, payload)
+            } catch {
+                // ignore -- fire-and-forget
+            }
+        }
+        let i = i + 1
+    }
+
+    // Log outbound event (keep last 50)
+    let log_entry = {
+        "event": event_type,
+        "data": data,
+        "time": time()
+    }
+    _triad_log = append(_triad_log, log_entry)
+    if len(_triad_log) > 50 {
+        _triad_log = slice(_triad_log, len(_triad_log) - 50, len(_triad_log))
+    }
+}
+
+fn get_triad_status() {
+    // Fetch live status from triad peers
+    let peers = {}
+    let i = 0
+    while i < len(TRIAD_NAMES) {
+        let peer_name = TRIAD_NAMES[i]
+        let peer_url = dict_get(TRIAD_PEERS, peer_name, "")
+        let health_url = peer_url + "/health"
+        try {
+            let resp = http_get(health_url)
+            if resp != null {
+                let parsed = json_decode(resp)
+                if parsed != null {
+                    let peers = dict_set(peers, peer_name, parsed)
+                } else { peers = dict_set(peers, peer_name, {"ok": false, "error": "parse_failed"})
+            } else { peers = dict_set(peers, peer_name, {"ok": false, "error": "unreachable"})
+            }
+        } catch {
+            let peers = dict_set(peers, peer_name, {"ok": false, "error": "unreachable"})
+        }
+        let i = i + 1
+    }
+    return peers
+}
+
+// ============================================================================
+// PORT CHECKING
+// ============================================================================
+}
+
+fn check_port_health(port_str) {
+    // HTTP /health check -- returns {ok, response_ms, data}
+    let t0 = time()
+    let url = "http://127.0.0.1:" + port_str + "/health"
+    try {
+        let resp = http_get(url)
+        let elapsed = time() - t0
+        let ms = round(elapsed * 1000, 0)
+        if resp != null {
+            let data = json_decode(resp)
+            if data != null {
+                return {"ok": true, "response_ms": ms, "data": data}
+            }
+            return {"ok": true, "response_ms": ms, "data": {}}
+        }
+        return {"ok": false, "response_ms": ms, "data": null}
+    } catch {
+        let elapsed = time() - t0
+        let ms = round(elapsed * 1000, 0)
+        return {"ok": false, "response_ms": ms, "data": null}
+    }
+}
+
+fn check_port_open(port_str) {
+    // Quick TCP connect check via powershell Test-NetConnection
+    // Returns true if something is LISTENING on the port
+    let cmd = "powershell -NoProfile -Command \"try { $c = New-Object System.Net.Sockets.TcpClient; $c.Connect('127.0.0.1', " + port_str + "); $c.Close(); Write-Output 'OPEN' } catch { Write-Output 'CLOSED' }\""
+    try {
+        let result = nova_run(cmd)
+        let trimmed = trim(result)
+        if contains(trimmed, "OPEN") {
+            return true
+        }
+        return false
+    } catch {
+        return false
+    }
+}
+
+fn find_pid_on_port(port_str) {
+    // Find which PIDs are listening on a given port (Windows)
+    let cmd = "netstat -ano -p tcp"
+    try {
+        let raw = nova_run(cmd)
+        let lines = split(raw, "\n")
+        let pids = []
+        let search_str = ":" + port_str
+        let i = 0
+        while i < len(lines) {
+            let line = trim(lines[i])
+            if contains(line, search_str) {
+                if contains(line, "LISTENING") {
+                    let parts = split(line, " ")
+                    // Get last non-empty part (PID)
+                    let j = len(parts) - 1
+                    while j >= 0 {
+                        let part = trim(parts[j])
+                        if len(part) > 0 {
+                            // Check it looks like a number
+                            let already = false
+                            let k = 0
+                            while k < len(pids) {
+                                if pids[k] == part {
+                                    let already = true
+                                }
+                                let k = k + 1
+                            }
+                            if already == false {
+                                pids = append(pids, part)
+                            }
+                            break
+                        }
+                        let j = j - 1
+                    }
+                }
+            }
+            let i = i + 1
+        }
+        return pids
+    } catch {
+        return []
+    }
+}
+
+fn find_all_listeners() {
+    // Get all listening TCP ports and their PIDs
+    // Returns dict of port_str -> [pid_str, ...]
+    let cmd = "netstat -ano -p tcp"
+    try {
+        let raw = nova_run(cmd)
+        let lines = split(raw, "\n")
+        let listeners = {}
+        let i = 0
+        while i < len(lines) {
+            let line = trim(lines[i])
+            if contains(line, "LISTENING") {
+                let parts = split(line, " ")
+                // Find the local address part (second non-empty field)
+                let non_empty = []
+                let j = 0
+                while j < len(parts) {
+                    let part = trim(parts[j])
+                    if len(part) > 0 {
+                        non_empty = append(non_empty, part)
+                    }
+                    let j = j + 1
+                }
+                if len(non_empty) >= 5 {
+                    let addr = non_empty[1]
+                    let pid_str = non_empty[len(non_empty) - 1]
+                    // Extract port from address (e.g., "0.0.0.0:9999" or "[::]:9999")
+                    let colon_parts = split(addr, ":")
+                    let port_part = colon_parts[len(colon_parts) - 1]
+                    let port_part = trim(port_part)
+                    if len(port_part) > 0 {
+                        let existing = dict_get(listeners, port_part, null)
+                        if existing == null {
+                            let existing = []
+                        }
+                        // Check if PID already in list
+                        let already = false
+                        let k = 0
+                        while k < len(existing) {
+                            if existing[k] == pid_str {
+                                let already = true
+                            }
+                            let k = k + 1
+                        }
+                        if already == false {
+                            existing = append(existing, pid_str)
+                        }
+                        let listeners = dict_set(listeners, port_part, existing)
+                    }
+                }
+            }
+            let i = i + 1
+        }
+        return listeners
+    } catch {
+        return {}
+    }
+}
+
+// ============================================================================
+// CONFLICT DETECTION
+// ============================================================================
+
+fn detect_conflicts() {
+    // Find port conflicts: duplicate listeners, wrong service, etc.
+    let conflicts = []
+    let listeners = find_all_listeners()
+
+    let i = 0
+    while i < len(PORT_KEYS) {
+        let port_str = PORT_KEYS[i]
+        // Skip self
+        if port_str != "9986" {
+            let info = dict_get(PORT_REGISTRY, port_str, {})
+            let pids = dict_get(listeners, port_str, [])
+
+            // Conflict: multiple PIDs on same port
+            if len(pids) > 1 {
+                let svc_name = dict_get(info, "name", "unknown")
+                let is_crit = dict_get(info, "critical", false)
+                let conflict = {
+                    "type": "duplicate",
+                    "port": port_str,
+                    "service": svc_name,
+                    "pids": pids,
+                    "critical": is_crit,
+                    "time": time()
+                }
+                conflicts = append(conflicts, conflict)
+                _conflicts_found = _conflicts_found + 1
+            }
+        }
+        let i = i + 1
+    }
+
+    return conflicts
+}
+
+fn resolve_conflict(port_str, keep_pid) {
+    // Resolve a port conflict by killing duplicate listeners
+    // If keep_pid specified, kill all others. Otherwise kill highest PID.
+    let pids = find_pid_on_port(port_str)
+
+    if len(pids) <= 1 {
+        return {"ok": true, "trit": T_TRUE, "msg": "no conflict", "port": port_str}
+    }
+
+    // Decide who to keep
+    let to_kill = []
+    if keep_pid != null {
+        if keep_pid != "" {
+            let j = 0
+            while j < len(pids) {
+                if pids[j] != keep_pid {
+                    to_kill = append(to_kill, pids[j])
+                }
+                let j = j + 1
+            }
+        }
+    }
+
+    // If no keep_pid specified, keep the first (lowest) PID
+    if len(to_kill) == 0 {
+        if len(pids) > 1 {
+            let j = 1
+            while j < len(pids) {
+                to_kill = append(to_kill, pids[j])
+                let j = j + 1
+            }
+        }
+    }
+
+    // Kill the excess PIDs
+    let killed = []
+    let j = 0
+    while j < len(to_kill) {
+        let pid = to_kill[j]
+        try {
+            let cmd = "taskkill /f /pid " + str(pid)
+            nova_run(cmd)
+            killed = append(killed, pid)
+        } catch {
+            // ignore failed kills
+        }
+        let j = j + 1
+    }
+
+    if len(killed) > 0 {
+        _conflicts_resolved = _conflicts_resolved + len(killed)
+        let info = dict_get(PORT_REGISTRY, port_str, {})
+        let svc_name = dict_get(info, "name", "?")
+        let kept_pid = ""
+        if keep_pid != null {
+            if keep_pid != "" {
+                let kept_pid = keep_pid
+            }
+        }
+        if kept_pid == "" {
+            if len(pids) > 0 {
+                let kept_pid = pids[0]
+            }
+        }
+        let log_entry = {
+            "port": port_str,
+            "service": svc_name,
+            "killed_pids": killed,
+            "kept_pid": kept_pid,
+            "time": time()
+        }
+        _conflict_log = append(_conflict_log, log_entry)
+        if len(_conflict_log) > 100 {
+            _conflict_log = slice(_conflict_log, len(_conflict_log) - 100, len(_conflict_log))
+        }
+    }
+
+    let kept = ""
+    if keep_pid != null {
+        if keep_pid != "" {
+            let kept = keep_pid
+        }
+    }
+    if kept == "" {
+        if len(pids) > 0 {
+            let kept = pids[0]
+        }
+    }
+    return {
+        "ok": true, "trit": T_TRUE,
+        "port": port_str, "killed": killed,
+        "kept": kept
+    }
+}
+
+// ============================================================================
+// PORT WEIGHING (the core balance check)
+// ============================================================================
+
+fn weigh_all() {
+    // Weigh every registered port. Returns weight map + balance score.
+    let weights = {}
+    let alive = 0
+    let dead = 0
+    let critical_down = 0
+    let total = len(PORT_KEYS) - 1
+
+    let i = 0
+    while i < len(PORT_KEYS) {
+        let port_str = PORT_KEYS[i]
+        let info = dict_get(PORT_REGISTRY, port_str, {})
+        let svc_name = dict_get(info, "name", "unknown")
+        let is_crit = dict_get(info, "critical", false)
+
+        // Self check -- always BALANCED
+        if port_str == "9986" {
+            let w = {
+                "name": svc_name, "state": T_TRUE,
+                "open": true, "healthy": true,
+                "response_ms": 0, "critical": is_crit
+            }
+            let weights = dict_set(weights, port_str, w)
+            let i = i + 1
+            continue
+        }
+
+        // Check if port is open
+        let is_open = check_port_open(port_str)
+
+        if is_open == true {
+            // Port open -- do HTTP health check
+            let health = check_port_health(port_str)
+            let health_ok = dict_get(health, "ok", false)
+            let health_ms = dict_get(health, "response_ms", 0)
+
+            let state = T_TRUE
+            if health_ok == false {
+                let state = T_MAYBE
+            }
+
+            let w = {
+                "name": svc_name, "state": state,
+                "open": true, "healthy": health_ok,
+                "response_ms": health_ms, "critical": is_crit
+            }
+            let weights = dict_set(weights, port_str, w)
+
+            if health_ok == true {
+                let alive = alive + 1
+            } else { dead = dead + 1
+                if is_crit == true {
+                    let critical_down = critical_down + 1
+        } else {
+            // Port closed -- service is DOWN
+            let w = {
+                "name": svc_name, "state": T_FALSE,
+                "open": false, "healthy": false,
+                "response_ms": -1, "critical": is_crit
+            }
+            let weights = dict_set(weights, port_str, w)
+            let dead = dead + 1
+            if is_crit == true {
+                let critical_down = critical_down + 1
+            }
+        }
+
+        let i = i + 1
+    }
+
+    // Balance ratio: alive / total (excluding self)
+    let balance = 0
+    if total > 0 {
+        let balance = round(alive / total, 3)
+    }
+
+    return {
+        "weights": weights,
+        "alive": alive,
+        "dead": dead,
+        "total": total + 1,
+        "critical_down": critical_down,
+        "balance": balance,
+        "time": time()
+    }
+}
+
+// ============================================================================
+// WEIGH CYCLE (background thread)
+// The balance that keeps the scale level.
+// ============================================================================
+}
+}
+
+fn weigh_cycle() {
+    // Initial warmup delay (7 seconds, after TSpin's 5s)
+    sleep(H7)
+
+    while true {
+        try {
+            _weigh_count = _weigh_count + 1
+            let result = weigh_all()
+
+            _last_weigh = result
+            _port_weights = dict_get(result, "weights", {})
+
+            // Detect + resolve conflicts every 13th weigh
+            let mod_check = _weigh_count % H13
+            if mod_check == 0 {
+                try {
+                    let conflicts = detect_conflicts()
+                    if len(conflicts) > 0 {
+                        let c_idx = 0
+                        while c_idx < len(conflicts) {
+                            let c = conflicts[c_idx]
+                            let c_port = dict_get(c, "port", "0")
+                            resolve_conflict(c_port, null)
+                            let c_idx = c_idx + 1
+                        }
+                        let c_ports = []
+                        let c_idx = 0
+                        while c_idx < len(conflicts) {
+                            c_ports = append(c_ports, dict_get(conflicts[c_idx], "port", "0"))
+                            let c_idx = c_idx + 1
+                        }
+                        notify_triad("conflict_resolved", {
+                            "count": len(conflicts),
+                            "ports": c_ports
+                        })
+                    }
+                } catch {
+                    // ignore conflict detection errors
+                }
+            }
+
+            // Update scale state
+            let prev_state = _scale_state
+            let crit_down = dict_get(result, "critical_down", 0)
+            let balance = dict_get(result, "balance", 0)
+
+            if crit_down > 0 {
+                _scale_state = TIPPED
+            } else {
+                if balance < 0.3 {
+                    _scale_state = TIPPED
+                } else {
+                    if balance < 0.7 {
+                        _scale_state = TILTING
+                    } else { _scale_state = BALANCED
+                    }
+                }
+            }
+
+            // Notify triad on state transitions
+            if _scale_state != prev_state {
+                let from_label = scale_label(prev_state)
+                let to_label = scale_label(_scale_state)
+                notify_triad("state_changed", {
+                    "from": from_label,
+                    "to": to_label,
+                    "balance": balance,
+                    "critical_down": crit_down
+                })
+            }
+            if _scale_state == TIPPED {
+                if crit_down > 0 {
+                    notify_triad("emergency", {
+                        "type": "critical_services_down",
+                        "critical_down": crit_down,
+                        "balance": balance
+                    })
+                }
+            }
+
+            // Track continuity (rolling window)
+            _continuity = append(_continuity, balance)
+            if len(_continuity) > CONTINUITY_WINDOW {
+                _continuity = slice(_continuity, len(_continuity) - CONTINUITY_WINDOW, len(_continuity))
+            }
+
+            // Log to console occasionally
+            let log_check = _weigh_count % H13
+            if _weigh_count <= 3 {
+                let slabel = scale_label(_scale_state)
+                let atotal = dict_get(result, "alive", 0)
+                let ttotal = dict_get(result, "total", 0)
+                print("[TScale] Weigh #" + str(_weigh_count) + ": " + slabel + " balance=" + str(balance) + " alive=" + str(atotal) + "/" + str(ttotal))
+            } else {
+                if log_check == 0 {
+                    let slabel = scale_label(_scale_state)
+                    let atotal = dict_get(result, "alive", 0)
+                    let ttotal = dict_get(result, "total", 0)
+                    print("[TScale] Weigh #" + str(_weigh_count) + ": " + slabel + " balance=" + str(balance) + " alive=" + str(atotal) + "/" + str(ttotal))
+                }
+            }
+
+            _last_weigh_time = time()
+
+        } catch {
+            print("[TScale] Weigh error in cycle #" + str(_weigh_count))
+        }
+
+        sleep(WEIGH_INTERVAL)
+    }
+}
+
+// ============================================================================
+// HTTP HANDLERS -- GET endpoints
+// ============================================================================
+
+fn handle_health(body) {
+    let uptime = round(time() - _t0, 0)
+    let balance = dict_get(_last_weigh, "balance", 0)
+    let alive = dict_get(_last_weigh, "alive", 0)
+    let total = dict_get(_last_weigh, "total", 0)
+    let slabel = scale_label(_scale_state)
+    let schar = trit_char(_scale_state)
+    let resp = ns_health_dict(SERVICE, VERSION, PORT, {})
+    let resp = dict_set(resp, "scale_state", _scale_state)
+    let resp = dict_set(resp, "scale_label", slabel)
+    let resp = dict_set(resp, "self_trit", _scale_state)
+    let resp = dict_set(resp, "char", schar)
+    let resp = dict_set(resp, "weighs", _weigh_count)
+    let resp = dict_set(resp, "balance", balance)
+    let resp = dict_set(resp, "alive", alive)
+    let resp = dict_set(resp, "total", total)
+    let resp = dict_set(resp, "conflicts_found", _conflicts_found)
+    let resp = dict_set(resp, "conflicts_resolved", _conflicts_resolved)
+    let resp = dict_set(resp, "uptime", int(uptime))
+    return resp
+}
+
+fn handle_status(body) {
+    let balance = dict_get(_last_weigh, "balance", 0)
+    let alive = dict_get(_last_weigh, "alive", 0)
+    let dead = dict_get(_last_weigh, "dead", 0)
+    let total = dict_get(_last_weigh, "total", 0)
+    let crit_down = dict_get(_last_weigh, "critical_down", 0)
+    let slabel = scale_label(_scale_state)
+
+    // Calculate avg balance from continuity window
+    let avg_balance = 0
+    if len(_continuity) > 0 {
+        let sum = 0
+        let ci = 0
+        while ci < len(_continuity) {
+            let sum = sum + _continuity[ci]
+            let ci = ci + 1
+        }
+        let avg_balance = round(sum / len(_continuity), 3)
+    }
+
+    return {
+        "scale_state": slabel, "trit": _scale_state,
+        "weighs": _weigh_count,
+        "balance": balance,
+        "alive": alive,
+        "dead": dead,
+        "total": total,
+        "critical_down": crit_down,
+        "conflicts_found": _conflicts_found,
+        "conflicts_resolved": _conflicts_resolved,
+        "avg_balance": avg_balance,
+        "continuity_samples": len(_continuity),
+        "reservations": len(_reservations)
+    }
+}
+
+fn handle_weigh(body) {
+    // Full weigh -- returns every port's weight
+    let result = weigh_all()
+    _last_weigh = result
+    _port_weights = dict_get(result, "weights", {})
+    let weights = dict_get(result, "weights", {})
+    let balance = dict_get(result, "balance", 0)
+    let alive = dict_get(result, "alive", 0)
+    let dead = dict_get(result, "dead", 0)
+    let total = dict_get(result, "total", 0)
+    let crit_down = dict_get(result, "critical_down", 0)
+
+    return {
+        "ok": true, "trit": _scale_state,
+        "balance": balance,
+        "alive": alive, "dead": dead,
+        "total": total,
+        "critical_down": crit_down,
+        "weights": weights
+    }
+}
+
+fn handle_conflicts(body) {
+    let conflicts = detect_conflicts()
+    // Get recent resolution log (last 20)
+    let recent = []
+    let start_idx = 0
+    if len(_conflict_log) > 20 {
+        let start_idx = len(_conflict_log) - 20
+    }
+    let ci = start_idx
+    while ci < len(_conflict_log) {
+        recent = append(recent, _conflict_log[ci])
+        let ci = ci + 1
+    }
+
+    return {
+        "ok": true, "active": conflicts,
+        "total_found": _conflicts_found,
+        "total_resolved": _conflicts_resolved,
+        "recent_resolutions": recent
+    }
+}
+
+fn handle_continuity(body) {
+    // Calculate avg balance
+    let avg = 0
+    if len(_continuity) > 0 {
+        let sum = 0
+        let ci = 0
+        while ci < len(_continuity) {
+            let sum = sum + _continuity[ci]
+            let ci = ci + 1
+        }
+        let avg = round(sum / len(_continuity), 3)
+    }
+
+    // Calculate uptime %: samples where balance > 0.5
+    let up_samples = 0
+    let ci = 0
+    while ci < len(_continuity) {
+        if _continuity[ci] > 0.5 {
+            let up_samples = up_samples + 1
+        }
+        let ci = ci + 1
+    }
+    let uptime_pct = 0
+    if len(_continuity) > 0 {
+        let uptime_pct = round(up_samples / len(_continuity) * 100, 1)
+    }
+
+    // Get recent samples (last H13 = 13)
+    let recent = []
+    let start_idx = 0
+    if len(_continuity) > H13 {
+        let start_idx = len(_continuity) - H13
+    }
+    let ci = start_idx
+    while ci < len(_continuity) {
+        recent = append(recent, _continuity[ci])
+        let ci = ci + 1
+    }
+
+    return {
+        "ok": true, "trit": _scale_state,
+        "avg_balance": avg,
+        "uptime_pct": uptime_pct,
+        "samples": len(_continuity),
+        "window": CONTINUITY_WINDOW,
+        "recent": recent
+    }
+}
+
+fn handle_registry(body) {
+    return {
+        "ok": true,
+        "ports": PORT_REGISTRY,
+        "count": len(PORT_KEYS)
+    }
+}
+
+fn handle_reservations(body) {
+    return {
+        "ok": true,
+        "reservations": _reservations,
+        "count": len(keys(_reservations))
+    }
+}
+
+fn handle_triad(body) {
+    let peers = get_triad_status()
+
+    // Get recent inbound events (last 20)
+    let inbound = []
+    let start_idx = 0
+    if len(_triad_events) > 20 {
+        let start_idx = len(_triad_events) - 20
+    }
+    let ci = start_idx
+    while ci < len(_triad_events) {
+        inbound = append(inbound, _triad_events[ci])
+        let ci = ci + 1
+    }
+
+    // Get recent outbound events (last 20)
+    let outbound = []
+    let start_idx2 = 0
+    if len(_triad_log) > 20 {
+        let start_idx2 = len(_triad_log) - 20
+    }
+    let ci = start_idx2
+    while ci < len(_triad_log) {
+        outbound = append(outbound, _triad_log[ci])
+        let ci = ci + 1
+    }
+
+    // Check if all peers are healthy
+    let all_healthy = true
+    let pi = 0
+    while pi < len(TRIAD_NAMES) {
+        let peer_name = TRIAD_NAMES[pi]
+        let peer_data = dict_get(peers, peer_name, {})
+        let peer_ok = dict_get(peer_data, "ok", false)
+        if peer_ok == false {
+            let all_healthy = false
+        }
+        let pi = pi + 1
+    }
+
+    let slabel = scale_label(_scale_state)
+    return {
+        "ok": true, "service": SERVICE,
+        "self_state": slabel, "self_trit": _scale_state,
+        "peers": peers,
+        "events_received": len(_triad_events),
+        "events_sent": len(_triad_log),
+        "recent_inbound": inbound,
+        "recent_outbound": outbound,
+        "triad_healthy": all_healthy
+    }
+}
+
+// ============================================================================
+// HTTP HANDLERS -- POST endpoints
+// ============================================================================
+
+fn handle_reserve(body) {
+    // PORT RESERVATION
+    let port_num = str(dict_get(body, "port", "0"))
+    let name = dict_get(body, "name", "unknown")
+    let pid = dict_get(body, "pid", 0)
+
+    // Check if already reserved
+    let existing = dict_get(_reservations, port_num, null)
+    if existing != null {
+        let ex_name = dict_get(existing, "name", "?")
+        return {
+            "ok": false, "trit": T_FALSE,
+            "reason": "port " + port_num + " already reserved by " + ex_name,
+            "existing": existing
+        }
+    }
+
+    // Check if port is actually in use
+    let is_open = check_port_open(port_num)
+    if is_open == true {
+        let pids = find_pid_on_port(port_num)
+        return {
+            "ok": false, "trit": T_MAYBE,
+            "reason": "port " + port_num + " already in use",
+            "pids": pids
+        }
+    }
+
+    // Reserve the port
+    let reservation = {
+        "name": name, "pid": pid,
+        "reserved_at": time()
+    }
+    _reservations = dict_set(_reservations, port_num, reservation)
+
+    return {
+        "ok": true, "trit": T_TRUE,
+        "port": port_num, "name": name,
+        "msg": "port " + port_num + " reserved for " + name
+    }
+}
+
+fn handle_free(body) {
+    let port_num = str(dict_get(body, "port", "0"))
+
+    // Check if reserved
+    let existing = dict_get(_reservations, port_num, null)
+    if existing != null {
+        let freed_name = dict_get(existing, "name", "?")
+        _reservations = dict_del(_reservations, port_num)
+        return {
+            "ok": true, "trit": T_TRUE,
+            "port": port_num, "freed": freed_name
+        }
+    }
+
+    return {
+        "ok": true, "trit": T_MAYBE,
+        "port": port_num, "msg": "was not reserved"
+    }
+}
+
+fn handle_resolve(body) {
+    // Resolve a specific port conflict
+    let port_num = str(dict_get(body, "port", "0"))
+    let keep_pid = dict_get(body, "keep_pid", null)
+
+    if port_num == "0" {
+        return {"ok": false, "trit": T_FALSE, "error": "port required"}
+    }
+
+    let result = resolve_conflict(port_num, keep_pid)
+    return result
+}
+
+fn handle_rebalance(body) {
+    // Resolve ALL detected conflicts
+    let conflicts = detect_conflicts()
+    let resolved = []
+    let ci = 0
+    while ci < len(conflicts) {
+        let c = conflicts[ci]
+        let c_port = dict_get(c, "port", "0")
+        let r = resolve_conflict(c_port, null)
+        resolved = append(resolved, r)
+        let ci = ci + 1
+    }
+
+    let result_trit = T_TRUE
+    if len(conflicts) > 0 {
+        let result_trit = T_MAYBE
+    }
+
+    return {
+        "ok": true, "trit": result_trit,
+        "conflicts_found": len(conflicts),
+        "resolved": resolved
+    }
+}
+
+fn handle_check(body) {
+    // Quick check: is a specific port available?
+    let port_num = str(dict_get(body, "port", "0"))
+    let is_open = check_port_open(port_num)
+    let reserved = dict_get(_reservations, port_num, null)
+    let is_reserved = false
+    if reserved != null {
+        let is_reserved = true
+    }
+    let reg_entry = dict_get(PORT_REGISTRY, port_num, null)
+    let is_registered = false
+    let reg_name = null
+    if reg_entry != null {
+        let is_registered = true
+        let reg_name = dict_get(reg_entry, "name", null)
+    }
+
+    let pids = []
+    if is_open == true {
+        let pids = find_pid_on_port(port_num)
+    }
+
+    let available = true
+    if is_open == true {
+        let available = false
+    }
+    if is_reserved == true {
+        let available = false
+    }
+
+    let check_trit = T_TRUE
+    if is_open == true {
+        let check_trit = T_FALSE
+    } else {
+        if is_reserved == true {
+            let check_trit = T_MAYBE
+        }
+    }
+
+    return {
+        "ok": true,
+        "port": port_num,
+        "available": available,
+        "open": is_open,
+        "reserved": is_reserved,
+        "registered": is_registered,
+        "pids": pids,
+        "registry_name": reg_name,
+        "trit": check_trit
+    }
+}
+
+fn handle_kill_port(body) {
+    // Kill everything on a specific port
+    let port_num = str(dict_get(body, "port", "0"))
+
+    // Check if port is protected
+    if is_protected_port(port_num) {
+        return {
+            "ok": false, "trit": T_FALSE,
+            "error": "port " + port_num + " is protected (infrastructure)"
+        }
+    }
+
+    let pids = find_pid_on_port(port_num)
+    let killed = []
+
+    // De-duplicate PIDs and kill each
+    let seen = []
+    let j = 0
+    while j < len(pids) {
+        let pid = pids[j]
+        let already = false
+        let k = 0
+        while k < len(seen) {
+            if seen[k] == pid {
+                let already = true
+            }
+            let k = k + 1
+        }
+        if already == false {
+            seen = append(seen, pid)
+            try {
+                let cmd = "taskkill /f /pid " + str(pid)
+                nova_run(cmd)
+                killed = append(killed, pid)
+            } catch {
+                // ignore failed kill
+            }
+        }
+        let j = j + 1
+    }
+
+    // Remove any reservation for this port
+    _reservations = dict_del(_reservations, port_num)
+
+    return {
+        "ok": true, "trit": T_TRUE,
+        "port": port_num, "killed_pids": killed
+    }
+}
+
+fn handle_triad_event(body) {
+    // TRIAD INBOUND EVENT
+    let event = dict_get(body, "event", "")
+    let source = dict_get(body, "source", "?")
+
+    // Store the inbound event (keep last 100)
+    _triad_events = append(_triad_events, body)
+    if len(_triad_events) > 100 {
+        _triad_events = slice(_triad_events, len(_triad_events) - 100, len(_triad_events))
+    }
+
+    let response = {"ok": true, "trit": T_TRUE, "received": event}
+
+    if event == "zombie_killed" {
+        // TSpin killed zombies -- trigger immediate reweigh
+        let result = weigh_all()
+        _last_weigh = result
+        _port_weights = dict_get(result, "weights", {})
+        let balance = dict_get(result, "balance", 0)
+        let response = dict_set(response, "reweigh_triggered", true)
+        let response = dict_set(response, "balance", balance)
+    }
+
+    if event == "attack_reflected" {
+        // TShield detected threat -- check port stealth
+        let slabel = scale_label(_scale_state)
+        let response = dict_set(response, "port_check_triggered", true)
+        let response = dict_set(response, "scale_state", slabel)
+    }
+
+    if event == "threat_detected" {
+        // TShield detected threat -- check port stealth
+        let slabel = scale_label(_scale_state)
+        let response = dict_set(response, "port_check_triggered", true)
+        let response = dict_set(response, "scale_state", slabel)
+    }
+
+    if event == "emergency" {
+        // Emergency from peer -- immediate conflict scan + resolve
+        let conflicts = detect_conflicts()
+        if len(conflicts) > 0 {
+            let c_idx = 0
+            while c_idx < len(conflicts) {
+                let c = conflicts[c_idx]
+                let c_port = dict_get(c, "port", "0")
+                resolve_conflict(c_port, null)
+                let c_idx = c_idx + 1
+            }
+        }
+        let response = dict_set(response, "emergency_conflicts_resolved", len(conflicts))
+    }
+
+    return response
+}
+
+// ============================================================================
+// ROUTE REGISTRATION
+// ============================================================================
+
+let server = tserve(PORT, "TScale v2.0 - Port Balancer + Conflict Resolver")
+
+// GET routes
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/scale/status", "handle_status")
+troute(server, "GET", "/scale/weigh", "handle_weigh")
+troute(server, "GET", "/scale/conflicts", "handle_conflicts")
+troute(server, "GET", "/scale/continuity", "handle_continuity")
+troute(server, "GET", "/scale/registry", "handle_registry")
+troute(server, "GET", "/scale/reservations", "handle_reservations")
+troute(server, "GET", "/triad", "handle_triad")
+
+// POST routes
+troute(server, "POST", "/scale/reserve", "handle_reserve")
+troute(server, "POST", "/scale/free", "handle_free")
+troute(server, "POST", "/scale/resolve", "handle_resolve")
+troute(server, "POST", "/scale/rebalance", "handle_rebalance")
+troute(server, "POST", "/scale/check", "handle_check")
+troute(server, "POST", "/scale/kill_port", "handle_kill_port")
+troute(server, "POST", "/triad/event", "handle_triad_event")
+
+// ============================================================================
+// STARTUP
+// ============================================================================
+
+print("[TScale] The Port Scale v" + VERSION + " -- Port " + str(PORT))
+print("[TScale] Scale states: +1=BALANCED  0=TILTING  -1=TIPPED")
+print("[TScale] Monitoring " + str(len(PORT_KEYS)) + " ports")
+print("[TScale] Weigh interval: " + str(WEIGH_INTERVAL) + "s | Harmonics: 3-5-7-13")
+print("[TScale] Triad peers: TSpin(:9970) TShield(:9987) THunter(:9988)")
+print("[TScale] GET: /health /scale/status /scale/weigh /scale/conflicts /scale/continuity")
+print("[TScale] GET: /scale/registry /scale/reservations /triad")
+print("[TScale] POST: /scale/reserve /scale/free /scale/resolve /scale/rebalance")
+print("[TScale] POST: /scale/check /scale/kill_port /triad/event")
+print("[TScale] Runtime: NovaLang | The scale is balancing...")
+
+// Register self in reservations
+let _reservations = dict_set(_reservations, "9986", {
+    "name": SERVICE, "pid": 0,
+    "reserved_at": time()
+})
+
+// Background weigh cycle runs lazily on each request (NovaLang has no threading)
+// The weigh_cycle logic is triggered via maybe_weigh() calls in handlers
+
+// Start HTTP server (MUST be last line)
+tstart(server)

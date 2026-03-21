@@ -1,0 +1,1635 @@
+// NovaX TRedis Service v1.0 - Ternary Redis Wrapper (NovaLang)
+// Port 9917: Redis operations through ternary-native micro-tools
+//
+// 7 ternary-native redis tools on 3-5-7-13 harmonic constants:
+//   1. /tredis/get   -- Get key value (GET key)
+//   2. /tredis/set   -- Set key value with optional TTL (SET key value [EX seconds])
+//   3. /tredis/del   -- Delete one or more keys (DEL key1 key2...)
+//   4. /tredis/keys  -- List keys matching pattern (KEYS pattern, default *)
+//   5. /tredis/hash  -- Hash operations (HGET, HSET, HGETALL, HDEL)
+//   6. /tredis/list  -- List operations (LPUSH, RPUSH, LRANGE, LPOP, RPOP, LLEN)
+//   7. /tredis/info  -- Server info (INFO, DBSIZE, PING)
+//
+// N-S Mapping:
+//   data_stream        = velocity_field (data flowing through Redis)
+//   eviction_pressure  = turbulent_energy (memory pressure)
+//   Reynolds(redis)    = data_ops * H5
+//   RE_LAMINAR=27      = low data throughput
+//   RE_TRANSITION=125  = moderate data churn
+//   RE_TURBULENT=343   = heavy data operations
+//
+// Endpoints:
+//   GET  /health                -- Health check (includes redis_alive)
+//   GET  /tredis/service-status -- Full service status with stats
+//   POST /tredis/get            -- Get key value
+//   POST /tredis/set            -- Set key value with optional TTL
+//   POST /tredis/del            -- Delete keys
+//   POST /tredis/keys           -- List keys matching pattern
+//   POST /tredis/hash           -- Hash operations
+//   POST /tredis/list           -- List operations
+//   POST /tredis/info           -- Server info
+
+let PORT = 9917
+let server = tserve(PORT, "TRedis v1.0 - Ternary Redis Wrapper")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE     = 2187
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+let TOOLS_COUNT    = 7
+let VERSION        = "1.0.0"
+let SERVICE_NAME   = "nova-tredis"
+let REDIS_TIMEOUT  = 13
+
+// -- Global Stats --
+let stat_ops         = 0
+let stat_trit_true   = 0
+let stat_trit_maybe  = 0
+let stat_trit_false  = 0
+let stat_t0          = time()
+
+// by_tool counters (one per tool)
+let by_tool_get      = 0
+let by_tool_set      = 0
+let by_tool_del      = 0
+let by_tool_keys     = 0
+let by_tool_hash     = 0
+let by_tool_list     = 0
+let by_tool_info     = 0
+
+// -- N-S flow tracking --
+let _data_ops_count  = 0
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_stat(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    _data_ops_count = _data_ops_count + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "get" {
+        by_tool_get = by_tool_get + 1
+    }
+    if3 tool_name == "set" {
+        by_tool_set = by_tool_set + 1
+    }
+    if3 tool_name == "del" {
+        by_tool_del = by_tool_del + 1
+    }
+    if3 tool_name == "keys" {
+        by_tool_keys = by_tool_keys + 1
+    }
+    if3 tool_name == "hash" {
+        by_tool_hash = by_tool_hash + 1
+    }
+    if3 tool_name == "list" {
+        by_tool_list = by_tool_list + 1
+    }
+    if3 tool_name == "info" {
+        by_tool_info = by_tool_info + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: run a redis-cli command with standard timeout
+// Returns stripped output string
+// ===========================================================================
+fn run_redis(cmd) {
+    let raw = nova_run(cmd, REDIS_TIMEOUT)
+    let output = strip(str(raw))
+    return output
+}
+
+// ===========================================================================
+// HELPER: check if output indicates a redis error
+// ===========================================================================
+fn is_redis_error(output) {
+    let lc = lower(output)
+    if3 contains(lc, "err ") {
+        return true
+    }
+    if3 contains(lc, "error") {
+        return true
+    }
+    if3 contains(lc, "wrongtype") {
+        return true
+    }
+    if3 contains(lc, "could not connect") {
+        return true
+    }
+    if3 contains(lc, "connection refused") {
+        return true
+    }
+    if3 starts_with(lc, "(error)") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: check if redis is alive via PING
+// ===========================================================================
+fn redis_alive() {
+    let cmd = "redis-cli PING 2>&1"
+    let output = run_redis(cmd)
+    let lc = lower(output)
+    if3 contains(lc, "pong") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: sanitize a value for redis-cli shell command
+// Wraps value in double quotes, escapes inner double quotes
+// ===========================================================================
+fn safe_val(v) {
+    let s = str(v)
+    let escaped = replace(s, "\"", "\\\"")
+    return "\"" + escaped + "\""
+}
+
+// ===========================================================================
+// HELPER: parse redis integer reply like "(integer) 5"
+// Returns the integer or -1 on failure
+// ===========================================================================
+fn parse_int_reply(output) {
+    if3 contains(output, "(integer)") {
+        let tmp = replace(output, "(integer) ", "")
+        let cleaned = strip(tmp)
+        return int(cleaned)
+    }
+    // Some redis-cli versions just return the number
+    let trimmed = strip(output)
+    if3 len(trimmed) > 0 {
+        let first_char = slice(trimmed, 0, 1)
+        // Check if it looks numeric (digit or minus)
+        if3 first_char == "0" {
+            return int(trimmed)
+        }
+        if3 first_char == "1" {
+            return int(trimmed)
+        }
+        if3 first_char == "2" {
+            return int(trimmed)
+        }
+        if3 first_char == "3" {
+            return int(trimmed)
+        }
+        if3 first_char == "4" {
+            return int(trimmed)
+        }
+        if3 first_char == "5" {
+            return int(trimmed)
+        }
+        if3 first_char == "6" {
+            return int(trimmed)
+        }
+        if3 first_char == "7" {
+            return int(trimmed)
+        }
+        if3 first_char == "8" {
+            return int(trimmed)
+        }
+        if3 first_char == "9" {
+            return int(trimmed)
+        }
+    }
+    return -1
+}
+
+// ===========================================================================
+// HELPER: check if redis output is nil
+// ===========================================================================
+fn is_nil(output) {
+    let trimmed = strip(output)
+    if3 trimmed == "(nil)" {
+        return true
+    }
+    if3 trimmed == "" {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: check if redis output is empty list
+// ===========================================================================
+fn is_empty_list(output) {
+    let trimmed = strip(output)
+    if3 trimmed == "(empty list or set)" {
+        return true
+    }
+    if3 trimmed == "(empty array)" {
+        return true
+    }
+    if3 len(trimmed) == 0 {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: parse redis list output into a NovaLang list
+// redis-cli outputs numbered lines like:
+//   1) "value1"
+//   2) "value2"
+// or just lines of values
+// ===========================================================================
+fn parse_redis_list(output) {
+    let result = []
+    if3 is_empty_list(output) == true {
+        return result
+    }
+    let lines = split(output, "\n")
+    let i = 0
+    while3 i < len(lines) {
+        let line = strip(dict_get(lines, i, ""))
+        if3 len(line) > 0 {
+            // Strip numbered prefix like "1) "
+            let val = line
+            if3 contains(line, ") ") {
+                let paren_parts = split(line, ") ")
+                // Rejoin everything after first ") "
+                let vp = 1
+                let rejoined = ""
+                while3 vp < len(paren_parts) {
+                    if3 vp > 1 {
+                        rejoined = rejoined + ") "
+                    }
+                    rejoined = rejoined + dict_get(paren_parts, vp, "")
+                    vp = vp + 1
+                }
+                val = rejoined
+            }
+            // Strip surrounding quotes
+            let val_stripped = strip(val)
+            if3 len(val_stripped) >= 2 {
+                let fc = slice(val_stripped, 0, 1)
+                let lc_char = slice(val_stripped, len(val_stripped) - 1, len(val_stripped))
+                if3 fc == "\"" {
+                    if3 lc_char == "\"" {
+                        val_stripped = slice(val_stripped, 1, len(val_stripped) - 1)
+                    }
+                }
+            }
+            result = append(result, val_stripped)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ===========================================================================
+// HELPER: strip surrounding quotes from redis-cli output value
+// ===========================================================================
+fn strip_quotes(val) {
+    let s = strip(val)
+    if3 len(s) >= 2 {
+        let fc = slice(s, 0, 1)
+        let lc_char = slice(s, len(s) - 1, len(s))
+        if3 fc == "\"" {
+            if3 lc_char == "\"" {
+                return slice(s, 1, len(s) - 1)
+            }
+        }
+    }
+    return s
+}
+
+// ===========================================================================
+// TOOL 1: POST /tredis/get
+// Get key value (GET key)
+// Body: {key: "mykey"}
+// Trit: +1=value found, 0=key doesn't exist (nil), -1=error
+// ===========================================================================
+fn handle_get(body) {
+    let key = dict_get(body, "key", "")
+
+    // Key is required
+    if3 len(key) == 0 {
+        record_stat("get", T_FALSE)
+        return {
+            "ok": false,
+            "key": "",
+            "value": "",
+            "error": "key is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let cmd = "redis-cli GET " + safe_val(key) + " 2>&1"
+    let output = run_redis(cmd)
+
+    // Check for error
+    if3 is_redis_error(output) == true {
+        record_stat("get", T_FALSE)
+        return {
+            "ok": false,
+            "key": key,
+            "value": "",
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Check for nil (key doesn't exist)
+    if3 is_nil(output) == true {
+        record_stat("get", T_MAYBE)
+        return {
+            "ok": true,
+            "key": key,
+            "value": "",
+            "exists": false,
+            "note": "key does not exist",
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Value found - strip surrounding quotes
+    let value = strip_quotes(output)
+
+    record_stat("get", T_TRUE)
+    return {
+        "ok": true,
+        "key": key,
+        "value": value,
+        "exists": true,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 2: POST /tredis/set
+// Set key value with optional TTL
+// Body: {key: "mykey", value: "myval", ttl: 0}
+// Trit: +1=OK set, -1=error
+// ===========================================================================
+fn handle_set(body) {
+    let key = dict_get(body, "key", "")
+    let value = dict_get(body, "value", "")
+    let ttl = dict_get(body, "ttl", 0)
+
+    // Key is required
+    if3 len(key) == 0 {
+        record_stat("set", T_FALSE)
+        return {
+            "ok": false,
+            "key": "",
+            "value": "",
+            "error": "key is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Build command
+    let cmd = "redis-cli SET " + safe_val(key) + " " + safe_val(value)
+
+    // Add TTL if specified
+    if3 ttl > 0 {
+        cmd = cmd + " EX " + str(ttl)
+    }
+    cmd = cmd + " 2>&1"
+
+    let output = run_redis(cmd)
+
+    // Check for error
+    if3 is_redis_error(output) == true {
+        record_stat("set", T_FALSE)
+        return {
+            "ok": false,
+            "key": key,
+            "value": value,
+            "ttl": ttl,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Check for OK
+    let lc_output = lower(output)
+    if3 contains(lc_output, "ok") {
+        record_stat("set", T_TRUE)
+        return {
+            "ok": true,
+            "key": key,
+            "value": value,
+            "ttl": ttl,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Unexpected output - treat as maybe
+    record_stat("set", T_FALSE)
+    return {
+        "ok": false,
+        "key": key,
+        "value": value,
+        "ttl": ttl,
+        "output": output,
+        "error": "unexpected response: " + output,
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 3: POST /tredis/del
+// Delete one or more keys
+// Body: {keys: ["key1", "key2"]} or {key: "single_key"}
+// Trit: +1=deleted, 0=none existed, -1=error
+// ===========================================================================
+fn handle_del(body) {
+    let keys_list = dict_get(body, "keys", [])
+    let single_key = dict_get(body, "key", "")
+
+    // Support single key via "key" param
+    if3 len(keys_list) == 0 {
+        if3 len(single_key) > 0 {
+            keys_list = append(keys_list, single_key)
+        }
+    }
+
+    // Keys required
+    if3 len(keys_list) == 0 {
+        record_stat("del", T_FALSE)
+        return {
+            "ok": false,
+            "keys": [],
+            "deleted": 0,
+            "error": "at least one key is required (use 'key' or 'keys')",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Build key list for command
+    let key_args = ""
+    let ki = 0
+    while3 ki < len(keys_list) {
+        let k = dict_get(keys_list, ki, "")
+        if3 ki > 0 {
+            key_args = key_args + " "
+        }
+        key_args = key_args + safe_val(k)
+        ki = ki + 1
+    }
+
+    let cmd = "redis-cli DEL " + key_args + " 2>&1"
+    let output = run_redis(cmd)
+
+    // Check for error
+    if3 is_redis_error(output) == true {
+        record_stat("del", T_FALSE)
+        return {
+            "ok": false,
+            "keys": keys_list,
+            "deleted": 0,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse integer reply for count of deleted keys
+    let deleted = parse_int_reply(output)
+    if3 deleted < 0 {
+        deleted = 0
+    }
+
+    // Trit: +1 if any deleted, 0 if none existed
+    let del_trit = T_TRUE
+    if3 deleted == 0 {
+        del_trit = T_MAYBE
+    }
+
+    record_stat("del", del_trit)
+    return {
+        "ok": true,
+        "keys": keys_list,
+        "deleted": deleted,
+        "requested": len(keys_list),
+        "trit": del_trit,
+        "char": bt_one(del_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 4: POST /tredis/keys
+// List keys matching pattern
+// Body: {pattern: "*"} (default "*")
+// Trit: +1=keys found, 0=no keys match, -1=error
+// ===========================================================================
+fn handle_keys(body) {
+    let pattern = dict_get(body, "pattern", "*")
+
+    if3 len(pattern) == 0 {
+        pattern = "*"
+    }
+
+    let cmd = "redis-cli KEYS " + safe_val(pattern) + " 2>&1"
+    let output = run_redis(cmd)
+
+    // Check for error
+    if3 is_redis_error(output) == true {
+        record_stat("keys", T_FALSE)
+        return {
+            "ok": false,
+            "pattern": pattern,
+            "keys": [],
+            "count": 0,
+            "error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Check for empty list
+    if3 is_empty_list(output) == true {
+        record_stat("keys", T_MAYBE)
+        return {
+            "ok": true,
+            "pattern": pattern,
+            "keys": [],
+            "count": 0,
+            "note": "no keys match pattern",
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse key list
+    let found_keys = parse_redis_list(output)
+
+    // N-S: Reynolds from key count (data_stream = velocity_field)
+    let re = len(found_keys) * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    let keys_trit = T_TRUE
+    if3 len(found_keys) == 0 {
+        keys_trit = T_MAYBE
+    }
+
+    record_stat("keys", keys_trit)
+    return {
+        "ok": true,
+        "pattern": pattern,
+        "keys": found_keys,
+        "count": len(found_keys),
+        "reynolds": re,
+        "regime": regime,
+        "trit": keys_trit,
+        "char": bt_one(keys_trit),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 5: POST /tredis/hash
+// Hash operations: hget, hset, hgetall, hdel
+// Body: {action: "hget"|"hset"|"hgetall"|"hdel", key, field, value}
+// ===========================================================================
+fn handle_hash(body) {
+    let action = dict_get(body, "action", "hget")
+    let key = dict_get(body, "key", "")
+    let field = dict_get(body, "field", "")
+    let value = dict_get(body, "value", "")
+
+    // Key is always required
+    if3 len(key) == 0 {
+        record_stat("hash", T_FALSE)
+        return {
+            "ok": false,
+            "action": action,
+            "key": "",
+            "error": "key is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- HGET --
+    if3 action == "hget" {
+        if3 len(field) == 0 {
+            record_stat("hash", T_FALSE)
+            return {
+                "ok": false,
+                "action": "hget",
+                "key": key,
+                "error": "field is required for hget",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "redis-cli HGET " + safe_val(key) + " " + safe_val(field) + " 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("hash", T_FALSE)
+            return {
+                "ok": false,
+                "action": "hget",
+                "key": key,
+                "field": field,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        if3 is_nil(output) == true {
+            record_stat("hash", T_MAYBE)
+            return {
+                "ok": true,
+                "action": "hget",
+                "key": key,
+                "field": field,
+                "value": "",
+                "exists": false,
+                "note": "field does not exist",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "runtime": "novalang"
+            }
+        }
+
+        let hval = strip_quotes(output)
+        record_stat("hash", T_TRUE)
+        return {
+            "ok": true,
+            "action": "hget",
+            "key": key,
+            "field": field,
+            "value": hval,
+            "exists": true,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- HSET --
+    if3 action == "hset" {
+        if3 len(field) == 0 {
+            record_stat("hash", T_FALSE)
+            return {
+                "ok": false,
+                "action": "hset",
+                "key": key,
+                "error": "field is required for hset",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "redis-cli HSET " + safe_val(key) + " " + safe_val(field) + " " + safe_val(value) + " 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("hash", T_FALSE)
+            return {
+                "ok": false,
+                "action": "hset",
+                "key": key,
+                "field": field,
+                "value": value,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // HSET returns (integer) 1 for new field, 0 for updated
+        let was_new = parse_int_reply(output)
+        let hset_note = "field updated"
+        if3 was_new == 1 {
+            hset_note = "new field created"
+        }
+
+        record_stat("hash", T_TRUE)
+        return {
+            "ok": true,
+            "action": "hset",
+            "key": key,
+            "field": field,
+            "value": value,
+            "new_field": was_new,
+            "note": hset_note,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- HGETALL --
+    if3 action == "hgetall" {
+        let cmd = "redis-cli HGETALL " + safe_val(key) + " 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("hash", T_FALSE)
+            return {
+                "ok": false,
+                "action": "hgetall",
+                "key": key,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        if3 is_empty_list(output) == true {
+            record_stat("hash", T_MAYBE)
+            return {
+                "ok": true,
+                "action": "hgetall",
+                "key": key,
+                "fields": {},
+                "field_count": 0,
+                "note": "hash is empty or does not exist",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Parse alternating field/value lines from HGETALL
+        // redis-cli outputs:
+        //   1) "field1"
+        //   2) "value1"
+        //   3) "field2"
+        //   4) "value2"
+        let raw_items = parse_redis_list(output)
+        let fields = {}
+        let field_count = 0
+        let ri = 0
+        while3 ri < len(raw_items) {
+            let f_name = dict_get(raw_items, ri, "")
+            let f_val_idx = ri + 1
+            let f_val = ""
+            if3 f_val_idx < len(raw_items) {
+                f_val = dict_get(raw_items, f_val_idx, "")
+            }
+            if3 len(f_name) > 0 {
+                dict_set(fields, f_name, f_val)
+                field_count = field_count + 1
+            }
+            ri = ri + 2
+        }
+
+        let hgetall_trit = T_TRUE
+        if3 field_count == 0 {
+            hgetall_trit = T_MAYBE
+        }
+
+        record_stat("hash", hgetall_trit)
+        return {
+            "ok": true,
+            "action": "hgetall",
+            "key": key,
+            "fields": fields,
+            "field_count": field_count,
+            "trit": hgetall_trit,
+            "char": bt_one(hgetall_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- HDEL --
+    if3 action == "hdel" {
+        if3 len(field) == 0 {
+            record_stat("hash", T_FALSE)
+            return {
+                "ok": false,
+                "action": "hdel",
+                "key": key,
+                "error": "field is required for hdel",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "redis-cli HDEL " + safe_val(key) + " " + safe_val(field) + " 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("hash", T_FALSE)
+            return {
+                "ok": false,
+                "action": "hdel",
+                "key": key,
+                "field": field,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // HDEL returns (integer) N for fields removed
+        let removed = parse_int_reply(output)
+        if3 removed < 0 {
+            removed = 0
+        }
+
+        let hdel_trit = T_TRUE
+        if3 removed == 0 {
+            hdel_trit = T_MAYBE
+        }
+
+        record_stat("hash", hdel_trit)
+        return {
+            "ok": true,
+            "action": "hdel",
+            "key": key,
+            "field": field,
+            "removed": removed,
+            "trit": hdel_trit,
+            "char": bt_one(hdel_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // Unknown hash action
+    record_stat("hash", T_FALSE)
+    return {
+        "ok": false,
+        "action": action,
+        "key": key,
+        "error": "unknown hash action: " + action + " (use hget/hset/hgetall/hdel)",
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 6: POST /tredis/list
+// List operations: lpush, rpush, lrange, lpop, rpop, llen
+// Body: {action, key, value, start, stop}
+// ===========================================================================
+fn handle_list(body) {
+    let action = dict_get(body, "action", "lrange")
+    let key = dict_get(body, "key", "")
+    let value = dict_get(body, "value", "")
+    let start = dict_get(body, "start", 0)
+    let stop = dict_get(body, "stop", -1)
+
+    // Key is always required
+    if3 len(key) == 0 {
+        record_stat("list", T_FALSE)
+        return {
+            "ok": false,
+            "action": action,
+            "key": "",
+            "error": "key is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- LPUSH --
+    if3 action == "lpush" {
+        if3 len(str(value)) == 0 {
+            record_stat("list", T_FALSE)
+            return {
+                "ok": false,
+                "action": "lpush",
+                "key": key,
+                "error": "value is required for lpush",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "redis-cli LPUSH " + safe_val(key) + " " + safe_val(value) + " 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("list", T_FALSE)
+            return {
+                "ok": false,
+                "action": "lpush",
+                "key": key,
+                "value": value,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // LPUSH returns new list length
+        let new_len = parse_int_reply(output)
+
+        record_stat("list", T_TRUE)
+        return {
+            "ok": true,
+            "action": "lpush",
+            "key": key,
+            "value": value,
+            "list_length": new_len,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- RPUSH --
+    if3 action == "rpush" {
+        if3 len(str(value)) == 0 {
+            record_stat("list", T_FALSE)
+            return {
+                "ok": false,
+                "action": "rpush",
+                "key": key,
+                "error": "value is required for rpush",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let cmd = "redis-cli RPUSH " + safe_val(key) + " " + safe_val(value) + " 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("list", T_FALSE)
+            return {
+                "ok": false,
+                "action": "rpush",
+                "key": key,
+                "value": value,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let new_len = parse_int_reply(output)
+
+        record_stat("list", T_TRUE)
+        return {
+            "ok": true,
+            "action": "rpush",
+            "key": key,
+            "value": value,
+            "list_length": new_len,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- LRANGE --
+    if3 action == "lrange" {
+        let cmd = "redis-cli LRANGE " + safe_val(key) + " " + str(start) + " " + str(stop) + " 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("list", T_FALSE)
+            return {
+                "ok": false,
+                "action": "lrange",
+                "key": key,
+                "start": start,
+                "stop": stop,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        if3 is_empty_list(output) == true {
+            record_stat("list", T_MAYBE)
+            return {
+                "ok": true,
+                "action": "lrange",
+                "key": key,
+                "start": start,
+                "stop": stop,
+                "items": [],
+                "count": 0,
+                "note": "list is empty or does not exist",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "runtime": "novalang"
+            }
+        }
+
+        let items = parse_redis_list(output)
+
+        let lrange_trit = T_TRUE
+        if3 len(items) == 0 {
+            lrange_trit = T_MAYBE
+        }
+
+        record_stat("list", lrange_trit)
+        return {
+            "ok": true,
+            "action": "lrange",
+            "key": key,
+            "start": start,
+            "stop": stop,
+            "items": items,
+            "count": len(items),
+            "trit": lrange_trit,
+            "char": bt_one(lrange_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- LPOP --
+    if3 action == "lpop" {
+        let cmd = "redis-cli LPOP " + safe_val(key) + " 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("list", T_FALSE)
+            return {
+                "ok": false,
+                "action": "lpop",
+                "key": key,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        if3 is_nil(output) == true {
+            record_stat("list", T_MAYBE)
+            return {
+                "ok": true,
+                "action": "lpop",
+                "key": key,
+                "value": "",
+                "exists": false,
+                "note": "list is empty or does not exist",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "runtime": "novalang"
+            }
+        }
+
+        let popped = strip_quotes(output)
+
+        record_stat("list", T_TRUE)
+        return {
+            "ok": true,
+            "action": "lpop",
+            "key": key,
+            "value": popped,
+            "exists": true,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- RPOP --
+    if3 action == "rpop" {
+        let cmd = "redis-cli RPOP " + safe_val(key) + " 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("list", T_FALSE)
+            return {
+                "ok": false,
+                "action": "rpop",
+                "key": key,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        if3 is_nil(output) == true {
+            record_stat("list", T_MAYBE)
+            return {
+                "ok": true,
+                "action": "rpop",
+                "key": key,
+                "value": "",
+                "exists": false,
+                "note": "list is empty or does not exist",
+                "trit": T_MAYBE,
+                "char": bt_one(T_MAYBE),
+                "runtime": "novalang"
+            }
+        }
+
+        let popped = strip_quotes(output)
+
+        record_stat("list", T_TRUE)
+        return {
+            "ok": true,
+            "action": "rpop",
+            "key": key,
+            "value": popped,
+            "exists": true,
+            "trit": T_TRUE,
+            "char": bt_one(T_TRUE),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- LLEN --
+    if3 action == "llen" {
+        let cmd = "redis-cli LLEN " + safe_val(key) + " 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("list", T_FALSE)
+            return {
+                "ok": false,
+                "action": "llen",
+                "key": key,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        let list_len = parse_int_reply(output)
+        if3 list_len < 0 {
+            list_len = 0
+        }
+
+        let llen_trit = T_TRUE
+        if3 list_len == 0 {
+            llen_trit = T_MAYBE
+        }
+
+        record_stat("list", llen_trit)
+        return {
+            "ok": true,
+            "action": "llen",
+            "key": key,
+            "length": list_len,
+            "trit": llen_trit,
+            "char": bt_one(llen_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // Unknown list action
+    record_stat("list", T_FALSE)
+    return {
+        "ok": false,
+        "action": action,
+        "key": key,
+        "error": "unknown list action: " + action + " (use lpush/rpush/lrange/lpop/rpop/llen)",
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// TOOL 7: POST /tredis/info
+// Server info: info, dbsize, ping
+// Body: {action: "ping"|"dbsize"|"info", section: ""}
+// ===========================================================================
+fn handle_info(body) {
+    let action = dict_get(body, "action", "ping")
+    let section = dict_get(body, "section", "")
+
+    // -- PING --
+    if3 action == "ping" {
+        let cmd = "redis-cli PING 2>&1"
+        let output = run_redis(cmd)
+        let lc_output = lower(output)
+
+        if3 contains(lc_output, "pong") {
+            record_stat("info", T_TRUE)
+            return {
+                "ok": true,
+                "action": "ping",
+                "response": "PONG",
+                "alive": true,
+                "trit": T_TRUE,
+                "char": bt_one(T_TRUE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Ping failed
+        record_stat("info", T_FALSE)
+        return {
+            "ok": false,
+            "action": "ping",
+            "response": output,
+            "alive": false,
+            "error": "redis not responding",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- DBSIZE --
+    if3 action == "dbsize" {
+        let cmd = "redis-cli DBSIZE 2>&1"
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("info", T_FALSE)
+            return {
+                "ok": false,
+                "action": "dbsize",
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Parse dbsize - output like "(integer) 42" or "db0:keys=42..."
+        let db_keys = 0
+        if3 contains(output, "(integer)") {
+            db_keys = parse_int_reply(output)
+        }
+        if3 contains(output, "keys=") {
+            // Alternative format: "db0:keys=42,expires=0,avg_ttl=0"
+            let kparts = split(output, "keys=")
+            if3 len(kparts) > 1 {
+                let num_part = dict_get(kparts, 1, "0")
+                let comma_parts = split(num_part, ",")
+                let num_str = strip(dict_get(comma_parts, 0, "0"))
+                db_keys = int(num_str)
+            }
+        }
+        if3 db_keys < 0 {
+            db_keys = 0
+        }
+
+        // N-S: Reynolds from key count
+        let re = db_keys * H5
+        if3 re > 999 {
+            re = 999
+        }
+        let regime = flow_regime(re)
+
+        let dbsize_trit = T_TRUE
+        if3 db_keys == 0 {
+            dbsize_trit = T_MAYBE
+        }
+
+        record_stat("info", dbsize_trit)
+        return {
+            "ok": true,
+            "action": "dbsize",
+            "keys": db_keys,
+            "reynolds": re,
+            "regime": regime,
+            "trit": dbsize_trit,
+            "char": bt_one(dbsize_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // -- INFO --
+    if3 action == "info" {
+        let cmd = "redis-cli INFO"
+        if3 len(section) > 0 {
+            cmd = cmd + " " + section
+        }
+        cmd = cmd + " 2>&1"
+
+        let output = run_redis(cmd)
+
+        if3 is_redis_error(output) == true {
+            record_stat("info", T_FALSE)
+            return {
+                "ok": false,
+                "action": "info",
+                "section": section,
+                "error": output,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+
+        // Parse key:value pairs from INFO output
+        // Lines are either "# Section" headers or "key:value" pairs
+        let info_data = {}
+        let current_section = "general"
+        let pair_count = 0
+
+        if3 len(output) > 0 {
+            let lines = split(output, "\n")
+            let i = 0
+            while3 i < len(lines) {
+                let line = strip(dict_get(lines, i, ""))
+                if3 len(line) > 0 {
+                    // Check for section header
+                    if3 starts_with(line, "# ") {
+                        let sec_name = slice(line, 2, len(line))
+                        current_section = lower(strip(sec_name))
+                    }
+                    // Check for key:value pair
+                    if3 contains(line, ":") {
+                        if3 starts_with(line, "# ") == false {
+                            let kv = split(line, ":")
+                            let ikey = strip(dict_get(kv, 0, ""))
+                            // Rejoin value parts (value might contain colons)
+                            let ival = ""
+                            let kvi = 1
+                            while3 kvi < len(kv) {
+                                if3 kvi > 1 {
+                                    ival = ival + ":"
+                                }
+                                ival = ival + dict_get(kv, kvi, "")
+                                kvi = kvi + 1
+                            }
+                            ival = strip(ival)
+                            if3 len(ikey) > 0 {
+                                dict_set(info_data, ikey, ival)
+                                pair_count = pair_count + 1
+                            }
+                        }
+                    }
+                }
+                i = i + 1
+            }
+        }
+
+        // Extract key metrics for N-S mapping
+        let used_memory_str = dict_get(info_data, "used_memory_human", "0")
+        let connected_clients_str = dict_get(info_data, "connected_clients", "0")
+        let total_commands_str = dict_get(info_data, "total_commands_processed", "0")
+        let uptime_str = dict_get(info_data, "uptime_in_seconds", "0")
+        let redis_version = dict_get(info_data, "redis_version", "unknown")
+
+        let info_trit = T_TRUE
+        if3 pair_count == 0 {
+            info_trit = T_MAYBE
+        }
+
+        record_stat("info", info_trit)
+        return {
+            "ok": true,
+            "action": "info",
+            "section": section,
+            "info": info_data,
+            "pair_count": pair_count,
+            "summary": {
+                "redis_version": redis_version,
+                "used_memory": used_memory_str,
+                "connected_clients": connected_clients_str,
+                "total_commands": total_commands_str,
+                "uptime_seconds": uptime_str
+            },
+            "trit": info_trit,
+            "char": bt_one(info_trit),
+            "runtime": "novalang"
+        }
+    }
+
+    // Unknown info action
+    record_stat("info", T_FALSE)
+    return {
+        "ok": false,
+        "action": action,
+        "error": "unknown info action: " + action + " (use ping/dbsize/info)",
+        "trit": T_FALSE,
+        "char": bt_one(T_FALSE),
+        "runtime": "novalang"
+    }
+}
+
+// ===========================================================================
+// GET /health -- Standard health endpoint (includes redis_alive check)
+// ===========================================================================
+fn health() {
+    let uptime = time() - stat_t0
+
+    // Check if redis is alive
+    let redis_up = redis_alive()
+
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        if3 redis_up == true {
+            self_trit = T_TRUE
+        }
+    }
+    if3 redis_up == false {
+        self_trit = T_FALSE
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "runtime": "novalang",
+        "redis_alive": redis_up,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "tools": TOOLS_COUNT,
+        "self_trit": self_trit,
+        "char": bt_one(self_trit),
+        "uptime_s": uptime,
+        "quality": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        }
+    }
+}
+
+// ===========================================================================
+// GET /tredis/service-status -- Full service status with stats
+// ===========================================================================
+fn tredis_service_status() {
+    let uptime = time() - stat_t0
+
+    // Check redis connectivity
+    let redis_up = redis_alive()
+
+    // Service Reynolds from total false ops (eviction_pressure = turbulent_energy)
+    let re = stat_trit_false * H5
+    if3 re > 999 {
+        re = 999
+    }
+    let regime = flow_regime(re)
+
+    // Data flow Reynolds (data_stream = velocity_field)
+    let data_re = _data_ops_count * H5
+    if3 data_re > 999 {
+        data_re = 999
+    }
+    let data_regime = flow_regime(data_re)
+
+    // System trit
+    let sys_trit = T_TRUE
+    if3 redis_up == false {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    let by_tool = {}
+    dict_set(by_tool, "get", by_tool_get)
+    dict_set(by_tool, "set", by_tool_set)
+    dict_set(by_tool, "del", by_tool_del)
+    dict_set(by_tool, "keys", by_tool_keys)
+    dict_set(by_tool, "hash", by_tool_hash)
+    dict_set(by_tool, "list", by_tool_list)
+    dict_set(by_tool, "info", by_tool_info)
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "redis_alive": redis_up,
+        "total_ops": stat_ops,
+        "data_ops": _data_ops_count,
+        "by_tool": by_tool,
+        "trits": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        },
+        "reynolds": re,
+        "regime": regime,
+        "data_reynolds": data_re,
+        "data_regime": data_regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE,
+        "ns_mapping": {
+            "data_stream": "velocity_field",
+            "eviction_pressure": "turbulent_energy",
+            "reynolds_formula": "data_ops * H5"
+        }
+    }
+}
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+troute(server, "GET",  "/health",                "health")
+troute(server, "GET",  "/tredis/service-status",  "tredis_service_status")
+troute(server, "POST", "/tredis/get",             "handle_get")
+troute(server, "POST", "/tredis/set",             "handle_set")
+troute(server, "POST", "/tredis/del",             "handle_del")
+troute(server, "POST", "/tredis/keys",            "handle_keys")
+troute(server, "POST", "/tredis/hash",            "handle_hash")
+troute(server, "POST", "/tredis/list",            "handle_list")
+troute(server, "POST", "/tredis/info",            "handle_info")
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[TRedis] NovaX Ternary Redis Wrapper v" + VERSION + " on port " + str(PORT))
+print("[TRedis] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[TRedis] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TRedis] Re boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TRedis] N-S: data_stream=velocity_field | eviction_pressure=turbulent_energy | Re=data_ops*H5")
+print("[TRedis] Redis backend: redis-cli (shell) | Timeout: " + str(REDIS_TIMEOUT) + "s (H13)")
+print("[TRedis] Routes: /health, /tredis/service-status")
+print("[TRedis]         /tredis/get, /tredis/set, /tredis/del, /tredis/keys")
+print("[TRedis]         /tredis/hash, /tredis/list, /tredis/info")
+print("[TRedis] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

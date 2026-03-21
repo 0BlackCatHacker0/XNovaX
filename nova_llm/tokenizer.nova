@@ -1,0 +1,411 @@
+// NovaX LLM Tokenizer v1.0 — Ternary Byte-Pair Encoding
+// Builds vocabulary from training data using 3-5-7-13 merge schedule
+// Each token gets a balanced ternary ID
+//
+// N-S Mapping:
+//   token_flow    = velocity_field (text flowing through BPE merges)
+//   merge_freq    = pressure_field (high-frequency pairs create merge pressure)
+//   vocab_growth  = Reynolds routing (laminar=common merges, turbulent=rare tokens)
+//   encoding      = viscosity (tokenization smoothness)
+//
+// 3-5-7-13 Harmonic Design:
+//   H3=3   -- ternary token IDs, merge phases
+//   H5=5   -- BPE merge rounds per phase (3^5=243 merges per batch)
+//   H7=7   -- composition depth, max token length
+//   H13=13 -- carrier frame, special token count
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+// -- 3-5-7-13 Constants --
+let VOCAB_TARGET = 32768
+let MERGE_BATCH = 243        // 3^5 merges per phase
+let MAX_TOKEN_LEN = 7        // H7
+let SPECIAL_TOKENS = 13      // H13 special tokens
+let BLOCK = 2187             // 3^7
+
+// -- Special Token Registry --
+let PAD_TOKEN = 0
+let BOS_TOKEN = 1
+let EOS_TOKEN = 2
+let UNK_TOKEN = 3
+let MASK_TOKEN = 4
+let SEP_TOKEN = 5
+let CLS_TOKEN = 6
+let NEWLINE_TOKEN = 7
+let TAB_TOKEN = 8
+let SPACE_TOKEN = 9
+let NUM_TOKEN = 10
+let CODE_TOKEN = 11
+let TERNARY_TOKEN = 12
+
+let SPECIAL_MAP = {
+    "<PAD>": 0, "<BOS>": 1, "<EOS>": 2, "<UNK>": 3,
+    "<MASK>": 4, "<SEP>": 5, "<CLS>": 6, "<NL>": 7,
+    "<TAB>": 8, "<SP>": 9, "<NUM>": 10, "<CODE>": 11,
+    "<TERNARY>": 12
+}
+
+// -- Balanced Ternary ID Conversion --
+// Convert integer to balanced ternary representation {-1, 0, +1}
+fn int_to_balanced_ternary(n) {
+    if3 n == 0 { return [0] }
+    let trits = []
+    let val = n
+    while3 val > 0 {
+        let rem = val % 3
+        if3 rem == 0 {
+            trits = append(trits, 0)
+            val = val / 3
+        } else3 if3 rem == 1 {
+            trits = append(trits, 1)
+            val = (val - 1) / 3
+        } else3 {
+            trits = append(trits, -1)
+            val = (val + 1) / 3
+        }
+    }
+    return trits
+}
+
+// -- Count byte pairs in tokenized corpus --
+fn count_pairs(sequences) {
+    let pair_counts = {}
+    let si = 0
+    while3 si < len(sequences) {
+        let seq = sequences[si]
+        let ti = 0
+        while3 ti < len(seq) - 1 {
+            let pair_key = str(seq[ti]) + "," + str(seq[ti + 1])
+            let current = dict_get(pair_counts, pair_key) ?? 0
+            pair_counts = dict_set(pair_counts, pair_key, current + 1)
+            ti = ti + 1
+        }
+        si = si + 1
+    }
+    return pair_counts
+}
+
+// -- Find the most frequent pair --
+fn best_pair(pair_counts) {
+    let best_key = ""
+    let best_count = 0
+    let keys_list = keys(pair_counts)
+    let ki = 0
+    while3 ki < len(keys_list) {
+        let k = keys_list[ki]
+        let c = dict_get(pair_counts, k) ?? 0
+        if3 c > best_count {
+            best_count = c
+            best_key = k
+        }
+        ki = ki + 1
+    }
+    return {"key": best_key, "count": best_count}
+}
+
+// -- Merge a pair in all sequences --
+fn merge_pair(sequences, pair_a, pair_b, new_id) {
+    let result = []
+    let si = 0
+    while3 si < len(sequences) {
+        let seq = sequences[si]
+        let new_seq = []
+        let ti = 0
+        while3 ti < len(seq) {
+            if3 ti < len(seq) - 1 {
+                if3 seq[ti] == pair_a {
+                    if3 seq[ti + 1] == pair_b {
+                        new_seq = append(new_seq, new_id)
+                        ti = ti + 2
+                    } else3 {
+                        new_seq = append(new_seq, seq[ti])
+                        ti = ti + 1
+                    }
+                } else3 {
+                    new_seq = append(new_seq, seq[ti])
+                    ti = ti + 1
+                }
+            } else3 {
+                new_seq = append(new_seq, seq[ti])
+                ti = ti + 1
+            }
+        }
+        result = append(result, new_seq)
+        si = si + 1
+    }
+    return result
+}
+
+// -- Build vocabulary from texts using BPE with 3-5-7-13 schedule --
+// Phase 1: byte-level tokens (256 base)
+// Phase 2: BPE merges in batches of 243 (3^5)
+// Phase 3: assign balanced ternary IDs
+fn build_vocab(texts, vocab_size) {
+    print("=== NovaX Ternary BPE Tokenizer ===")
+    print("Target vocab size: " + str(vocab_size))
+    print("Merge batch size: " + str(MERGE_BATCH) + " (3^5)")
+
+    // Phase 1: Initialize byte-level vocabulary
+    let vocab = {}
+    let id_to_token = {}
+    let merges = []
+
+    // Reserve special tokens (H13=13 slots)
+    let special_keys = keys(SPECIAL_MAP)
+    let ski = 0
+    while3 ski < len(special_keys) {
+        let sk = special_keys[ski]
+        let sv = dict_get(SPECIAL_MAP, sk) ?? 0
+        vocab = dict_set(vocab, sk, sv)
+        id_to_token = dict_set(id_to_token, str(sv), sk)
+        ski = ski + 1
+    }
+
+    // Add byte tokens (13 to 268)
+    let bi = 0
+    while3 bi < 256 {
+        let byte_tok = "<byte_" + str(bi) + ">"
+        let byte_id = bi + SPECIAL_TOKENS
+        vocab = dict_set(vocab, byte_tok, byte_id)
+        id_to_token = dict_set(id_to_token, str(byte_id), byte_tok)
+        bi = bi + 1
+    }
+
+    let next_id = 256 + SPECIAL_TOKENS  // 269
+
+    // Phase 2: Convert texts to byte sequences
+    print("Phase 2: Tokenizing " + str(len(texts)) + " texts to bytes...")
+    let sequences = []
+    let text_i = 0
+    while3 text_i < len(texts) {
+        let text = texts[text_i]
+        let byte_seq = []
+        let ci = 0
+        while3 ci < len(text) {
+            let char_code = ord(text[ci])
+            byte_seq = append(byte_seq, char_code + SPECIAL_TOKENS)
+            ci = ci + 1
+        }
+        sequences = append(sequences, byte_seq)
+        text_i = text_i + 1
+    }
+
+    // Phase 3: BPE merges in batches of 243 (H5=3^5)
+    let target_merges = vocab_size - next_id
+    let total_merged = 0
+    let phase = 1
+    print("Phase 3: Running BPE merges (target: " + str(target_merges) + ")")
+
+    while3 total_merged < target_merges {
+        let batch_count = 0
+        let batch_limit = MERGE_BATCH
+        if3 total_merged + batch_limit > target_merges {
+            batch_limit = target_merges - total_merged
+        }
+
+        while3 batch_count < batch_limit {
+            let pairs = count_pairs(sequences)
+            let bp = best_pair(pairs)
+            if3 bp["count"] < 2 {
+                print("No more pairs with count >= 2, stopping at " + str(total_merged) + " merges")
+                batch_count = batch_limit  // break inner
+                total_merged = target_merges  // break outer
+            } else3 {
+                // Parse pair key "a,b"
+                let comma_pos = index_of(bp["key"], ",")
+                let pair_a = int(slice(bp["key"], 0, comma_pos))
+                let pair_b = int(slice(bp["key"], comma_pos + 1, len(bp["key"])))
+
+                // Create merged token
+                let tok_a = dict_get(id_to_token, str(pair_a)) ?? "<unk>"
+                let tok_b = dict_get(id_to_token, str(pair_b)) ?? "<unk>"
+                let merged_tok = tok_a + tok_b
+                vocab = dict_set(vocab, merged_tok, next_id)
+                id_to_token = dict_set(id_to_token, str(next_id), merged_tok)
+                merges = append(merges, [pair_a, pair_b, next_id])
+
+                // Apply merge to all sequences
+                sequences = merge_pair(sequences, pair_a, pair_b, next_id)
+
+                next_id = next_id + 1
+                total_merged = total_merged + 1
+                batch_count = batch_count + 1
+            }
+        }
+
+        if3 total_merged < target_merges {
+            print("  Phase " + str(phase) + " complete: " + str(total_merged) + "/" + str(target_merges) + " merges")
+            phase = phase + 1
+        }
+    }
+
+    // Phase 4: Assign balanced ternary IDs
+    print("Phase 4: Computing balanced ternary IDs...")
+    let ternary_ids = {}
+    let all_keys = keys(vocab)
+    let tki = 0
+    while3 tki < len(all_keys) {
+        let tok = all_keys[tki]
+        let tok_id = dict_get(vocab, tok) ?? 0
+        let bt = int_to_balanced_ternary(tok_id)
+        ternary_ids = dict_set(ternary_ids, str(tok_id), bt)
+        tki = tki + 1
+    }
+
+    print("=== Vocab built: " + str(len(all_keys)) + " tokens ===")
+    return {
+        "vocab": vocab,
+        "id_to_token": id_to_token,
+        "merges": merges,
+        "ternary_ids": ternary_ids,
+        "vocab_size": len(all_keys)
+    }
+}
+
+// -- Encode text to token IDs --
+fn encode(text, vocab_data) {
+    let vocab = vocab_data["vocab"]
+    let merge_list = vocab_data["merges"]
+
+    // Start with byte-level tokens
+    let ids = []
+    let ci = 0
+    while3 ci < len(text) {
+        let char_code = ord(text[ci])
+        ids = append(ids, char_code + SPECIAL_TOKENS)
+        ci = ci + 1
+    }
+
+    // Apply merges in order
+    let mi = 0
+    while3 mi < len(merge_list) {
+        let merge = merge_list[mi]
+        let pa = merge[0]
+        let pb = merge[1]
+        let new_id = merge[2]
+        let new_ids = []
+        let ii = 0
+        while3 ii < len(ids) {
+            if3 ii < len(ids) - 1 {
+                if3 ids[ii] == pa {
+                    if3 ids[ii + 1] == pb {
+                        new_ids = append(new_ids, new_id)
+                        ii = ii + 2
+                    } else3 {
+                        new_ids = append(new_ids, ids[ii])
+                        ii = ii + 1
+                    }
+                } else3 {
+                    new_ids = append(new_ids, ids[ii])
+                    ii = ii + 1
+                }
+            } else3 {
+                new_ids = append(new_ids, ids[ii])
+                ii = ii + 1
+            }
+        }
+        ids = new_ids
+        mi = mi + 1
+    }
+
+    return ids
+}
+
+// -- Decode token IDs to text --
+fn decode(ids, vocab_data) {
+    let id_to_token = vocab_data["id_to_token"]
+    let result = ""
+    let di = 0
+    while3 di < len(ids) {
+        let tok = dict_get(id_to_token, str(ids[di])) ?? "<UNK>"
+        // Strip byte wrapper
+        if3 starts_with(tok, "<byte_") {
+            let num_str = slice(tok, 6, len(tok) - 1)
+            let char_code = int(num_str)
+            result = result + chr(char_code)
+        } else3 if3 starts_with(tok, "<") {
+            // Special token, skip in output or add marker
+            if3 tok == "<NL>" {
+                result = result + "\n"
+            } else3 if3 tok == "<TAB>" {
+                result = result + "\t"
+            } else3 if3 tok == "<SP>" {
+                result = result + " "
+            }
+            // Other special tokens omitted from decoded text
+        } else3 {
+            result = result + tok
+        }
+        di = di + 1
+    }
+    return result
+}
+
+// -- Save vocabulary to JSON file --
+fn save_vocab(vocab_data, path) {
+    let save_obj = {
+        "vocab": vocab_data["vocab"],
+        "id_to_token": vocab_data["id_to_token"],
+        "merges": vocab_data["merges"],
+        "vocab_size": vocab_data["vocab_size"],
+        "format": "novax_ternary_bpe_v1",
+        "constants": {"H3": 3, "H5": 5, "H7": 7, "H13": 13, "BLOCK": 2187}
+    }
+    let json_str = json_encode(save_obj)
+    write_file(path, json_str)
+    print("Vocab saved to " + path + " (" + str(vocab_data["vocab_size"]) + " tokens)")
+    return 1
+}
+
+// -- Load vocabulary from JSON file --
+fn load_vocab(path) {
+    let raw = read_file(path)
+    let data = json_decode(raw)
+    print("Vocab loaded from " + path + " (" + str(dict_get(data, "vocab_size") ?? 0) + " tokens)")
+    return data
+}
+
+// -- Main: Build vocab from training data --
+fn main() {
+    let data_path = "C:/NovaX/data/llm_training/training_pairs_v2.json"
+    let vocab_path = "C:/NovaX/nova_llm/vocab.json"
+
+    print("Loading training data from " + data_path + "...")
+    let raw = read_file(data_path)
+    let pairs = json_decode(raw)
+
+    // Extract all text from training pairs
+    let texts = []
+    let pi = 0
+    while3 pi < len(pairs) {
+        let pair = pairs[pi]
+        let prompt = dict_get(pair, "prompt") ?? ""
+        let response = dict_get(pair, "response") ?? ""
+        if3 len(prompt) > 0 {
+            texts = append(texts, prompt)
+        }
+        if3 len(response) > 0 {
+            texts = append(texts, response)
+        }
+        pi = pi + 1
+    }
+
+    print("Extracted " + str(len(texts)) + " text segments")
+
+    // Build vocabulary
+    let vocab_data = build_vocab(texts, VOCAB_TARGET)
+
+    // Save vocabulary
+    save_vocab(vocab_data, vocab_path)
+
+    // Test encode/decode roundtrip
+    let test_text = "NovaX ternary AI"
+    let encoded = encode(test_text, vocab_data)
+    let decoded = decode(encoded, vocab_data)
+    print("Roundtrip test: '" + test_text + "' -> " + str(len(encoded)) + " tokens -> '" + decoded + "'")
+
+    return 1
+}
+
+main()

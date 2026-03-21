@@ -1,0 +1,689 @@
+// Nova Model Selector Service v1.0 — Dynamic Model Selection via Tripple Resonance
+// Port 9931: Ranks models by domain-specific scores, fires parallel queries, learns from results
+// Ternary: +1 = best model selected, 0 = partial/fallback, -1 = no models available
+//
+// N-S Mapping:
+//   model_scores     = pressure_field (quality pressure per model)
+//   domain_routing   = channel_selector (routes queries into optimal model pipe)
+//   parallel_query   = turbulent_mixing (multiple models compete simultaneously)
+//   learning_update  = viscous_feedback (scores adjust based on response quality)
+//   score_decay      = thermal_dissipation (old scores fade, fresh data matters)
+//
+// 3-5-7-13 Harmonic Design:
+//   H3=3   -- ternary scoring (+1/0/-1), top-3 default selection
+//   H5=5   -- max parallel queries, quality base
+//   H7=7   -- max leaderboard depth per tier, composition boundary
+//   H13=13 -- leaderboard size per domain, carrier frame
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+import3("C:/NovaX/lib/nova_pure_tools.nova")
+
+let PORT = 9931
+let SERVICE_NAME = "nova-model-selector"
+let VERSION = "1.0.0"
+
+// -- 3-5-7-13 Harmonic Constants --
+let BLOCK_SIZE = 2187
+let TOP_N_DEFAULT = 3
+let LEADERBOARD_SIZE = 13
+let DECAY_FACTOR = 0.95
+let MAX_PARALLEL = 5
+
+// -- Score cache path --
+let SCORES_FILE = "C:/NovaX/data/model_scores.json"
+let SUPER_ARCHIVE = "C:/NovaX/data/super_archive"
+
+// -- Cloud router endpoint (for parallel queries) --
+let CLOUD_ROUTER_URL = "http://127.0.0.1:9878"
+
+// -- Global state --
+let _scores = {}
+let _scores_meta = {}
+let _stats = {
+    "total_selects": 0,
+    "total_parallels": 0,
+    "total_learns": 0,
+    "t0": time()
+}
+
+// -- N-S counters --
+let _ns = ns_init_counters()
+
+// ============================================================
+// DOMAIN CLASSIFICATION (mirrored from cloud router)
+// ============================================================
+
+let _DOMAIN_KEYWORDS = {
+    "MATH": ["equation", "calculate", "solve", "derivative", "integral", "algebra", "geometry", "proof", "theorem", "mathematical"],
+    "CODE": ["function", "code", "program", "debug", "error", "compile", "script", "algorithm", "syntax", "api", "class", "variable"],
+    "LONG": ["poem", "story", "write", "creative", "essay", "narrative", "chapter", "fiction", "lyrics", "compose", "describe in detail"],
+    "VISION": ["image", "picture", "photo", "screenshot", "diagram", "visual", "see", "look at"],
+    "LANGUAGE": ["translate", "translation", "spanish", "french", "german", "chinese", "japanese", "language"],
+    "FACT": ["what is", "who is", "when did", "where is", "define", "explain", "history of"],
+    "AGENT": ["plan", "execute", "build", "create", "implement", "deploy", "automate"],
+    "INSTRUCT": ["how to", "steps to", "guide", "tutorial", "instructions"],
+    "REASON": ["why", "analyze", "compare", "evaluate", "think about", "consider", "logic"]
+}
+
+fn classify_domain(prompt) {
+    let lp = lower(prompt)
+    let domains = ["MATH", "CODE", "LONG", "VISION", "LANGUAGE", "FACT", "AGENT", "INSTRUCT", "REASON"]
+    let best_domain = "REASON"
+    let best_hits = 0
+    let di = 0
+    while3 di < len(domains) {
+        let domain = domains[di]
+        let kws = dict_get(_DOMAIN_KEYWORDS, domain) ?? []
+        let hits = 0
+        let ki = 0
+        while3 ki < len(kws) {
+            let kw = kws[ki]
+            if3 contains(lp, kw) == true {
+                hits = hits + 1
+            }
+            ki = ki + 1
+        }
+        if3 hits > best_hits {
+            best_hits = hits
+            best_domain = domain
+        }
+        di = di + 1
+    }
+    // Numeric pattern fallback
+    if3 best_hits == 0 {
+        if3 contains(lp, "+") == true { if3 contains(lp, "=") == true { best_domain = "MATH" } }
+        if3 contains(lp, "*") == true { best_domain = "MATH" }
+    }
+    return best_domain
+}
+
+// ============================================================
+// SCORE CACHE MANAGEMENT
+// ============================================================
+
+// -- Load scores from disk --
+fn load_scores() {
+    let content = try3 { read_file(SCORES_FILE) } fail { "" }
+    if3 content == "" {
+        print("[SELECTOR] No score cache found at " + SCORES_FILE + " — starting cold")
+        return -1
+    }
+    let data = try3 { json_decode(content) } fail { {} }
+    let version = dict_get(data, "version") ?? ""
+    if3 version == "" {
+        print("[SELECTOR] Invalid score cache format")
+        return -1
+    }
+    _scores = dict_get(data, "scores") ?? {}
+    _scores_meta = {}
+    _scores_meta = dict_set(_scores_meta, "version", version)
+    _scores_meta = dict_set(_scores_meta, "generated", dict_get(data, "generated") ?? 0)
+    _scores_meta = dict_set(_scores_meta, "total_models", dict_get(data, "total_models") ?? 0)
+    _scores_meta = dict_set(_scores_meta, "total_samples", dict_get(data, "total_samples") ?? 0)
+    print("[SELECTOR] Loaded " + str(len(keys(_scores))) + " models from score cache")
+    return 1
+}
+
+// -- Save scores to disk --
+fn save_scores() {
+    let output = {}
+    output = dict_set(output, "version", "1.0.0")
+    output = dict_set(output, "generated", time())
+    output = dict_set(output, "total_models", len(keys(_scores)))
+    output = dict_set(output, "total_samples", dict_get(_scores_meta, "total_samples") ?? 0)
+    output = dict_set(output, "scores", _scores)
+    let json_str = json_encode(output)
+    let ok = try3 { write_file(SCORES_FILE, json_str) } fail { -1 }
+    if3 ok == -1 {
+        print("[SELECTOR] FAILED to save score cache")
+        return -1
+    }
+    return 1
+}
+
+// -- Apply daily decay to all scores (multiply by DECAY_FACTOR) --
+let _last_decay_day = ""
+
+fn apply_decay() {
+    let today = str(floor(time() / 86400))
+    if3 today == _last_decay_day { return 0 }
+    _last_decay_day = today
+
+    let model_keys = keys(_scores)
+    let mi = 0
+    while3 mi < len(model_keys) {
+        let mk = model_keys[mi]
+        let model_data = dict_get(_scores, mk) ?? {}
+        let domain_keys = keys(model_data)
+        let new_domains = {}
+        let di = 0
+        while3 di < len(domain_keys) {
+            let dk = domain_keys[di]
+            let old_score = dict_get(model_data, dk) ?? 0
+            let new_score = old_score * DECAY_FACTOR
+            new_domains = dict_set(new_domains, dk, new_score)
+            di = di + 1
+        }
+        _scores = dict_set(_scores, mk, new_domains)
+        mi = mi + 1
+    }
+    print("[SELECTOR] Decay applied (factor=" + str(DECAY_FACTOR) + ") to " + str(len(model_keys)) + " models")
+    save_scores()
+    return 1
+}
+
+// ============================================================
+// PROVIDER MAPPING — maps model keys to cloud router providers
+// ============================================================
+
+// Known provider name -> cloud router provider name mapping
+let _PROVIDER_MAP = {
+    "cerebras_direct": "cerebras_direct",
+    "sambanova_direct": "sambanova_direct",
+    "google_ai_studio": "google_ai_studio",
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "google": "google",
+    "openrouter": "openrouter",
+    "groq": "groq",
+    "deepseek": "deepseek",
+    "mistral": "mistral",
+    "mistral_direct": "mistral_direct",
+    "cohere": "cohere",
+    "cohere_direct": "cohere_direct",
+    "together": "together",
+    "together_direct": "together_direct",
+    "nvidia_nim": "nvidia_nim",
+    "cloudflare_ai": "cloudflare_ai",
+    "kluster_ai": "kluster_ai",
+    "deepinfra": "deepinfra",
+    "github_models": "github_models",
+    "apifreellm": "apifreellm"
+}
+
+fn extract_provider(model_key) {
+    // model_key is "provider/model_name" — extract provider part
+    let parts = split(model_key, "/")
+    if3 len(parts) > 0 { return parts[0] }
+    return model_key
+}
+
+fn extract_model_id(model_key) {
+    // model_key is "provider/model_name" — extract model part
+    let parts = split(model_key, "/")
+    if3 len(parts) > 1 {
+        // Rejoin everything after the first "/" (model may contain slashes)
+        let result = parts[1]
+        let pi = 2
+        while3 pi < len(parts) {
+            result = result + "/" + parts[pi]
+            pi = pi + 1
+        }
+        return result
+    }
+    return model_key
+}
+
+fn resolve_router_provider(provider_name) {
+    let mapped = dict_get(_PROVIDER_MAP, provider_name) ?? ""
+    if3 mapped != "" { return mapped }
+    return provider_name
+}
+
+// ============================================================
+// CORE: SELECT BEST MODELS
+// ============================================================
+
+fn select_best(prompt, domain, top_n) {
+    // Apply daily decay
+    apply_decay()
+
+    // Classify domain if not provided
+    if3 domain == "" { domain = classify_domain(prompt) }
+    if3 top_n <= 0 { top_n = TOP_N_DEFAULT }
+    if3 top_n > MAX_PARALLEL { top_n = MAX_PARALLEL }
+
+    // Collect all models that have a score for this domain
+    let candidates = []
+    let model_keys = keys(_scores)
+    let mi = 0
+    while3 mi < len(model_keys) {
+        let mk = model_keys[mi]
+        let model_data = dict_get(_scores, mk) ?? {}
+        let domain_score = dict_get(model_data, domain) ?? -999
+        if3 domain_score > -999 {
+            let provider = extract_provider(mk)
+            let model_id = extract_model_id(mk)
+            let router_provider = resolve_router_provider(provider)
+            candidates = append(candidates, {
+                "model_key": mk,
+                "provider": provider,
+                "router_provider": router_provider,
+                "model_id": model_id,
+                "score": domain_score,
+                "domain": domain
+            })
+        }
+        mi = mi + 1
+    }
+
+    // Sort by score descending (simple selection sort for top_n)
+    let ranked = []
+    let used = {}
+    let ri = 0
+    while3 ri < top_n {
+        let best_idx = -1
+        let best_score = -999
+        let ci = 0
+        while3 ci < len(candidates) {
+            let used_flag = dict_get(used, str(ci)) ?? false
+            if3 used_flag != true {
+                let cs = dict_get(candidates[ci], "score") ?? -999
+                if3 cs > best_score {
+                    best_score = cs
+                    best_idx = ci
+                }
+            }
+            ci = ci + 1
+        }
+        if3 best_idx >= 0 {
+            ranked = append(ranked, candidates[best_idx])
+            used = dict_set(used, str(best_idx), true)
+        }
+        ri = ri + 1
+    }
+
+    _stats = dict_set(_stats, "total_selects", (dict_get(_stats, "total_selects") ?? 0) + 1)
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "domain": domain,
+        "top_n": len(ranked),
+        "models": ranked,
+        "total_candidates": len(candidates)
+    }
+}
+
+// ============================================================
+// CORE: PARALLEL QUERY
+// ============================================================
+
+fn _quality_from_length(rlen) {
+    if3 rlen > 500 { return 3 }
+    if3 rlen > 200 { return 2 }
+    if3 rlen > 50 { return 1 }
+    if3 rlen > 10 { return 0 }
+    return -1
+}
+
+fn _speed_bonus(elapsed_ms) {
+    if3 elapsed_ms < 2000 { return 1 }
+    if3 elapsed_ms > 5000 { return -1 }
+    return 0
+}
+
+fn _coherence_score(word_count) {
+    if3 word_count > 50 { return 1 }
+    if3 word_count < 5 { return -1 }
+    return 0
+}
+
+fn score_parallel_response(resp_text, elapsed_ms) {
+    // Score = quality (length) + speed bonus + coherence
+    let rlen = len(resp_text)
+    let quality = _quality_from_length(rlen)
+    let speed = _speed_bonus(elapsed_ms)
+    let word_count = len(split(resp_text, " "))
+    let coherence = _coherence_score(word_count)
+    return quality + speed + coherence
+}
+
+fn parallel_query(prompt, top_n) {
+    // Step 1: Get top models
+    let selection = select_best(prompt, "", top_n)
+    let models = dict_get(selection, "models") ?? []
+    let domain = dict_get(selection, "domain") ?? "REASON"
+
+    if3 len(models) == 0 {
+        return {"ok": false, "trit": -1, "error": "no_models_available", "domain": domain}
+    }
+
+    // Step 2: Fire queries to each model via cloud router
+    let results = []
+    let qi = 0
+    while3 qi < len(models) {
+        let m = models[qi]
+        let provider = dict_get(m, "router_provider") ?? ""
+        let model_id = dict_get(m, "model_id") ?? ""
+        let model_key = dict_get(m, "model_key") ?? ""
+
+        let t0 = time()
+        let body = json_encode({
+            "prompt": prompt,
+            "provider": provider,
+            "model": model_id
+        })
+        let resp = try3 { http_post(CLOUD_ROUTER_URL + "/api/v1/query", body) } fail { {"error": "query_failed"} }
+        let elapsed_ms = floor((time() - t0) * 1000)
+
+        let resp_body = dict_get(resp, "body") ?? ""
+        let parsed = try3 { json_decode(resp_body) } fail { resp }
+        let ok = dict_get(parsed, "ok") ?? false
+        let response_text = ""
+        if3 ok == true {
+            let result_obj = dict_get(parsed, "result") ?? {}
+            response_text = dict_get(result_obj, "response") ?? (dict_get(parsed, "response") ?? "")
+        }
+
+        let score = score_parallel_response(response_text, elapsed_ms)
+
+        results = append(results, {
+            "model_key": model_key,
+            "provider": provider,
+            "model_id": model_id,
+            "ok": ok,
+            "response": response_text,
+            "time_ms": elapsed_ms,
+            "score": score,
+            "response_length": len(response_text)
+        })
+        qi = qi + 1
+    }
+
+    // Step 3: Find the best response
+    let best_idx = 0
+    let best_score = -999
+    let bi = 0
+    while3 bi < len(results) {
+        let rs = dict_get(results[bi], "score") ?? -999
+        if3 rs > best_score {
+            best_score = rs
+            best_idx = bi
+        }
+        bi = bi + 1
+    }
+
+    let winner = results[best_idx]
+    let winner_key = dict_get(winner, "model_key") ?? ""
+
+    // Step 4: Learn from results — winner gets +1, losers get -1
+    let li = 0
+    while3 li < len(results) {
+        let r = results[li]
+        let mk = dict_get(r, "model_key") ?? ""
+        let rok = dict_get(r, "ok") ?? false
+        if3 rok == true {
+            if3 li == best_idx {
+                learn_score(mk, domain, 1)
+            } else3 {
+                learn_score(mk, domain, -1)
+            }
+        } else3 {
+            learn_score(mk, domain, -1)
+        }
+        li = li + 1
+    }
+
+    _stats = dict_set(_stats, "total_parallels", (dict_get(_stats, "total_parallels") ?? 0) + 1)
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "domain": domain,
+        "winner": winner,
+        "all_results": results,
+        "total_queried": len(results),
+        "best_score": best_score
+    }
+}
+
+// ============================================================
+// CORE: LEARNING / SCORE UPDATE
+// ============================================================
+
+fn learn_score(model_key, domain, delta) {
+    // delta: +1 for win, -1 for loss, 0 for neutral
+    if3 model_key == "" { return -1 }
+    if3 domain == "" { domain = "REASON" }
+
+    let model_data = dict_get(_scores, model_key) ?? {}
+    let old_score = dict_get(model_data, domain) ?? 0
+
+    // Tripple resonance update: bounded between -1.0 and 1.0
+    // Use learning rate of 0.1 to smooth updates
+    let learning_rate = 0.1
+    let new_score = old_score + (delta * learning_rate)
+    // Clamp to [-1.0, 1.0]
+    if3 new_score > 1.0 { new_score = 1.0 }
+    if3 new_score < -1.0 { new_score = -1.0 }
+
+    model_data = dict_set(model_data, domain, new_score)
+    _scores = dict_set(_scores, model_key, model_data)
+
+    _stats = dict_set(_stats, "total_learns", (dict_get(_stats, "total_learns") ?? 0) + 1)
+
+    // Persist every 13 learns (H13 carrier frame)
+    let total_learns = dict_get(_stats, "total_learns") ?? 0
+    let remainder = total_learns - (floor(total_learns / H13) * H13)
+    if3 remainder == 0 {
+        save_scores()
+    }
+
+    return 1
+}
+
+// ============================================================
+// CORE: LEADERBOARD
+// ============================================================
+
+fn build_leaderboard() {
+    let domains = ["MATH", "CODE", "LONG", "VISION", "LANGUAGE", "FACT", "AGENT", "INSTRUCT", "REASON", "DOMAIN"]
+    let leaderboard = {}
+
+    let di = 0
+    while3 di < len(domains) {
+        let domain = domains[di]
+
+        // Collect all models with scores for this domain
+        let candidates = []
+        let model_keys = keys(_scores)
+        let mi = 0
+        while3 mi < len(model_keys) {
+            let mk = model_keys[mi]
+            let model_data = dict_get(_scores, mk) ?? {}
+            let domain_score = dict_get(model_data, domain) ?? -999
+            if3 domain_score > -999 {
+                candidates = append(candidates, {
+                    "model_key": mk,
+                    "provider": extract_provider(mk),
+                    "model_id": extract_model_id(mk),
+                    "score": domain_score
+                })
+            }
+            mi = mi + 1
+        }
+
+        // Selection sort for top LEADERBOARD_SIZE
+        let ranked = []
+        let used = {}
+        let ri = 0
+        let limit = LEADERBOARD_SIZE
+        if3 len(candidates) < limit { limit = len(candidates) }
+        while3 ri < limit {
+            let best_idx = -1
+            let best_score = -999
+            let ci = 0
+            while3 ci < len(candidates) {
+                let used_flag = dict_get(used, str(ci)) ?? false
+                if3 used_flag != true {
+                    let cs = dict_get(candidates[ci], "score") ?? -999
+                    if3 cs > best_score {
+                        best_score = cs
+                        best_idx = ci
+                    }
+                }
+                ci = ci + 1
+            }
+            if3 best_idx >= 0 {
+                ranked = append(ranked, candidates[best_idx])
+                used = dict_set(used, str(best_idx), true)
+            }
+            ri = ri + 1
+        }
+
+        leaderboard = dict_set(leaderboard, domain, ranked)
+        di = di + 1
+    }
+
+    return leaderboard
+}
+
+// ============================================================
+// ROUTE HANDLERS
+// ============================================================
+
+// -- POST /select/best --
+fn handle_select_best(req) {
+    let t0 = time()
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let prompt = dict_get(body, "prompt") ?? (dict_get(req, "prompt") ?? "")
+    if3 prompt == "" {
+        return {"ok": false, "trit": -1, "error": "missing prompt"}
+    }
+    let domain = dict_get(body, "domain") ?? (dict_get(req, "domain") ?? "")
+    let top_n = dict_get(body, "top_n") ?? (dict_get(req, "top_n") ?? TOP_N_DEFAULT)
+
+    let result = select_best(prompt, domain, top_n)
+    let elapsed = floor((time() - t0) * 1000)
+    result = dict_set(result, "time_ms", elapsed)
+    _ns = ns_record(_ns, elapsed, false)
+    return result
+}
+
+// -- POST /select/parallel --
+fn handle_select_parallel(req) {
+    let t0 = time()
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let prompt = dict_get(body, "prompt") ?? (dict_get(req, "prompt") ?? "")
+    if3 prompt == "" {
+        return {"ok": false, "trit": -1, "error": "missing prompt"}
+    }
+    let top_n = dict_get(body, "top_n") ?? (dict_get(req, "top_n") ?? TOP_N_DEFAULT)
+
+    let result = parallel_query(prompt, top_n)
+    let elapsed = floor((time() - t0) * 1000)
+    result = dict_set(result, "time_ms", elapsed)
+    _ns = ns_record(_ns, elapsed, false)
+    return result
+}
+
+// -- POST /select/learn --
+fn handle_select_learn(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let model = dict_get(body, "model") ?? (dict_get(req, "model") ?? "")
+    let domain = dict_get(body, "domain") ?? (dict_get(req, "domain") ?? "")
+    let score = dict_get(body, "score") ?? (dict_get(req, "score") ?? 0)
+
+    if3 model == "" {
+        return {"ok": false, "trit": -1, "error": "missing model"}
+    }
+
+    let result = learn_score(model, domain, score)
+    return {
+        "ok": true,
+        "trit": result,
+        "model": model,
+        "domain": domain,
+        "delta": score,
+        "ternary": true
+    }
+}
+
+// -- GET /select/leaderboard --
+fn handle_leaderboard(req) {
+    let lb = build_leaderboard()
+    return {
+        "ok": true,
+        "trit": 1,
+        "leaderboard": lb,
+        "leaderboard_size": LEADERBOARD_SIZE,
+        "total_models": len(keys(_scores)),
+        "ternary": true
+    }
+}
+
+// -- GET /health --
+fn handle_health(req) {
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, _ns)
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "total_models", len(keys(_scores)))
+    resp = dict_set(resp, "total_selects", dict_get(_stats, "total_selects") ?? 0)
+    resp = dict_set(resp, "total_parallels", dict_get(_stats, "total_parallels") ?? 0)
+    resp = dict_set(resp, "total_learns", dict_get(_stats, "total_learns") ?? 0)
+    resp = dict_set(resp, "scores_version", dict_get(_scores_meta, "version") ?? "none")
+    resp = dict_set(resp, "stub", false)
+    return resp
+}
+
+// -- GET /status --
+fn handle_status(req) {
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "total_models": len(keys(_scores)),
+        "total_selects": dict_get(_stats, "total_selects") ?? 0,
+        "total_parallels": dict_get(_stats, "total_parallels") ?? 0,
+        "total_learns": dict_get(_stats, "total_learns") ?? 0,
+        "decay_factor": DECAY_FACTOR,
+        "leaderboard_size": LEADERBOARD_SIZE,
+        "trit": 1,
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// ============================================================
+// INITIALIZATION
+// ============================================================
+
+// Load score cache
+let _load_result = load_scores()
+if3 _load_result == -1 {
+    print("[SELECTOR] Running cold — build scores with nova_model_scores_init.nova first")
+}
+
+// Apply decay on boot
+apply_decay()
+
+// ============================================================
+// SERVER SETUP
+// ============================================================
+let server = tserve(PORT, SERVICE_NAME)
+
+// Health and status
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/status", "handle_status")
+
+// Core selection endpoints
+troute(server, "POST", "/select/best", "handle_select_best")
+troute(server, "POST", "/select/parallel", "handle_select_parallel")
+troute(server, "POST", "/select/learn", "handle_select_learn")
+troute(server, "GET", "/select/leaderboard", "handle_leaderboard")
+
+// ============================================================
+// BOOT
+// ============================================================
+print("[Model Selector] Nova Model Selector v" + VERSION + " on port " + str(PORT))
+print("[Model Selector] Runtime: NovaLang | Ternary: TRUE")
+print("[Model Selector] Models loaded: " + str(len(keys(_scores))))
+print("[Model Selector] Decay factor: " + str(DECAY_FACTOR) + " per day")
+print("[Model Selector] Leaderboard: top " + str(LEADERBOARD_SIZE) + " per domain (H13)")
+print("[Model Selector] Routes: /health /status /select/best /select/parallel /select/learn /select/leaderboard")
+print("[Model Selector] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+
+tstart(server)

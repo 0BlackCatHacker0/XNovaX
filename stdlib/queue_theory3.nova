@@ -1,0 +1,213 @@
+// ============================================================================
+// queue_theory3.nova — Queuing Theory Router (Little's Law + M/M/1)
+// ============================================================================
+// Uses queuing theory to predict service latency and optimal routing:
+//   Little's Law: L = λ * W  (items in system = arrival rate * wait time)
+//   M/M/1 Queue: W = 1/(μ - λ)  (wait time for single-server queue)
+//   Utilization: ρ = λ/μ  (server load)
+//
+// Ternary state:
+//   +1 = queue healthy (ρ < 0.7, low latency)
+//    0 = queue pressured (0.7 ≤ ρ < 0.9, degraded)
+//   -1 = queue saturated (ρ ≥ 0.9, near failure)
+//
+// Uses v1.4 features: ??, default params
+// 3-5-7-13: window=H13(13), thresholds at H3/H5/H7 aligned
+// ============================================================================
+
+fn qt3_new(name = "queue", capacity = 100) {
+    return {
+        "name": name,
+        "capacity": capacity,
+        "providers": {},
+        "total_routed": 0,
+        "total_rejected": 0
+    }
+}
+
+fn qt3_register(q, provider_name, service_rate = 100) {
+    let providers = dict_get(q, "providers") ?? {}
+    let entry = {
+        "name": provider_name,
+        "service_rate": service_rate,
+        "arrival_rate": 0,
+        "in_flight": 0,
+        "total_served": 0,
+        "total_wait_ms": 0,
+        "window_arrivals": [],
+        "window_departures": []
+    }
+    providers = dict_set(providers, provider_name, entry)
+    let result = deep_clone(q)
+    result = dict_set(result, "providers", providers)
+    return result
+}
+
+// ── Record an arrival (request sent to provider) ────────────────
+fn qt3_arrive(q, provider_name) {
+    let providers = dict_get(q, "providers") ?? {}
+    let entry = dict_get(providers, provider_name) ?? {}
+    let in_flight = (dict_get(entry, "in_flight") ?? 0) + 1
+    let window = dict_get(entry, "window_arrivals") ?? []
+    window = append(window, time_ms())
+    // Keep window to last 13 entries (H13)
+    if3 len(window) > 13 {
+        window = slice(window, len(window) - 13, len(window))
+    }
+    entry = dict_set(entry, "in_flight", in_flight)
+    entry = dict_set(entry, "window_arrivals", window)
+    providers = dict_set(providers, provider_name, entry)
+    let result = deep_clone(q)
+    result = dict_set(result, "providers", providers)
+    result = dict_set(result, "total_routed", (dict_get(q, "total_routed") ?? 0) + 1)
+    return result
+}
+
+// ── Record a departure (response received from provider) ────────
+fn qt3_depart(q, provider_name, wait_ms = 0) {
+    let providers = dict_get(q, "providers") ?? {}
+    let entry = dict_get(providers, provider_name) ?? {}
+    let in_flight = (dict_get(entry, "in_flight") ?? 0) - 1
+    if3 in_flight < 0 { in_flight = 0 }
+    let total_served = (dict_get(entry, "total_served") ?? 0) + 1
+    let total_wait = (dict_get(entry, "total_wait_ms") ?? 0) + wait_ms
+    let window = dict_get(entry, "window_departures") ?? []
+    window = append(window, time_ms())
+    if3 len(window) > 13 {
+        window = slice(window, len(window) - 13, len(window))
+    }
+    entry = dict_set(entry, "in_flight", in_flight)
+    entry = dict_set(entry, "total_served", total_served)
+    entry = dict_set(entry, "total_wait_ms", total_wait)
+    entry = dict_set(entry, "window_departures", window)
+    // Update measured service rate (μ) from recent departures
+    if3 len(window) >= 2 {
+        let span = window[len(window) - 1] - window[0]
+        if3 span > 0 {
+            let measured_rate = ((len(window) - 1) * 1000) / span
+            entry = dict_set(entry, "service_rate", measured_rate)
+        }
+    }
+    providers = dict_set(providers, provider_name, entry)
+    let result = deep_clone(q)
+    result = dict_set(result, "providers", providers)
+    return result
+}
+
+// ── Calculate arrival rate (λ) from recent window ───────────────
+fn qt3_arrival_rate(q, provider_name) {
+    let providers = dict_get(q, "providers") ?? {}
+    let entry = dict_get(providers, provider_name) ?? {}
+    let window = dict_get(entry, "window_arrivals") ?? []
+    if3 len(window) < 2 { return 0 }
+    let span = window[len(window) - 1] - window[0]
+    if3 span <= 0 { return 0 }
+    // Rate in requests per second
+    return ((len(window) - 1) * 1000) / span
+}
+
+// ── Calculate utilization (ρ = λ/μ) ─────────────────────────────
+fn qt3_utilization(q, provider_name) {
+    let providers = dict_get(q, "providers") ?? {}
+    let entry = dict_get(providers, provider_name) ?? {}
+    let mu = dict_get(entry, "service_rate") ?? 100
+    let lambda = qt3_arrival_rate(q, provider_name)
+    if3 mu <= 0 { return 1.0 }
+    let rho = lambda / mu
+    if3 rho > 1.0 { rho = 1.0 }
+    return rho
+}
+
+// ── Predict wait time using M/M/1 model: W = 1/(μ - λ) ─────────
+fn qt3_predicted_wait(q, provider_name) {
+    let providers = dict_get(q, "providers") ?? {}
+    let entry = dict_get(providers, provider_name) ?? {}
+    let mu = dict_get(entry, "service_rate") ?? 100
+    let lambda = qt3_arrival_rate(q, provider_name)
+    if3 lambda >= mu { return 99999 }
+    let diff = mu - lambda
+    if3 diff <= 0 { return 99999 }
+    // W in milliseconds = 1000 / (μ - λ)
+    return 1000 / diff
+}
+
+// ── Little's Law: L = λ * W (expected items in system) ──────────
+fn qt3_expected_queue_length(q, provider_name) {
+    let lambda = qt3_arrival_rate(q, provider_name)
+    let w = qt3_predicted_wait(q, provider_name)
+    return lambda * w / 1000
+}
+
+// ── Health trit based on utilization ────────────────────────────
+fn qt3_health(q, provider_name) {
+    let rho = qt3_utilization(q, provider_name)
+    if3 rho < 0.7 { return 1 }
+    if3 rho < 0.9 { return 0 }
+    return -1
+}
+
+// ── Select best provider (lowest predicted wait time) ───────────
+fn qt3_select(q) {
+    let providers = dict_get(q, "providers") ?? {}
+    let prov_names = dict_keys(providers)
+    if3 len(prov_names) == 0 {
+        return {"provider": null, "trit": -1}
+    }
+    let best_name = prov_names[0]
+    let best_wait = 999999
+    let i = 0
+    while3 i < len(prov_names) {
+        let pname = prov_names[i]
+        let rho = qt3_utilization(q, pname)
+        // Skip saturated providers
+        if3 rho < 0.95 {
+            let wait = qt3_predicted_wait(q, pname)
+            if3 wait < best_wait {
+                best_wait = wait
+                best_name = pname
+            }
+        }
+        i = i + 1
+    }
+    let trit = qt3_health(q, best_name)
+    return {
+        "provider": best_name,
+        "trit": trit,
+        "predicted_wait_ms": best_wait,
+        "utilization": qt3_utilization(q, best_name)
+    }
+}
+
+// ── Stats for all providers ─────────────────────────────────────
+fn qt3_stats(q) {
+    let providers = dict_get(q, "providers") ?? {}
+    let prov_names = dict_keys(providers)
+    let provider_stats = {}
+    let i = 0
+    while3 i < len(prov_names) {
+        let pname = prov_names[i]
+        let entry = dict_get(providers, pname) ?? {}
+        let total_served = dict_get(entry, "total_served") ?? 0
+        let total_wait = dict_get(entry, "total_wait_ms") ?? 0
+        let avg_wait = 0
+        if3 total_served > 0 { avg_wait = total_wait / total_served }
+        provider_stats = dict_set(provider_stats, pname, {
+            "utilization": qt3_utilization(q, pname),
+            "health": qt3_health(q, pname),
+            "in_flight": dict_get(entry, "in_flight") ?? 0,
+            "total_served": total_served,
+            "avg_wait_ms": avg_wait,
+            "predicted_wait_ms": qt3_predicted_wait(q, pname),
+            "queue_length": qt3_expected_queue_length(q, pname),
+            "arrival_rate": qt3_arrival_rate(q, pname),
+            "service_rate": dict_get(entry, "service_rate") ?? 100
+        })
+        i = i + 1
+    }
+    return {
+        "name": dict_get(q, "name") ?? "queue",
+        "total_routed": dict_get(q, "total_routed") ?? 0,
+        "total_rejected": dict_get(q, "total_rejected") ?? 0,
+        "providers": provider_stats
+    }
+}

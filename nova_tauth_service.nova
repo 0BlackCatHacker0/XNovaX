@@ -1,0 +1,375 @@
+// Nova TAuth Service v1.0 - Session Token Authentication Micro-Tool
+// Port 9952: Zero-trust session token auth for NovaX services
+//
+// WARNING: sha256() in NovaLang is cascaded FNV-1a, NOT cryptographic SHA-256.
+// Token seals use this for integrity checks only (collision-resistant enough
+// for local service auth). Not suitable for external-facing authentication.
+//
+// Ternary states:
+//   +1 (TRUE)  = authenticated / valid token
+//    0 (MAYBE) = localhost health bypass (no token needed)
+//   -1 (FALSE) = denied / invalid token
+//
+// 3-5-7-13 Harmonic Constants:
+//   Token length = 32 hex chars (uuid_hex(32))
+//   Session seal uses H13-char SHA prefix for integrity
+//   Auth log capped at H13 * H5^3 = 13 * 125 = 1625 -> use 1000 (round)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9952
+let VERSION = "1.0"
+let TOKEN_FILE = "C:\\NovaX\\.session_token"
+let TOKEN_LENGTH = 32
+let AUTH_LOG_MAX = 1000
+
+// -- 3-5-7-13 Harmonic Constants --
+
+// -- Core State --
+let current_token = ""
+let token_created = 0
+let token_generation = 0
+let auth_log = []
+
+// -- Token Management --
+
+fn generate_token() {
+    // Generate a 32-hex-char session token via uuid_hex
+    let tok = uuid_hex(32)
+    let current_token = tok
+    let token_created = time()
+    token_generation = token_generation + 1
+    // Write token to file so all local services can read it
+    nova_write(TOKEN_FILE, tok)
+    return tok
+}
+
+fn validate_token(tok) {
+    // Returns TRUE(1), MAYBE(0), or FALSE(-1)
+    if3 len(tok) == 0 {
+        return MAYBE   // no token provided
+    }
+    if3 len(current_token) == 0 {
+        return FALSE   // no token generated yet
+    }
+    if3 tok == current_token {
+        return TRUE    // valid
+    }
+    return FALSE       // invalid
+}
+
+fn record_auth(svc, path, source_ip, decision, reason) {
+    // Append auth decision; cap log at AUTH_LOG_MAX
+    let entry = {
+        "timestamp": time(),
+        "service": svc,
+        "path": path,
+        "source_ip": source_ip,
+        "decision": decision,
+        "reason": reason
+    }
+    auth_log = append(auth_log, entry)
+    if3 len(auth_log) > AUTH_LOG_MAX {
+        // Trim oldest half (amortized)
+        let auth_log = slice(auth_log, 500, len(auth_log))
+    }
+}
+
+// -- Helper: check if path is a health path --
+fn is_health_path(path) {
+    // Strip query params
+    let parts = split(path, "?")
+    let clean = parts[0]
+    if3 clean == "/health" {
+        return TRUE
+    }
+    if3 clean == "/tauth/health" {
+        return TRUE
+    }
+    if3 endswith(clean, "/health") {
+        return TRUE
+    }
+    return FALSE
+}
+
+// -- Helper: check if source IP is localhost --
+fn is_localhost_ip(ip) {
+    if3 ip == "127.0.0.1" {
+        return TRUE
+    }
+    if3 ip == "::1" {
+        return TRUE
+    }
+    if3 ip == "localhost" {
+        return TRUE
+    }
+    return FALSE
+}
+
+// -- Route Handlers --
+
+// GET /health and GET /tauth/health
+fn health() {
+    let token_active = FALSE
+    if3 len(current_token) > 0 {
+        let token_active = TRUE
+    }
+    let resp = ns_health_dict("nova-tauth", VERSION, PORT, {})
+    resp = dict_set(resp, "token_active", token_active)
+    resp = dict_set(resp, "token_generation", token_generation)
+    resp = dict_set(resp, "token_created", token_created)
+    resp = dict_set(resp, "auth_log_size", len(auth_log))
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// GET /tauth/token - return current token (localhost-only via network binding)
+fn tauth_token() {
+    if3 len(current_token) == 0 {
+        return {
+            "ok": false,
+            "trit": FALSE,
+            "error": "no token generated"
+        }
+    }
+    return {
+        "ok": true,
+        "trit": TRUE,
+        "token": current_token,
+        "generation": token_generation,
+        "created": token_created
+    }
+}
+
+// GET /tauth/status - summary of auth system state
+fn tauth_status() {
+    let token_active = FALSE
+    if3 len(current_token) > 0 {
+        let token_active = TRUE
+    }
+    let trit_val = FALSE
+    if3 token_active == TRUE {
+        let trit_val = TRUE
+    }
+    let total_events = len(auth_log)
+    // Count allowed (decision >= 0) and denied (decision < 0)
+    let allowed = 0
+    let denied = 0
+    let i = 0
+    while3 i < total_events {
+        let entry = auth_log[i]
+        let dec = dict_get(entry, "decision") ?? FALSE
+        if3 dec >= 0 {
+            allowed = allowed + 1
+        }
+        if3 dec < 0 {
+            denied = denied + 1
+        }
+        i = i + 1
+    }
+    return {
+        "ok": true,
+        "trit": trit_val,
+        "token_active": token_active,
+        "token_generation": token_generation,
+        "token_created": token_created,
+        "token_file": TOKEN_FILE,
+        "auth_events_total": total_events,
+        "auth_allowed": allowed,
+        "auth_denied": denied,
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// POST /tauth/validate - check if a token is valid
+fn tauth_validate(body) {
+    let tok = dict_get(body, "token") ?? ""
+    let result_trit = validate_token(tok)
+    if3 result_trit == TRUE {
+        return {
+            "ok": true,
+            "trit": TRUE,
+            "valid": true,
+            "msg": "token valid"
+        }
+    } else result_trit == MAYBE {
+        return {
+            "ok": false,
+            "trit": MAYBE,
+            "valid": false,
+            "msg": "no token provided"
+    } else {
+        return {
+            "ok": false,
+            "trit": FALSE,
+            "valid": false,
+            "msg": "invalid token"
+        }
+    }
+}
+
+// POST /tauth/generate - rotate the session token
+}
+fn tauth_generate(body) {
+    let new_token = generate_token()
+    let gen = token_generation
+    // Use sha256 prefix as a seal for integrity (H13 chars)
+    let seal_full = sha256(new_token)
+    let seal = slice(seal_full, 0, H13)
+    return {
+        "ok": true,
+        "trit": TRUE,
+        "token": new_token,
+        "generation": gen,
+        "seal": seal,
+        "seal_trit": TRUE,
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// POST /tauth/middleware - auth decision gateway for other services
+fn tauth_middleware(body) {
+    let tok = dict_get(body, "token") ?? ""
+    let svc = dict_get(body, "service") ?? "unknown"
+    let path = dict_get(body, "path") ?? "/"
+    let source_ip = dict_get(body, "source_ip") ?? ""
+
+    // Rule 1: localhost + health path = bypass (MAYBE trit)
+    let localhost_check = is_localhost_ip(source_ip)
+    let health_check = is_health_path(path)
+
+    if3 localhost_check == TRUE {
+        if3 health_check == TRUE {
+            record_auth(svc, path, source_ip, MAYBE, "health_bypass")
+            return {
+                "ok": true,
+                "trit": MAYBE,
+                "allow": true,
+                "reason": "health_bypass",
+                "msg": "localhost health - no token required"
+            }
+        } else health_check == MAYBE {
+            // MAYBE from is_health_path not expected, treat as not health
+        } else {
+            // not a health path, fall through to token validation below
+        }
+    } else localhost_check == MAYBE {
+        // MAYBE not expected from is_localhost_ip
+    } else {
+        // not localhost, fall through to token validation below
+    }
+
+    // Rules 2-4: validate the token
+    let token_trit = validate_token(tok)
+
+    if3 token_trit == TRUE {
+        record_auth(svc, path, source_ip, TRUE, "authenticated")
+        return {
+            "ok": true,
+            "trit": TRUE,
+            "allow": true,
+            "reason": "authenticated",
+            "msg": "valid token"
+        }
+    } else token_trit == MAYBE {
+        record_auth(svc, path, source_ip, MAYBE, "missing_token")
+        return {
+            "ok": false,
+            "trit": MAYBE,
+            "allow": false,
+            "reason": "missing_token",
+            "msg": "no token provided - include X-Nova-Token header or ?token= param"
+    } else {
+        record_auth(svc, path, source_ip, FALSE, "invalid_token")
+        return {
+            "ok": false,
+            "trit": FALSE,
+            "allow": false,
+            "reason": "invalid_token",
+            "msg": "token rejected - may be expired or rotated"
+        }
+    }
+}
+
+// POST /tauth/log - retrieve recent auth decisions
+}
+fn tauth_log(body) {
+    let n = dict_get(body, "n") ?? 50
+    let filter_service = dict_get(body, "service") ?? ""
+    // Clamp n between 1 and 500
+    if3 n < 1 {
+        let n = 1
+    }
+    if3 n > 500 {
+        let n = 500
+    }
+    // Build filtered entries list
+    let entries = []
+    let total = len(auth_log)
+    let i = 0
+    while3 i < total {
+        let entry = auth_log[i]
+        if3 len(filter_service) > 0 {
+            let entry_svc = dict_get(entry, "service") ?? ""
+            if3 entry_svc == filter_service {
+                entries = append(entries, entry)
+            }
+        }
+        if3 len(filter_service) == 0 {
+            entries = append(entries, entry)
+        }
+        i = i + 1
+    }
+    // Take last n entries
+    let entry_count = len(entries)
+    let start = entry_count - n
+    if3 start < 0 {
+        let start = 0
+    }
+    let recent = slice(entries, start, entry_count)
+    return {
+        "ok": true,
+        "trit": TRUE,
+        "entries": recent,
+        "count": len(recent),
+        "total": entry_count,
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// -- Server Setup --
+let server = tserve(PORT, "TAuth v1.0 - Session Token Authentication")
+
+// -- Register Routes --
+troute(server, "GET", "/health", "health")
+troute(server, "GET", "/tauth/health", "health")
+troute(server, "GET", "/tauth/token", "tauth_token")
+troute(server, "GET", "/tauth/status", "tauth_status")
+troute(server, "POST", "/tauth/validate", "tauth_validate")
+troute(server, "POST", "/tauth/generate", "tauth_generate")
+troute(server, "POST", "/tauth/middleware", "tauth_middleware")
+troute(server, "POST", "/tauth/log", "tauth_log")
+
+// -- Startup: Generate Initial Session Token --
+let startup_token = generate_token()
+let token_prefix = slice(startup_token, 0, 8)
+let token_suffix = slice(startup_token, 28, 32)
+
+print("[TAuth] NovaX Session Token Authentication v" + VERSION + " starting...")
+print("[TAuth] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TAuth] Token file: " + TOKEN_FILE)
+print("[TAuth] Initial token gen#1: " + token_prefix + "..." + token_suffix)
+print("[TAuth] Token length: " + str(TOKEN_LENGTH) + " hex chars (uuid_hex(32))")
+print("[TAuth] Auth log cap: " + str(AUTH_LOG_MAX) + " entries (slice-trimmed)")
+print("[TAuth] Health bypass: /health, /tauth/health, **/health (localhost only)")
+print("[TAuth] Routes: GET /health, GET /tauth/health, GET /tauth/token, GET /tauth/status")
+print("[TAuth]         POST /tauth/validate, POST /tauth/generate, POST /tauth/middleware, POST /tauth/log")
+print("[TAuth] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TAuth] Seal prefix: " + slice(sha256(startup_token), 0, H13))
+
+tstart(server)

@@ -1,0 +1,99 @@
+// ============================================================================
+// retry3.nova — Ternary Retry Engine with Exponential Backoff
+// ============================================================================
+// Retry strategies for unreliable operations using ternary state:
+//   +1 = succeeded, operation completed
+//    0 = retrying, attempts in progress
+//   -1 = exhausted, all retries failed
+//
+// Uses v1.4 features: ??, default params, in operator
+// 3-5-7-13 Harmonics: max_retries=H7(7), base_delay=H3*100(300ms)
+// ============================================================================
+
+fn retry3_new(name = "retry", max_retries = 7, base_delay_ms = 300, max_delay_ms = 13000) {
+    return {
+        "name": name,
+        "max_retries": max_retries,
+        "base_delay_ms": base_delay_ms,
+        "max_delay_ms": max_delay_ms,
+        "attempt": 0,
+        "state": 1,
+        "last_error": null,
+        "total_attempts": 0,
+        "total_successes": 0,
+        "total_failures": 0
+    }
+}
+
+fn retry3_next_delay(r) {
+    let attempt = dict_get(r, "attempt") ?? 0
+    let base = dict_get(r, "base_delay_ms") ?? 300
+    let max_d = dict_get(r, "max_delay_ms") ?? 13000
+    // Exponential backoff: base * 2^attempt
+    let delay = base
+    let i = 0
+    while3 i < attempt {
+        delay = delay * 2
+        i = i + 1
+    }
+    return clamp(delay, base, max_d)
+}
+
+fn retry3_attempt(r) {
+    let attempt = (dict_get(r, "attempt") ?? 0) + 1
+    let max_r = dict_get(r, "max_retries") ?? 7
+    let total = (dict_get(r, "total_attempts") ?? 0) + 1
+    let result = deep_clone(r)
+    result = dict_set(result, "attempt", attempt)
+    result = dict_set(result, "total_attempts", total)
+    result = dict_set(result, "state", 0)
+    if3 attempt >= max_r {
+        result = dict_set(result, "state", -1)
+        let fails = (dict_get(r, "total_failures") ?? 0) + 1
+        result = dict_set(result, "total_failures", fails)
+    }
+    return result
+}
+
+fn retry3_success(r) {
+    let sc = (dict_get(r, "total_successes") ?? 0) + 1
+    let result = deep_clone(r)
+    result = dict_set(result, "state", 1)
+    result = dict_set(result, "attempt", 0)
+    result = dict_set(result, "last_error", null)
+    result = dict_set(result, "total_successes", sc)
+    return result
+}
+
+fn retry3_failure(r, error_msg = null) {
+    let result = retry3_attempt(r)
+    result = dict_set(result, "last_error", error_msg)
+    return result
+}
+
+fn retry3_should_retry(r) {
+    let state = dict_get(r, "state") ?? -1
+    return state == 0
+}
+
+fn retry3_is_exhausted(r) {
+    let state = dict_get(r, "state") ?? -1
+    return state == -1
+}
+
+fn retry3_stats(r) {
+    let state = dict_get(r, "state") ?? 0
+    let state_name = "retrying"
+    if3 state == 1 { state_name = "ok" }
+    if3 state == -1 { state_name = "exhausted" }
+    return {
+        "name": dict_get(r, "name") ?? "retry",
+        "state": state_name,
+        "attempt": dict_get(r, "attempt") ?? 0,
+        "max_retries": dict_get(r, "max_retries") ?? 7,
+        "total_attempts": dict_get(r, "total_attempts") ?? 0,
+        "total_successes": dict_get(r, "total_successes") ?? 0,
+        "total_failures": dict_get(r, "total_failures") ?? 0,
+        "last_error": dict_get(r, "last_error") ?? null
+    }
+}

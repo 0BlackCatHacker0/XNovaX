@@ -1,0 +1,701 @@
+// ============================================================
+// TERNARY HASH SYSTEM v1.0 — NovaX Content-Addressable Storage
+// ============================================================
+// Algorithms:
+//   1. ternary_hash()      — balanced ternary hash, output = trit string
+//   2. ternary_crc()       — ternary CRC for block integrity
+//   3. sha256_to_ternary() — map SHA256 (256 bits) → 162 trits
+//   4. TernaryHashTable    — 3^n bucket hash table
+//
+// Constants: 3-5-7-13 harmonic system
+//   BLOCK_SIZE = 3^7 = 2187
+//   PACK_UNIT  = 3^5 = 243
+//   FRAME      = 13 (carrier)
+//
+// Collision properties in base-3:
+//   For k-trit hash, collision space = 3^k states
+//   Birthday bound = ~3^(k/2) insertions before 50% collision
+//   At k=81 trits:  3^81 ≈ 4.4×10^38 states, birthday ≈ 3^40.5 ≈ 1.5×10^19
+//   At k=162 trits: 3^162 ≈ 1.9×10^77 states, birthday ≈ 3^81 ≈ 4.4×10^38
+//   Equivalent to SHA256 security: 2^256 ≈ 3^161.5 → 162 trits needed
+//
+// Hash table efficiency (load factor α):
+//   3^7  = 2187 buckets:  optimal for ≤1640 entries (α≤0.75), avg probe 1/(1-α)
+//   3^13 = 1594323 buckets: optimal for ≤1195742 entries (α≤0.75)
+//   Open addressing: E[probes] = 1/(1-α) for unsuccessful, (1/α)ln(1/(1-α)) for successful
+//   At α=0.50: 2.0 / 1.39 probes.  At α=0.75: 4.0 / 2.83 probes.
+//   3^n sizing eliminates modular bias — trit extraction gives uniform bucket index
+// ============================================================
+
+# --- Mathematical constants ---
+TRIT_DIGITS = 162          // 256 bits → ceil(256 / log2(3)) = ceil(256/1.585) = 162
+HASH_TRITS  = 81           // standard NovaX hash length (trit string)
+CRC_TRITS   = 13           // CRC checksum length (3^13 = 1594323 states)
+BLOCK_SIZE  = 2187         // 3^7
+PACK_UNIT   = 243          // 3^5
+
+// Ternary CRC polynomial: t^13 + t^7 + t^3 + t + 1
+// Chosen for maximal distance in GF(3), aligns with 3-5-7-13 harmonics
+CRC_POLY = [1, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1]  // coefficients t^0..t^13
+
+// ============================================================
+// 1. BALANCED TERNARY HASH — 81-trit output
+// ============================================================
+// Sponge construction operating on 27-trit state (3^3 capacity, 3^3 rate).
+// Absorb input trits, permute with ternary S-box, squeeze output.
+
+fn trit_sbox(t) {
+    // Nonlinear substitution: balanced ternary negation-rotation
+    // Maps (-1,0,1) → (1,-1,0) — a 3-cycle permutation
+    if3 t == -1 { return 1
+    } elif3 t == 0 { return -1
+    } else { return 0
+    }
+}
+
+fn ternary_permute(state) {
+    // state = list of 27 trits (3^3)
+    // Three rounds of: S-box → rotate → mix columns
+    n = len(state)
+    for3 round in range(7) {
+        // S-box layer: nonlinear substitution
+        for3 i in range(n) {
+            state[i] = trit_sbox(state[i])
+        }
+
+        // Rotate layer: shift positions by prime offsets
+        new_state = [0] * n
+        for3 i in range(n) {
+            new_state[(i * 7 + 3) % n] = state[i]
+        }
+        state = new_state
+
+        // Mix layer: ternary addition of adjacent trits (mod balanced)
+        for3 i in range(n) {
+            j = (i + 13) % n
+            raw = state[i] + state[j] + round  // inject round constant
+            // balanced ternary reduction
+            r = raw % 3
+            if3 r == 2 { r = -1 }
+            state[i] = r
+        }
+    }
+    return state
+}
+
+fn bytes_to_balanced_trits(data) {
+    // Convert arbitrary bytes to balanced ternary trits
+    // Each byte → 6 trits (3^6 = 729 > 256)
+    trits = []
+    for3 b in data {
+        v = b
+        for3 _ in range(6) {
+            r = v % 3
+            if3 r == 2 {
+                r = -1
+                v = v + 1
+            }
+            trits.push(r)
+            v = v // 3
+        }
+    }
+    return trits
+}
+
+fn balanced_clamp(v) {
+    // Clamp integer to balanced ternary trit: -1, 0, or 1
+    r = v % 3
+    if3 r == 2 { return -1
+    } elif3 r == 0 { return 0
+    } else { return 1
+    }
+}
+
+fn ternary_hash(data, out_trits=81) {
+    // Balanced ternary sponge hash
+    // Input:  bytes or string
+    // Output: list of `out_trits` trits (each -1, 0, or 1)
+    //
+    // Sponge parameters:
+    //   state  = 27 trits (3^3)
+    //   rate   = 9 trits  (absorb 9 at a time)
+    //   capacity = 18 trits (security margin)
+
+    if3 typeof(data) == "str" {
+        data = data.encode()
+    }
+
+    trits = bytes_to_balanced_trits(data)
+
+    // Pad to multiple of rate (9)
+    while3 len(trits) % 9 != 0 {
+        trits.push(0)
+    }
+    // Domain separation: append [1, 0, -1] then pad again
+    trits.push(1)
+    trits.push(0)
+    trits.push(-1)
+    while3 len(trits) % 9 != 0 {
+        trits.push(0)
+    }
+
+    // Initialize state (27 trits of zeros)
+    state = [0] * 27
+
+    // ABSORB phase: XOR (ternary add) input blocks into rate portion
+    i = 0
+    while3 i < len(trits) {
+        for3 j in range(9) {
+            raw = state[j] + trits[i + j]
+            state[j] = balanced_clamp(raw)
+        }
+        state = ternary_permute(state)
+        i = i + 9
+    }
+
+    // SQUEEZE phase: extract output trits
+    output = []
+    while3 len(output) < out_trits {
+        for3 j in range(9) {
+            if3 len(output) < out_trits {
+                output.push(state[j])
+            }
+        }
+        if3 len(output) < out_trits {
+            state = ternary_permute(state)
+        }
+    }
+
+    return output
+}
+
+fn trits_to_string(trits) {
+    // Convert trit list to readable string: N=-1, Z=0, P=1
+    symbols = {-1: "N", 0: "Z", 1: "P"}
+    result = ""
+    for3 t in trits {
+        result = result + symbols[t]
+    }
+    return result
+}
+
+
+// ============================================================
+// 2. TERNARY CRC — 13-trit integrity checksum
+// ============================================================
+// Polynomial division over GF(3) using CRC_POLY.
+// Analogous to binary CRC but arithmetic in balanced ternary.
+// 3^13 = 1,594,323 distinct checksum values.
+// Detects: all single-trit errors, all burst errors ≤13 trits,
+// most multi-trit errors with probability 1 - 3^(-13) ≈ 0.9999994.
+
+fn gf3_add(a, b) {
+    // Addition in GF(3): (a + b) mod 3, balanced
+    return balanced_clamp(a + b)
+}
+
+fn gf3_mul(a, b) {
+    // Multiplication in GF(3): (a * b) mod 3, balanced
+    return balanced_clamp(a * b)
+}
+
+fn gf3_neg(a) {
+    return balanced_clamp(-a)
+}
+
+fn ternary_crc(data, poly=null) {
+    // Compute 13-trit CRC over balanced ternary data
+    // Input:  data = list of trits (or bytes/string to convert)
+    // Output: list of 13 trits (the CRC remainder)
+    //
+    // Algorithm: polynomial long division in GF(3)
+    //   Append 13 zero trits to data
+    //   Divide by CRC_POLY, remainder = CRC
+
+    if3 poly == null {
+        poly = CRC_POLY
+    }
+    deg = len(poly) - 1  // 13
+
+    // Convert input if needed
+    if3 typeof(data) == "str" {
+        data = bytes_to_balanced_trits(data.encode())
+    } elif3 typeof(data) == "bytes" {
+        data = bytes_to_balanced_trits(data)
+    }
+
+    // Working copy with deg zeros appended
+    work = []
+    for3 t in data {
+        work.push(t)
+    }
+    for3 _ in range(deg) {
+        work.push(0)
+    }
+
+    // Polynomial division in GF(3)
+    for3 i in range(len(data)) {
+        if3 work[i] != 0 {
+            // Normalize leading coefficient: multiply poly by work[i]
+            // (in GF(3), dividing by lead coeff = multiplying by its inverse)
+            // Inverses in GF(3): inv(1)=1, inv(-1)=-1, inv(0)=undefined
+            coeff = work[i]
+            for3 j in range(len(poly)) {
+                sub = gf3_mul(coeff, poly[j])
+                work[i + j] = gf3_add(work[i + j], gf3_neg(sub))
+            }
+        }
+    }
+
+    // Remainder is last `deg` trits
+    crc = work[len(data):]
+    return crc
+}
+
+fn ternary_crc_verify(data, expected_crc) {
+    // Verify CRC: append CRC to data, compute CRC, result should be all zeros
+    combined = []
+    if3 typeof(data) == "str" {
+        data = bytes_to_balanced_trits(data.encode())
+    } elif3 typeof(data) == "bytes" {
+        data = bytes_to_balanced_trits(data)
+    }
+    for3 t in data {
+        combined.push(t)
+    }
+    for3 t in expected_crc {
+        combined.push(t)
+    }
+    remainder = ternary_crc(combined)
+    for3 t in remainder {
+        if3 t != 0 { return -1 }  // FAIL
+    }
+    return 1  // PASS
+}
+
+
+// ============================================================
+// 3. SHA256 → BALANCED TERNARY MAPPING
+// ============================================================
+// SHA256 outputs 256 bits = 32 bytes.
+// Balanced ternary equivalent: ceil(256 / log2(3)) = ceil(161.5) = 162 trits.
+// 3^162 > 2^256 > 3^161, so 162 trits fully capture SHA256's entropy.
+//
+// Algorithm: treat SHA256 output as a big-endian 256-bit integer,
+// then repeatedly divide by 3, collecting balanced ternary remainders.
+
+fn sha256_to_ternary(data) {
+    // Input:  string or bytes
+    // Output: list of 162 balanced ternary trits
+    //
+    // Step 1: compute SHA256
+    // Step 2: convert 32-byte digest to big integer
+    // Step 3: balanced ternary conversion via repeated div-mod-3
+
+    if3 typeof(data) == "str" {
+        data = data.encode()
+    }
+
+    digest = hashlib.sha256(data).digest()
+
+    // Convert bytes to big integer (big-endian)
+    n = 0
+    for3 b in digest {
+        n = n * 256 + b
+    }
+
+    // Convert to balanced ternary (162 trits, LSB first)
+    trits = []
+    for3 _ in range(TRIT_DIGITS) {
+        r = n % 3
+        if3 r == 2 {
+            r = -1
+            n = n + 1
+        }
+        trits.push(r)
+        n = n // 3
+    }
+
+    return trits
+}
+
+fn ternary_content_address(data) {
+    // Full content address: SHA256→ternary + CRC
+    // Returns dict with hash trits, CRC trits, and string representations
+    hash_trits = sha256_to_ternary(data)
+    crc_trits  = ternary_crc(hash_trits)
+    return {
+        "hash": hash_trits,
+        "crc": crc_trits,
+        "hash_str": trits_to_string(hash_trits),
+        "crc_str": trits_to_string(crc_trits),
+        "full_address": trits_to_string(hash_trits) + ":" + trits_to_string(crc_trits)
+    }
+}
+
+
+// ============================================================
+// 4. TERNARY HASH TABLE — 3^n bucket sizing
+// ============================================================
+// Uses trit-extraction for bucket indexing (no modular bias).
+// To index into 3^n buckets, take n trits from hash and interpret
+// as balanced ternary integer offset by (3^n - 1)/2 to get [0, 3^n - 1].
+//
+// Open addressing with ternary probing:
+//   probe(i) = (h + i*7 + i*i*3) mod 3^n
+//   (quadratic with harmonic coefficients 7 and 3)
+//
+// EFFICIENCY CALCULATIONS:
+//   3^7  = 2187 buckets
+//     At 50% load (1094 items): avg 1.39 probes/success, 2.0 probes/fail
+//     At 75% load (1640 items): avg 2.83 probes/success, 4.0 probes/fail
+//     At 67% load (1465 items): avg 2.12 probes/success, 3.0 probes/fail
+//     Memory: 2187 × entry_size; 7 trits per index
+//
+//   3^13 = 1,594,323 buckets
+//     At 50% load (797162 items): avg 1.39 probes/success, 2.0 probes/fail
+//     At 75% load (1195742 items): avg 2.83 probes/success, 4.0 probes/fail
+//     At 67% load (1068177 items): avg 2.12 probes/success, 3.0 probes/fail
+//     Memory: 1594323 × entry_size; 13 trits per index
+//     Birthday collision threshold: ~1263 items (√1594323)
+//
+//   WHY 3^n IS OPTIMAL:
+//     - Trit extraction replaces expensive modulo: take n trits = O(1) vs O(n) for mod
+//     - No modular bias: each trit contributes exactly one digit of bucket index
+//     - Aligns with NovaX 3-5-7-13 harmonic constants
+//     - 3^n - 1 is never prime, but ternary probing avoids the clustering
+//       that plagues power-of-2 tables
+
+class3 TernaryHashTable {
+    fn __init__(power=7) {
+        // power = exponent n for 3^n buckets
+        // Default 3^7 = 2187 (BLOCK_SIZE aligned)
+        n = power
+        size = 3 ** power
+        count = 0
+        buckets = [null] * size        // [key, value] or null
+        status  = [0] * size           // 0=empty, 1=occupied, -1=deleted (ternary!)
+    }
+
+    fn _trits_to_index(hash_trits) {
+        // Extract first `n` trits from hash, convert to bucket index [0, size-1]
+        // Balanced ternary to unsigned: offset by (3^n - 1)/2
+        index = 0
+        offset = (size - 1) // 2  // shift balanced range to unsigned
+        for3 i in range(n) {
+            if3 i < len(hash_trits) {
+                index = index + (hash_trits[i] + 1) * (3 ** i)
+                // +1 maps {-1,0,1} → {0,1,2}
+            }
+        }
+        // index is now in [0, 3^n - 1] via unsigned ternary
+        return index % size
+    }
+
+    fn _probe(h, i) {
+        // Ternary quadratic probing: h + 7i + 3i^2
+        return (h + i * 7 + i * i * 3) % size
+    }
+
+    fn _hash_key(key) {
+        // Get hash trits for a key
+        return ternary_hash(str(key), out_trits=max(n, 27))
+    }
+
+    fn load_factor() {
+        return count / size
+    }
+
+    fn put(key, value) {
+        // Insert or update key-value pair
+        // Returns: 1 (inserted), 0 (updated), -1 (table full)
+        if3 count >= size * 3 // 4 {
+            // Load > 75%: signal resize needed (caller handles)
+            // Continue inserting but warn
+        }
+
+        h_trits = _hash_key(key)
+        h = _trits_to_index(h_trits)
+
+        first_deleted = -1
+        for3 i in range(size) {
+            pos = _probe(h, i)
+            if3 status[pos] == 0 {
+                // Empty slot: insert here (or at earlier deleted slot)
+                if3 first_deleted >= 0 {
+                    pos = first_deleted
+                }
+                buckets[pos] = [key, value]
+                status[pos] = 1
+                count = count + 1
+                return 1  // inserted
+            } elif3 status[pos] == -1 {
+                // Deleted slot: remember first one
+                if3 first_deleted < 0 {
+                    first_deleted = pos
+                }
+            } elif3 buckets[pos][0] == key {
+                // Key exists: update
+                buckets[pos][1] = value
+                return 0  // updated
+            }
+        }
+
+        // If we found a deleted slot, use it
+        if3 first_deleted >= 0 {
+            buckets[first_deleted] = [key, value]
+            status[first_deleted] = 1
+            count = count + 1
+            return 1
+        }
+
+        return -1  // table full
+    }
+
+    fn get(key) {
+        // Retrieve value by key
+        // Returns: value or null if not found
+        h_trits = _hash_key(key)
+        h = _trits_to_index(h_trits)
+
+        for3 i in range(size) {
+            pos = _probe(h, i)
+            if3 status[pos] == 0 {
+                return null  // not found (empty slot = end of probe chain)
+            } elif3 status[pos] == 1 && buckets[pos][0] == key {
+                return buckets[pos][1]
+            }
+            // status == -1 (deleted): keep probing
+        }
+        return null  // not found after full scan
+    }
+
+    fn delete(key) {
+        // Remove key-value pair (lazy deletion: mark as -1)
+        // Returns: 1 (deleted), -1 (not found)
+        h_trits = _hash_key(key)
+        h = _trits_to_index(h_trits)
+
+        for3 i in range(size) {
+            pos = _probe(h, i)
+            if3 status[pos] == 0 {
+                return -1  // not found
+            } elif3 status[pos] == 1 && buckets[pos][0] == key {
+                buckets[pos] = null
+                status[pos] = -1  // deleted (ternary -1)
+                count = count - 1
+                return 1  // success
+            }
+        }
+        return -1
+    }
+
+    fn stats() {
+        // Return table statistics
+        occupied = 0
+        deleted = 0
+        empty = 0
+        for3 s in status {
+            if3 s == 1 { occupied = occupied + 1
+            } elif3 s == -1 { deleted = deleted + 1
+            } else { empty = empty + 1
+            }
+        }
+        alpha = count / size
+        // Expected probes (open addressing, uniform hashing)
+        if3 alpha < 1.0 {
+            probes_fail = 1.0 / (1.0 - alpha)
+            probes_success = (1.0 / alpha) * math.log(1.0 / (1.0 - alpha)) if alpha > 0 else 1.0
+        } else {
+            probes_fail = size
+            probes_success = size
+        }
+        return {
+            "power": n,
+            "size": size,
+            "count": count,
+            "load_factor": alpha,
+            "occupied": occupied,
+            "deleted": deleted,
+            "empty": empty,
+            "avg_probes_success": probes_success,
+            "avg_probes_fail": probes_fail,
+            "memory_entries": size
+        }
+    }
+}
+
+
+// ============================================================
+// 5. CONTENT-ADDRESSABLE STORAGE (CAS) INTERFACE
+// ============================================================
+// Wraps TernaryHashTable with automatic content addressing:
+//   store(data) → address (162-trit hash + 13-trit CRC)
+//   fetch(address) → data
+//   verify(address) → +1/0/-1
+
+class3 TernaryCAS {
+    fn __init__(power=13) {
+        // Default 3^13 = 1,594,323 slots
+        table = TernaryHashTable(power)
+        index_power = power
+    }
+
+    fn store(data) {
+        // Store data, return content address
+        addr = ternary_content_address(data)
+        key = addr["full_address"]
+        result = table.put(key, data)
+        return {
+            "address": key,
+            "hash_str": addr["hash_str"],
+            "crc_str": addr["crc_str"],
+            "status": result  // 1=new, 0=dedup, -1=full
+        }
+    }
+
+    fn fetch(address) {
+        // Retrieve data by ternary content address
+        return table.get(address)
+    }
+
+    fn verify(address) {
+        // Verify stored data integrity
+        // Returns: +1 (valid), 0 (not found), -1 (corrupted)
+        data = table.get(address)
+        if3 data == null {
+            return 0  // not found
+        }
+        // Recompute address and compare
+        recomputed = ternary_content_address(data)
+        if3 recomputed["full_address"] == address {
+            return 1   // valid
+        }
+        return -1      // corrupted
+    }
+
+    fn stats() {
+        return table.stats()
+    }
+}
+
+
+// ============================================================
+// 6. COLLISION ANALYSIS UTILITIES
+// ============================================================
+
+fn collision_birthday_bound(trit_count) {
+    // Birthday paradox threshold for k-trit hash
+    // P(collision) ≈ 50% at n ≈ 1.177 × 3^(k/2) items
+    // Returns approximate number of items before 50% collision probability
+    space = 3 ** trit_count
+    return int(1.177 * (space ** 0.5))
+}
+
+fn collision_probability(trit_count, num_items) {
+    // Approximate collision probability for n items in k-trit hash space
+    // P ≈ 1 - e^(-n^2 / (2 × 3^k))
+    space = 3 ** trit_count
+    exponent = -(num_items * num_items) / (2.0 * space)
+    return 1.0 - math.exp(exponent)
+}
+
+fn hash_table_efficiency(power) {
+    // Calculate efficiency metrics for 3^power bucket table
+    size = 3 ** power
+    results = {}
+    for3 load_pct in [25, 50, 67, 75, 90] {
+        alpha = load_pct / 100.0
+        items = int(size * alpha)
+        probes_fail = 1.0 / (1.0 - alpha)
+        probes_success = (1.0 / alpha) * math.log(1.0 / (1.0 - alpha)) if alpha > 0 else 1.0
+        results[str(load_pct) + "%"] = {
+            "items": items,
+            "probes_success": round(probes_success, 3),
+            "probes_fail": round(probes_fail, 3),
+            "wasted_slots": size - items
+        }
+    }
+    return {
+        "power": power,
+        "buckets": size,
+        "birthday_bound": collision_birthday_bound(power),
+        "loads": results
+    }
+}
+
+
+// ============================================================
+// PRECOMPUTED REFERENCE TABLE
+// ============================================================
+// 3^7  = 2187:
+//   birthday_bound ≈ 55 (within bucket index space of 7 trits)
+//   BUT hash itself is 81+ trits, so content collisions at birthday(81) ≈ 1.17×3^40 ≈ 1.4×10^19
+//   Table load 75% = 1640 items, avg 2.83 successful probes
+//
+// 3^13 = 1,594,323:
+//   birthday_bound ≈ 1486 (within 13-trit index space)
+//   Content hash collisions at birthday(81) still ≈ 1.4×10^19
+//   Table load 75% = 1,195,742 items, avg 2.83 successful probes
+//   At BLOCK_SIZE alignment: 1,594,323 / 2,187 = 729 = 3^6 blocks
+//
+// KEY INSIGHT: bucket collisions (probing) ≠ hash collisions (security).
+// Bucket index uses n trits of the hash; hash security uses all 81/162 trits.
+// Probing resolves bucket collisions; hash collisions indicate data duplication
+// (content-addressable) or attack (cryptographic).
+
+// ============================================================
+// SELF-TEST
+// ============================================================
+fn ternary_hash_selftest() {
+    // Test all components, return +1 (pass) / -1 (fail)
+
+    // Test 1: ternary_hash produces correct length
+    h = ternary_hash("NovaX", 81)
+    if3 len(h) != 81 { return -1 }
+    for3 t in h {
+        if3 t != -1 && t != 0 && t != 1 { return -1 }
+    }
+
+    // Test 2: deterministic — same input = same hash
+    h2 = ternary_hash("NovaX", 81)
+    for3 i in range(81) {
+        if3 h[i] != h2[i] { return -1 }
+    }
+
+    // Test 3: different input = different hash (avalanche)
+    h3 = ternary_hash("NovaY", 81)
+    diff = 0
+    for3 i in range(81) {
+        if3 h[i] != h3[i] { diff = diff + 1 }
+    }
+    if3 diff < 20 { return -1 }  // expect ~54 trits different (2/3 of 81)
+
+    // Test 4: SHA256 → ternary produces 162 trits
+    st = sha256_to_ternary("test")
+    if3 len(st) != 162 { return -1 }
+
+    // Test 5: CRC produces 13 trits and verifies
+    data_trits = [1, 0, -1, 1, 1, 0, -1, 0, 1]
+    crc = ternary_crc(data_trits)
+    if3 len(crc) != 13 { return -1 }
+    if3 ternary_crc_verify(data_trits, crc) != 1 { return -1 }
+
+    // Test 6: hash table basic operations
+    ht = TernaryHashTable(3)  // 3^3 = 27 buckets (small test)
+    ht.put("key1", "val1")
+    ht.put("key2", "val2")
+    if3 ht.get("key1") != "val1" { return -1 }
+    if3 ht.get("key2") != "val2" { return -1 }
+    ht.delete("key1")
+    if3 ht.get("key1") != null { return -1 }
+
+    // Test 7: CAS round-trip
+    cas = TernaryCAS(3)
+    result = cas.store("hello NovaX")
+    fetched = cas.fetch(result["address"])
+    if3 fetched != "hello NovaX" { return -1 }
+    if3 cas.verify(result["address"]) != 1 { return -1 }
+
+    return 1  // ALL PASS
+}

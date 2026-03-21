@@ -1,0 +1,2029 @@
+// NovaX THTTP Service v1.0 - Ternary HTTP Client (NovaLang)
+// Port 9919: HTTP client operations through ternary-native micro-tools
+//
+// 7 ternary-native HTTP client tools on 3-5-7-13 harmonic constants:
+//   1. /thttp/get      -- HTTP GET request (url, headers, timeout)
+//   2. /thttp/post     -- HTTP POST request (url, body, headers, content_type)
+//   3. /thttp/head     -- HTTP HEAD request (url, timeout) -- headers only
+//   4. /thttp/download -- Download file to disk (url, output_path, timeout)
+//   5. /thttp/json     -- GET JSON endpoint and parse (url, headers)
+//   6. /thttp/status   -- Check if URL is reachable (url, timeout)
+//   7. /thttp/headers  -- Get response headers for URL (url)
+//
+// N-S Mapping:
+//   http_flow          = velocity_field (data flowing through HTTP requests)
+//   error_pressure     = turbulent_energy (connection failures, timeouts)
+//   Reynolds(http)     = http_ops * H5
+//   RE_LAMINAR=27      = low request throughput
+//   RE_TRANSITION=125  = moderate request churn
+//   RE_TURBULENT=343   = heavy request operations
+//
+// Endpoints:
+//   GET  /health                -- Health check
+//   GET  /thttp/service-status  -- Full service status with stats
+//   POST /thttp/get             -- HTTP GET request
+//   POST /thttp/post            -- HTTP POST request
+//   POST /thttp/head            -- HTTP HEAD request
+//   POST /thttp/download        -- Download file to disk
+//   POST /thttp/json            -- GET JSON and parse
+//   POST /thttp/status          -- Check URL reachability
+//   POST /thttp/headers         -- Get response headers
+//
+// Backend: curl via thttp_curl.nova micro-tool (zero Python)
+// All HTTP calls executed via curl through shell() -- pure NovaLang
+// Response bodies are truncated to 5000 chars to prevent memory issues
+// Downloads use curl -o for native file streaming
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9919
+let server = tserve(PORT, "THTTP v1.0 - Ternary HTTP Client")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE     = 2187
+let RE_LAMINAR     = 27
+let RE_TRANSITION  = 125
+let RE_TURBULENT   = 343
+
+let TOOLS_COUNT    = 7
+let VERSION        = "1.0.0"
+let SERVICE_NAME   = "nova-thttp"
+
+// Default timeout in seconds (H13 harmonic)
+let DEFAULT_TIMEOUT = 13
+
+// Max response body size returned in JSON (bytes)
+let MAX_BODY_SIZE  = 5000
+
+// Max download timeout (larger files need more time)
+let DOWNLOAD_TIMEOUT = 120
+
+// -- Global Stats --
+let stat_ops         = 0
+let stat_trit_true   = 0
+let stat_trit_maybe  = 0
+let stat_trit_false  = 0
+let stat_t0          = time()
+
+// by_tool counters (one per tool)
+let by_tool_get      = 0
+let by_tool_post     = 0
+let by_tool_head     = 0
+let by_tool_download = 0
+let by_tool_json     = 0
+let by_tool_status   = 0
+let by_tool_headers  = 0
+
+// -- N-S flow tracking --
+let _http_ops_count  = 0
+
+// -- Byte tracking --
+let _total_bytes_received  = 0
+let _total_bytes_sent      = 0
+let _total_downloads       = 0
+let _total_download_bytes  = 0
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: 3-char balanced ternary representation
+// Maps a trit to its 3-character balanced ternary form:
+//   +1 -> "+~~"  (positive in trit-0, zero elsewhere)
+//    0 -> "~~~"  (all zero)
+//   -1 -> "T~~"  (negative in trit-0, zero elsewhere)
+// ===========================================================================
+fn bt_three(t) {
+    if3 t == T_TRUE {
+        return "+~~"
+    }
+    if3 t == T_MAYBE {
+        return "~~~"
+    }
+    return "T~~"
+}
+
+// ===========================================================================
+// HELPER: compute Reynolds number from operation count
+// Re = ops * H5, capped at 999
+// ===========================================================================
+fn compute_reynolds(ops) {
+    let re = ops * H5
+    if3 re > 999 {
+        re = 999
+    }
+    return re
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: record a stat op
+// ===========================================================================
+fn record_op(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    _http_ops_count = _http_ops_count + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "get" {
+        by_tool_get = by_tool_get + 1
+    }
+    if3 tool_name == "post" {
+        by_tool_post = by_tool_post + 1
+    }
+    if3 tool_name == "head" {
+        by_tool_head = by_tool_head + 1
+    }
+    if3 tool_name == "download" {
+        by_tool_download = by_tool_download + 1
+    }
+    if3 tool_name == "json" {
+        by_tool_json = by_tool_json + 1
+    }
+    if3 tool_name == "status" {
+        by_tool_status = by_tool_status + 1
+    }
+    if3 tool_name == "headers" {
+        by_tool_headers = by_tool_headers + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: check if nova_run output indicates an error
+// Checks for common Python/requests error prefixes and patterns
+// ===========================================================================
+fn is_error(output) {
+    if3 starts_with(output, "Error:") {
+        return true
+    }
+    if3 starts_with(output, "Traceback") {
+        return true
+    }
+    if3 contains(output, "ConnectionError") {
+        return true
+    }
+    if3 contains(output, "ConnectTimeout") {
+        return true
+    }
+    if3 contains(output, "ReadTimeout") {
+        return true
+    }
+    if3 contains(output, "Timeout") {
+        return true
+    }
+    if3 contains(output, "ConnectionRefusedError") {
+        return true
+    }
+    if3 contains(output, "ConnectionResetError") {
+        return true
+    }
+    if3 contains(output, "SSLError") {
+        return true
+    }
+    if3 contains(output, "SSLCertVerificationError") {
+        return true
+    }
+    if3 contains(output, "MaxRetryError") {
+        return true
+    }
+    if3 contains(output, "NewConnectionError") {
+        return true
+    }
+    if3 contains(output, "InvalidURL") {
+        return true
+    }
+    if3 contains(output, "MissingSchema") {
+        return true
+    }
+    if3 contains(output, "InvalidSchema") {
+        return true
+    }
+    if3 contains(output, "TooManyRedirects") {
+        return true
+    }
+    if3 contains(output, "ChunkedEncodingError") {
+        return true
+    }
+    if3 contains(output, "ContentDecodingError") {
+        return true
+    }
+    if3 contains(output, "requests.exceptions") {
+        return true
+    }
+    if3 contains(output, "urllib3.exceptions") {
+        return true
+    }
+    if3 contains(output, "socket.timeout") {
+        return true
+    }
+    if3 contains(output, "OSError") {
+        return true
+    }
+    if3 contains(output, "PermissionError") {
+        return true
+    }
+    if3 contains(output, "FileNotFoundError") {
+        return true
+    }
+    if3 contains(output, "IsADirectoryError") {
+        return true
+    }
+    if3 starts_with(output, "error") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: classify error type for N-S flow analysis
+// Returns a human-readable error category
+// ===========================================================================
+fn classify_error(output) {
+    if3 contains(output, "ConnectionError") {
+        return "connection_refused"
+    }
+    if3 contains(output, "ConnectionRefusedError") {
+        return "connection_refused"
+    }
+    if3 contains(output, "ConnectTimeout") {
+        return "connect_timeout"
+    }
+    if3 contains(output, "ReadTimeout") {
+        return "read_timeout"
+    }
+    if3 contains(output, "Timeout") {
+        return "timeout"
+    }
+    if3 contains(output, "SSLError") {
+        return "ssl_error"
+    }
+    if3 contains(output, "SSLCertVerificationError") {
+        return "ssl_cert_invalid"
+    }
+    if3 contains(output, "MaxRetryError") {
+        return "max_retries"
+    }
+    if3 contains(output, "TooManyRedirects") {
+        return "too_many_redirects"
+    }
+    if3 contains(output, "InvalidURL") {
+        return "invalid_url"
+    }
+    if3 contains(output, "MissingSchema") {
+        return "missing_schema"
+    }
+    if3 contains(output, "InvalidSchema") {
+        return "invalid_schema"
+    }
+    if3 contains(output, "ConnectionResetError") {
+        return "connection_reset"
+    }
+    if3 contains(output, "PermissionError") {
+        return "permission_denied"
+    }
+    if3 contains(output, "FileNotFoundError") {
+        return "file_not_found"
+    }
+    if3 contains(output, "OSError") {
+        return "os_error"
+    }
+    if3 starts_with(output, "Error:") {
+        return "nova_run_error"
+    }
+    if3 starts_with(output, "Traceback") {
+        return "python_exception"
+    }
+    return "unknown_error"
+}
+
+// ===========================================================================
+// HELPER: escape a string for use inside python single-quoted strings
+// Handles backslashes (Windows paths) and single quotes
+// ===========================================================================
+fn escape_for_py(s) {
+    let step1 = replace(s, "\\", "\\\\")
+    let step2 = replace(step1, "'", "\\'")
+    return step2
+}
+
+// ===========================================================================
+// HELPER: escape URL for python command embedding
+// URLs may contain special characters that need escaping
+// ===========================================================================
+fn escape_url(url) {
+    let step1 = replace(url, "\\", "\\\\")
+    let step2 = replace(step1, "'", "\\'")
+    let step3 = replace(step2, "\"", "\\\"")
+    return step3
+}
+
+// ===========================================================================
+// HELPER: build headers dict python snippet
+// Takes a NovaLang dict of headers, returns python dict literal string
+// e.g. {"Accept": "application/json"} -> "{'Accept':'application/json'}"
+// If headers is empty or not a dict, returns "{}"
+// ===========================================================================
+fn build_headers_py(headers) {
+    if3 type(headers) != "dict" {
+        return "{}"
+    }
+    let keys = keys(headers)
+    if3 len(keys) == 0 {
+        return "{}"
+    }
+    let result = "{"
+    let i = 0
+    while3 i < len(keys) {
+        let k = keys[i]
+        let v = dict_get(headers, k) ?? ""
+        let ek = escape_for_py(str(k))
+        let ev = escape_for_py(str(v))
+        if3 i > 0 {
+            result = result + ","
+        }
+        result = result + "'" + ek + "':'" + ev + "'"
+        i = i + 1
+    }
+    result = result + "}"
+    return result
+}
+
+// ===========================================================================
+// HELPER: determine trit from HTTP status code
+// 2xx -> T_TRUE (+1, success)
+// 3xx -> T_MAYBE (0, redirect/partial)
+// 4xx/5xx -> T_FALSE (-1, client/server error)
+// ===========================================================================
+fn status_to_trit(status_code) {
+    if3 status_code >= 200 {
+        if3 status_code < 300 {
+            return T_TRUE
+        }
+    }
+    if3 status_code >= 300 {
+        if3 status_code < 400 {
+            return T_MAYBE
+        }
+    }
+    return T_FALSE
+}
+
+// ===========================================================================
+// HELPER: human-readable status category
+// ===========================================================================
+fn status_category(status_code) {
+    if3 status_code >= 100 {
+        if3 status_code < 200 {
+            return "informational"
+        }
+    }
+    if3 status_code >= 200 {
+        if3 status_code < 300 {
+            return "success"
+        }
+    }
+    if3 status_code >= 300 {
+        if3 status_code < 400 {
+            return "redirect"
+        }
+    }
+    if3 status_code >= 400 {
+        if3 status_code < 500 {
+            return "client_error"
+        }
+    }
+    if3 status_code >= 500 {
+        if3 status_code < 600 {
+            return "server_error"
+        }
+    }
+    return "unknown"
+}
+
+// ===========================================================================
+// HELPER: safe JSON parse from nova_run output
+// nova_run returns a string; we need to parse it as JSON dict
+// Uses python to validate and re-emit as clean JSON
+// Returns parsed dict or error dict
+// ===========================================================================
+fn safe_json_decode(output) {
+    // First check if output is an error
+    if3 is_error(output) == true { err_result = {}
+        err_result = dict_set(err_result, "_error", true)
+        err_result = dict_set(err_result, "_message", output)
+        return err_result
+    }
+
+    // Trim whitespace
+    let trimmed = trim(output)
+    if3 len(trimmed) == 0 { empty_result = {}
+        empty_result = dict_set(empty_result, "_error", true)
+        empty_result = dict_set(empty_result, "_message", "empty response")
+        return empty_result
+    }
+
+    // Pure NovaLang: use json_decode builtin (zero Python)
+    let parsed = json_decode(trimmed)
+    if3 type(parsed) == "dict" {
+        return parsed
+    }
+    if3 type(parsed) == "list" { list_result = {}
+        list_result = dict_set(list_result, "_data", parsed)
+        return list_result
+    }
+
+    // If json_parse failed, return error
+    let fail_result = {}
+    fail_result = dict_set(fail_result, "_error", true)
+    fail_result = dict_set(fail_result, "_message", "json parse failed: " + slice(trimmed, 0, 200))
+    return fail_result
+}
+
+// ===========================================================================
+// HELPER: validate URL has a scheme
+// Returns the URL with https:// prepended if no scheme present
+// ===========================================================================
+fn ensure_scheme(url) {
+    if3 starts_with(url, "http://") {
+        return url
+    }
+    if3 starts_with(url, "https://") {
+        return url
+    }
+    if3 starts_with(url, "ftp://") {
+        return url
+    }
+    // Default to https
+    return "https://" + url
+}
+
+// ===========================================================================
+// HELPER: extract domain from URL for logging
+// ===========================================================================
+fn extract_domain(url) {
+    let working = url
+    // Strip scheme
+    if3 contains(working, "://") { parts = split(working, "://")
+        working = parts[1]
+    }
+    // Strip path
+    if3 contains(working, "/") { parts2 = split(working, "/")
+        working = parts2[0]
+    }
+    // Strip port
+    if3 contains(working, ":") { parts3 = split(working, ":")
+        working = parts3[0]
+    }
+    return working
+}
+
+// ===========================================================================
+// HELPER: compute N-S Reynolds for a single request
+// Based on response size and status code
+// ===========================================================================
+fn request_reynolds(body_len, status_code) {
+    // Base: body length contributes to flow volume
+    let base = body_len / BLOCK_SIZE
+    // Error responses add turbulence
+    if3 status_code >= 400 {
+        base = base + RE_LAMINAR
+    }
+    if3 status_code >= 500 {
+        base = base + RE_TRANSITION
+    }
+    let re = base * H5
+    if3 re > 999 {
+        re = 999
+    }
+    return re
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//  TOOL 1: POST /thttp/get
+//  HTTP GET request
+//  Body: {url: "https://...", headers: {}, timeout: 13}
+//  Trit: +1=2xx success, 0=3xx redirect, -1=4xx/5xx/error
+//
+// ===========================================================================
+// ===========================================================================
+fn handle_get(body) {
+    let url = dict_get(body, "url") ?? ""
+
+    // URL is required
+    if3 len(url) == 0 {
+        record_op("get", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/get",
+            "url": "",
+            "error": "url is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let url_clean = ensure_scheme(trim(url))
+    let url_escaped = escape_url(url_clean)
+    let headers = dict_get(body, "headers") ?? {}
+    let timeout = dict_get(body, "timeout") ?? DEFAULT_TIMEOUT
+
+    // Validate timeout
+    if3 timeout < 1 {
+        timeout = DEFAULT_TIMEOUT
+    }
+    if3 timeout > 120 {
+        timeout = 120
+    }
+
+    let domain = extract_domain(url_clean)
+
+    // Pure NovaLang: use thttp_curl.nova micro-tool (zero Python)
+    let req_data = {}
+    req_data = dict_set(req_data, "url", url_clean)
+    req_data = dict_set(req_data, "headers", headers)
+    req_data = dict_set(req_data, "timeout", timeout)
+    nova_write("C:/NovaX/temp/thttp_req.json", json_encode(req_data))
+    let curl_tool = "C:/NovaX/novalang.exe C:/NovaX/tools/thttp_curl.nova get"
+
+    let t_start = time()
+    let output = nova_run(curl_tool)
+    let t_elapsed = time() - t_start
+
+    // Check for execution error
+    if3 is_error(output) == true { err_type = classify_error(output)
+        let re = compute_reynolds(_http_ops_count)
+        let regime = flow_regime(re)
+
+        record_op("get", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/get",
+            "url": url_clean,
+            "domain": domain,
+            "error": trim(output),
+            "error_type": err_type,
+            "elapsed_s": t_elapsed,
+            "reynolds": re,
+            "regime": regime,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse JSON response
+    let parsed = safe_json_decode(output)
+    let parse_err = dict_get(parsed, "_error") ?? false
+
+    if3 parse_err == true { parse_msg = dict_get(parsed, "_message") ?? "unknown parse error"
+        record_op("get", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/get",
+            "url": url_clean,
+            "domain": domain,
+            "error": "response parse error: " + parse_msg,
+            "raw_output": slice(trim(output), 0, 500),
+            "elapsed_s": t_elapsed,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract response fields
+    let status_code = dict_get(parsed, "status") ?? 0
+    let resp_body = dict_get(parsed, "body") ?? ""
+    let resp_headers = dict_get(parsed, "headers") ?? {}
+    let final_url = dict_get(parsed, "url") ?? url_clean
+    let resp_elapsed = dict_get(parsed, "elapsed") ?? 0
+    let resp_encoding = dict_get(parsed, "encoding") ?? ""
+    let content_length = dict_get(parsed, "content_length") ?? 0
+
+    // Track bytes
+    _total_bytes_received = _total_bytes_received + content_length
+
+    // Compute trit from status code
+    let trit = status_to_trit(status_code)
+    let category = status_category(status_code)
+
+    // N-S flow analysis
+    let re = request_reynolds(content_length, status_code)
+    let regime = flow_regime(re)
+
+    // Detect redirect
+    let was_redirected = false
+    if3 final_url != url_clean {
+        was_redirected = true
+    }
+
+    // Body truncation warning
+    let body_truncated = false
+    if3 content_length > MAX_BODY_SIZE {
+        body_truncated = true
+    }
+
+    record_op("get", trit)
+    return {
+        "ok": true,
+        "tool": "thttp/get",
+        "url": url_clean,
+        "final_url": final_url,
+        "domain": domain,
+        "status": status_code,
+        "category": category,
+        "body": resp_body,
+        "body_length": content_length,
+        "body_truncated": body_truncated,
+        "headers": resp_headers,
+        "encoding": resp_encoding,
+        "redirected": was_redirected,
+        "elapsed_s": resp_elapsed,
+        "wall_time_s": t_elapsed,
+        "reynolds": re,
+        "regime": regime,
+        "trit": trit,
+        "char": bt_one(trit),
+        "bt3": bt_three(trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//  TOOL 2: POST /thttp/post
+//  HTTP POST request
+//  Body: {url: "https://...", body: {}, headers: {}, content_type: "application/json"}
+//  Trit: +1=2xx success, 0=3xx redirect, -1=4xx/5xx/error
+//
+// ===========================================================================
+// ===========================================================================
+fn handle_post(body) {
+    let url = dict_get(body, "url") ?? ""
+
+    // URL is required
+    if3 len(url) == 0 {
+        record_op("post", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/post",
+            "url": "",
+            "error": "url is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let url_clean = ensure_scheme(trim(url))
+    let url_escaped = escape_url(url_clean)
+    let post_body = dict_get(body, "body") ?? {}
+    let headers = dict_get(body, "headers") ?? {}
+    let content_type = dict_get(body, "content_type") ?? "application/json"
+    let timeout = dict_get(body, "timeout") ?? DEFAULT_TIMEOUT
+    let domain = extract_domain(url_clean)
+
+    // Validate timeout
+    if3 timeout < 1 {
+        timeout = DEFAULT_TIMEOUT
+    }
+    if3 timeout > 120 {
+        timeout = 120
+    }
+
+    // Serialize the post body to JSON string
+    let body_json = json_encode(post_body)
+
+    // Pure NovaLang: use thttp_curl.nova micro-tool (zero Python)
+    let req_data = {}
+    req_data = dict_set(req_data, "url", url_clean)
+    req_data = dict_set(req_data, "headers", headers)
+    req_data = dict_set(req_data, "timeout", timeout)
+    req_data = dict_set(req_data, "body", post_body)
+    req_data = dict_set(req_data, "content_type", content_type)
+    nova_write("C:/NovaX/temp/thttp_req.json", json_encode(req_data))
+    let curl_tool = "C:/NovaX/novalang.exe C:/NovaX/tools/thttp_curl.nova post"
+
+    let t_start = time()
+    let output = nova_run(curl_tool)
+    let t_elapsed = time() - t_start
+
+    // Check for execution error
+    if3 is_error(output) == true { err_type = classify_error(output)
+        let re = compute_reynolds(_http_ops_count)
+        let regime = flow_regime(re)
+
+        record_op("post", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/post",
+            "url": url_clean,
+            "domain": domain,
+            "content_type": content_type,
+            "error": trim(output),
+            "error_type": err_type,
+            "elapsed_s": t_elapsed,
+            "reynolds": re,
+            "regime": regime,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse JSON response
+    let parsed = safe_json_decode(output)
+    let parse_err = dict_get(parsed, "_error") ?? false
+
+    if3 parse_err == true { parse_msg = dict_get(parsed, "_message") ?? "unknown parse error"
+        record_op("post", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/post",
+            "url": url_clean,
+            "domain": domain,
+            "error": "response parse error: " + parse_msg,
+            "raw_output": slice(trim(output), 0, 500),
+            "elapsed_s": t_elapsed,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract response fields
+    let status_code = dict_get(parsed, "status") ?? 0
+    let resp_body = dict_get(parsed, "body") ?? ""
+    let resp_headers = dict_get(parsed, "headers") ?? {}
+    let final_url = dict_get(parsed, "url") ?? url_clean
+    let resp_elapsed = dict_get(parsed, "elapsed") ?? 0
+    let content_length = dict_get(parsed, "content_length") ?? 0
+
+    // Track bytes
+    _total_bytes_received = _total_bytes_received + content_length
+    _total_bytes_sent = _total_bytes_sent + len(body_json)
+
+    // Compute trit
+    let trit = status_to_trit(status_code)
+    let category = status_category(status_code)
+
+    // N-S flow
+    let re = request_reynolds(content_length, status_code)
+    let regime = flow_regime(re)
+
+    // Detect redirect
+    let was_redirected = false
+    if3 final_url != url_clean {
+        was_redirected = true
+    }
+
+    // Body truncation
+    let body_truncated = false
+    if3 content_length > MAX_BODY_SIZE {
+        body_truncated = true
+    }
+
+    record_op("post", trit)
+    return {
+        "ok": true,
+        "tool": "thttp/post",
+        "url": url_clean,
+        "final_url": final_url,
+        "domain": domain,
+        "content_type": content_type,
+        "status": status_code,
+        "category": category,
+        "body": resp_body,
+        "body_length": content_length,
+        "body_truncated": body_truncated,
+        "headers": resp_headers,
+        "redirected": was_redirected,
+        "request_body_size": len(body_json),
+        "elapsed_s": resp_elapsed,
+        "wall_time_s": t_elapsed,
+        "reynolds": re,
+        "regime": regime,
+        "trit": trit,
+        "char": bt_one(trit),
+        "bt3": bt_three(trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//  TOOL 3: POST /thttp/head
+//  HTTP HEAD request - returns headers only (no body)
+//  Body: {url: "https://...", timeout: 13}
+//  Trit: +1=2xx success, 0=3xx redirect, -1=4xx/5xx/error
+//
+// ===========================================================================
+// ===========================================================================
+fn handle_head(body) {
+    let url = dict_get(body, "url") ?? ""
+
+    // URL is required
+    if3 len(url) == 0 {
+        record_op("head", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/head",
+            "url": "",
+            "error": "url is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let url_clean = ensure_scheme(trim(url))
+    let url_escaped = escape_url(url_clean)
+    let timeout = dict_get(body, "timeout") ?? DEFAULT_TIMEOUT
+    let domain = extract_domain(url_clean)
+
+    // Validate timeout
+    if3 timeout < 1 {
+        timeout = DEFAULT_TIMEOUT
+    }
+    if3 timeout > 120 {
+        timeout = 120
+    }
+
+    // Pure NovaLang: use thttp_curl.nova micro-tool (zero Python)
+    let req_data = {}
+    req_data = dict_set(req_data, "url", url_clean)
+    req_data = dict_set(req_data, "timeout", timeout)
+    nova_write("C:/NovaX/temp/thttp_req.json", json_encode(req_data))
+    let curl_tool = "C:/NovaX/novalang.exe C:/NovaX/tools/thttp_curl.nova head"
+
+    let t_start = time()
+    let output = nova_run(curl_tool)
+    let t_elapsed = time() - t_start
+
+    // Check for execution error
+    if3 is_error(output) == true { err_type = classify_error(output)
+        let re = compute_reynolds(_http_ops_count)
+        let regime = flow_regime(re)
+
+        record_op("head", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/head",
+            "url": url_clean,
+            "domain": domain,
+            "error": trim(output),
+            "error_type": err_type,
+            "elapsed_s": t_elapsed,
+            "reynolds": re,
+            "regime": regime,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse JSON response
+    let parsed = safe_json_decode(output)
+    let parse_err = dict_get(parsed, "_error") ?? false
+
+    if3 parse_err == true { parse_msg = dict_get(parsed, "_message") ?? "unknown parse error"
+        record_op("head", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/head",
+            "url": url_clean,
+            "domain": domain,
+            "error": "response parse error: " + parse_msg,
+            "raw_output": slice(trim(output), 0, 500),
+            "elapsed_s": t_elapsed,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract fields
+    let status_code = dict_get(parsed, "status") ?? 0
+    let resp_headers = dict_get(parsed, "headers") ?? {}
+    let final_url = dict_get(parsed, "url") ?? url_clean
+    let resp_elapsed = dict_get(parsed, "elapsed") ?? 0
+
+    // Extract useful header values
+    let content_type_hdr = dict_get(resp_headers, "Content-Type") ?? ""
+    if3 len(content_type_hdr) == 0 {
+        content_type_hdr = dict_get(resp_headers, "content-type") ?? ""
+    }
+    let content_length_hdr = dict_get(resp_headers, "Content-Length") ?? "unknown"
+    if3 content_length_hdr == "unknown" {
+        content_length_hdr = dict_get(resp_headers, "content-length") ?? "unknown"
+    }
+    let server_hdr = dict_get(resp_headers, "Server") ?? ""
+    if3 len(server_hdr) == 0 {
+        server_hdr = dict_get(resp_headers, "server") ?? ""
+    }
+
+    // Compute trit
+    let trit = status_to_trit(status_code)
+    let category = status_category(status_code)
+
+    // N-S
+    let re = compute_reynolds(_http_ops_count)
+    let regime = flow_regime(re)
+
+    // Redirect detection
+    let was_redirected = false
+    if3 final_url != url_clean {
+        was_redirected = true
+    }
+
+    record_op("head", trit)
+    return {
+        "ok": true,
+        "tool": "thttp/head",
+        "url": url_clean,
+        "final_url": final_url,
+        "domain": domain,
+        "status": status_code,
+        "category": category,
+        "headers": resp_headers,
+        "content_type": content_type_hdr,
+        "content_length": content_length_hdr,
+        "server": server_hdr,
+        "redirected": was_redirected,
+        "elapsed_s": resp_elapsed,
+        "wall_time_s": t_elapsed,
+        "reynolds": re,
+        "regime": regime,
+        "trit": trit,
+        "char": bt_one(trit),
+        "bt3": bt_three(trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//  TOOL 4: POST /thttp/download
+//  Download file to disk with streaming
+//  Body: {url: "https://...", output_path: "C:/NovaX/file.bin", timeout: 120}
+//  Trit: +1=download complete, 0=partial/unknown size, -1=error
+//
+// ===========================================================================
+// ===========================================================================
+fn handle_download(body) {
+    let url = dict_get(body, "url") ?? ""
+
+    // URL is required
+    if3 len(url) == 0 {
+        record_op("download", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/download",
+            "url": "",
+            "error": "url is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let output_path = dict_get(body, "output_path") ?? ""
+
+    // output_path is required
+    if3 len(output_path) == 0 {
+        record_op("download", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/download",
+            "url": url,
+            "error": "output_path is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let url_clean = ensure_scheme(trim(url))
+    let url_escaped = escape_url(url_clean)
+    let path_escaped = escape_for_py(output_path)
+    let timeout = dict_get(body, "timeout") ?? DOWNLOAD_TIMEOUT
+    let domain = extract_domain(url_clean)
+
+    // Validate timeout
+    if3 timeout < 1 {
+        timeout = DOWNLOAD_TIMEOUT
+    }
+    if3 timeout > 600 {
+        timeout = 600
+    }
+
+    // Pure NovaLang: use thttp_curl.nova micro-tool (zero Python)
+    let req_data = {}
+    req_data = dict_set(req_data, "url", url_clean)
+    req_data = dict_set(req_data, "timeout", timeout)
+    req_data = dict_set(req_data, "output_path", output_path)
+    nova_write("C:/NovaX/temp/thttp_req.json", json_encode(req_data))
+    let curl_tool = "C:/NovaX/novalang.exe C:/NovaX/tools/thttp_curl.nova download"
+
+    let t_start = time()
+    let output = nova_run(curl_tool)
+    let t_elapsed = time() - t_start
+
+    // Check for execution error
+    if3 is_error(output) == true { err_type = classify_error(output)
+        let re = compute_reynolds(_http_ops_count)
+        let regime = flow_regime(re)
+
+        record_op("download", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/download",
+            "url": url_clean,
+            "domain": domain,
+            "output_path": output_path,
+            "error": trim(output),
+            "error_type": err_type,
+            "elapsed_s": t_elapsed,
+            "reynolds": re,
+            "regime": regime,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse JSON response
+    let parsed = safe_json_decode(output)
+    let parse_err = dict_get(parsed, "_error") ?? false
+
+    if3 parse_err == true { parse_msg = dict_get(parsed, "_message") ?? "unknown parse error"
+        record_op("download", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/download",
+            "url": url_clean,
+            "domain": domain,
+            "output_path": output_path,
+            "error": "response parse error: " + parse_msg,
+            "raw_output": slice(trim(output), 0, 500),
+            "elapsed_s": t_elapsed,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract fields
+    let status_code = dict_get(parsed, "status") ?? 0
+    let file_size = dict_get(parsed, "file_size") ?? 0
+    let content_length_str = dict_get(parsed, "content_length") ?? "unknown"
+    let resp_headers = dict_get(parsed, "headers") ?? {}
+    let final_url = dict_get(parsed, "url") ?? url_clean
+    let resp_elapsed = dict_get(parsed, "elapsed") ?? 0
+
+    // Track download stats
+    _total_downloads = _total_downloads + 1
+    _total_download_bytes = _total_download_bytes + file_size
+    _total_bytes_received = _total_bytes_received + file_size
+
+    // Determine trit: +1 if 2xx and file exists with size > 0
+    let trit = T_FALSE
+    if3 status_code >= 200 {
+        if3 status_code < 300 {
+            if3 file_size > 0 {
+                trit = T_TRUE
+            } else {
+                // Downloaded but file is empty -- maybe
+                trit = T_MAYBE
+            }
+        }
+    }
+    if3 status_code >= 300 {
+        if3 status_code < 400 {
+            trit = T_MAYBE
+        }
+    }
+
+    let category = status_category(status_code)
+
+    // Compute download speed
+    let speed_bps = 0
+    if3 t_elapsed > 0 {
+        speed_bps = file_size / t_elapsed
+    }
+    let speed_kbps = speed_bps / 1024
+
+    // Content-Length verification
+    let size_verified = false
+    if3 content_length_str != "unknown" { expected_size = int(content_length_str)
+        if3 expected_size > 0 {
+            if3 file_size == expected_size {
+                size_verified = true
+            }
+        }
+    }
+
+    // N-S flow
+    let re = request_reynolds(file_size, status_code)
+    let regime = flow_regime(re)
+
+    record_op("download", trit)
+    return {
+        "ok": true,
+        "tool": "thttp/download",
+        "url": url_clean,
+        "final_url": final_url,
+        "domain": domain,
+        "output_path": output_path,
+        "status": status_code,
+        "category": category,
+        "file_size": file_size,
+        "content_length": content_length_str,
+        "size_verified": size_verified,
+        "speed_kbps": speed_kbps,
+        "headers": resp_headers,
+        "elapsed_s": resp_elapsed,
+        "wall_time_s": t_elapsed,
+        "reynolds": re,
+        "regime": regime,
+        "trit": trit,
+        "char": bt_one(trit),
+        "bt3": bt_three(trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//  TOOL 5: POST /thttp/json
+//  GET a JSON endpoint and parse the response
+//  Body: {url: "https://api.example.com/data", headers: {}}
+//  Trit: +1=valid JSON response, 0=response but not JSON, -1=error
+//
+// ===========================================================================
+// ===========================================================================
+fn handle_json(body) {
+    let url = dict_get(body, "url") ?? ""
+
+    // URL is required
+    if3 len(url) == 0 {
+        record_op("json", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/json",
+            "url": "",
+            "error": "url is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let url_clean = ensure_scheme(trim(url))
+    let url_escaped = escape_url(url_clean)
+    let headers = dict_get(body, "headers") ?? {}
+    let timeout = dict_get(body, "timeout") ?? DEFAULT_TIMEOUT
+    let domain = extract_domain(url_clean)
+
+    // Validate timeout
+    if3 timeout < 1 {
+        timeout = DEFAULT_TIMEOUT
+    }
+    if3 timeout > 120 {
+        timeout = 120
+    }
+
+    // Add Accept: application/json to headers
+    headers = dict_set(headers, "Accept", "application/json")
+
+    // Pure NovaLang: use thttp_curl.nova GET then parse as JSON (zero Python)
+    let req_data = {}
+    req_data = dict_set(req_data, "url", url_clean)
+    req_data = dict_set(req_data, "headers", headers)
+    req_data = dict_set(req_data, "timeout", timeout)
+    nova_write("C:/NovaX/temp/thttp_req.json", json_encode(req_data))
+    let curl_tool = "C:/NovaX/novalang.exe C:/NovaX/tools/thttp_curl.nova get"
+
+    let t_start = time()
+    let output = nova_run(curl_tool)
+    let t_elapsed = time() - t_start
+
+    // Check for execution error
+    if3 is_error(output) == true { err_type = classify_error(output)
+        let re = compute_reynolds(_http_ops_count)
+        let regime = flow_regime(re)
+
+        record_op("json", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/json",
+            "url": url_clean,
+            "domain": domain,
+            "error": trim(output),
+            "error_type": err_type,
+            "elapsed_s": t_elapsed,
+            "reynolds": re,
+            "regime": regime,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse the wrapper JSON
+    let parsed = safe_json_decode(output)
+    let parse_err = dict_get(parsed, "_error") ?? false
+
+    if3 parse_err == true { parse_msg = dict_get(parsed, "_message") ?? "unknown parse error"
+        record_op("json", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/json",
+            "url": url_clean,
+            "domain": domain,
+            "error": "response parse error: " + parse_msg,
+            "raw_output": slice(trim(output), 0, 500),
+            "elapsed_s": t_elapsed,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract fields from curl GET response
+    let status_code = dict_get(parsed, "status") ?? 0
+    let resp_body = dict_get(parsed, "body") ?? ""
+    let content_type_resp = dict_get(parsed, "content_type") ?? ""
+    if3 len(content_type_resp) == 0 {
+        content_type_resp = dict_get(parsed, "encoding") ?? ""
+    }
+    let resp_headers = dict_get(parsed, "headers") ?? {}
+    let final_url = dict_get(parsed, "url") ?? url_clean
+    let resp_elapsed = dict_get(parsed, "elapsed") ?? 0
+    let content_length = dict_get(parsed, "content_length") ?? 0
+
+    // Try to parse response body as JSON (pure NovaLang)
+    let is_json_resp = false
+    let json_data = {}
+    let trimmed_body = trim(resp_body)
+    if3 len(trimmed_body) > 0 {
+        let try_json = try3 { json_decode(trimmed_body) } { "__NOJSON__" }
+        if3 try_json != "__NOJSON__" {
+            is_json_resp = true
+            json_data = try_json
+        }
+    }
+
+    // Track bytes
+    _total_bytes_received = _total_bytes_received + content_length
+
+    // Determine trit:
+    // +1 = 2xx + valid JSON
+    //  0 = 2xx but NOT valid JSON, or 3xx
+    // -1 = 4xx/5xx or error
+    let trit = T_FALSE
+    if3 status_code >= 200 {
+        if3 status_code < 300 {
+            if3 is_json_resp == true {
+                trit = T_TRUE
+            } else {
+                trit = T_MAYBE
+            }
+        }
+    }
+    if3 status_code >= 300 {
+        if3 status_code < 400 {
+            trit = T_MAYBE
+        }
+    }
+
+    let category = status_category(status_code)
+
+    // N-S flow
+    let re = request_reynolds(content_length, status_code)
+    let regime = flow_regime(re)
+
+    // Detect redirect
+    let was_redirected = false
+    if3 final_url != url_clean {
+        was_redirected = true
+    }
+
+    // Count keys if data is a dict
+    let data_keys_count = 0
+    if3 type(json_data) == "dict" { dk = keys(json_data)
+        data_keys_count = len(dk)
+    }
+    if3 type(json_data) == "list" {
+        data_keys_count = len(json_data)
+    }
+
+    record_op("json", trit)
+    return {
+        "ok": true,
+        "tool": "thttp/json",
+        "url": url_clean,
+        "final_url": final_url,
+        "domain": domain,
+        "status": status_code,
+        "category": category,
+        "is_json": is_json_resp,
+        "data": json_data,
+        "data_keys": data_keys_count,
+        "content_type": content_type_resp,
+        "content_length": content_length,
+        "headers": resp_headers,
+        "redirected": was_redirected,
+        "elapsed_s": resp_elapsed,
+        "wall_time_s": t_elapsed,
+        "reynolds": re,
+        "regime": regime,
+        "trit": trit,
+        "char": bt_one(trit),
+        "bt3": bt_three(trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//  TOOL 6: POST /thttp/status
+//  Check if a URL is reachable (lightweight connectivity check)
+//  Body: {url: "https://example.com", timeout: 5}
+//  Trit: +1=reachable (2xx), 0=reachable but non-2xx, -1=unreachable
+//
+// ===========================================================================
+// ===========================================================================
+fn handle_status(body) {
+    let url = dict_get(body, "url") ?? ""
+
+    // URL is required
+    if3 len(url) == 0 {
+        record_op("status", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/status",
+            "url": "",
+            "error": "url is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let url_clean = ensure_scheme(trim(url))
+    let url_escaped = escape_url(url_clean)
+    let timeout = dict_get(body, "timeout") ?? H5
+    let domain = extract_domain(url_clean)
+
+    // Status checks should be fast -- default to H5 (5s) timeout
+    if3 timeout < 1 {
+        timeout = H5
+    }
+    if3 timeout > 30 {
+        timeout = 30
+    }
+
+    // Pure NovaLang: use thttp_curl.nova status (zero Python)
+    let req_data = {}
+    req_data = dict_set(req_data, "url", url_clean)
+    req_data = dict_set(req_data, "timeout", timeout)
+    nova_write("C:/NovaX/temp/thttp_req.json", json_encode(req_data))
+    let curl_tool = "C:/NovaX/novalang.exe C:/NovaX/tools/thttp_curl.nova status"
+
+    let t_start = time()
+    let output = nova_run(curl_tool)
+    let t_elapsed = time() - t_start
+
+    // Check for execution error -- means URL is unreachable
+    if3 is_error(output) == true { err_type = classify_error(output)
+        let re = compute_reynolds(_http_ops_count)
+        let regime = flow_regime(re)
+
+        record_op("status", T_FALSE)
+        return {
+            "ok": true,
+            "tool": "thttp/status",
+            "url": url_clean,
+            "domain": domain,
+            "reachable": false,
+            "status_code": 0,
+            "error": trim(output),
+            "error_type": err_type,
+            "elapsed_s": t_elapsed,
+            "reynolds": re,
+            "regime": regime,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse response
+    let parsed = safe_json_decode(output)
+    let parse_err = dict_get(parsed, "_error") ?? false
+
+    if3 parse_err == true { parse_msg = dict_get(parsed, "_message") ?? "unknown parse error"
+        record_op("status", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/status",
+            "url": url_clean,
+            "domain": domain,
+            "reachable": false,
+            "error": "response parse error: " + parse_msg,
+            "elapsed_s": t_elapsed,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract fields
+    let status_code = dict_get(parsed, "status") ?? 0
+    let final_url = dict_get(parsed, "url") ?? url_clean
+    let resp_elapsed = dict_get(parsed, "elapsed") ?? 0
+    let server_name = dict_get(parsed, "server") ?? ""
+    let content_type_val = dict_get(parsed, "content_type") ?? ""
+
+    // Trit: +1 if 2xx (healthy), 0 if reachable but not 2xx, -1 never here (error caught above)
+    let trit = T_MAYBE
+    if3 status_code >= 200 {
+        if3 status_code < 300 {
+            trit = T_TRUE
+        }
+    }
+
+    let category = status_category(status_code)
+
+    // Redirect detection
+    let was_redirected = false
+    if3 final_url != url_clean {
+        was_redirected = true
+    }
+
+    // N-S flow
+    let re = compute_reynolds(_http_ops_count)
+    let regime = flow_regime(re)
+
+    record_op("status", trit)
+    return {
+        "ok": true,
+        "tool": "thttp/status",
+        "url": url_clean,
+        "final_url": final_url,
+        "domain": domain,
+        "reachable": true,
+        "status_code": status_code,
+        "category": category,
+        "server": server_name,
+        "content_type": content_type_val,
+        "redirected": was_redirected,
+        "elapsed_s": resp_elapsed,
+        "wall_time_s": t_elapsed,
+        "reynolds": re,
+        "regime": regime,
+        "trit": trit,
+        "char": bt_one(trit),
+        "bt3": bt_three(trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//  TOOL 7: POST /thttp/headers
+//  Get full response headers for a URL
+//  Body: {url: "https://example.com"}
+//  Trit: +1=headers retrieved, 0=retrieved but non-2xx, -1=error
+//
+// ===========================================================================
+// ===========================================================================
+fn handle_headers(body) {
+    let url = dict_get(body, "url") ?? ""
+
+    // URL is required
+    if3 len(url) == 0 {
+        record_op("headers", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/headers",
+            "url": "",
+            "error": "url is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let url_clean = ensure_scheme(trim(url))
+    let url_escaped = escape_url(url_clean)
+    let timeout = dict_get(body, "timeout") ?? DEFAULT_TIMEOUT
+    let domain = extract_domain(url_clean)
+
+    // Validate timeout
+    if3 timeout < 1 {
+        timeout = DEFAULT_TIMEOUT
+    }
+    if3 timeout > 60 {
+        timeout = 60
+    }
+
+    // Pure NovaLang: use thttp_curl.nova headers (zero Python)
+    let req_data = {}
+    req_data = dict_set(req_data, "url", url_clean)
+    req_data = dict_set(req_data, "timeout", timeout)
+    nova_write("C:/NovaX/temp/thttp_req.json", json_encode(req_data))
+    let curl_tool = "C:/NovaX/novalang.exe C:/NovaX/tools/thttp_curl.nova headers"
+
+    let t_start = time()
+    let output = nova_run(curl_tool)
+    let t_elapsed = time() - t_start
+
+    // Check for execution error
+    if3 is_error(output) == true { err_type = classify_error(output)
+        let re = compute_reynolds(_http_ops_count)
+        let regime = flow_regime(re)
+
+        record_op("headers", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/headers",
+            "url": url_clean,
+            "domain": domain,
+            "error": trim(output),
+            "error_type": err_type,
+            "elapsed_s": t_elapsed,
+            "reynolds": re,
+            "regime": regime,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse JSON response
+    let parsed = safe_json_decode(output)
+    let parse_err = dict_get(parsed, "_error") ?? false
+
+    if3 parse_err == true { parse_msg = dict_get(parsed, "_message") ?? "unknown parse error"
+        record_op("headers", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "thttp/headers",
+            "url": url_clean,
+            "domain": domain,
+            "error": "response parse error: " + parse_msg,
+            "raw_output": slice(trim(output), 0, 500),
+            "elapsed_s": t_elapsed,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract fields
+    let status_code = dict_get(parsed, "status") ?? 0
+    let resp_headers = dict_get(parsed, "headers") ?? {}
+    let header_count = dict_get(parsed, "header_count") ?? 0
+    let final_url = dict_get(parsed, "url") ?? url_clean
+    let resp_elapsed = dict_get(parsed, "elapsed") ?? 0
+
+    // Extract common security/cache headers for analysis
+    let security_headers = {}
+    let hsts = dict_get(resp_headers, "Strict-Transport-Security") ?? ""
+    if3 len(hsts) == 0 {
+        hsts = dict_get(resp_headers, "strict-transport-security") ?? ""
+    }
+    security_headers = dict_set(security_headers, "hsts", hsts)
+
+    let csp = dict_get(resp_headers, "Content-Security-Policy") ?? ""
+    if3 len(csp) == 0 {
+        csp = dict_get(resp_headers, "content-security-policy") ?? ""
+    }
+    security_headers = dict_set(security_headers, "csp", csp)
+
+    let xfo = dict_get(resp_headers, "X-Frame-Options") ?? ""
+    if3 len(xfo) == 0 {
+        xfo = dict_get(resp_headers, "x-frame-options") ?? ""
+    }
+    security_headers = dict_set(security_headers, "x_frame_options", xfo)
+
+    let xcto = dict_get(resp_headers, "X-Content-Type-Options") ?? ""
+    if3 len(xcto) == 0 {
+        xcto = dict_get(resp_headers, "x-content-type-options") ?? ""
+    }
+    security_headers = dict_set(security_headers, "x_content_type_options", xcto)
+
+    let xxp = dict_get(resp_headers, "X-XSS-Protection") ?? ""
+    if3 len(xxp) == 0 {
+        xxp = dict_get(resp_headers, "x-xss-protection") ?? ""
+    }
+    security_headers = dict_set(security_headers, "x_xss_protection", xxp)
+
+    // Cache headers
+    let cache_headers = {}
+    let cache_control = dict_get(resp_headers, "Cache-Control") ?? ""
+    if3 len(cache_control) == 0 {
+        cache_control = dict_get(resp_headers, "cache-control") ?? ""
+    }
+    cache_headers = dict_set(cache_headers, "cache_control", cache_control)
+
+    let etag = dict_get(resp_headers, "ETag") ?? ""
+    if3 len(etag) == 0 {
+        etag = dict_get(resp_headers, "etag") ?? ""
+    }
+    cache_headers = dict_set(cache_headers, "etag", etag)
+
+    let last_modified = dict_get(resp_headers, "Last-Modified") ?? ""
+    if3 len(last_modified) == 0 {
+        last_modified = dict_get(resp_headers, "last-modified") ?? ""
+    }
+    cache_headers = dict_set(cache_headers, "last_modified", last_modified)
+
+    let expires = dict_get(resp_headers, "Expires") ?? ""
+    if3 len(expires) == 0 {
+        expires = dict_get(resp_headers, "expires") ?? ""
+    }
+    cache_headers = dict_set(cache_headers, "expires", expires)
+
+    // Count security headers present (for security score)
+    let security_score = 0
+    if3 len(hsts) > 0 {
+        security_score = security_score + 1
+    }
+    if3 len(csp) > 0 {
+        security_score = security_score + 1
+    }
+    if3 len(xfo) > 0 {
+        security_score = security_score + 1
+    }
+    if3 len(xcto) > 0 {
+        security_score = security_score + 1
+    }
+    if3 len(xxp) > 0 {
+        security_score = security_score + 1
+    }
+
+    // Server identification
+    let server_hdr = dict_get(resp_headers, "Server") ?? ""
+    if3 len(server_hdr) == 0 {
+        server_hdr = dict_get(resp_headers, "server") ?? ""
+    }
+
+    let powered_by = dict_get(resp_headers, "X-Powered-By") ?? ""
+    if3 len(powered_by) == 0 {
+        powered_by = dict_get(resp_headers, "x-powered-by") ?? ""
+    }
+
+    // Compute trit
+    let trit = T_MAYBE
+    if3 status_code >= 200 {
+        if3 status_code < 300 {
+            trit = T_TRUE
+        }
+    }
+    if3 status_code >= 400 {
+        trit = T_FALSE
+    }
+
+    let category = status_category(status_code)
+
+    // N-S flow
+    let re = compute_reynolds(_http_ops_count)
+    let regime = flow_regime(re)
+
+    // Redirect detection
+    let was_redirected = false
+    if3 final_url != url_clean {
+        was_redirected = true
+    }
+
+    record_op("headers", trit)
+    return {
+        "ok": true,
+        "tool": "thttp/headers",
+        "url": url_clean,
+        "final_url": final_url,
+        "domain": domain,
+        "status": status_code,
+        "category": category,
+        "headers": resp_headers,
+        "header_count": header_count,
+        "server": server_hdr,
+        "powered_by": powered_by,
+        "security_headers": security_headers,
+        "security_score": security_score,
+        "security_max": 5,
+        "cache_headers": cache_headers,
+        "redirected": was_redirected,
+        "elapsed_s": resp_elapsed,
+        "wall_time_s": t_elapsed,
+        "reynolds": re,
+        "regime": regime,
+        "trit": trit,
+        "char": bt_one(trit),
+        "bt3": bt_three(trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//  GET /health -- Standard health endpoint
+//
+// ===========================================================================
+// ===========================================================================
+fn handle_health() {
+    let uptime = time() - stat_t0
+
+    // Probe curl availability (pure NovaLang, zero Python)
+    let probe_r = shell("curl --version 2>NUL")
+    let probe_out = try3 { dict_get(probe_r, "stdout") } { "" }
+    let curl_ok = false
+    if3 contains(probe_out, "curl") {
+        curl_ok = true
+    }
+
+    // Determine health trit
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        if3 curl_ok == true {
+            self_trit = T_TRUE
+        }
+    }
+    if3 curl_ok == false {
+        self_trit = T_FALSE
+    }
+
+    // N-S service Reynolds
+    let re = compute_reynolds(stat_trit_false)
+    let regime = flow_regime(re)
+
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "curl_available", curl_ok)
+    resp = dict_set(resp, "backend", "curl")
+    resp = dict_set(resp, "harmonics", {"H3": H3, "H5": H5, "H7": H7, "H13": H13})
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "self_trit", self_trit)
+    resp = dict_set(resp, "char", bt_one(self_trit))
+    resp = dict_set(resp, "bt3", bt_three(self_trit))
+    resp = dict_set(resp, "uptime_s", uptime)
+    resp = dict_set(resp, "total_ops", stat_ops)
+    resp = dict_set(resp, "reynolds", re)
+    resp = dict_set(resp, "regime", regime)
+    resp = dict_set(resp, "quality", {"strong": stat_trit_true, "partial": stat_trit_maybe, "failed": stat_trit_false})
+    return resp
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//  GET /thttp/service-status -- Full service status with detailed stats
+//
+// ===========================================================================
+// ===========================================================================
+fn handle_service_status() {
+    let uptime = time() - stat_t0
+
+    // Check curl availability (pure NovaLang, zero Python)
+    let probe_r2 = shell("curl --version 2>NUL")
+    let probe_out2 = try3 { dict_get(probe_r2, "stdout") } { "" }
+    let python_ok = false
+    if3 contains(probe_out2, "curl") {
+        python_ok = true
+    }
+
+    // Service Reynolds from total false ops (error_pressure = turbulent_energy)
+    let re = compute_reynolds(stat_trit_false)
+    let regime = flow_regime(re)
+
+    // Data flow Reynolds (http_flow = velocity_field)
+    let data_re = compute_reynolds(_http_ops_count)
+    let data_regime = flow_regime(data_re)
+
+    // Download Reynolds (download volume drives turbulence)
+    let dl_re = 0
+    if3 _total_download_bytes > 0 {
+        dl_re = (_total_download_bytes / BLOCK_SIZE) * H5
+        if3 dl_re > 999 {
+            dl_re = 999
+        }
+    }
+    let dl_regime = flow_regime(dl_re)
+
+    // System trit
+    let sys_trit = T_TRUE
+    if3 python_ok == false {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    // Success rate
+    let success_rate = 0
+    if3 stat_ops > 0 {
+        success_rate = (stat_trit_true * 100) / stat_ops
+    }
+
+    // By-tool counters
+    let by_tool = {}
+    by_tool = dict_set(by_tool, "get", by_tool_get)
+    by_tool = dict_set(by_tool, "post", by_tool_post)
+    by_tool = dict_set(by_tool, "head", by_tool_head)
+    by_tool = dict_set(by_tool, "download", by_tool_download)
+    by_tool = dict_set(by_tool, "json", by_tool_json)
+    by_tool = dict_set(by_tool, "status", by_tool_status)
+    by_tool = dict_set(by_tool, "headers", by_tool_headers)
+
+    // Bandwidth stats
+    let bandwidth = {}
+    bandwidth = dict_set(bandwidth, "bytes_received", _total_bytes_received)
+    bandwidth = dict_set(bandwidth, "bytes_sent", _total_bytes_sent)
+    bandwidth = dict_set(bandwidth, "total_downloads", _total_downloads)
+    bandwidth = dict_set(bandwidth, "download_bytes", _total_download_bytes)
+
+    // Human readable bandwidth
+    let recv_kb = _total_bytes_received / 1024
+    let sent_kb = _total_bytes_sent / 1024
+    let dl_kb = _total_download_bytes / 1024
+    bandwidth = dict_set(bandwidth, "received_kb", recv_kb)
+    bandwidth = dict_set(bandwidth, "sent_kb", sent_kb)
+    bandwidth = dict_set(bandwidth, "download_kb", dl_kb)
+
+    // Average request rate
+    let req_per_min = 0
+    if3 uptime > 0 {
+        req_per_min = (stat_ops * 60) / uptime
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "python_available": python_ok,
+        "requests_available": python_ok,
+        "total_ops": stat_ops,
+        "http_ops": _http_ops_count,
+        "success_rate_pct": success_rate,
+        "requests_per_min": req_per_min,
+        "by_tool": by_tool,
+        "bandwidth": bandwidth,
+        "trits": {
+            "strong": stat_trit_true,
+            "partial": stat_trit_maybe,
+            "failed": stat_trit_false
+        },
+        "reynolds": re,
+        "regime": regime,
+        "data_reynolds": data_re,
+        "data_regime": data_regime,
+        "download_reynolds": dl_re,
+        "download_regime": dl_regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "system_bt3": bt_three(sys_trit),
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE,
+        "defaults": {
+            "timeout": DEFAULT_TIMEOUT,
+            "download_timeout": DOWNLOAD_TIMEOUT,
+            "max_body_size": MAX_BODY_SIZE
+        },
+        "ns_mapping": {
+            "http_flow": "velocity_field",
+            "error_pressure": "turbulent_energy",
+            "download_volume": "mass_flow",
+            "reynolds_formula": "http_ops * H5",
+            "re_laminar": RE_LAMINAR,
+            "re_transition": RE_TRANSITION,
+            "re_turbulent": RE_TURBULENT
+        }
+    }
+}
+
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+troute(server, "GET",  "/health",                "handle_health")
+troute(server, "GET",  "/thttp/service-status",  "handle_service_status")
+troute(server, "POST", "/thttp/get",             "handle_get")
+troute(server, "POST", "/thttp/post",            "handle_post")
+troute(server, "POST", "/thttp/head",            "handle_head")
+troute(server, "POST", "/thttp/download",        "handle_download")
+troute(server, "POST", "/thttp/json",            "handle_json")
+troute(server, "POST", "/thttp/status",          "handle_status")
+troute(server, "POST", "/thttp/headers",         "handle_headers")
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[THTTP] NovaX Ternary HTTP Client v" + VERSION + " on port " + str(PORT))
+print("[THTTP] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[THTTP] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[THTTP] Re boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[THTTP] N-S: http_flow=velocity_field | error_pressure=turbulent_energy | Re=http_ops*H5")
+print("[THTTP] Backend: python requests (shell) | Default timeout: " + str(DEFAULT_TIMEOUT) + "s (H13)")
+print("[THTTP] Max body: " + str(MAX_BODY_SIZE) + " bytes | Download timeout: " + str(DOWNLOAD_TIMEOUT) + "s")
+print("[THTTP] Block size: " + str(BLOCK_SIZE) + " (3^7) | Download chunks: 8192 bytes")
+print("[THTTP] Routes: /health, /thttp/service-status")
+print("[THTTP]         /thttp/get, /thttp/post, /thttp/head, /thttp/download")
+print("[THTTP]         /thttp/json, /thttp/status, /thttp/headers")
+print("[THTTP] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

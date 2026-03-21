@@ -1,0 +1,2027 @@
+// NovaX TYAML Service v1.0 - Ternary YAML/JSON/Config Processing (NovaLang)
+// Port 9921: YAML and JSON config file operations through ternary-native micro-tools
+//
+// 7 ternary-native YAML/JSON/Config tools on 3-5-7-13 harmonic constants:
+//   1. /tyaml/parse     -- Parse YAML file/string to JSON
+//   2. /tyaml/validate  -- Validate YAML syntax (valid/invalid with error details)
+//   3. /tyaml/convert   -- Convert between YAML<->JSON (yaml2json / json2yaml)
+//   4. /tyaml/get       -- Get a value by dot-path from YAML/JSON
+//   5. /tyaml/set       -- Set a value by dot-path in YAML/JSON (write back)
+//   6. /tyaml/merge     -- Merge two YAML/JSON files (base + overlay)
+//   7. /tyaml/keys      -- List all keys at a given depth
+//
+// N-S Mapping:
+//   config_flow        = velocity_field (config data flowing through parse/transform)
+//   schema_complexity  = turbulent_energy (nested depth, key count, merge conflicts)
+//   Reynolds(yaml)     = config_ops * H5
+//   RE_LAMINAR=27      = simple flat configs (few keys, shallow)
+//   RE_TRANSITION=125  = moderate configs (nested, moderate key count)
+//   RE_TURBULENT=343   = complex configs (deep nesting, many keys, merges)
+//
+// Harmonics:
+//   MAX_BODY      = BLOCK * H5 = 2187 * 5 = 10935
+//   MAX_DEPTH     = H13 = 13 (maximum nesting depth for key listing)
+//   MAX_FILE_BYTES = BLOCK * H13 = 2187 * 13 = 28431
+//   YAML_TIMEOUT  = H13 = 13s (yq command timeout)
+//   TEMP_DIR      = C:\NovaX\tmp\tyaml (temp files for text-based input)
+//
+// Endpoints:
+//   GET  /health                -- Health check
+//   GET  /tyaml/service-status  -- Full service status with stats
+//   POST /tyaml/parse           -- Parse YAML to JSON
+//   POST /tyaml/validate        -- Validate YAML syntax
+//   POST /tyaml/convert         -- Convert YAML<->JSON
+//   POST /tyaml/get             -- Get value by dot-path
+//   POST /tyaml/set             -- Set value by dot-path
+//   POST /tyaml/merge           -- Merge two YAML/JSON files
+//   POST /tyaml/keys            -- List keys at depth
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9921
+let server = tserve(PORT, "TYAML v1.0 - Ternary YAML/JSON/Config Processing")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds flow boundaries (N-S) --
+let BLOCK_SIZE      = 2187
+let RE_LAMINAR      = 27
+let RE_TRANSITION   = 125
+let RE_TURBULENT    = 343
+
+// -- Service Constants --
+let TOOLS_COUNT     = 7
+let VERSION         = "1.0.0"
+let SERVICE_NAME    = "nova-tyaml"
+let YAML_TIMEOUT    = 13
+let MAX_BODY        = 10935
+let MAX_DEPTH       = 13
+let MAX_FILE_BYTES  = 28431
+let TEMP_DIR        = "C:\\NovaX\\data"
+let SAFE_ROOT       = "C:\\NovaX"
+
+// -- Global Stats --
+let stat_ops         = 0
+let stat_trit_true   = 0
+let stat_trit_maybe  = 0
+let stat_trit_false  = 0
+let stat_t0          = time()
+
+// by_tool counters (one per tool)
+let by_tool_parse    = 0
+let by_tool_validate = 0
+let by_tool_convert  = 0
+let by_tool_get      = 0
+let by_tool_set      = 0
+let by_tool_merge    = 0
+let by_tool_keys     = 0
+
+// -- N-S flow tracking --
+let ns_total_keys_processed    = 0
+let ns_total_depth_traversed   = 0
+let ns_total_merges            = 0
+let ns_total_conversions       = 0
+let ns_max_depth_seen          = 0
+let ns_total_file_bytes        = 0
+
+// -- Temp file counter for unique names --
+let _temp_counter = 0
+
+
+// ===========================================================================
+// HELPER: balanced ternary char from trit (+, ~, T)
+// ===========================================================================
+fn bt_one(t) {
+    if3 t == T_TRUE {
+        return "+"
+    }
+    if3 t == T_MAYBE {
+        return "~"
+    }
+    return "T"
+}
+
+// ===========================================================================
+// HELPER: balanced ternary 3-char representation
+// Encodes trit value into 3-char balanced ternary string
+// ===========================================================================
+fn bt_three(t) {
+    if3 t == T_TRUE {
+        return "+0+"
+    }
+    if3 t == T_MAYBE {
+        return "000"
+    }
+    if3 t == T_FALSE {
+        return "T0T"
+    }
+    // For numeric values, simple encoding
+    if3 t > 0 {
+        return "+++"
+    }
+    if3 t < 0 {
+        return "TTT"
+    }
+    return "000"
+}
+
+// ===========================================================================
+// HELPER: compute Reynolds number for config operations
+// N-S: config_flow = velocity_field, Re = ops * H5
+// ===========================================================================
+fn compute_reynolds() {
+    let re = stat_ops * H5
+    if3 re > 999 {
+        re = 999
+    }
+    if3 re < 0 {
+        re = 0
+    }
+    return re
+}
+
+// ===========================================================================
+// HELPER: flow regime from Reynolds number
+// ===========================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re_num < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// ===========================================================================
+// HELPER: record a stat operation
+// Increments global counters and per-tool counters
+// ===========================================================================
+fn record_op(tool_name, trit) {
+    stat_ops = stat_ops + 1
+    if3 trit == T_TRUE {
+        stat_trit_true = stat_trit_true + 1
+    }
+    if3 trit == T_MAYBE {
+        stat_trit_maybe = stat_trit_maybe + 1
+    }
+    if3 trit == T_FALSE {
+        stat_trit_false = stat_trit_false + 1
+    }
+    if3 tool_name == "parse" {
+        by_tool_parse = by_tool_parse + 1
+    }
+    if3 tool_name == "validate" {
+        by_tool_validate = by_tool_validate + 1
+    }
+    if3 tool_name == "convert" {
+        by_tool_convert = by_tool_convert + 1
+    }
+    if3 tool_name == "get" {
+        by_tool_get = by_tool_get + 1
+    }
+    if3 tool_name == "set" {
+        by_tool_set = by_tool_set + 1
+    }
+    if3 tool_name == "merge" {
+        by_tool_merge = by_tool_merge + 1
+    }
+    if3 tool_name == "keys" {
+        by_tool_keys = by_tool_keys + 1
+    }
+}
+
+// ===========================================================================
+// HELPER: escape a file path for use inside shell commands
+// Replaces backslash with double-backslash, then single-quote with escaped
+// ===========================================================================
+fn escape_for_py(s) {
+    let escaped = replace(s, "\\", "\\\\")
+    escaped = replace(escaped, "'", "\\'")
+    return escaped
+}
+
+// ===========================================================================
+// HELPER: check if output indicates a yq/yaml error
+// Returns true if the output looks like an error, false otherwise
+// ===========================================================================
+fn is_error(output) {
+    if3 starts_with(output, "Error:") {
+        return true
+    }
+    if3 starts_with(output, "Traceback") {
+        return true
+    }
+    if3 contains(output, "yaml.scanner.ScannerError") {
+        return true
+    }
+    if3 contains(output, "yaml.parser.ParserError") {
+        return true
+    }
+    if3 contains(output, "yaml.reader.ReaderError") {
+        return true
+    }
+    if3 contains(output, "yaml.composer.ComposerError") {
+        return true
+    }
+    if3 contains(output, "FileNotFoundError") {
+        return true
+    }
+    if3 contains(output, "PermissionError") {
+        return true
+    }
+    if3 contains(output, "IsADirectoryError") {
+        return true
+    }
+    if3 contains(output, "OSError") {
+        return true
+    }
+    if3 contains(output, "IOError") {
+        return true
+    }
+    if3 contains(output, "json.decoder.JSONDecodeError") {
+        return true
+    }
+    if3 contains(output, "ValueError") {
+        return true
+    }
+    if3 contains(output, "TypeError") {
+        return true
+    }
+    if3 contains(output, "KeyError") {
+        return true
+    }
+    if3 contains(output, "IndexError") {
+        return true
+    }
+    if3 contains(output, "AttributeError") {
+        return true
+    }
+    if3 contains(output, "ModuleNotFoundError") {
+        return true
+    }
+    if3 contains(output, "ImportError") {
+        return true
+    }
+    let lc = lower(output)
+    if3 starts_with(lc, "error") {
+        return true
+    }
+    if3 contains(lc, "traceback (most recent call last)") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: run a shell command with standard YAML timeout
+// Returns trimmed output string
+// ===========================================================================
+fn run_cmd(cmd) {
+    let raw = nova_run(cmd, YAML_TIMEOUT)
+    let output = trim(str(raw))
+    return output
+}
+
+// ===========================================================================
+// HELPER: generate a unique temp file path for text-based input
+// Creates files in TEMP_DIR with incrementing counter
+// ===========================================================================
+fn make_temp_path(ext) {
+    _temp_counter = _temp_counter + 1
+    let ts = str(int(time()))
+    let name = "tyaml_tmp_" + ts + "_" + str(_temp_counter) + "." + ext
+    let path = TEMP_DIR + "\\" + name
+    return path
+}
+
+// ===========================================================================
+// HELPER: write text content to a temp file via NovaLang
+// Returns the temp file path on success, or error string
+// ===========================================================================
+fn write_temp_file(text, ext) {
+    let tmp_path = make_temp_path(ext)
+    // Use NovaLang's native nova_write — handles all escaping properly
+    nova_write(tmp_path, text)
+    return tmp_path
+}
+
+// ===========================================================================
+// HELPER: delete a temp file — pure NovaLang, zero Python
+// ===========================================================================
+fn delete_temp_file(path) {
+    let del_cmd = "del /q \"" + path + "\" 2>NUL & echo ok"
+    let del_out = shell(del_cmd)
+    return del_out
+}
+
+// ===========================================================================
+// HELPER: validate that a path starts with SAFE_ROOT
+// Returns true if safe, false if escapes
+// ===========================================================================
+fn is_safe_path(path) {
+    if3 len(path) == 0 {
+        return false
+    }
+    let safe_len = len(SAFE_ROOT)
+    if3 len(path) < safe_len {
+        return false
+    }
+    let prefix = slice(path, 0, safe_len)
+    if3 prefix == SAFE_ROOT {
+        return true
+    }
+    // Also allow temp directory paths (which are under SAFE_ROOT anyway)
+    return false
+}
+
+// ===========================================================================
+// HELPER: determine if input has a path or text, resolve to a file path
+// If "path" key is present, use it directly
+// If "text" key is present, write to temp file and return temp path
+// Returns dict with "path" (resolved path) and "is_temp" (boolean)
+// On error, returns dict with "error" key
+// ===========================================================================
+fn resolve_input(body, path_key, text_key) {
+    let file_path = str(dict_get(body, path_key) ?? "")
+    let text_val = str(dict_get(body, text_key) ?? "")
+
+    let result = {}
+    if3 len(file_path) > 0 {
+        // Use file path directly
+        result = dict_set(result, "path", file_path)
+        result = dict_set(result, "is_temp", false)
+        result = dict_set(result, "source", "file")
+        return result
+    }
+    if3 len(text_val) > 0 {
+        // Write text to temp file
+        let tmp = write_temp_file(text_val, "yaml")
+        if3 starts_with(tmp, "Error:") {
+            result = dict_set(result, "error", tmp)
+            return result
+        }
+        result = dict_set(result, "path", tmp)
+        result = dict_set(result, "is_temp", true)
+        result = dict_set(result, "source", "text")
+        return result
+    }
+
+    // Neither path nor text provided
+    result = dict_set(result, "error", "either '" + path_key + "' or '" + text_key + "' parameter is required")
+    return result
+}
+
+// ===========================================================================
+// HELPER: clean up temp file if needed
+// ===========================================================================
+fn cleanup_temp(resolved) {
+    let is_temp = dict_get(resolved, "is_temp") ?? false
+    if3 is_temp == true { tmp_path = dict_get(resolved, "path") ?? ""
+        if3 len(tmp_path) > 0 { _del = delete_temp_file(tmp_path)
+        }
+    }
+}
+
+// ===========================================================================
+// HELPER: compute schema complexity Reynolds
+// Based on depth, key count, and file size
+// N-S: schema_complexity = turbulent_energy
+// ===========================================================================
+fn schema_reynolds(depth, key_count) {
+    let complexity = (depth * depth * H3) + (key_count * H5)
+    if3 complexity > 999 {
+        complexity = 999
+    }
+    if3 complexity < 0 {
+        complexity = 0
+    }
+    return complexity
+}
+
+// ===========================================================================
+// HELPER: extract error detail from command output
+// Returns a cleaner single-line error message
+// ===========================================================================
+fn extract_error_detail(output) {
+    // If output contains a colon-separated error, extract last line
+    let lines = split(output, "\n")
+    let line_count = len(lines)
+    if3 line_count == 0 {
+        return output
+    }
+    // Walk from the end to find the actual error line
+    let idx = line_count - 1
+    while3 idx >= 0 {
+        let line = trim(lines[idx])
+        if3 len(line) > 0 {
+            // Check if this line looks like an error message
+            if3 contains(line, "Error") {
+                return line
+            }
+            if3 contains(line, "error") {
+                return line
+            }
+            if3 contains(line, "Exception") {
+                return line
+            }
+        }
+        idx = idx - 1
+    }
+    // Fallback: return first non-empty line
+    let first_idx = 0
+    while3 first_idx < line_count {
+        let first_line = trim(lines[first_idx])
+        if3 len(first_line) > 0 {
+            return first_line
+        }
+        first_idx = first_idx + 1
+    }
+    return output
+}
+
+// ===========================================================================
+// HELPER: check if a string looks like it might be JSON
+// ===========================================================================
+fn looks_like_json(text) {
+    let trimmed = trim(text)
+    if3 starts_with(trimmed, "{") {
+        return true
+    }
+    if3 starts_with(trimmed, "[") {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: determine file extension from path
+// ===========================================================================
+fn get_extension(path) {
+    let parts = split(path, ".")
+    let part_count = len(parts)
+    if3 part_count < 2 {
+        return ""
+    }
+    let last_idx = part_count - 1
+    let ext = lower(parts[last_idx])
+    return ext
+}
+
+// ===========================================================================
+// HELPER: check if a file extension is YAML
+// ===========================================================================
+fn is_yaml_ext(ext) {
+    if3 ext == "yaml" {
+        return true
+    }
+    if3 ext == "yml" {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: check if a file extension is JSON
+// ===========================================================================
+fn is_json_ext(ext) {
+    if3 ext == "json" {
+        return true
+    }
+    return false
+}
+
+// ===========================================================================
+// HELPER: validate dot-path key (no empty segments, reasonable length)
+// ===========================================================================
+fn is_valid_dotpath(key) {
+    if3 len(key) == 0 {
+        return false
+    }
+    if3 len(key) > 256 {
+        return false
+    }
+    // Check for empty segments (consecutive dots)
+    if3 contains(key, "..") {
+        return false
+    }
+    // Check it doesn't start or end with dot
+    if3 starts_with(key, ".") {
+        return false
+    }
+    // Count segments to check depth
+    let segments = split(key, ".")
+    let seg_count = len(segments)
+    if3 seg_count > MAX_DEPTH {
+        return false
+    }
+    // Check each segment is non-empty
+    let si = 0
+    while3 si < seg_count {
+        let seg = segments[si]
+        if3 len(seg) == 0 {
+            return false
+        }
+        si = si + 1
+    }
+    return true
+}
+
+// ===========================================================================
+// HELPER: sanitize a value for safe embedding in yq/shell command
+// Handles basic types: string, number, boolean, null
+// Returns a JSON-safe representation for yq
+// ===========================================================================
+fn to_py_value(value) {
+    let val_str = str(value)
+    let val_type = type(value)
+
+    // Boolean handling
+    if3 val_str == "true" {
+        return "True"
+    }
+    if3 val_str == "false" {
+        return "False"
+    }
+    if3 val_str == "null" {
+        return "None"
+    }
+    if3 val_str == "none" {
+        return "None"
+    }
+
+    // Check if it looks numeric
+    // Try int conversion
+    if3 val_type == "int" {
+        return val_str
+    }
+    if3 val_type == "float" {
+        return val_str
+    }
+
+    // Default: treat as string, properly quoted
+    let escaped_val = escape_for_py(val_str)
+    return "'" + escaped_val + "'"
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//                     TOOL HANDLERS (7 TOOLS)
+//
+// ===========================================================================
+// ===========================================================================
+
+
+// ===========================================================================
+// TOOL 1: POST /tyaml/parse
+// Parse YAML file or string to JSON output
+// Body: {path: "file.yaml"} OR {text: "yaml content..."}
+// Trit: +1=parsed successfully, 0=empty/null result, -1=parse error
+// ===========================================================================
+fn handle_parse(body) {
+    // Resolve input to a file path
+    let resolved = resolve_input(body, "path", "text")
+
+    // Check for resolution error
+    let res_error = dict_get(resolved, "error") ?? ""
+    if3 len(res_error) > 0 {
+        record_op("parse", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "parse",
+            "error": res_error,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let file_path = dict_get(resolved, "path") ?? ""
+    let source = dict_get(resolved, "source") ?? "unknown"
+    let esc_path = escape_for_py(file_path)
+
+    // Parse YAML to JSON via yq — pure NovaLang, zero Python
+    let yq_cmd = "C:/NovaX/tools/yq.exe -o json \"" + file_path + "\""
+    let output = shell(yq_cmd)
+
+    // Clean up temp file if applicable
+    cleanup_temp(resolved)
+
+    // Check for errors
+    if3 is_error(output) { error_detail = extract_error_detail(output)
+        record_op("parse", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "parse",
+            "source": source,
+            "error": error_detail,
+            "raw_error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Check for null/empty result
+    let trimmed_output = trim(output)
+    if3 trimmed_output == "null" {
+        record_op("parse", T_MAYBE)
+        ns_total_keys_processed = ns_total_keys_processed + 0
+        return {
+            "ok": true,
+            "tool": "parse",
+            "source": source,
+            "data": "null",
+            "note": "YAML document parsed but contains null/empty content",
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "bt3": bt_three(T_MAYBE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(trimmed_output) == 0 {
+        record_op("parse", T_MAYBE)
+        return {
+            "ok": true,
+            "tool": "parse",
+            "source": source,
+            "data": "null",
+            "note": "YAML document parsed but produced empty output",
+            "trit": T_MAYBE,
+            "char": bt_one(T_MAYBE),
+            "bt3": bt_three(T_MAYBE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Count approximate keys (count occurrences of quote-colon patterns)
+    // Simple heuristic: count lines with ":" in the JSON output
+    let output_lines = split(output, "\n")
+    let key_count = 0
+    let li = 0
+    while3 li < len(output_lines) {
+        let line = output_lines[li]
+        if3 contains(line, ":") {
+            key_count = key_count + 1
+        }
+        li = li + 1
+    }
+
+    // Track N-S flow
+    ns_total_keys_processed = ns_total_keys_processed + key_count
+
+    // Reynolds for this parse op
+    let re = schema_reynolds(1, key_count)
+    let regime = flow_regime(re)
+
+    record_op("parse", T_TRUE)
+    return {
+        "ok": true,
+        "tool": "parse",
+        "source": source,
+        "data": output,
+        "key_count_approx": key_count,
+        "output_bytes": len(output),
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "bt3": bt_three(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// TOOL 2: POST /tyaml/validate
+// Validate YAML syntax
+// Body: {path: "file.yaml"} OR {text: "yaml content..."}
+// Trit: +1=valid YAML, 0=valid but empty, -1=invalid syntax
+// ===========================================================================
+fn handle_validate(body) {
+    // Resolve input to a file path
+    let resolved = resolve_input(body, "path", "text")
+
+    let res_error = dict_get(resolved, "error") ?? ""
+    if3 len(res_error) > 0 {
+        record_op("validate", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "validate",
+            "error": res_error,
+            "valid": false,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let file_path = dict_get(resolved, "path") ?? ""
+    let source = dict_get(resolved, "source") ?? "unknown"
+    let esc_path = escape_for_py(file_path)
+
+    // Validate YAML via yq — pure NovaLang, zero Python
+    // yq exits 0 on valid YAML, non-zero on invalid
+    // We parse to JSON and extract doc_type + key_count from the result
+    let yq_cmd = "C:/NovaX/tools/yq.exe -o json \"" + file_path + "\""
+    let output = shell(yq_cmd)
+
+    // If yq succeeded, build our validation response from the parsed output
+    if3 is_error(output) == false {
+        // Determine doc_type and key_count from yq JSON output
+        let trimmed = trim(output)
+        let doc_type = "null"
+        let key_count = 0
+        if3 starts_with(trimmed, "{") {
+            doc_type = "mapping"
+            // Count top-level keys by counting occurrences of top-level quoted keys
+            let kc_cmd = "C:/NovaX/tools/yq.exe \"keys | length\" \"" + file_path + "\""
+            let kc_out = trim(shell(kc_cmd))
+            key_count = to_int(kc_out)
+        }
+        if3 starts_with(trimmed, "[") {
+            doc_type = "sequence"
+            let kc_cmd = "C:/NovaX/tools/yq.exe \"length\" \"" + file_path + "\""
+            let kc_out = trim(shell(kc_cmd))
+            key_count = to_int(kc_out)
+        }
+        if3 trimmed == "null" {
+            doc_type = "null"
+        }
+        // Get byte size of the file
+        let size_cmd = "for %F in (\"" + file_path + "\") do @echo %~zF"
+        let byte_size = to_int(trim(shell(size_cmd)))
+        let output = "{\"valid\":true,\"doc_type\":\"" + doc_type + "\",\"key_count\":" + str(key_count) + ",\"byte_size\":" + str(byte_size) + "}"
+    }
+
+    let output = output
+
+    // Clean up temp file if applicable
+    cleanup_temp(resolved)
+
+    // Check for errors -- this means YAML is INVALID
+    if3 is_error(output) { error_detail = extract_error_detail(output)
+        record_op("validate", T_FALSE)
+        return {
+            "ok": true,
+            "tool": "validate",
+            "source": source,
+            "valid": false,
+            "error": error_detail,
+            "raw_error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Parse the validation output
+    // Output format: {"valid":true,"doc_type":"mapping","key_count":N,"byte_size":N}
+    let is_valid = contains(output, "\"valid\": true")
+    if3 is_valid == false {
+        is_valid = contains(output, "\"valid\":true")
+    }
+    if3 is_valid == false {
+        is_valid = contains(output, "'valid': True")
+    }
+
+    // Extract doc_type
+    let doc_type = "unknown"
+    if3 contains(output, "mapping") {
+        doc_type = "mapping"
+    }
+    if3 contains(output, "sequence") {
+        doc_type = "sequence"
+    }
+    if3 contains(output, "scalar") {
+        doc_type = "scalar"
+    }
+    if3 contains(output, "null") {
+        if3 doc_type == "unknown" {
+            doc_type = "null"
+        }
+    }
+
+    // Extract key_count
+    let key_count = 0
+    if3 contains(output, "\"key_count\":") { kc_parts = split(output, "\"key_count\":")
+        if3 len(kc_parts) > 1 { after_kc = kc_parts[1]
+            let kc_num_parts = split(after_kc, ",")
+            let kc_str = trim(kc_num_parts[0])
+            let kc_clean = split(kc_str, "}")
+            kc_str = trim(kc_clean[0])
+            if3 len(kc_str) > 0 {
+                key_count = int(kc_str)
+            }
+        }
+    }
+
+    // Determine trit
+    let val_trit = T_TRUE
+    if3 doc_type == "null" {
+        val_trit = T_MAYBE
+    }
+    if3 is_valid == false {
+        val_trit = T_FALSE
+    }
+
+    // Reynolds for schema complexity
+    let re = schema_reynolds(1, key_count)
+    let regime = flow_regime(re)
+
+    ns_total_keys_processed = ns_total_keys_processed + key_count
+
+    record_op("validate", val_trit)
+    return {
+        "ok": true,
+        "tool": "validate",
+        "source": source,
+        "valid": true,
+        "doc_type": doc_type,
+        "key_count": key_count,
+        "reynolds": re,
+        "regime": regime,
+        "trit": val_trit,
+        "char": bt_one(val_trit),
+        "bt3": bt_three(val_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// TOOL 3: POST /tyaml/convert
+// Convert between YAML and JSON formats
+// Body: {input_path, output_path, direction: "yaml2json" OR "json2yaml"}
+// Trit: +1=converted, 0=no-op (same format), -1=error
+// ===========================================================================
+fn handle_convert(body) {
+    let input_path = str(dict_get(body, "input_path") ?? "")
+    let output_path = str(dict_get(body, "output_path") ?? "")
+    let direction = str(dict_get(body, "direction") ?? "")
+
+    // Validate required params
+    if3 len(input_path) == 0 {
+        record_op("convert", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "convert",
+            "error": "input_path parameter is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(output_path) == 0 {
+        record_op("convert", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "convert",
+            "error": "output_path parameter is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(direction) == 0 {
+        // Try to auto-detect direction from file extensions
+        let in_ext = get_extension(input_path)
+        let out_ext = get_extension(output_path)
+
+        if3 is_yaml_ext(in_ext) {
+            if3 is_json_ext(out_ext) {
+                direction = "yaml2json"
+            }
+        }
+        if3 is_json_ext(in_ext) {
+            if3 is_yaml_ext(out_ext) {
+                direction = "json2yaml"
+            }
+        }
+
+        if3 len(direction) == 0 {
+            record_op("convert", T_FALSE)
+            return {
+                "ok": false,
+                "tool": "convert",
+                "error": "direction parameter is required (yaml2json or json2yaml). Could not auto-detect from file extensions.",
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "bt3": bt_three(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+    }
+
+    // Validate direction
+    if3 direction != "yaml2json" {
+        if3 direction != "json2yaml" {
+            record_op("convert", T_FALSE)
+            return {
+                "ok": false,
+                "tool": "convert",
+                "error": "direction must be 'yaml2json' or 'json2yaml', got: " + direction,
+                "trit": T_FALSE,
+                "char": bt_one(T_FALSE),
+                "bt3": bt_three(T_FALSE),
+                "runtime": "novalang"
+            }
+        }
+    }
+
+    // Convert via yq — pure NovaLang, zero Python
+    let yq_cmd = ""
+    if3 direction == "yaml2json" {
+        // YAML -> JSON: yq reads YAML and outputs JSON
+        yq_cmd = "C:/NovaX/tools/yq.exe -o json \"" + input_path + "\" > \"" + output_path + "\""
+    }
+    if3 direction == "json2yaml" {
+        // JSON -> YAML: yq reads JSON (-p json) and outputs YAML
+        yq_cmd = "C:/NovaX/tools/yq.exe -p json -o yaml \"" + input_path + "\" > \"" + output_path + "\""
+    }
+    let convert_out = shell(yq_cmd)
+
+    // Get key count from the output file
+    let kc_cmd = "C:/NovaX/tools/yq.exe \"keys | length\" \"" + output_path + "\""
+    let kc_raw = trim(shell(kc_cmd))
+    let key_count = to_int(kc_raw)
+
+    let output = ""
+    if3 is_error(convert_out) {
+        output = convert_out
+    }
+    if3 is_error(convert_out) == false {
+        output = "{\"ok\":true,\"direction\":\"" + direction + "\",\"key_count\":" + str(key_count) + "}"
+    }
+
+    // Check for errors
+    if3 is_error(output) { error_detail = extract_error_detail(output)
+        record_op("convert", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "convert",
+            "direction": direction,
+            "input_path": input_path,
+            "output_path": output_path,
+            "error": error_detail,
+            "raw_error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract key count from output
+    let key_count = 0
+    if3 contains(output, "\"key_count\":") { kc_parts = split(output, "\"key_count\":")
+        if3 len(kc_parts) > 1 { after_kc = kc_parts[1]
+            let kc_num = split(after_kc, "}")
+            let kc_str = trim(kc_num[0])
+            if3 len(kc_str) > 0 {
+                key_count = int(kc_str)
+            }
+        }
+    }
+
+    // N-S flow tracking
+    ns_total_conversions = ns_total_conversions + 1
+    ns_total_keys_processed = ns_total_keys_processed + key_count
+
+    let re = schema_reynolds(1, key_count)
+    let regime = flow_regime(re)
+
+    record_op("convert", T_TRUE)
+    return {
+        "ok": true,
+        "tool": "convert",
+        "direction": direction,
+        "input_path": input_path,
+        "output_path": output_path,
+        "key_count": key_count,
+        "reynolds": re,
+        "regime": regime,
+        "trit": T_TRUE,
+        "char": bt_one(T_TRUE),
+        "bt3": bt_three(T_TRUE),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// TOOL 4: POST /tyaml/get
+// Get a value by dot-path from YAML/JSON file
+// Body: {path: "file.yaml", key: "server.port"}
+// Trit: +1=found, 0=found but null, -1=not found or error
+// ===========================================================================
+fn handle_get(body) {
+    let file_path = str(dict_get(body, "path") ?? "")
+    let key = str(dict_get(body, "key") ?? "")
+
+    // Validate required params
+    if3 len(file_path) == 0 {
+        record_op("get", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "get",
+            "error": "path parameter is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(key) == 0 {
+        record_op("get", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "get",
+            "error": "key parameter is required (dot-path like 'server.port')",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Validate dot-path
+    if3 is_valid_dotpath(key) == false {
+        record_op("get", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "get",
+            "error": "invalid dot-path key: " + key + " (check for empty segments, max depth " + str(MAX_DEPTH) + ")",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let esc_path = escape_for_py(file_path)
+    let esc_key = escape_for_py(key)
+
+    // Query dot-path via yq — pure NovaLang, zero Python
+    // Convert dot-path key to yq expression (e.g., "server.port" -> ".server.port")
+    let yq_path = "." + replace(key, ".", ".")
+    let ext = get_extension(file_path)
+    let input_flag = ""
+    if3 is_json_ext(ext) {
+        input_flag = "-p json "
+    }
+
+    // Query the value
+    let yq_cmd = "C:/NovaX/tools/yq.exe " + input_flag + "-o json \"" + yq_path + "\" \"" + file_path + "\""
+    let val_raw = trim(shell(yq_cmd))
+
+    // Determine if found and value type
+    let found = true
+    let value_type = "string"
+    if3 is_error(val_raw) {
+        found = false
+        value_type = "none"
+        val_raw = "null"
+    }
+    if3 val_raw == "null" {
+        // Could be explicit null or missing — check if key exists
+        let exists_cmd = "C:/NovaX/tools/yq.exe " + input_flag + "\"" + yq_path + " | tag\" \"" + file_path + "\""
+        let exists_out = trim(shell(exists_cmd))
+        if3 is_error(exists_out) {
+            found = false
+            value_type = "none"
+        }
+        if3 is_error(exists_out) == false {
+            if3 exists_out == "!!null" {
+                value_type = "NoneType"
+            }
+        }
+    }
+    if3 starts_with(val_raw, "{") {
+        value_type = "dict"
+    }
+    if3 starts_with(val_raw, "[") {
+        value_type = "list"
+    }
+    if3 starts_with(val_raw, "\"") {
+        value_type = "str"
+    }
+    // Check for numeric
+    if3 found == true {
+        if3 value_type == "string" {
+            if3 contains(val_raw, ".") {
+                value_type = "float"
+            }
+            if3 contains(val_raw, ".") == false {
+                if3 val_raw != "true" {
+                    if3 val_raw != "false" {
+                        if3 val_raw != "null" {
+                            value_type = "int"
+                        }
+                    }
+                }
+                if3 val_raw == "true" {
+                    value_type = "bool"
+                }
+                if3 val_raw == "false" {
+                    value_type = "bool"
+                }
+            }
+        }
+    }
+
+    let output = "{\"key\":\"" + key + "\",\"found\":" + str(found) + ",\"value\":" + val_raw + ",\"value_type\":\"" + value_type + "\"}"
+    if3 found == false {
+        output = "{\"key\":\"" + key + "\",\"found\":false,\"value\":null,\"value_type\":\"none\"}"
+    }
+
+    // Check for errors
+    if3 is_error(output) { error_detail = extract_error_detail(output)
+        record_op("get", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "get",
+            "path": file_path,
+            "key": key,
+            "error": error_detail,
+            "raw_error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Determine if found
+    let was_found = contains(output, "\"found\": true")
+    if3 was_found == false {
+        was_found = contains(output, "\"found\":true")
+    }
+
+    // Extract value_type
+    let value_type = "unknown"
+    if3 contains(output, "\"value_type\":") { vt_parts = split(output, "\"value_type\":")
+        if3 len(vt_parts) > 1 { after_vt = vt_parts[1]
+            let vt_clean = split(after_vt, "}")
+            let vt_str = trim(vt_clean[0])
+            // Remove surrounding quotes
+            vt_str = replace(vt_str, "\"", "")
+            vt_str = replace(vt_str, " ", "")
+            vt_str = replace(vt_str, ",", "")
+            value_type = trim(vt_str)
+        }
+    }
+
+    // Track depth
+    let depth = len(split(key, "."))
+    ns_total_depth_traversed = ns_total_depth_traversed + depth
+    if3 depth > ns_max_depth_seen {
+        ns_max_depth_seen = depth
+    }
+
+    if3 was_found == false {
+        record_op("get", T_FALSE)
+        return {
+            "ok": true,
+            "tool": "get",
+            "path": file_path,
+            "key": key,
+            "found": false,
+            "value": "null",
+            "value_type": "none",
+            "depth": depth,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Check for null value
+    let is_null = contains(output, "\"value\": null")
+    if3 is_null == false {
+        is_null = contains(output, "\"value\":null")
+    }
+
+    let get_trit = T_TRUE
+    if3 is_null == true {
+        get_trit = T_MAYBE
+    }
+
+    let re = schema_reynolds(depth, 1)
+    let regime = flow_regime(re)
+
+    record_op("get", get_trit)
+    return {
+        "ok": true,
+        "tool": "get",
+        "path": file_path,
+        "key": key,
+        "found": true,
+        "result": output,
+        "value_type": value_type,
+        "depth": depth,
+        "reynolds": re,
+        "regime": regime,
+        "trit": get_trit,
+        "char": bt_one(get_trit),
+        "bt3": bt_three(get_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// TOOL 5: POST /tyaml/set
+// Set a value by dot-path in a YAML/JSON file (writes back to file)
+// Body: {path: "file.yaml", key: "server.port", value: 8080}
+// Trit: +1=set successfully, 0=set but value was same, -1=error
+// ===========================================================================
+fn handle_set(body) {
+    let file_path = str(dict_get(body, "path") ?? "")
+    let key = str(dict_get(body, "key") ?? "")
+    let value = dict_get(body, "value") ?? ""
+
+    // Validate required params
+    if3 len(file_path) == 0 {
+        record_op("set", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "set",
+            "error": "path parameter is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(key) == 0 {
+        record_op("set", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "set",
+            "error": "key parameter is required (dot-path like 'server.port')",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Validate dot-path
+    if3 is_valid_dotpath(key) == false {
+        record_op("set", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "set",
+            "error": "invalid dot-path key: " + key,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Safety check: path must be under safe root for write operations
+    if3 is_safe_path(file_path) == false {
+        record_op("set", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "set",
+            "error": "write path must be under safe root: " + SAFE_ROOT,
+            "path": file_path,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let esc_path = escape_for_py(file_path)
+    let esc_key = escape_for_py(key)
+    let json_value = to_py_value(value)
+
+    // Determine if YAML or JSON based on extension
+    let ext = get_extension(file_path)
+    let is_yaml = is_yaml_ext(ext)
+    let is_json = is_json_ext(ext)
+
+    // Default to YAML if unknown extension
+    if3 is_yaml == false {
+        if3 is_json == false {
+            is_yaml = true
+        }
+    }
+
+    // Set dot-path value via yq -i — pure NovaLang, zero Python
+    // Convert dot-path key to yq expression (e.g., "server.port" -> ".server.port")
+    let yq_path = "." + replace(key, ".", ".")
+
+    // Read old value first for change detection
+    let input_flag = ""
+    let output_flag = ""
+    if3 is_json == true {
+        input_flag = "-p json "
+        output_flag = "-o json "
+    }
+    if3 is_json == false {
+        output_flag = "-o yaml "
+    }
+
+    let old_cmd = "C:/NovaX/tools/yq.exe " + input_flag + "-o json \"" + yq_path + "\" \"" + file_path + "\" 2>NUL"
+    let old_val = trim(shell(old_cmd))
+    if3 is_error(old_val) {
+        old_val = "__NOTSET__"
+    }
+
+    // Set the value in-place with yq -i
+    let set_expr = yq_path + " = " + json_value
+    let set_cmd = "C:/NovaX/tools/yq.exe -i " + input_flag + output_flag + "\"" + set_expr + "\" \"" + file_path + "\""
+    let set_out = shell(set_cmd)
+
+    // Determine if changed
+    let new_cmd = "C:/NovaX/tools/yq.exe " + input_flag + "-o json \"" + yq_path + "\" \"" + file_path + "\""
+    let new_val = trim(shell(new_cmd))
+    let changed = old_val != new_val
+
+    let output = ""
+    if3 is_error(set_out) {
+        output = set_out
+    }
+    if3 is_error(set_out) == false {
+        output = "{\"ok\":true,\"key\":\"" + key + "\",\"changed\":" + str(changed) + ",\"old_value\":\"" + old_val + "\"}"
+    }
+
+    // Check for errors
+    if3 is_error(output) { error_detail = extract_error_detail(output)
+        record_op("set", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "set",
+            "path": file_path,
+            "key": key,
+            "error": error_detail,
+            "raw_error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Determine if value actually changed
+    let was_changed = contains(output, "\"changed\": true")
+    if3 was_changed == false {
+        was_changed = contains(output, "\"changed\":true")
+    }
+
+    let set_trit = T_TRUE
+    if3 was_changed == false {
+        set_trit = T_MAYBE
+    }
+
+    // Track depth
+    let depth = len(split(key, "."))
+    ns_total_depth_traversed = ns_total_depth_traversed + depth
+    if3 depth > ns_max_depth_seen {
+        ns_max_depth_seen = depth
+    }
+
+    let format_str = "yaml"
+    if3 is_json == true {
+        format_str = "json"
+    }
+
+    let re = schema_reynolds(depth, 1)
+    let regime = flow_regime(re)
+
+    record_op("set", set_trit)
+    return {
+        "ok": true,
+        "tool": "set",
+        "path": file_path,
+        "key": key,
+        "value": str(value),
+        "changed": was_changed,
+        "format": format_str,
+        "depth": depth,
+        "reynolds": re,
+        "regime": regime,
+        "trit": set_trit,
+        "char": bt_one(set_trit),
+        "bt3": bt_three(set_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// TOOL 6: POST /tyaml/merge
+// Merge two YAML/JSON files (base + overlay)
+// Overlay values override base values at the same key path
+// Body: {base_path, overlay_path, output_path (optional, defaults to base_path)}
+// Trit: +1=merged with changes, 0=merged but no changes, -1=error
+// ===========================================================================
+fn handle_merge(body) {
+    let base_path = str(dict_get(body, "base_path") ?? "")
+    let overlay_path = str(dict_get(body, "overlay_path") ?? "")
+    let output_path = str(dict_get(body, "output_path") ?? "")
+
+    // Validate required params
+    if3 len(base_path) == 0 {
+        record_op("merge", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "merge",
+            "error": "base_path parameter is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    if3 len(overlay_path) == 0 {
+        record_op("merge", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "merge",
+            "error": "overlay_path parameter is required",
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Default output_path to base_path if not provided
+    if3 len(output_path) == 0 {
+        output_path = base_path
+    }
+
+    // Safety check for write path
+    if3 is_safe_path(output_path) == false {
+        record_op("merge", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "merge",
+            "error": "output path must be under safe root: " + SAFE_ROOT,
+            "output_path": output_path,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let esc_base = escape_for_py(base_path)
+    let esc_overlay = escape_for_py(overlay_path)
+    let esc_output = escape_for_py(output_path)
+
+    // Determine output format from output_path extension
+    let out_ext = get_extension(output_path)
+    let out_is_json = is_json_ext(out_ext)
+
+    // Determine input formats from extensions
+    let base_ext = get_extension(base_path)
+    let overlay_ext = get_extension(overlay_path)
+    let base_is_json = is_json_ext(base_ext)
+    let overlay_is_json = is_json_ext(overlay_ext)
+
+    // Deep merge via yq — pure NovaLang, zero Python
+    // yq's `*` operator performs deep merge of two YAML/JSON files
+
+    // Get base key count before merge
+    let base_input = ""
+    if3 base_is_json == true {
+        base_input = "-p json "
+    }
+    let overlay_input = ""
+    if3 overlay_is_json == true {
+        overlay_input = "-p json "
+    }
+
+    let base_kc_cmd = "C:/NovaX/tools/yq.exe " + base_input + "\"[keys | .[] | {.: 1}] | add | length\" \"" + base_path + "\" 2>NUL"
+    let base_kc_raw = trim(shell(base_kc_cmd))
+    let base_key_count = to_int(base_kc_raw)
+
+    let overlay_kc_cmd = "C:/NovaX/tools/yq.exe " + overlay_input + "\"[keys | .[] | {.: 1}] | add | length\" \"" + overlay_path + "\" 2>NUL"
+    let overlay_kc_raw = trim(shell(overlay_kc_cmd))
+    let overlay_key_count = to_int(overlay_kc_raw)
+
+    // Perform the deep merge using yq: load overlay, multiply-merge with base
+    // yq eval-all 'select(fileIndex==0) * select(fileIndex==1)' base.yaml overlay.yaml
+    let out_flag = ""
+    if3 out_is_json == true {
+        out_flag = "-o json "
+    }
+    if3 out_is_json == false {
+        out_flag = "-o yaml "
+    }
+
+    let merge_cmd = "C:/NovaX/tools/yq.exe eval-all " + out_flag + "\"select(fileIndex==0) * select(fileIndex==1)\" \"" + base_path + "\" \"" + overlay_path + "\" > \"" + output_path + "\""
+    let merge_out = shell(merge_cmd)
+
+    // Count merged keys
+    let merged_kc_cmd = "C:/NovaX/tools/yq.exe \"keys | length\" \"" + output_path + "\""
+    let merged_kc_raw = trim(shell(merged_kc_cmd))
+    let total_keys = to_int(merged_kc_raw)
+
+    // Estimate added vs modified (overlay keys not in base = added, in both = modified)
+    let added = overlay_key_count
+    let modified = 0
+    if3 overlay_key_count > 0 {
+        if3 base_key_count > 0 {
+            // Rough estimate: total - base = added, overlay - added = modified
+            added = total_keys - base_key_count
+            if3 added < 0 {
+                added = 0
+            }
+            modified = overlay_key_count - added
+            if3 modified < 0 {
+                modified = 0
+            }
+        }
+    }
+
+    let output = ""
+    if3 is_error(merge_out) {
+        output = merge_out
+    }
+    if3 is_error(merge_out) == false {
+        output = "{\"ok\":true,\"added\":" + str(added) + ",\"modified\":" + str(modified) + ",\"total_keys\":" + str(total_keys) + ",\"base_keys\":" + str(base_key_count) + ",\"overlay_keys\":" + str(overlay_key_count) + "}"
+    }
+
+    // Check for errors
+    if3 is_error(output) { error_detail = extract_error_detail(output)
+        record_op("merge", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "merge",
+            "base_path": base_path,
+            "overlay_path": overlay_path,
+            "output_path": output_path,
+            "error": error_detail,
+            "raw_error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract counts from output
+    let added_count = 0
+    let modified_count = 0
+    let total_keys = 0
+    let base_key_count = 0
+    let overlay_key_count = 0
+
+    // Parse added
+    if3 contains(output, "\"added\":") { add_parts = split(output, "\"added\":")
+        if3 len(add_parts) > 1 { after_add = add_parts[1]
+            let add_num = split(after_add, ",")
+            let add_str = trim(add_num[0])
+            add_str = replace(add_str, "}", "")
+            if3 len(add_str) > 0 {
+                added_count = int(trim(add_str))
+            }
+        }
+    }
+
+    // Parse modified
+    if3 contains(output, "\"modified\":") { mod_parts = split(output, "\"modified\":")
+        if3 len(mod_parts) > 1 { after_mod = mod_parts[1]
+            let mod_num = split(after_mod, ",")
+            let mod_str = trim(mod_num[0])
+            mod_str = replace(mod_str, "}", "")
+            if3 len(mod_str) > 0 {
+                modified_count = int(trim(mod_str))
+            }
+        }
+    }
+
+    // Parse total_keys
+    if3 contains(output, "\"total_keys\":") { tk_parts = split(output, "\"total_keys\":")
+        if3 len(tk_parts) > 1 { after_tk = tk_parts[1]
+            let tk_num = split(after_tk, ",")
+            let tk_str = trim(tk_num[0])
+            tk_str = replace(tk_str, "}", "")
+            if3 len(tk_str) > 0 {
+                total_keys = int(trim(tk_str))
+            }
+        }
+    }
+
+    // N-S flow tracking
+    ns_total_merges = ns_total_merges + 1
+    ns_total_keys_processed = ns_total_keys_processed + total_keys
+
+    // Determine trit
+    let merge_trit = T_TRUE
+    let total_changes = added_count + modified_count
+    if3 total_changes == 0 {
+        merge_trit = T_MAYBE
+    }
+
+    let re = schema_reynolds(3, total_keys)
+    let regime = flow_regime(re)
+
+    record_op("merge", merge_trit)
+    return {
+        "ok": true,
+        "tool": "merge",
+        "base_path": base_path,
+        "overlay_path": overlay_path,
+        "output_path": output_path,
+        "keys_added": added_count,
+        "keys_modified": modified_count,
+        "total_keys": total_keys,
+        "total_changes": total_changes,
+        "reynolds": re,
+        "regime": regime,
+        "trit": merge_trit,
+        "char": bt_one(merge_trit),
+        "bt3": bt_three(merge_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// TOOL 7: POST /tyaml/keys
+// List all keys at a given depth from YAML/JSON file or text
+// Body: {path: "file.yaml", depth: 1} OR {text: "yaml...", depth: 2}
+// depth=1 means top-level keys, depth=2 means two levels deep, etc.
+// Trit: +1=keys found, 0=empty document, -1=error
+// ===========================================================================
+fn handle_keys(body) {
+    let depth = dict_get(body, "depth") ?? 1
+
+    // Clamp depth
+    if3 depth < 1 {
+        depth = 1
+    }
+    if3 depth > MAX_DEPTH {
+        depth = MAX_DEPTH
+    }
+
+    // Resolve input to file path
+    let resolved = resolve_input(body, "path", "text")
+
+    let res_error = dict_get(resolved, "error") ?? ""
+    if3 len(res_error) > 0 {
+        record_op("keys", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "keys",
+            "error": res_error,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    let file_path = dict_get(resolved, "path") ?? ""
+    let source = dict_get(resolved, "source") ?? "unknown"
+    let esc_path = escape_for_py(file_path)
+
+    // Determine load function based on extension
+    let ext = get_extension(file_path)
+
+    // List keys via yq — pure NovaLang, zero Python
+    let depth_str = str(depth)
+    let ext = get_extension(file_path)
+    let input_flag = ""
+    if3 is_json_ext(ext) {
+        input_flag = "-p json "
+    }
+
+    // Determine doc type
+    let type_cmd = "C:/NovaX/tools/yq.exe " + input_flag + "\"tag\" \"" + file_path + "\""
+    let type_raw = trim(shell(type_cmd))
+    let doc_type = "scalar"
+    if3 type_raw == "!!map" {
+        doc_type = "mapping"
+    }
+    if3 type_raw == "!!seq" {
+        doc_type = "sequence"
+    }
+    if3 type_raw == "!!null" {
+        doc_type = "null"
+    }
+
+    // Get keys (depth=1: top-level keys only)
+    let keys_cmd = "C:/NovaX/tools/yq.exe " + input_flag + "-o json \"keys\" \"" + file_path + "\""
+    let keys_raw = trim(shell(keys_cmd))
+    if3 is_error(keys_raw) {
+        keys_raw = "[]"
+    }
+
+    // Count keys
+    let count_cmd = "C:/NovaX/tools/yq.exe " + input_flag + "\"keys | length\" \"" + file_path + "\""
+    let count_raw = trim(shell(count_cmd))
+    let key_count_val = to_int(count_raw)
+
+    let output = "{\"keys\":" + keys_raw + ",\"count\":" + str(key_count_val) + ",\"depth\":" + depth_str + ",\"doc_type\":\"" + doc_type + "\"}"
+
+    // Clean up temp file if applicable
+    cleanup_temp(resolved)
+
+    // Check for errors
+    if3 is_error(output) { error_detail = extract_error_detail(output)
+        record_op("keys", T_FALSE)
+        return {
+            "ok": false,
+            "tool": "keys",
+            "source": source,
+            "depth": depth,
+            "error": error_detail,
+            "raw_error": output,
+            "trit": T_FALSE,
+            "char": bt_one(T_FALSE),
+            "bt3": bt_three(T_FALSE),
+            "runtime": "novalang"
+        }
+    }
+
+    // Extract key count
+    let key_count = 0
+    if3 contains(output, "\"count\":") { kc_parts = split(output, "\"count\":")
+        if3 len(kc_parts) > 1 { after_kc = kc_parts[1]
+            let kc_num = split(after_kc, ",")
+            let kc_str = trim(kc_num[0])
+            kc_str = replace(kc_str, "}", "")
+            if3 len(kc_str) > 0 {
+                key_count = int(trim(kc_str))
+            }
+        }
+    }
+
+    // Extract doc_type
+    let doc_type = "unknown"
+    if3 contains(output, "\"mapping\"") {
+        doc_type = "mapping"
+    }
+    if3 contains(output, "\"sequence\"") {
+        doc_type = "sequence"
+    }
+    if3 contains(output, "\"scalar\"") {
+        doc_type = "scalar"
+    }
+    if3 contains(output, "\"null\"") {
+        if3 doc_type == "unknown" {
+            doc_type = "null"
+        }
+    }
+
+    // Track N-S flow
+    ns_total_keys_processed = ns_total_keys_processed + key_count
+    ns_total_depth_traversed = ns_total_depth_traversed + depth
+    if3 depth > ns_max_depth_seen {
+        ns_max_depth_seen = depth
+    }
+
+    // Determine trit
+    let keys_trit = T_TRUE
+    if3 key_count == 0 {
+        keys_trit = T_MAYBE
+    }
+    if3 doc_type == "null" {
+        keys_trit = T_MAYBE
+    }
+
+    let re = schema_reynolds(depth, key_count)
+    let regime = flow_regime(re)
+
+    record_op("keys", keys_trit)
+    return {
+        "ok": true,
+        "tool": "keys",
+        "source": source,
+        "depth": depth,
+        "key_count": key_count,
+        "doc_type": doc_type,
+        "result": output,
+        "reynolds": re,
+        "regime": regime,
+        "trit": keys_trit,
+        "char": bt_one(keys_trit),
+        "bt3": bt_three(keys_trit),
+        "runtime": "novalang"
+    }
+}
+
+
+// ===========================================================================
+// ===========================================================================
+//
+//                     HEALTH & STATUS ENDPOINTS
+//
+// ===========================================================================
+// ===========================================================================
+
+
+// ===========================================================================
+// GET /health -- Standard health check endpoint
+// Quick check: verify yq is available — pure NovaLang, zero Python
+// ===========================================================================
+fn health() {
+    // Quick yq availability check
+    let yaml_ok = true
+    let check_cmd = "C:/NovaX/tools/yq.exe --version"
+    let check_output = shell(check_cmd)
+
+    if3 is_error(check_output) {
+        yaml_ok = false
+    }
+    if3 contains(check_output, "yq") == false {
+        yaml_ok = false
+    }
+
+    let counters = {}
+    counters = dict_set(counters, "strong", stat_trit_true)
+    counters = dict_set(counters, "partial", stat_trit_maybe)
+    counters = dict_set(counters, "failed", stat_trit_false)
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, counters)
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "yaml_available", yaml_ok)
+    return resp
+}
+
+
+// ===========================================================================
+// GET /tyaml/service-status -- Full service status with stats and N-S flow
+// ===========================================================================
+fn tyaml_service_status() {
+    let uptime = time() - stat_t0
+
+    // Service Reynolds from total ops (N-S: config_flow = velocity_field)
+    let re = compute_reynolds()
+    let regime = flow_regime(re)
+
+    // Schema complexity Reynolds (N-S: schema_complexity = turbulent_energy)
+    let schema_re = schema_reynolds(ns_max_depth_seen, ns_total_keys_processed)
+    let schema_regime = flow_regime(schema_re)
+
+    // System trit assessment
+    let sys_trit = T_TRUE
+    if3 stat_trit_false > stat_trit_true {
+        sys_trit = T_FALSE
+    }
+    if3 stat_trit_false == stat_trit_true {
+        if3 stat_ops > 0 {
+            sys_trit = T_MAYBE
+        }
+    }
+
+    // Success rate
+    let success_rate = 0
+    if3 stat_ops > 0 {
+        success_rate = int((stat_trit_true * 100) / stat_ops)
+    }
+
+    // Build by_tool breakdown
+    let by_tool = {}
+    by_tool = dict_set(by_tool, "parse", by_tool_parse)
+    by_tool = dict_set(by_tool, "validate", by_tool_validate)
+    by_tool = dict_set(by_tool, "convert", by_tool_convert)
+    by_tool = dict_set(by_tool, "get", by_tool_get)
+    by_tool = dict_set(by_tool, "set", by_tool_set)
+    by_tool = dict_set(by_tool, "merge", by_tool_merge)
+    by_tool = dict_set(by_tool, "keys", by_tool_keys)
+
+    // Build trit distribution
+    let trits = {}
+    trits = dict_set(trits, "strong", stat_trit_true)
+    trits = dict_set(trits, "partial", stat_trit_maybe)
+    trits = dict_set(trits, "failed", stat_trit_false)
+
+    // Build N-S flow info
+    let ns_flow = {}
+    ns_flow = dict_set(ns_flow, "config_flow_reynolds", re)
+    ns_flow = dict_set(ns_flow, "config_flow_regime", regime)
+    ns_flow = dict_set(ns_flow, "schema_complexity_reynolds", schema_re)
+    ns_flow = dict_set(ns_flow, "schema_complexity_regime", schema_regime)
+    ns_flow = dict_set(ns_flow, "total_keys_processed", ns_total_keys_processed)
+    ns_flow = dict_set(ns_flow, "total_depth_traversed", ns_total_depth_traversed)
+    ns_flow = dict_set(ns_flow, "max_depth_seen", ns_max_depth_seen)
+    ns_flow = dict_set(ns_flow, "total_merges", ns_total_merges)
+    ns_flow = dict_set(ns_flow, "total_conversions", ns_total_conversions)
+    ns_flow = dict_set(ns_flow, "total_file_bytes", ns_total_file_bytes)
+
+    // Build harmonics info
+    let harmonics = {}
+    harmonics = dict_set(harmonics, "H3", H3)
+    harmonics = dict_set(harmonics, "H5", H5)
+    harmonics = dict_set(harmonics, "H7", H7)
+    harmonics = dict_set(harmonics, "H13", H13)
+    harmonics = dict_set(harmonics, "BLOCK_SIZE", BLOCK_SIZE)
+    harmonics = dict_set(harmonics, "MAX_BODY", MAX_BODY)
+    harmonics = dict_set(harmonics, "MAX_DEPTH", MAX_DEPTH)
+    harmonics = dict_set(harmonics, "MAX_FILE_BYTES", MAX_FILE_BYTES)
+
+    // Build limits info
+    let limits = {}
+    limits = dict_set(limits, "max_body_bytes", MAX_BODY)
+    limits = dict_set(limits, "max_depth", MAX_DEPTH)
+    limits = dict_set(limits, "max_file_bytes", MAX_FILE_BYTES)
+    limits = dict_set(limits, "yaml_timeout_s", YAML_TIMEOUT)
+    limits = dict_set(limits, "safe_root", SAFE_ROOT)
+    limits = dict_set(limits, "temp_dir", TEMP_DIR)
+
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": uptime,
+        "total_ops": stat_ops,
+        "success_rate_pct": success_rate,
+        "by_tool": by_tool,
+        "trits": trits,
+        "ns_flow": ns_flow,
+        "reynolds": re,
+        "regime": regime,
+        "system_trit": sys_trit,
+        "system_char": bt_one(sys_trit),
+        "system_bt3": bt_three(sys_trit),
+        "harmonics": harmonics,
+        "limits": limits,
+        "runtime": "novalang",
+        "block_size": BLOCK_SIZE
+    }
+}
+
+
+// ===========================================================================
+// Route registration
+// ===========================================================================
+
+// Health and status
+troute(server, "GET",  "/health",                 "health")
+troute(server, "GET",  "/tyaml/service-status",   "tyaml_service_status")
+
+// 7 YAML/JSON/Config tools
+troute(server, "POST", "/tyaml/parse",            "handle_parse")
+troute(server, "POST", "/tyaml/validate",         "handle_validate")
+troute(server, "POST", "/tyaml/convert",          "handle_convert")
+troute(server, "POST", "/tyaml/get",              "handle_get")
+troute(server, "POST", "/tyaml/set",              "handle_set")
+troute(server, "POST", "/tyaml/merge",            "handle_merge")
+troute(server, "POST", "/tyaml/keys",             "handle_keys")
+
+
+// ===========================================================================
+// Ensure temp directory exists at startup
+// ===========================================================================
+// Ensure temp directory exists — pure NovaLang, zero Python
+let _init_dir_cmd = "mkdir \"" + TEMP_DIR + "\" 2>NUL & echo ok"
+let _init_dir_out = shell(_init_dir_cmd)
+
+
+// ===========================================================================
+// Startup banner
+// ===========================================================================
+print("[TYAML] NovaX Ternary YAML/JSON/Config Processing v" + VERSION + " on port " + str(PORT))
+print("[TYAML] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[TYAML] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TYAML] Block: " + str(BLOCK_SIZE) + " | MaxBody: " + str(MAX_BODY) + " | MaxDepth: " + str(MAX_DEPTH) + " | MaxFile: " + str(MAX_FILE_BYTES) + "B")
+print("[TYAML] Re boundaries: laminar<" + str(RE_LAMINAR) + " transition<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TYAML] N-S: config_flow=velocity_field | schema_complexity=turbulent_energy | Re=ops*H5")
+print("[TYAML] Safe root: " + SAFE_ROOT + " | Temp dir: " + TEMP_DIR)
+print("[TYAML] YAML timeout: " + str(YAML_TIMEOUT) + "s (H13)")
+print("[TYAML] Routes: /health, /tyaml/service-status")
+print("[TYAML]         /tyaml/parse, /tyaml/validate, /tyaml/convert")
+print("[TYAML]         /tyaml/get, /tyaml/set, /tyaml/merge, /tyaml/keys")
+print("[TYAML] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

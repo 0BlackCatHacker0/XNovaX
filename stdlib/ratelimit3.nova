@@ -1,0 +1,82 @@
+// ============================================================================
+// ratelimit3.nova — Ternary Rate Limiter (Token Bucket Algorithm)
+// ============================================================================
+// Controls request flow using ternary state:
+//   +1 = allowed, tokens available
+//    0 = throttled, near limit
+//   -1 = blocked, bucket empty
+//
+// Uses v1.4 features: ??, default params
+// 3-5-7-13 Harmonics: default rate=H13(13/s), burst=H7(7)
+// ============================================================================
+
+fn ratelimit3_new(name = "limiter", rate_per_sec = 13, burst = 7) {
+    let now = time_ms()
+    return {
+        "name": name,
+        "rate_per_sec": rate_per_sec,
+        "burst": burst,
+        "tokens": burst,
+        "last_refill": now,
+        "total_allowed": 0,
+        "total_blocked": 0
+    }
+}
+
+fn ratelimit3_refill(rl) {
+    let now = time_ms()
+    let last = dict_get(rl, "last_refill") ?? now
+    let rate = dict_get(rl, "rate_per_sec") ?? 13
+    let burst = dict_get(rl, "burst") ?? 7
+    let tokens = dict_get(rl, "tokens") ?? 0
+    let elapsed_ms = now - last
+    if3 elapsed_ms <= 0 { return rl }
+    let new_tokens = (elapsed_ms * rate) / 1000
+    let total = tokens + new_tokens
+    if3 total > burst { total = burst }
+    let result = deep_clone(rl)
+    result = dict_set(result, "tokens", total)
+    result = dict_set(result, "last_refill", now)
+    return result
+}
+
+fn ratelimit3_check(rl, cost = 1) {
+    let refreshed = ratelimit3_refill(rl)
+    let tokens = dict_get(refreshed, "tokens") ?? 0
+    let burst = dict_get(refreshed, "burst") ?? 7
+    if3 tokens >= cost {
+        // Allowed
+        let result = dict_set(refreshed, "tokens", tokens - cost)
+        let allowed = (dict_get(refreshed, "total_allowed") ?? 0) + 1
+        result = dict_set(result, "total_allowed", allowed)
+        return {"rl": result, "allowed": 1, "trit": 1}
+    }
+    if3 tokens > 0 {
+        // Near limit — throttled
+        let blocked = (dict_get(refreshed, "total_blocked") ?? 0) + 1
+        let result = dict_set(refreshed, "total_blocked", blocked)
+        return {"rl": result, "allowed": 0, "trit": 0}
+    }
+    // Blocked
+    let blocked = (dict_get(refreshed, "total_blocked") ?? 0) + 1
+    let result = dict_set(refreshed, "total_blocked", blocked)
+    return {"rl": result, "allowed": -1, "trit": -1}
+}
+
+fn ratelimit3_stats(rl) {
+    let refreshed = ratelimit3_refill(rl)
+    let tokens = dict_get(refreshed, "tokens") ?? 0
+    let burst = dict_get(refreshed, "burst") ?? 7
+    let state = "allowed"
+    if3 tokens < 2 { state = "throttled" }
+    if3 tokens <= 0 { state = "blocked" }
+    return {
+        "name": dict_get(refreshed, "name") ?? "limiter",
+        "state": state,
+        "tokens": tokens,
+        "burst": burst,
+        "rate_per_sec": dict_get(refreshed, "rate_per_sec") ?? 13,
+        "total_allowed": dict_get(refreshed, "total_allowed") ?? 0,
+        "total_blocked": dict_get(refreshed, "total_blocked") ?? 0
+    }
+}

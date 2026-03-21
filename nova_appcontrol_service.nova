@@ -1,0 +1,998 @@
+// Nova AppControl Service v3.0 - Autonomous Desktop Agent Runtime (NovaLang)
+// Port 9887: Window management, keyboard/mouse, screenshots, Blender bridge,
+// task queue, screen state reading. All ctypes ops delegated to helper script.
+//
+// N-S Mapping:
+//   desktop_flow    = velocity_field
+//   window_state    = particle_position
+//   input_action    = force_application
+//   task_queue      = laminar_pipeline
+//   trit            = Reynolds classification (+1 ok, 0 partial, -1 fail)
+//
+// All Win32/ctypes operations are delegated via nova_run() to:
+//   appcontrol_helper.py <command> <json_args>
+// This avoids forbidden import/class/ctypes in NovaLang.
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9887
+let server = tserve(PORT, "Nova AppControl v3.0 - Desktop Agent Runtime")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let BLOCK = 2187
+
+// -- Ternary constants --
+let T_TRUE  = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// -- Reynolds boundaries --
+let RE_LAMINAR      = 27
+let RE_TRANSITIONAL = 125
+let RE_TURBULENT    = 343
+
+// -- Paths --
+let HELPER = "C:\\NovaX\\appcontrol_helper.py"
+let PW = "C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\pythonw.exe"
+let TASK_FILE = "C:\\NovaX\\memory\\agent_tasks.json"
+let BLENDER_CMD_FILE = "C:\\NovaX\\memory\\blender_cmd.json"
+let BLENDER_RESULT_FILE = "C:\\NovaX\\memory\\blender_result.json"
+
+// -- Global State --
+let start_time = time()
+let tasks = {}
+let task_queue = []
+let task_history = []
+let TASK_HISTORY_MAX = 100
+let apps = {}
+let last_target = ""
+
+// ============================================================
+// Helper: run a Win32 operation via the Python helper script
+// Returns parsed JSON result or error dict
+// ============================================================
+fn run_helper(command, args_json) {
+    let cmd_str = PW + " " + HELPER + " " + command + " " + args_json
+    let raw = ""
+    try3 {
+        raw = nova_run(cmd_str, 15)
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "helper exec failed"}
+    }
+    let result = {}
+    try3 {
+        result = json_decode(raw)
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "helper parse failed", "raw": str(raw)}
+    }
+    return result
+}
+
+// Helper shorthand: run_helper with a dict encoded to JSON
+fn helper(command, args_dict) {
+    let j = json_encode(args_dict)
+    return run_helper(command, j)
+}
+
+// ============================================================
+// Ternary trit classifier
+// ============================================================
+fn trit(val) {
+    if3 val == true {
+        return T_TRUE
+    }
+    if3 val == false {
+        return T_FALSE
+    }
+    if3 type_of(val) == "number" {
+        if3 val > 0 {
+            return T_TRUE
+        }
+        if3 val < 0 {
+            return T_FALSE
+        }
+    }
+    return T_MAYBE
+}
+
+// ============================================================
+// Task Queue System
+// Multi-AI coordination: create -> claim -> run -> complete/fail
+// Uses list + slice instead of deque (forbidden)
+// ============================================================
+
+fn save_tasks() {
+    let data = json_encode({"tasks": tasks, "queue": task_queue, "ts": time()})
+    try3 {
+        nova_write(TASK_FILE, data)
+    } else {}
+    return T_TRUE
+}
+
+fn load_tasks() {
+    let raw = ""
+    try3 {
+        raw = nova_read(TASK_FILE)
+    } else {
+        return T_FALSE
+    }
+    if3 len(str(raw)) == 0 {
+        return T_FALSE
+    }
+    let data = {}
+    try3 {
+        data = json_decode(raw)
+    } else {
+        return T_FALSE
+    }
+    try3 {
+        tasks = data["tasks"]
+    } else {}
+    try3 {
+        task_queue = data["queue"]
+    } else {}
+    // Reset any stuck running tasks back to pending
+    let tkeys = keys(tasks)
+    let i = 0
+    while3 i < len(tkeys) {
+        let tid = tkeys[i]
+        let t = dict_get(tasks, tid) ?? {}
+        let st = dict_get(t, "status") ?? ""
+        if3 st == "running" {
+            t = dict_set(t, "status", "pending")
+            // Add back to queue if not already there
+            let found = false
+            let qi = 0
+            while3 qi < len(task_queue) {
+                if3 dict_get(task_queue, qi) == tid {
+                    found = true
+                }
+                qi = qi + 1
+            }
+            if3 found == false {
+                task_queue = append(task_queue, tid)
+            }
+        }
+        i = i + 1
+    }
+    return T_TRUE
+}
+
+fn create_task(goal, agent_id, priority, parent_id, context) {
+    let tid = slice(uuid_hex(), 0, 8)
+    let task = {
+        "id": tid,
+        "goal": goal,
+        "status": "pending",
+        "priority": priority,
+        "agent_id": agent_id,
+        "parent_id": parent_id,
+        "context": context,
+        "actions": [],
+        "result": "",
+        "created": time(),
+        "claimed_at": 0,
+        "completed_at": 0,
+        "error": ""
+    }
+    tasks = dict_set(tasks, tid, task)
+    task_queue = append(task_queue, tid)
+    save_tasks()
+    return task
+}
+
+fn claim_task_by_id(agent_id, task_id) {
+    if3 dict_has(tasks, task_id) == false {
+        return {}
+    }
+    let t = dict_get(tasks, task_id) ?? {}
+    let st = dict_get(t, "status") ?? ""
+    if3 st != "pending" {
+        return {}
+    }
+    t = dict_set(t, "status", "claimed")
+    t = dict_set(t, "agent_id", agent_id)
+    t = dict_set(t, "claimed_at", time())
+    // Remove from queue
+    let new_q = []
+    let qi = 0
+    while3 qi < len(task_queue) {
+        let qval = dict_get(task_queue, qi)
+        if3 qval != task_id {
+            new_q = append(new_q, qval)
+        }
+        qi = qi + 1
+    }
+    task_queue = new_q
+    save_tasks()
+    return t
+}
+
+fn claim_next_task(agent_id) {
+    // Find highest priority pending task
+    let best_id = ""
+    let best_pri = -9999
+    let qi = 0
+    while3 qi < len(task_queue) {
+        let tid = dict_get(task_queue, qi)
+        let t = dict_get(tasks, tid) ?? {}
+        let st = dict_get(t, "status") ?? ""
+        if3 st == "pending" {
+            let pri = dict_get(t, "priority") ?? 0
+            if3 pri > best_pri {
+                let best_pri = pri
+                let best_id = tid
+            }
+        }
+        qi = qi + 1
+    }
+    if3 len(best_id) > 0 {
+        return claim_task_by_id(agent_id, best_id)
+    }
+    return {}
+}
+
+fn update_task(task_id, status, result, error, action_log) {
+    if3 dict_has(tasks, task_id) == false {
+        return {}
+    }
+    let t = dict_get(tasks, task_id) ?? {}
+    if3 len(str(status)) > 0 {
+        t = dict_set(t, "status", status)
+    }
+    if3 len(str(result)) > 0 {
+        t = dict_set(t, "result", result)
+    }
+    if3 len(str(error)) > 0 {
+        t = dict_set(t, "error", error)
+    }
+    if3 len(str(action_log)) > 0 {
+        let acts = dict_get(t, "actions") ?? []
+        acts = append(acts, action_log)
+        t = dict_set(t, "actions", acts)
+    }
+    if3 status == "completed" {
+        t = dict_set(t, "completed_at", time())
+        task_history = append(task_history, t)
+        // Cap history
+        if3 len(task_history) > TASK_HISTORY_MAX {
+            task_history = slice(task_history, len(task_history) - TASK_HISTORY_MAX, len(task_history))
+        }
+    }
+    if3 status == "failed" {
+        t = dict_set(t, "completed_at", time())
+        task_history = append(task_history, t)
+        if3 len(task_history) > TASK_HISTORY_MAX {
+            task_history = slice(task_history, len(task_history) - TASK_HISTORY_MAX, len(task_history))
+        }
+    }
+    save_tasks()
+    return t
+}
+
+// Load tasks from disk on startup
+let _load_ok = load_tasks()
+
+// ============================================================
+// LIVE HTML - streaming screenshot viewer
+// ============================================================
+let LIVE_HTML = "<!DOCTYPE html><html><head><title>NovaX Live Preview</title><style>*{margin:0;padding:0;box-sizing:border-box;}body{background:#0a0a0f;overflow:hidden;font-family:Consolas,monospace;color:#e0e0e0;}#viewport{width:100vw;height:calc(100vh - 40px);object-fit:contain;display:block;}#bar{height:40px;background:linear-gradient(180deg,#1a1a2e 0%,#0f0f1a 100%);display:flex;align-items:center;padding:0 12px;gap:10px;border-top:1px solid #00ff8833;}.label{color:#00ff88;font-size:11px;font-weight:bold;letter-spacing:1px;}.stat{color:#888;font-size:10px;}.stat b{color:#0f8;}.btn{background:#00ff8818;border:1px solid #00ff8844;color:#00ff88;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:10px;font-family:inherit;}.btn:hover{background:#00ff8833;border-color:#00ff88;}#target{background:#0003;border:1px solid #333;color:#ccc;padding:3px 8px;border-radius:3px;font-size:10px;font-family:inherit;width:180px;}.spacer{flex:1;}#status{width:8px;height:8px;border-radius:50%;background:#00ff88;box-shadow:0 0 6px #00ff88;}</style></head><body><img id='viewport' src='/screenshot?target=active'><div id='bar'><div id='status'></div><span class='label'>NOVAX LIVE</span><select id='target'><option value='active'>Active Window</option><option value='Blender'>Blender</option><option value='ChatGPT'>ChatGPT</option><option value='Claude'>Claude Desktop</option><option value=''>Desktop (All)</option></select><button class='btn' onclick=\"setTarget('Blender')\">BLD</button><button class='btn' onclick=\"setTarget('ChatGPT')\">GPT</button><button class='btn' onclick=\"setTarget('Claude')\">CLD</button><button class='btn' onclick=\"setTarget('active')\">ACT</button><span class='spacer'></span><span class='stat'><b id='fps'>--</b> fps</span><span class='stat'><b id='size'>--</b></span><span class='stat'><b id='tgt'>active</b></span></div><script>var img=document.getElementById('viewport');var fpsEl=document.getElementById('fps');var sizeEl=document.getElementById('size');var tgtEl=document.getElementById('tgt');var sel=document.getElementById('target');var target='active',frames=0,last=Date.now(),running=true;function setTarget(t){target=t;sel.value=t;tgtEl.textContent=t||'desktop';refresh();}sel.onchange=function(){setTarget(sel.value);};function refresh(){if(!running)return;var t=Date.now();var url=target?'/screenshot?target='+encodeURIComponent(target)+'&t='+t:'/screenshot?t='+t;img.src=url;frames++;if(t-last>1000){fpsEl.textContent=frames;frames=0;last=t;}}img.onload=function(){sizeEl.textContent=img.naturalWidth+'x'+img.naturalHeight;setTimeout(refresh,200);};img.onerror=function(){setTimeout(refresh,1000);};refresh();</script></body></html>"
+
+// ============================================================
+// VK_MAP - Virtual key code lookup
+// ============================================================
+let VK_MAP = {
+    "ENTER": 13, "RETURN": 13, "ESCAPE": 27, "ESC": 27,
+    "TAB": 9, "SPACE": 32, "BACKSPACE": 8, "DELETE": 46,
+    "UP": 38, "DOWN": 40, "LEFT": 37, "RIGHT": 39,
+    "HOME": 36, "END": 35, "PAGEUP": 33, "PAGEDOWN": 34,
+    "F1": 112, "F2": 113, "F3": 114, "F4": 115,
+    "F5": 116, "F6": 117, "F7": 118, "F8": 119,
+    "F9": 120, "F10": 121, "F11": 122, "F12": 123,
+    "CTRL": 17, "CONTROL": 17, "ALT": 18, "SHIFT": 16,
+    "WIN": 91, "LWIN": 91, "RWIN": 92,
+    "A": 65, "B": 66, "C": 67, "D": 68, "E": 69,
+    "F": 70, "G": 71, "H": 72, "I": 73, "J": 74,
+    "K": 75, "L": 76, "M": 77, "N": 78, "O": 79,
+    "P": 80, "Q": 81, "R": 82, "S": 83, "T": 84,
+    "U": 85, "V": 86, "W": 87, "X": 88, "Y": 89, "Z": 90,
+    "0": 48, "1": 49, "2": 50, "3": 51, "4": 52,
+    "5": 53, "6": 54, "7": 55, "8": 56, "9": 57
+}
+
+// ============================================================
+// Route Handlers
+// ============================================================
+
+// GET /health
+fn handle_health(body) {
+    let resp = ns_health_dict("nova-appcontrol", "3.0", PORT, {})
+    resp = dict_set(resp, "session", "desktop")
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// GET /windows - enumerate all visible windows
+fn handle_windows(body) {
+    let result = helper("enum_windows", {})
+    let wins = dict_get(result, "windows") ?? []
+    return {"ok": true, "trit": T_TRUE, "windows": wins, "count": len(wins)}
+}
+
+// GET /find/<search> - find window by title substring
+// Note: NovaLang troute does not support path params, so we use POST
+fn handle_find(body) {
+    let search = dict_get(body, "search") ?? ""
+    if3 len(search) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "search required"}
+    }
+    let result = helper("find_window", {"search": search})
+    let w = dict_get(result, "window") ?? {}
+    if3 len(keys(w)) > 0 {
+        return {"ok": true, "trit": T_TRUE, "window": w}
+    }
+    return {"ok": false, "trit": T_FALSE, "error": "No window matching search"}
+}
+
+// GET /screenshot - capture window/desktop screenshot as PNG
+// Delegated entirely to helper which returns base64-encoded PNG
+fn handle_screenshot(body) {
+    let target = dict_get(body, "target") ?? last_target
+    if3 len(str(target)) > 0 {
+        last_target = target
+    }
+    let result = helper("screenshot", {"target": target})
+    return result
+}
+
+// GET /elements - find child controls of a target window
+fn handle_elements(body) {
+    let search = dict_get(body, "search") ?? (dict_get(body, "target") ?? "")
+    let result = helper("elements", {"search": search})
+    return result
+}
+
+// GET /state - machine-readable screen state for AI decision-making
+fn handle_state(body) {
+    let target = dict_get(body, "target") ?? ""
+    let result = helper("screen_state", {"target": target})
+    return result
+}
+
+// GET /tasks - list all tasks
+fn handle_tasks(body) {
+    let pending = []
+    let active = []
+    let tkeys = keys(tasks)
+    let i = 0
+    while3 i < len(tkeys) {
+        let tid = tkeys[i]
+        let t = dict_get(tasks, tid) ?? {}
+        let st = dict_get(t, "status") ?? ""
+        if3 st == "pending" {
+            pending = append(pending, t)
+        }
+        if3 st == "claimed" {
+            active = append(active, t)
+        }
+        if3 st == "running" {
+            active = append(active, t)
+        }
+        i = i + 1
+    }
+    let hist_start = len(task_history) - 10
+    if3 hist_start < 0 {
+        let hist_start = 0
+    }
+    let recent_hist = slice(task_history, hist_start, len(task_history))
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "pending": pending,
+        "active": active,
+        "history": recent_hist,
+        "counts": {
+            "pending": len(pending),
+            "active": len(active),
+            "history": len(task_history)
+        }
+    }
+}
+
+// GET /live - streaming screenshot HTML viewer
+fn handle_live(body) {
+    return {"_html": LIVE_HTML}
+}
+
+// GET /apps - list tracked launched apps
+fn handle_apps(body) {
+    let app_list = values(apps)
+    return {"ok": true, "trit": T_TRUE, "apps": app_list, "count": len(app_list)}
+}
+
+// ============================================================
+// POST Route Handlers
+// ============================================================
+
+// POST /focus - focus a window by hwnd, pid, or title search
+fn handle_focus(body) {
+    let hwnd = dict_get(body, "hwnd") ?? 0
+    let search = dict_get(body, "search") ?? (dict_get(body, "name") ?? "")
+    let pid = dict_get(body, "pid") ?? 0
+    let result = helper("focus", {"hwnd": hwnd, "search": search, "pid": pid})
+    return result
+}
+
+// POST /click - click at coordinates (absolute or window-relative)
+fn handle_click(body) {
+    let result = helper("click", body)
+    return result
+}
+
+// POST /doubleclick - double-click at coordinates
+fn handle_doubleclick(body) {
+    let result = helper("doubleclick", body)
+    return result
+}
+
+// POST /scroll - scroll at coordinates
+fn handle_scroll(body) {
+    let delta = dict_get(body, "delta") ?? H3
+    let direction = dict_get(body, "direction") ?? "up"
+    body = dict_set(body, "delta", delta)
+    body = dict_set(body, "direction", direction)
+    let result = helper("scroll", body)
+    return result
+}
+
+// POST /drag - drag from one point to another
+fn handle_drag(body) {
+    let steps = dict_get(body, "steps") ?? H7
+    let duration = dict_get(body, "duration") ?? 0.3
+    body = dict_set(body, "steps", steps)
+    body = dict_set(body, "duration", duration)
+    let result = helper("drag", body)
+    return result
+}
+
+// POST /clicktext - find a child control by text and click its center
+fn handle_clicktext(body) {
+    let result = helper("clicktext", body)
+    return result
+}
+
+// POST /filedialog - type a path into an open file dialog and press Enter
+fn handle_filedialog(body) {
+    let filepath = dict_get(body, "path") ?? ""
+    if3 len(filepath) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "path required"}
+    }
+    let result = helper("filedialog", {"path": filepath})
+    return result
+}
+
+// POST /type - type text using unicode input events
+fn handle_type(body) {
+    let text = dict_get(body, "text") ?? ""
+    let hwnd = dict_get(body, "hwnd") ?? 0
+    let result = helper("type_text", {"text": text, "hwnd": hwnd})
+    return result
+}
+
+// POST /key - press a single key
+fn handle_key(body) {
+    let key = upper(dict_get(body, "key") ?? "")
+    let vk = dict_get(body, "vk") ?? (dict_get(VK_MAP, key) ?? 0)
+    let hwnd = dict_get(body, "hwnd") ?? 0
+    if3 vk == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "Unknown key: " + key}
+    }
+    let result = helper("send_key", {"vk": vk, "hwnd": hwnd, "key": key})
+    return result
+}
+
+// POST /hotkey - send a hotkey combo like ["ctrl", "a"]
+fn handle_hotkey(body) {
+    let hk_keys = dict_get(body, "keys") ?? []
+    let hwnd = dict_get(body, "hwnd") ?? 0
+    // Resolve VK codes for each key name
+    let vks = []
+    let ki = 0
+    while3 ki < len(hk_keys) {
+        let kname = upper(dict_get(hk_keys, ki))
+        let vk = dict_get(VK_MAP, kname) ?? 0
+        if3 vk > 0 {
+            vks = append(vks, vk)
+        }
+        ki = ki + 1
+    }
+    let result = helper("hotkey", {"vks": vks, "hwnd": hwnd, "keys": hk_keys})
+    return result
+}
+
+// POST /move - move and resize a window
+fn handle_move(body) {
+    let result = helper("move_window", body)
+    return result
+}
+
+// POST /embed - remove title bar and embed window at position
+fn handle_embed(body) {
+    let search = dict_get(body, "search") ?? (dict_get(body, "name") ?? "")
+    let x = dict_get(body, "x") ?? 0
+    let y = dict_get(body, "y") ?? 0
+    let w = dict_get(body, "w") ?? 800
+    let h = dict_get(body, "h") ?? 600
+    let result = helper("embed", {"search": search, "x": x, "y": y, "w": w, "h": h})
+    return result
+}
+
+// POST /unembed - restore title bar to window
+fn handle_unembed(body) {
+    let search = dict_get(body, "search") ?? (dict_get(body, "name") ?? "")
+    let result = helper("unembed", {"search": search})
+    return result
+}
+
+// POST /rect - get window rect
+fn handle_rect(body) {
+    let search = dict_get(body, "search") ?? (dict_get(body, "name") ?? "")
+    let result = helper("find_window", {"search": search})
+    let w = dict_get(result, "window") ?? {}
+    if3 len(keys(w)) > 0 {
+        return {"ok": true, "trit": T_TRUE, "window": w}
+    }
+    return {"ok": false, "trit": T_FALSE, "error": "Window not found"}
+}
+
+// POST /launch - launch an app
+fn handle_launch(body) {
+    let name = dict_get(body, "name") ?? ""
+    let exe = dict_get(body, "exe") ?? ""
+    if3 len(exe) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "exe path required"}
+    }
+    // Check if already running
+    if3 dict_has(apps, name) {
+        let existing = dict_get(apps, name) ?? {}
+        let existing_trit = dict_get(existing, "trit") ?? T_FALSE
+        if3 existing_trit == T_TRUE {
+            return {"ok": true, "trit": T_MAYBE, "status": "already_running", "app": existing}
+        }
+    }
+    let args = dict_get(body, "args") ?? []
+    let result = helper("launch", {"name": name, "exe": exe, "args": args})
+    let ok = dict_get(result, "ok") ?? false
+    if3 ok == true {
+        let pid = dict_get(result, "pid") ?? 0
+        let app_entry = {
+            "pid": pid,
+            "exe": exe,
+            "hwnd": 0,
+            "trit": T_TRUE,
+            "name": name,
+            "started": time()
+        }
+        apps = dict_set(apps, name, app_entry)
+        return {"ok": true, "trit": T_TRUE, "status": "launched", "pid": pid, "name": name}
+    }
+    return result
+}
+
+// POST /close - close a tracked app
+fn handle_close(body) {
+    let name = dict_get(body, "name") ?? ""
+    if3 dict_has(apps, name) == false {
+        return {"ok": false, "trit": T_FALSE, "error": str(name) + " not tracked"}
+    }
+    let app_info = dict_get(apps, name) ?? {}
+    let pid = dict_get(app_info, "pid") ?? 0
+    let result = helper("kill_pid", {"pid": pid})
+    apps = dict_del(apps, name)
+    return {"ok": true, "trit": T_TRUE, "closed": name}
+}
+
+// POST /minimize - minimize a window
+fn handle_minimize(body) {
+    let search = dict_get(body, "search") ?? ""
+    let result = helper("minimize", {"search": search})
+    return result
+}
+
+// POST /maximize - maximize a window
+fn handle_maximize(body) {
+    let search = dict_get(body, "search") ?? ""
+    let result = helper("maximize", {"search": search})
+    return result
+}
+
+// POST /restore - restore a window
+fn handle_restore(body) {
+    let search = dict_get(body, "search") ?? ""
+    let result = helper("restore", {"search": search})
+    return result
+}
+
+// POST /task/create - create a new task
+fn handle_task_create(body) {
+    let goal = dict_get(body, "goal") ?? ""
+    if3 len(goal) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "goal required"}
+    }
+    let agent_id = dict_get(body, "agent_id") ?? ""
+    let priority = int(dict_get(body, "priority") ?? 0)
+    let parent_id = dict_get(body, "parent_id") ?? ""
+    let context = dict_get(body, "context") ?? {}
+    let task = create_task(goal, agent_id, priority, parent_id, context)
+    return {"ok": true, "trit": T_TRUE, "task": task}
+}
+
+// POST /task/claim - claim a task for execution
+fn handle_task_claim(body) {
+    let agent_id = dict_get(body, "agent_id") ?? "unknown"
+    let task_id = dict_get(body, "task_id") ?? ""
+    let task = {}
+    if3 len(task_id) > 0 {
+        task = claim_task_by_id(agent_id, task_id)
+    }
+    if3 len(task_id) == 0 {
+        task = claim_next_task(agent_id)
+    }
+    if3 len(keys(task)) > 0 {
+        return {"ok": true, "trit": T_TRUE, "task": task}
+    }
+    return {"ok": false, "trit": T_MAYBE, "error": "No tasks available"}
+}
+
+// POST /task/update - update task status/result
+fn handle_task_update(body) {
+    let task_id = dict_get(body, "task_id") ?? ""
+    let status = dict_get(body, "status") ?? ""
+    let result = dict_get(body, "result") ?? ""
+    let error = dict_get(body, "error") ?? ""
+    let action_log = dict_get(body, "action_log") ?? ""
+    let task = update_task(task_id, status, result, error, action_log)
+    if3 len(keys(task)) > 0 {
+        return {"ok": true, "trit": T_TRUE, "task": task}
+    }
+    return {"ok": false, "trit": T_FALSE, "error": "Task " + str(task_id) + " not found"}
+}
+
+// POST /task/batch - create multiple tasks at once
+fn handle_task_batch(body) {
+    let goals = dict_get(body, "goals") ?? []
+    let batch_agent = dict_get(body, "agent_id") ?? ""
+    let created = []
+    let gi = 0
+    while3 gi < len(goals) {
+        let g = dict_get(goals, gi)
+        let g_type = type_of(g)
+        if3 g_type == "string" {
+            let t = create_task(g, batch_agent, 0, "", {})
+            created = append(created, t)
+        }
+        if3 g_type == "dict" {
+            let g_goal = dict_get(g, "goal") ?? ""
+            let g_agent = dict_get(g, "agent_id") ?? batch_agent
+            let g_pri = int(dict_get(g, "priority") ?? 0)
+            let g_parent = dict_get(g, "parent_id") ?? ""
+            let g_ctx = dict_get(g, "context") ?? {}
+            let t = create_task(g_goal, g_agent, g_pri, g_parent, g_ctx)
+            created = append(created, t)
+        }
+        gi = gi + 1
+    }
+    return {"ok": true, "trit": T_TRUE, "tasks": created, "count": len(created)}
+}
+
+// POST /blender/exec - execute Python in Blender via file bridge
+fn handle_blender_exec(body) {
+    let code = dict_get(body, "code") ?? ""
+    if3 len(code) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "code required"}
+    }
+    // Clear old result
+    try3 {
+        nova_write(BLENDER_RESULT_FILE, "")
+    } else {}
+    // Write command
+    let cmd_id = str(int(time() * 1000))
+    let cmd_data = json_encode({"code": code, "id": cmd_id, "ts": time()})
+    try3 {
+        nova_write(BLENDER_CMD_FILE, cmd_data)
+    } else {
+        return {"ok": false, "trit": T_FALSE, "error": "write cmd failed"}
+    }
+    // Poll for result (up to timeout seconds)
+    let timeout = float(dict_get(body, "timeout") ?? 10)
+    let polls = int(timeout / 0.5)
+    let poll_i = 0
+    let found = false
+    let bresult = {}
+    while3 poll_i < polls {
+        // Sleep 0.5s via helper
+        let _w = nova_run("ping -n 1 -w 500 127.0.0.1 >nul 2>&1", 2)
+        let raw = ""
+        try3 {
+            let raw = nova_read(BLENDER_RESULT_FILE)
+        } else {}
+        if3 len(str(raw)) > 1 {
+            try3 {
+                let bresult = json_decode(raw)
+                let found = true
+                // Clear result file
+                try3 {
+                    nova_write(BLENDER_RESULT_FILE, "")
+                } else {}
+            } else {}
+        }
+        if3 found == true {
+            let poll_i = polls
+        }
+        poll_i = poll_i + 1
+    }
+    if3 found == true {
+        let btrit = T_FALSE
+        if3 (dict_get(bresult, "ok") ?? false) == true {
+            let btrit = T_TRUE
+        }
+        return {"ok": dict_get(bresult, "ok") ?? false, "trit": btrit, "result": bresult}
+    }
+    return {"ok": false, "trit": T_FALSE, "error": "Blender did not respond -- ensure NovaX Bridge addon is active"}
+}
+
+// POST /blender/status - check if Blender bridge addon is responsive
+fn handle_blender_status(body) {
+    let probe_code = "_result = {'bridge': True}"
+    let probe_body = {"code": probe_code, "timeout": 3}
+    let result = handle_blender_exec(probe_body)
+    let ok = dict_get(result, "ok") ?? false
+    if3 ok == true {
+        return {"ok": true, "trit": T_TRUE, "addon_active": true}
+    }
+    return {"ok": true, "trit": T_MAYBE, "addon_active": false, "hint": "Run Blender bridge addon"}
+}
+
+// POST /script - multi-action scripting: execute a sequence of actions
+fn handle_script(body) {
+    let actions = dict_get(body, "actions") ?? []
+    // If body itself is a list, use that
+    if3 type_of(body) == "list" {
+        let actions = body
+    }
+    let results = []
+    let si = 0
+    while3 si < len(actions) {
+        let act = dict_get(actions, si)
+        let a = dict_get(act, "action") ?? ""
+        let r = {"i": si, "action": a, "trit": T_MAYBE}
+        try3 {
+            match3 a {
+                "focus" {
+                    let sr = helper("focus", act)
+                    let r = {"i": si, "action": a, "trit": dict_get(sr, "trit") ?? T_FALSE}
+                }
+                "click" {
+                    let sr = helper("click", act)
+                    let r = {"i": si, "action": a, "trit": T_TRUE, "x": dict_get(act, "x") ?? 0, "y": dict_get(act, "y") ?? 0}
+                }
+                "doubleclick" {
+                    let sr = helper("doubleclick", act)
+                    let r = {"i": si, "action": a, "trit": T_TRUE}
+                }
+                "type" {
+                    let sr = helper("type_text", act)
+                    let r = {"i": si, "action": a, "trit": T_TRUE}
+                }
+                "key" {
+                    let k = upper(dict_get(act, "key") ?? "")
+                    let vk = dict_get(VK_MAP, k) ?? 0
+                    if3 vk > 0 {
+                        let sr = helper("send_key", {"vk": vk, "key": k})
+                        let r = {"i": si, "action": a, "trit": T_TRUE, "key": k}
+                    }
+                    if3 vk == 0 {
+                        let r = {"i": si, "action": a, "trit": T_FALSE, "error": "unknown key " + k}
+                    }
+                }
+                "hotkey" {
+                    let hkeys = dict_get(act, "keys") ?? []
+                    let hvks = []
+                    let hki = 0
+                    while3 hki < len(hkeys) {
+                        let hkn = upper(dict_get(hkeys, hki))
+                        let hvk = dict_get(VK_MAP, hkn) ?? 0
+                        if3 hvk > 0 {
+                            hvks = append(hvks, hvk)
+                        }
+                        hki = hki + 1
+                    }
+                    let sr = helper("hotkey", {"vks": hvks, "keys": hkeys})
+                    let r = {"i": si, "action": a, "trit": T_TRUE}
+                }
+                "wait" {
+                    let wait_ms = dict_get(act, "ms") ?? 100
+                    let wait_s = wait_ms / 1000.0
+                    // Use ping for sleep
+                    let wait_cmd = "ping -n 1 -w " + str(int(wait_ms)) + " 127.0.0.1 >nul 2>&1"
+                    let _w = nova_run(wait_cmd, 5)
+                    let r = {"i": si, "action": a, "trit": T_TRUE}
+                }
+                "move" {
+                    let sr = helper("move_window", act)
+                    let r = {"i": si, "action": a, "trit": dict_get(sr, "trit") ?? T_FALSE}
+                }
+                "minimize" {
+                    let sr = helper("minimize", act)
+                    let r = {"i": si, "action": a, "trit": dict_get(sr, "trit") ?? T_FALSE}
+                }
+                "maximize" {
+                    let sr = helper("maximize", act)
+                    let r = {"i": si, "action": a, "trit": dict_get(sr, "trit") ?? T_FALSE}
+                }
+                "restore" {
+                    let sr = helper("restore", act)
+                    let r = {"i": si, "action": a, "trit": dict_get(sr, "trit") ?? T_FALSE}
+                }
+                "scroll" {
+                    let sr = helper("scroll", act)
+                    let r = {"i": si, "action": a, "trit": T_TRUE}
+                }
+                "drag" {
+                    let sr = helper("drag", act)
+                    let r = {"i": si, "action": a, "trit": T_TRUE}
+                }
+                "launch" {
+                    let sr = helper("launch", act)
+                    let r = {"i": si, "action": a, "trit": dict_get(sr, "trit") ?? T_FALSE}
+                }
+                "close" {
+                    let cname = dict_get(act, "name") ?? (dict_get(act, "search") ?? "")
+                    let sr = helper("kill_pid", {"name": cname})
+                    let r = {"i": si, "action": a, "trit": dict_get(sr, "trit") ?? T_FALSE}
+                }
+                "clicktext" {
+                    let sr = helper("clicktext", act)
+                    let r = {"i": si, "action": a, "trit": dict_get(sr, "trit") ?? T_FALSE}
+                }
+                "filedialog" {
+                    let fp = dict_get(act, "path") ?? ""
+                    if3 len(fp) > 0 {
+                        let sr = helper("filedialog", {"path": fp})
+                        let r = {"i": si, "action": a, "trit": T_TRUE, "path": fp}
+                    }
+                    if3 len(fp) == 0 {
+                        let r = {"i": si, "action": a, "trit": T_FALSE, "error": "path required"}
+                    }
+                }
+                "keydown" {
+                    let k = upper(dict_get(act, "key") ?? "")
+                    let vk = dict_get(VK_MAP, k) ?? 0
+                    if3 vk > 0 {
+                        let sr = helper("keydown", {"vk": vk, "key": k})
+                        let r = {"i": si, "action": a, "trit": T_TRUE, "key": k}
+                    }
+                    if3 vk == 0 {
+                        let r = {"i": si, "action": a, "trit": T_FALSE, "error": "unknown key " + k}
+                    }
+                }
+                "keyup" {
+                    let k = upper(dict_get(act, "key") ?? "")
+                    let vk = dict_get(VK_MAP, k) ?? 0
+                    if3 vk > 0 {
+                        let sr = helper("keyup", {"vk": vk, "key": k})
+                        let r = {"i": si, "action": a, "trit": T_TRUE, "key": k}
+                    }
+                    if3 vk == 0 {
+                        let r = {"i": si, "action": a, "trit": T_FALSE, "error": "unknown key " + k}
+                    }
+                }
+                "mousemove" {
+                    let sr = helper("mousemove", act)
+                    let r = {"i": si, "action": a, "trit": T_TRUE}
+                }
+                "blender_exec" {
+                    let bcode = dict_get(act, "code") ?? ""
+                    if3 len(bcode) > 0 {
+                        let br = handle_blender_exec({"code": bcode, "timeout": dict_get(act, "timeout") ?? 10})
+                        let r = {"i": si, "action": a, "trit": dict_get(br, "trit") ?? T_FALSE, "result": dict_get(br, "result") ?? {}}
+                    }
+                    if3 len(bcode) == 0 {
+                        let r = {"i": si, "action": a, "trit": T_FALSE, "error": "code required"}
+                    }
+                }
+                _ {
+                    let r = {"i": si, "action": a, "trit": T_MAYBE, "error": "unknown action"}
+        } else { r = {"i": si, "action": a, "trit": T_FALSE, "error": "action exec failed"}
+        }
+        results = append(results, r)
+        si = si + 1
+    }
+    // Count passed
+    let passed = 0
+    let ri = 0
+    while3 ri < len(results) {
+        let rr = dict_get(results, ri)
+        if3 (dict_get(rr, "trit") ?? T_FALSE) == T_TRUE {
+            passed = passed + 1
+        }
+        ri = ri + 1
+    }
+    let overall_trit = T_TRUE
+    if3 passed < len(results) {
+        let overall_trit = T_MAYBE
+    }
+    if3 passed == 0 {
+        if3 len(results) > 0 {
+            let overall_trit = T_FALSE
+        }
+    }
+    return {"ok": true, "trit": overall_trit, "results": results, "passed": passed, "total": len(results)}
+}
+
+// ============================================================
+// Register all routes
+// ============================================================
+
+// GET routes
+troute(server, "GET",  "/health",           "handle_health")
+troute(server, "GET",  "/windows",          "handle_windows")
+troute(server, "GET",  "/screenshot",       "handle_screenshot")
+troute(server, "GET",  "/elements",         "handle_elements")
+troute(server, "GET",  "/state",            "handle_state")
+troute(server, "GET",  "/tasks",            "handle_tasks")
+troute(server, "GET",  "/live",             "handle_live")
+troute(server, "GET",  "/apps",             "handle_apps")
+
+// POST routes
+troute(server, "POST", "/find",             "handle_find")
+troute(server, "POST", "/focus",            "handle_focus")
+troute(server, "POST", "/click",            "handle_click")
+troute(server, "POST", "/doubleclick",      "handle_doubleclick")
+troute(server, "POST", "/scroll",           "handle_scroll")
+troute(server, "POST", "/drag",             "handle_drag")
+troute(server, "POST", "/clicktext",        "handle_clicktext")
+troute(server, "POST", "/filedialog",       "handle_filedialog")
+troute(server, "POST", "/type",             "handle_type")
+troute(server, "POST", "/key",              "handle_key")
+troute(server, "POST", "/hotkey",           "handle_hotkey")
+troute(server, "POST", "/move",             "handle_move")
+troute(server, "POST", "/embed",            "handle_embed")
+troute(server, "POST", "/unembed",          "handle_unembed")
+troute(server, "POST", "/rect",             "handle_rect")
+troute(server, "POST", "/launch",           "handle_launch")
+troute(server, "POST", "/close",            "handle_close")
+troute(server, "POST", "/minimize",         "handle_minimize")
+troute(server, "POST", "/maximize",         "handle_maximize")
+troute(server, "POST", "/restore",          "handle_restore")
+troute(server, "POST", "/apps",             "handle_apps")
+troute(server, "POST", "/task/create",      "handle_task_create")
+troute(server, "POST", "/task/claim",       "handle_task_claim")
+troute(server, "POST", "/task/update",      "handle_task_update")
+troute(server, "POST", "/task/batch",       "handle_task_batch")
+troute(server, "POST", "/blender/exec",     "handle_blender_exec")
+troute(server, "POST", "/blender/status",   "handle_blender_status")
+troute(server, "POST", "/script",           "handle_script")
+
+// ============================================================
+// Boot banner
+// ============================================================
+print("[AppControl] Nova AppControl v3.0 - Desktop Agent Runtime (NovaLang)")
+print("[AppControl] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[AppControl] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[AppControl] BLOCK=" + str(BLOCK) + " | Reynolds: " + str(RE_LAMINAR) + "/" + str(RE_TRANSITIONAL) + "/" + str(RE_TURBULENT))
+print("[AppControl] Helper: " + HELPER)
+print("[AppControl] Task file: " + TASK_FILE)
+print("[AppControl] GET routes: /health, /windows, /screenshot, /elements, /state, /tasks, /live, /apps")
+print("[AppControl] POST routes: /find, /focus, /click, /doubleclick, /scroll, /drag, /clicktext")
+print("[AppControl] POST routes: /filedialog, /type, /key, /hotkey, /move, /embed, /unembed, /rect")
+print("[AppControl] POST routes: /launch, /close, /minimize, /maximize, /restore")
+print("[AppControl] POST routes: /task/create, /task/claim, /task/update, /task/batch")
+print("[AppControl] POST routes: /blender/exec, /blender/status, /script")
+
+tstart(server)

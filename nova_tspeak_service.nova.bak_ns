@@ -1,0 +1,1602 @@
+// nova_tspeak_service.nova -- NovaX TSpeak v2.0 - Ternary Inter-Model Communication Protocol
+// Port 9895 | Pure NovaLang port of nova_tspeak.py
+//
+// Models don't need English to communicate. TSpeak replaces binary tokens
+// with ternary tokens: +1 (agree), 0 (neutral), -1 (disagree). Each trit IS meaning.
+//
+// Navier-Stokes fluid dynamics govern communication patterns:
+//   Re < 27  (3^3) Laminar:      Whisper -- single trit vector, 1 round
+//   27-125   (5^3) Transitional: Discuss -- vectors + key-facts, 2 rounds
+//   125-343  (7^3) Turbulent:    Debate  -- full reasoning, viscous damping, 3-5 rounds
+//   343+           Chaotic:       Storm   -- decomposition, merge at intersections
+//
+// String-based JSON frames replace binary struct.pack:
+//   Header fields: magic, version, regime, reynolds, channel, round, payload_len, checksum
+//   Payload: JSON-encoded ternary state vectors
+//
+// Compression: 100-model deliberation 102KB English -> 1.7KB TSpeak (61x)
+//
+// Endpoints:
+//   POST /tspeak/encode      -- English text -> TSpeak frame
+//   POST /tspeak/decode      -- TSpeak frame -> readable summary
+//   POST /tspeak/deliberate  -- N-S-governed multi-model deliberation
+//   POST /tspeak/classify    -- Reynolds -> communication regime
+//   POST /tspeak/merge       -- Japanese multiplication merge
+//   POST /tspeak/carry       -- Soroban sequential carry
+//   POST /tspeak/math        -- Ternary arithmetic operations
+//   GET  /tspeak/status      -- Protocol stats
+//   GET  /health             -- Health check
+
+let PORT = 9895
+let server = tserve(PORT, "TSpeak v2.0 - Ternary Inter-Model Communication Protocol")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK_SIZE = 2187    // 3^7
+
+// -- Flow regime boundaries --
+let FLOW_LAMINAR = 27    // 3^3
+let FLOW_TRANS = 125     // 5^3
+let FLOW_TURBULENT = 343 // 7^3
+
+// -- Regime codes --
+let REGIME_LAMINAR = 0
+let REGIME_TRANSITIONAL = 1
+let REGIME_TURBULENT = 2
+let REGIME_CHAOTIC = 3
+
+// -- Ternary constants --
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// -- Version --
+let VERSION = 1
+let TSPEAK_MAGIC = "TSP"
+
+// -- Channel definitions --
+let CHANNELS = ["REASON", "MATH", "CODE", "INSTRUCT", "FACT",
+                "LONG", "VISION", "LANGUAGE", "AGENT", "DOMAIN"]
+
+// -- Channel name -> ID mapping --
+let CHANNEL_ID = {}
+let _ci = dict_set(CHANNEL_ID, "REASON", 0)
+let _ci = dict_set(CHANNEL_ID, "MATH", 1)
+let _ci = dict_set(CHANNEL_ID, "CODE", 2)
+let _ci = dict_set(CHANNEL_ID, "INSTRUCT", 3)
+let _ci = dict_set(CHANNEL_ID, "FACT", 4)
+let _ci = dict_set(CHANNEL_ID, "LONG", 5)
+let _ci = dict_set(CHANNEL_ID, "VISION", 6)
+let _ci = dict_set(CHANNEL_ID, "LANGUAGE", 7)
+let _ci = dict_set(CHANNEL_ID, "AGENT", 8)
+let _ci = dict_set(CHANNEL_ID, "DOMAIN", 9)
+
+// -- Topic dimensions for ternary encoding --
+let TOPIC_DIMS = ["cause", "effect", "method", "evidence", "certainty",
+                  "scope", "time", "complexity", "agreement", "novelty",
+                  "accuracy", "relevance", "completeness"]
+
+// -- Regime name tables --
+let REGIME_NAMES = {}
+let _rn = dict_set(REGIME_NAMES, "0", "laminar")
+let _rn = dict_set(REGIME_NAMES, "1", "transitional")
+let _rn = dict_set(REGIME_NAMES, "2", "turbulent")
+let _rn = dict_set(REGIME_NAMES, "3", "chaotic")
+
+let REGIME_PATTERNS = {}
+let _rp = dict_set(REGIME_PATTERNS, "0", "whisper")
+let _rp = dict_set(REGIME_PATTERNS, "1", "discuss")
+let _rp = dict_set(REGIME_PATTERNS, "2", "debate")
+let _rp = dict_set(REGIME_PATTERNS, "3", "storm")
+
+// -- Negation words for keyword scoring --
+let NEGATION_WORDS = ["not", "no", "never", "neither", "nor",
+                      "hardly", "barely", "rarely", "seldom", "without", "lack", "lacks"]
+let NEGATION_WINDOW = 3   // H3 words before keyword
+
+// ============================================================
+// Weighted keyword tables per topic dimension
+// Each entry: { "pos": [[keyword, weight], ...], "neg": [[keyword, weight], ...] }
+// ============================================================
+
+let KW_TABLES = {}
+
+let _kt = dict_set(KW_TABLES, "cause", {
+    "pos": [["because", 2], ["caused", 2], ["due to", 3], ["leads to", 2], ["result of", 2],
+            ["reason", 1], ["therefore", 2], ["consequently", 2], ["thus", 1], ["hence", 1]],
+    "neg": [["unrelated", 2], ["coincidence", 2], ["no reason", 3], ["independent", 1]]
+})
+
+let _kt = dict_set(KW_TABLES, "effect", {
+    "pos": [["effect", 2], ["impact", 2], ["consequence", 2], ["outcome", 2], ["affects", 2],
+            ["changes", 1], ["results in", 3], ["produces", 1], ["influences", 2]],
+    "neg": [["no effect", 3], ["negligible", 2], ["unchanged", 2], ["unaffected", 2]]
+})
+
+let _kt = dict_set(KW_TABLES, "method", {
+    "pos": [["method", 2], ["process", 1], ["technique", 2], ["approach", 2], ["algorithm", 2],
+            ["strategy", 1], ["procedure", 2], ["framework", 2], ["implementation", 2], ["step by step", 3]],
+    "neg": [["no method", 3], ["unclear how", 2], ["unstructured", 1], ["ad hoc", 1]]
+})
+
+let _kt = dict_set(KW_TABLES, "evidence", {
+    "pos": [["study", 2], ["research", 2], ["data", 1], ["evidence", 3], ["shown", 1],
+            ["demonstrates", 2], ["proves", 3], ["measured", 2], ["experiment", 2], ["peer-reviewed", 3]],
+    "neg": [["no evidence", 3], ["unproven", 2], ["anecdotal", 2], ["speculation", 2], ["opinion", 1]]
+})
+
+let _kt = dict_set(KW_TABLES, "certainty", {
+    "pos": [["certain", 3], ["definite", 3], ["clear", 1], ["proven", 2], ["confirmed", 2],
+            ["absolutely", 3], ["undoubtedly", 3], ["guarantee", 2], ["always", 2]],
+    "neg": [["uncertain", 2], ["maybe", 1], ["possibly", 1], ["might", 1], ["perhaps", 1],
+            ["debatable", 2], ["questionable", 2], ["unclear", 2], ["sometimes", 1]]
+})
+
+let _kt = dict_set(KW_TABLES, "scope", {
+    "pos": [["global", 3], ["widespread", 2], ["all", 1], ["every", 2], ["universal", 3],
+            ["everywhere", 2], ["entire", 2], ["whole", 1], ["comprehensive", 2]],
+    "neg": [["limited", 2], ["local", 1], ["some", 1], ["few", 1], ["narrow", 2],
+            ["specific", 1], ["particular", 1], ["isolated", 2]]
+})
+
+let _kt = dict_set(KW_TABLES, "time", {
+    "pos": [["recent", 2], ["current", 2], ["now", 1], ["modern", 2], ["ongoing", 2],
+            ["latest", 2], ["today", 1], ["contemporary", 2], ["new", 1], ["emerging", 2]],
+    "neg": [["historical", 1], ["ancient", 2], ["past", 1], ["old", 1], ["outdated", 2],
+            ["former", 1], ["previous", 1], ["legacy", 1]]
+})
+
+let _kt = dict_set(KW_TABLES, "complexity", {
+    "pos": [["complex", 2], ["intricate", 2], ["multiple", 1], ["various", 1], ["many", 1],
+            ["sophisticated", 2], ["nuanced", 2], ["multi-faceted", 3], ["layers", 1]],
+    "neg": [["simple", 2], ["basic", 1], ["single", 1], ["trivial", 2], ["straightforward", 2],
+            ["elementary", 2], ["plain", 1]]
+})
+
+let _kt = dict_set(KW_TABLES, "agreement", {
+    "pos": [["agree", 2], ["consensus", 3], ["accepted", 2], ["established", 2],
+            ["confirmed", 2], ["unanimous", 3], ["consistent", 2], ["aligned", 1]],
+    "neg": [["disagree", 2], ["controversial", 2], ["debated", 2], ["disputed", 2],
+            ["conflicting", 2], ["divided", 2], ["contested", 2]]
+})
+
+let _kt = dict_set(KW_TABLES, "novelty", {
+    "pos": [["new", 1], ["novel", 3], ["innovative", 3], ["emerging", 2], ["breakthrough", 3],
+            ["first", 1], ["pioneering", 3], ["original", 2], ["cutting-edge", 3]],
+    "neg": [["known", 1], ["established", 1], ["traditional", 1], ["conventional", 1],
+            ["standard", 1], ["classic", 1], ["well-known", 2]]
+})
+
+let _kt = dict_set(KW_TABLES, "accuracy", {
+    "pos": [["accurate", 3], ["precise", 3], ["exact", 3], ["correct", 2],
+            ["verified", 2], ["validated", 2], ["rigorous", 2], ["reliable", 2]],
+    "neg": [["approximate", 1], ["rough", 1], ["estimate", 1], ["imprecise", 2],
+            ["inaccurate", 3], ["wrong", 2], ["flawed", 2], ["error", 1]]
+})
+
+let _kt = dict_set(KW_TABLES, "relevance", {
+    "pos": [["relevant", 2], ["important", 2], ["key", 1], ["critical", 2], ["significant", 2],
+            ["essential", 2], ["crucial", 2], ["fundamental", 2], ["vital", 2]],
+    "neg": [["irrelevant", 3], ["minor", 1], ["trivial", 2], ["tangential", 2],
+            ["unimportant", 2], ["peripheral", 1], ["marginal", 1]]
+})
+
+let _kt = dict_set(KW_TABLES, "completeness", {
+    "pos": [["complete", 2], ["comprehensive", 3], ["thorough", 2], ["full", 1],
+            ["exhaustive", 3], ["detailed", 2], ["covers", 1], ["in-depth", 2]],
+    "neg": [["partial", 2], ["incomplete", 2], ["lacking", 2], ["missing", 2],
+            ["sparse", 1], ["superficial", 2], ["brief", 1], ["limited", 1]]
+})
+
+// ============================================================
+// Global Stats
+// ============================================================
+let stats_frames_encoded = 0
+let stats_frames_decoded = 0
+let stats_deliberations = 0
+let stats_merges = 0
+let stats_carries = 0
+let stats_total_original_bytes = 0
+let stats_total_tspeak_bytes = 0
+let stats_regime_laminar = 0
+let stats_regime_transitional = 0
+let stats_regime_turbulent = 0
+let stats_regime_chaotic = 0
+let stats_start_time = time()
+
+// ============================================================
+// Ternary Arithmetic Helpers (from Ternary Language Masterfile)
+// ============================================================
+
+// Ternary NOT: flip sign
+fn trit_not3(t) {
+    return 0 - t
+}
+
+// Ternary AND: min(a, b) -- Masterfile 4.1
+fn trit_and3(a, b) {
+    return min(a, b)
+}
+
+// Ternary OR: max(a, b) -- Masterfile 4.1
+fn trit_or3(a, b) {
+    return max(a, b)
+}
+
+// Ternary merge/resolve (?3 operator from Masterfile 6.3)
+// If both agree, keep. If one is neutral, take the other. If conflict, neutral.
+fn trit_merge3(a, b) {
+    if3 a == b {
+        return a
+    }
+    if3 a == 0 {
+        return b
+    }
+    if3 b == 0 {
+        return a
+    }
+    return 0  // conflict -> neutral
+}
+
+// Balanced ternary addition with carry. Masterfile Section 3.2
+// s = a + b + carry (each in {-1,0,+1})
+// Returns [output_trit, carry_out]
+fn bt_add_carry(a, b, carry) {
+    let s = a + b + carry
+    if3 s > 1 {
+        return [s - 3, 1]
+    }
+    if3 s < -1 {
+        return [s + 3, -1]
+    }
+    return [s, 0]
+}
+
+// ============================================================
+// Vector Operations
+// ============================================================
+
+// Merge multiple ternary vectors using majority vote
+fn vec_merge_majority(vectors) {
+    if3 len(vectors) == 0 {
+        return []
+    }
+    // Find max dimension count
+    let dim_count = 0
+    let vi = 0
+    while3 vi < len(vectors) {
+        let v = dict_get(vectors, vi)
+        if3 len(v) > dim_count {
+            let dim_count = len(v)
+        }
+        let vi = vi + 1
+    }
+
+    let result = []
+    let d = 0
+    while3 d < dim_count {
+        let s = 0
+        let vi = 0
+        while3 vi < len(vectors) {
+            let v = dict_get(vectors, vi)
+            if3 d < len(v) {
+                let s = s + dict_get(v, d)
+            }
+            let vi = vi + 1
+        }
+        if3 s > 0 {
+            append(result, 1)
+        } else s < 0 {
+            append(result, -1)
+        } else {
+            append(result, 0)
+        }
+        let d = d + 1
+    }
+    return result
+}
+
+// Merge multiple ternary vectors using AND3 (min)
+fn vec_merge_and3(vectors) {
+    if3 len(vectors) == 0 {
+        return []
+    }
+    let dim_count = 0
+    let vi = 0
+    while3 vi < len(vectors) {
+        let v = dict_get(vectors, vi)
+        if3 len(v) > dim_count {
+            let dim_count = len(v)
+        }
+        let vi = vi + 1
+    }
+
+    let result = []
+    let d = 0
+    while3 d < dim_count {
+        let m = 1
+        let vi = 0
+        while3 vi < len(vectors) {
+            let v = dict_get(vectors, vi)
+            let t = 0
+            if3 d < len(v) {
+                let t = dict_get(v, d)
+            }
+            let m = min(m, t)
+            let vi = vi + 1
+        }
+        append(result, m)
+        let d = d + 1
+    }
+    return result
+}
+
+// Merge multiple ternary vectors using OR3 (max)
+fn vec_merge_or3(vectors) {
+    if3 len(vectors) == 0 {
+        return []
+    }
+    let dim_count = 0
+    let vi = 0
+    while3 vi < len(vectors) {
+        let v = dict_get(vectors, vi)
+        if3 len(v) > dim_count {
+            let dim_count = len(v)
+        }
+        let vi = vi + 1
+    }
+
+    let result = []
+    let d = 0
+    while3 d < dim_count {
+        let m = -1
+        let vi = 0
+        while3 vi < len(vectors) {
+            let v = dict_get(vectors, vi)
+            let t = 0
+            if3 d < len(v) {
+                let t = dict_get(v, d)
+            }
+            let m = max(m, t)
+            let vi = vi + 1
+        }
+        append(result, m)
+        let d = d + 1
+    }
+    return result
+}
+
+// Merge multiple ternary vectors using pairwise merge3
+fn vec_merge_pairwise(vectors) {
+    if3 len(vectors) == 0 {
+        return []
+    }
+    let dim_count = 0
+    let vi = 0
+    while3 vi < len(vectors) {
+        let v = dict_get(vectors, vi)
+        if3 len(v) > dim_count {
+            let dim_count = len(v)
+        }
+        let vi = vi + 1
+    }
+
+    let result = []
+    let d = 0
+    while3 d < dim_count {
+        let first_v = dict_get(vectors, 0)
+        let acc = 0
+        if3 d < len(first_v) {
+            let acc = dict_get(first_v, d)
+        }
+        let vi = 1
+        while3 vi < len(vectors) {
+            let v = dict_get(vectors, vi)
+            let t = 0
+            if3 d < len(v) {
+                let t = dict_get(v, d)
+            }
+            let acc = trit_merge3(acc, t)
+            let vi = vi + 1
+        }
+        append(result, acc)
+        let d = d + 1
+    }
+    return result
+}
+
+// Multi-mode vector merge dispatcher
+fn vec_merge_ternary(vectors, mode) {
+    if3 mode == "majority" {
+        return vec_merge_majority(vectors)
+    }
+    if3 mode == "and3" {
+        return vec_merge_and3(vectors)
+    }
+    if3 mode == "or3" {
+        return vec_merge_or3(vectors)
+    }
+    if3 mode == "merge3" {
+        return vec_merge_pairwise(vectors)
+    }
+    return vec_merge_majority(vectors)
+}
+
+// Element-wise balanced ternary addition of two vectors. Masterfile 3.2
+fn vec_add_bt(a, b) {
+    let dim_count = len(a)
+    if3 len(b) > dim_count {
+        let dim_count = len(b)
+    }
+    let result = []
+    let carry = 0
+    let d = 0
+    while3 d < dim_count {
+        let ta = 0
+        if3 d < len(a) {
+            let ta = dict_get(a, d)
+        }
+        let tb = 0
+        if3 d < len(b) {
+            let tb = dict_get(b, d)
+        }
+        let add_result = bt_add_carry(ta, tb, carry)
+        append(result, dict_get(add_result, 0))
+        let carry = dict_get(add_result, 1)
+        let d = d + 1
+    }
+    if3 carry != 0 {
+        append(result, carry)
+    }
+    return result
+}
+
+// Negate a ternary vector
+fn vec_neg_bt(v) {
+    let result = []
+    let i = 0
+    while3 i < len(v) {
+        append(result, trit_not3(dict_get(v, i)))
+        let i = i + 1
+    }
+    return result
+}
+
+// ============================================================
+// Regime Classification (3-5-7-13 boundaries)
+// ============================================================
+
+fn classify_regime(reynolds) {
+    if3 reynolds < FLOW_LAMINAR {
+        return {"code": REGIME_LAMINAR, "name": "laminar", "pattern": "whisper", "max_rounds": 1}
+    }
+    if3 reynolds < FLOW_TRANS {
+        return {"code": REGIME_TRANSITIONAL, "name": "transitional", "pattern": "discuss", "max_rounds": 2}
+    }
+    if3 reynolds < FLOW_TURBULENT {
+        return {"code": REGIME_TURBULENT, "name": "turbulent", "pattern": "debate", "max_rounds": 4}
+    }
+    return {"code": REGIME_CHAOTIC, "name": "chaotic", "pattern": "storm", "max_rounds": 0}
+}
+
+// ============================================================
+// Frame Encoding/Decoding (string-based JSON frames)
+// Replaces binary struct.pack with JSON header + payload
+// Header is 13 fields (H13 carrier wave -- conceptual)
+// ============================================================
+
+// Build a JSON-based TSpeak frame: header dict + payload string
+fn encode_frame(regime, reynolds, channel_id, round_num, payload_json) {
+    let re_clamped = reynolds
+    if3 re_clamped > 65535 {
+        let re_clamped = 65535
+    }
+    // Checksum: first 8 chars of sha256 of payload (replaces CRC-16)
+    let checksum = sha256(payload_json)
+    let check_prefix = slice(checksum, 0, 8)
+
+    let frame = {
+        "magic": TSPEAK_MAGIC,
+        "version": VERSION,
+        "regime": regime,
+        "reynolds": re_clamped,
+        "channel_id": channel_id,
+        "round": round_num,
+        "payload_len": len(payload_json),
+        "checksum": check_prefix,
+        "payload": payload_json
+    }
+    return json_encode(frame)
+}
+
+// Decode a JSON-based TSpeak frame -> [header_dict, payload_string]
+fn decode_frame(frame_str) {
+    let frame = json_decode(frame_str)
+    let magic = dict_get(frame, "magic", "")
+    if3 magic != TSPEAK_MAGIC {
+        return [{"error": "Not a TSpeak frame"}, ""]
+    }
+
+    let payload = dict_get(frame, "payload", "")
+    let stored_check = dict_get(frame, "checksum", "")
+    let actual_check = slice(sha256(payload), 0, 8)
+    let crc_valid = stored_check == actual_check
+
+    let regime_code = dict_get(frame, "regime", 0)
+    let channel_id = dict_get(frame, "channel_id", 0)
+    let channel_name = "UNKNOWN"
+    if3 channel_id < len(CHANNELS) {
+        let channel_name = dict_get(CHANNELS, channel_id)
+    }
+
+    let header = {
+        "version": dict_get(frame, "version", 1),
+        "regime": dict_get(REGIME_NAMES, str(regime_code), "unknown"),
+        "regime_code": regime_code,
+        "reynolds": dict_get(frame, "reynolds", 0),
+        "channel": channel_name,
+        "channel_id": channel_id,
+        "round": dict_get(frame, "round", 0),
+        "payload_len": dict_get(frame, "payload_len", 0),
+        "crc_valid": crc_valid
+    }
+    return [header, payload]
+}
+
+// ============================================================
+// Topic Vector Extraction (keyword scoring with negation)
+// ============================================================
+
+// Check if any negation word appears in text before a position
+fn has_negation_before(text_lower, pos) {
+    // Get up to NEGATION_WINDOW words before the position
+    let before_text = slice(text_lower, 0, pos)
+    let words = split(before_text, " ")
+    let start_idx = len(words) - NEGATION_WINDOW
+    if3 start_idx < 0 {
+        let start_idx = 0
+    }
+    let check_words = slice(words, start_idx, len(words))
+    let i = 0
+    while3 i < len(check_words) {
+        let w = dict_get(check_words, i)
+        let j = 0
+        while3 j < len(NEGATION_WORDS) {
+            if3 w == dict_get(NEGATION_WORDS, j) {
+                return T_TRUE
+            }
+            let j = j + 1
+        }
+        let i = i + 1
+    }
+    return T_FALSE
+}
+
+// Score a keyword list against text, returning [pos_score, neg_score]
+fn score_keyword_list(text_lower, kw_list, is_positive) {
+    let pos_score = 0
+    let neg_score = 0
+    let ki = 0
+    while3 ki < len(kw_list) {
+        let entry = dict_get(kw_list, ki)
+        let kw = dict_get(entry, 0)
+        let weight = dict_get(entry, 1)
+
+        // Find all occurrences of keyword in text
+        let search_pos = 0
+        let found = true
+        while3 found == true {
+            // Manual indexOf: check if kw exists starting at search_pos
+            let remaining = slice(text_lower, search_pos, len(text_lower))
+            if3 contains(remaining, kw) == false {
+                let found = false
+            } else {
+                // Find exact position -- approximate by splitting
+                let parts = split(remaining, kw)
+                let idx = search_pos + len(dict_get(parts, 0))
+                let negated = has_negation_before(text_lower, idx)
+                if3 is_positive == true {
+                    if3 negated == T_TRUE {
+                        let neg_score = neg_score + weight
+                    } else {
+                        let pos_score = pos_score + weight
+                } else {
+                    if3 negated == T_TRUE {
+                        let pos_score = pos_score + weight
+                    } else {
+                        let neg_score = neg_score + weight
+                    }
+                }
+                let search_pos = idx + len(kw)
+                if3 search_pos >= len(text_lower) {
+                    let found = false
+                }
+            }
+        }
+        let ki = ki + 1
+    }
+    return [pos_score, neg_score]
+}
+
+// Extract ternary position vector from English text
+}
+fn extract_topic_vector(text) {
+    let text_lower = lower(text)
+    let vector = []
+
+    let di = 0
+    while3 di < len(TOPIC_DIMS) {
+        let dim = dict_get(TOPIC_DIMS, di)
+        let kw_data = dict_get(KW_TABLES, dim, {"pos": [], "neg": []})
+        let pos_kws = dict_get(kw_data, "pos", [])
+        let neg_kws = dict_get(kw_data, "neg", [])
+
+        // Score positive keywords
+        let pos_result = score_keyword_list(text_lower, pos_kws, true)
+        let pos_score = dict_get(pos_result, 0)
+        let neg_from_pos = dict_get(pos_result, 1)
+
+        // Score negative keywords
+        let neg_result = score_keyword_list(text_lower, neg_kws, false)
+        let pos_from_neg = dict_get(neg_result, 0)
+        let neg_from_neg = dict_get(neg_result, 1)
+
+        let total_pos = pos_score + pos_from_neg
+        let total_neg = neg_from_pos + neg_from_neg
+        let total = total_pos + total_neg
+
+        if3 total == 0 {
+            append(vector, 0)
+        } else {
+            let net = total_pos - total_neg
+            // Ternary thirds: > 1/3 of total -> positive
+            let threshold = total / 3.0
+            if3 net > threshold {
+                append(vector, 1)
+            } else net < (0 - threshold) {
+                append(vector, -1)
+            } else {
+                append(vector, 0)
+            }
+        }
+        let di = di + 1
+    }
+
+    // Cross-dimension logic (Masterfile 4.1 AND3/OR3)
+    // cause=0, effect=1, certainty=4, evidence=3, agreement=8, accuracy=10
+    let cause_val = dict_get(vector, 0)
+    let effect_val = dict_get(vector, 1)
+    let certainty_val = dict_get(vector, 4)
+    let evidence_val = dict_get(vector, 3)
+    let agreement_val = dict_get(vector, 8)
+    let accuracy_val = dict_get(vector, 10)
+
+    // cause AND effect implies certainty
+    let implied_cert = trit_and3(cause_val, effect_val)
+    if3 implied_cert == 1 {
+        if3 certainty_val == 0 {
+            // Promote from neutral -- rebuild vector at index 4
+            let new_vec = []
+            let vi = 0
+            while3 vi < len(vector) {
+                if3 vi == 4 {
+                    append(new_vec, 1)
+                } else {
+                    append(new_vec, dict_get(vector, vi))
+                }
+                let vi = vi + 1
+            }
+            let vector = new_vec
+        }
+    }
+
+    // evidence AND agreement implies accuracy
+    let implied_acc = trit_and3(evidence_val, agreement_val)
+    if3 implied_acc == 1 {
+        if3 accuracy_val == 0 {
+            let new_vec = []
+            let vi = 0
+            while3 vi < len(vector) {
+                if3 vi == 10 {
+                    append(new_vec, 1)
+                } else {
+                    append(new_vec, dict_get(vector, vi))
+                }
+                let vi = vi + 1
+            }
+            let vector = new_vec
+        }
+    }
+
+    return vector
+}
+
+// ============================================================
+// Viscous Damping (N-S viscous term, nu=1/H7)
+// ============================================================
+
+fn viscous_damp(scores, nu) {
+    if3 len(scores) < 3 {
+        // Return a copy
+        let result = []
+        let i = 0
+        while3 i < len(scores) {
+            append(result, dict_get(scores, i))
+            let i = i + 1
+        }
+        return result
+    }
+    let smoothed = []
+    let i = 0
+    while3 i < len(scores) {
+        append(smoothed, dict_get(scores, i))
+        let i = i + 1
+    }
+    // Apply Laplacian smoothing to interior elements
+    let i = 1
+    while3 i < len(scores) - 1 {
+        let prev = dict_get(scores, i - 1)
+        let curr = dict_get(scores, i)
+        let next = dict_get(scores, i + 1)
+        let laplacian = prev - 2 * curr + next
+        let new_val = curr + nu * laplacian
+        // Replace in smoothed list
+        let new_smoothed = []
+        let j = 0
+        while3 j < len(smoothed) {
+            if3 j == i {
+                append(new_smoothed, new_val)
+            } else {
+                append(new_smoothed, dict_get(smoothed, j))
+            }
+            let j = j + 1
+        }
+        let smoothed = new_smoothed
+        let i = i + 1
+    }
+    return smoothed
+}
+
+// ============================================================
+// Merge Vectors (weighted mode -- legacy)
+// ============================================================
+
+fn merge_vectors_weighted(vectors, weights) {
+    if3 len(vectors) == 0 {
+        return []
+    }
+    let dim_count = 0
+    let vi = 0
+    while3 vi < len(vectors) {
+        let v = dict_get(vectors, vi)
+        if3 len(v) > dim_count {
+            let dim_count = len(v)
+        }
+        let vi = vi + 1
+    }
+
+    let result = []
+    let d = 0
+    while3 d < dim_count {
+        let weighted_sum = 0
+        let total_weight = 0
+        let i = 0
+        while3 i < len(vectors) {
+            let v = dict_get(vectors, i)
+            if3 d < len(v) {
+                let w = dict_get(weights, i)
+                let weighted_sum = weighted_sum + dict_get(v, d) * w
+                let total_weight = total_weight + w
+            }
+            let i = i + 1
+        }
+        if3 total_weight > 0 {
+            let avg = weighted_sum / total_weight
+            // Ternary thirds
+            if3 avg > 1.0 / H3 {
+                append(result, 1)
+            } else avg < -1.0 / H3 {
+                append(result, -1)
+            } else {
+                append(result, 0)
+        } else {
+            append(result, 0)
+        }
+        let d = d + 1
+    }
+    return result
+}
+
+// Multi-mode merge dispatcher
+}
+fn merge_vectors(vectors, weights, mode) {
+    if3 mode == "majority" {
+        return vec_merge_ternary(vectors, "majority")
+    }
+    if3 mode == "merge3" {
+        return vec_merge_ternary(vectors, "merge3")
+    }
+    if3 mode == "bt_add" {
+        // Sequential balanced ternary addition
+        let acc = dict_get(vectors, 0)
+        let i = 1
+        while3 i < len(vectors) {
+            let acc = vec_add_bt(acc, dict_get(vectors, i))
+            let i = i + 1
+        }
+        // Normalize back to trits
+        let norm = []
+        let j = 0
+        while3 j < len(acc) {
+            let t = dict_get(acc, j)
+            let clamped = max(-1, min(1, t))
+            append(norm, clamped)
+            let j = j + 1
+        }
+        return norm
+    }
+    // Default: weighted merge
+    return merge_vectors_weighted(vectors, weights)
+}
+
+// ============================================================
+// Japanese Multiplication Merge
+// ============================================================
+
+fn japanese_merge(vectors, scores) {
+    if3 len(vectors) == 0 {
+        return [[], {"intersection_rounds": 0, "intersections": 0, "dimensions": 0}]
+    }
+    let dim_count = len(TOPIC_DIMS)
+    let consensus = []
+    let intersections = 0
+
+    let d = 0
+    while3 d < dim_count {
+        // Count votes per value: -1, 0, +1
+        let vote_neg = 0.0
+        let vote_zero = 0.0
+        let vote_pos = 0.0
+        let count_neg = 0
+        let count_zero = 0
+        let count_pos = 0
+
+        let i = 0
+        while3 i < len(vectors) {
+            let v = dict_get(vectors, i)
+            let t = 0
+            if3 d < len(v) {
+                let t = dict_get(v, d)
+            }
+            let s = dict_get(scores, i)
+            if3 t == -1 {
+                let vote_neg = vote_neg + s
+                let count_neg = count_neg + 1
+            } else t == 1 {
+                let vote_pos = vote_pos + s
+                let count_pos = count_pos + 1
+            } else {
+                let vote_zero = vote_zero + s
+                let count_zero = count_zero + 1
+            }
+            let i = i + 1
+        }
+
+        // Japanese multiplication: intersection = score * sqrt(count)
+        let iscore_neg = vote_neg * sqrt(max(1, count_neg))
+        let iscore_zero = vote_zero * sqrt(max(1, count_zero))
+        let iscore_pos = vote_pos * sqrt(max(1, count_pos))
+
+        let best_val = 0
+        let best_score = iscore_zero
+        if3 iscore_neg > best_score {
+            let best_val = -1
+            let best_score = iscore_neg
+        }
+        if3 iscore_pos > best_score {
+            let best_val = 1
+            let best_score = iscore_pos
+        }
+
+        // Count intersections (2+ models agree)
+        if3 count_neg >= 2 {
+            let intersections = intersections + 1
+        }
+        if3 count_zero >= 2 {
+            let intersections = intersections + 1
+        }
+        if3 count_pos >= 2 {
+            let intersections = intersections + 1
+        }
+
+        append(consensus, best_val)
+        let d = d + 1
+    }
+
+    let i_rounds = max(3, intersections / dim_count + 1)
+    let info = {
+        "intersection_rounds": i_rounds,
+        "intersections": intersections,
+        "dimensions": dim_count
+    }
+    return [consensus, info]
+}
+
+// ============================================================
+// Increment regime stats helper
+// ============================================================
+
+fn bump_regime_stat(regime_name) {
+    if3 regime_name == "laminar" {
+        stats_regime_laminar = stats_regime_laminar + 1
+    }
+    if3 regime_name == "transitional" {
+        stats_regime_transitional = stats_regime_transitional + 1
+    }
+    if3 regime_name == "turbulent" {
+        stats_regime_turbulent = stats_regime_turbulent + 1
+    }
+    if3 regime_name == "chaotic" {
+        stats_regime_chaotic = stats_regime_chaotic + 1
+    }
+}
+
+// ============================================================
+// Route Handlers
+// ============================================================
+
+// GET /health
+fn health(body) {
+    return {
+        "ok": true,
+        "service": "nova-tspeak",
+        "port": PORT,
+        "version": "2.0",
+        "ternary": true,
+        "trit": T_TRUE,
+        "runtime": "novalang",
+        "protocol": "TSpeak v2",
+        "dimensions": len(TOPIC_DIMS),
+        "harmonics": str(H3) + "-" + str(H5) + "-" + str(H7) + "-" + str(H13),
+        "masterfile_ops": ["not3", "and3", "or3", "merge3", "bt_add", "bt_neg", "majority"]
+    }
+}
+
+// GET /tspeak/status
+fn tspeak_status(body) {
+    let uptime = round(time() - stats_start_time, 1)
+    let avg_comp = "N/A"
+    if3 stats_total_original_bytes > 0 {
+        if3 stats_total_tspeak_bytes > 0 {
+            let avg_comp = round(stats_total_original_bytes / stats_total_tspeak_bytes, 1)
+        }
+    }
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "frames_encoded": stats_frames_encoded,
+        "frames_decoded": stats_frames_decoded,
+        "deliberations": stats_deliberations,
+        "merges": stats_merges,
+        "carries": stats_carries,
+        "total_original_bytes": stats_total_original_bytes,
+        "total_tspeak_bytes": stats_total_tspeak_bytes,
+        "avg_compression": avg_comp,
+        "uptime": uptime,
+        "topic_dimensions": TOPIC_DIMS,
+        "frame_header_bytes": H13,
+        "boundaries": {
+            "laminar": FLOW_LAMINAR,
+            "transitional": FLOW_TRANS,
+            "turbulent": FLOW_TURBULENT
+        },
+        "regime_distribution": {
+            "laminar": stats_regime_laminar,
+            "transitional": stats_regime_transitional,
+            "turbulent": stats_regime_turbulent,
+            "chaotic": stats_regime_chaotic
+        }
+    }
+}
+
+// POST /tspeak/encode -- English text -> TSpeak frame
+fn tspeak_encode(body) {
+    let text = dict_get(body, "text", "")
+    let channel = dict_get(body, "channel", "REASON")
+    let reynolds = float(dict_get(body, "reynolds", 100))
+
+    let regime_info = classify_regime(reynolds)
+    let regime_code = dict_get(regime_info, "code")
+    let regime_name = dict_get(regime_info, "name")
+    let pattern = dict_get(regime_info, "pattern")
+    let ch_id = dict_get(CHANNEL_ID, upper(channel), 0)
+
+    // Extract ternary topic vector
+    let vector = extract_topic_vector(text)
+
+    // Build payload dict
+    let key_text = ""
+    if3 regime_code >= REGIME_TRANSITIONAL {
+        let key_text = slice(text, 0, min(200, len(text)))
+    }
+    let payload_dict = {
+        "v": vector,
+        "d": len(TOPIC_DIMS),
+        "t": key_text
+    }
+    let payload_json = json_encode(payload_dict)
+
+    // Build frame (string-based JSON frame replaces binary)
+    let frame_str = encode_frame(regime_code, int(reynolds), ch_id, 0, payload_json)
+    let text_bytes = len(text)
+    let frame_bytes = len(frame_str)
+    let comp_ratio = "N/A"
+    if3 frame_bytes > 0 {
+        let comp_ratio = round(text_bytes / max(1, frame_bytes), 2)
+    }
+
+    // Update stats
+    stats_frames_encoded = stats_frames_encoded + 1
+    stats_total_original_bytes = stats_total_original_bytes + text_bytes
+    stats_total_tspeak_bytes = stats_total_tspeak_bytes + frame_bytes
+    bump_regime_stat(regime_name)
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "frame": frame_str,
+        "header_bytes": H13,
+        "payload_bytes": len(payload_json),
+        "total_bytes": frame_bytes,
+        "original_text_bytes": text_bytes,
+        "compression_ratio": comp_ratio,
+        "regime": regime_name,
+        "pattern": pattern,
+        "channel": channel,
+        "reynolds": reynolds,
+        "vector": vector,
+        "dimensions": len(TOPIC_DIMS)
+    }
+}
+
+// POST /tspeak/decode -- TSpeak frame -> readable summary
+fn tspeak_decode(body) {
+    let frame_str = dict_get(body, "frame", "")
+
+    let decoded = decode_frame(frame_str)
+    let header = dict_get(decoded, 0)
+    let payload_str = dict_get(decoded, 1)
+
+    if3 dict_has(header, "error") {
+        return {"ok": false, "trit": T_FALSE, "error": dict_get(header, "error")}
+    }
+
+    let payload = json_decode(payload_str)
+    let vector = dict_get(payload, "v", [])
+    let text_hint = dict_get(payload, "t", "")
+
+    // Interpret vector positions
+    let positions = {}
+    let i = 0
+    while3 i < len(vector) {
+        if3 i < len(TOPIC_DIMS) {
+            let dim_name = dict_get(TOPIC_DIMS, i)
+            let val = dict_get(vector, i)
+            let label = "neutral"
+            if3 val == 1 {
+                let label = "agree"
+            }
+            if3 val == -1 {
+                let label = "disagree"
+            }
+            let _p = dict_set(positions, dim_name, label)
+        }
+        let i = i + 1
+    }
+
+    // Count agree/neutral/disagree
+    let agree_count = 0
+    let neutral_count = 0
+    let disagree_count = 0
+    let i = 0
+    while3 i < len(vector) {
+        let v = dict_get(vector, i)
+        if3 v == 1 {
+            let agree_count = agree_count + 1
+        }
+        if3 v == 0 {
+            let neutral_count = neutral_count + 1
+        }
+        if3 v == -1 {
+            let disagree_count = disagree_count + 1
+        }
+        let i = i + 1
+    }
+
+    stats_frames_decoded = stats_frames_decoded + 1
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "header": header,
+        "vector": vector,
+        "positions": positions,
+        "text_hint": text_hint,
+        "agree_count": agree_count,
+        "neutral_count": neutral_count,
+        "disagree_count": disagree_count
+    }
+}
+
+// POST /tspeak/classify -- Reynolds -> communication regime
+fn tspeak_classify(body) {
+    let reynolds = float(dict_get(body, "reynolds", 100))
+    let regime_info = classify_regime(reynolds)
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "reynolds": reynolds,
+        "regime": dict_get(regime_info, "name"),
+        "regime_code": dict_get(regime_info, "code"),
+        "pattern": dict_get(regime_info, "pattern"),
+        "max_rounds": dict_get(regime_info, "max_rounds"),
+        "boundaries": {
+            "laminar": "< " + str(FLOW_LAMINAR) + " (3^3)",
+            "transitional": str(FLOW_LAMINAR) + "-" + str(FLOW_TRANS) + " (5^3)",
+            "turbulent": str(FLOW_TRANS) + "-" + str(FLOW_TURBULENT) + " (7^3)",
+            "chaotic": ">= " + str(FLOW_TURBULENT)
+        }
+    }
+}
+
+// POST /tspeak/deliberate -- N-S-governed multi-model deliberation
+fn tspeak_deliberate(body) {
+    let responses = dict_get(body, "responses", [])
+    let channel = dict_get(body, "channel", "REASON")
+    let reynolds = float(dict_get(body, "reynolds", 100))
+    let merge_mode = dict_get(body, "merge_mode", null)
+
+    // Wrap string responses
+    let wrapped = []
+    let ri = 0
+    while3 ri < len(responses) {
+        let r = dict_get(responses, ri)
+        if3 type_of(r) == "string" {
+            append(wrapped, {"text": r, "model": "unknown", "score": 0.5})
+        } else {
+            append(wrapped, r)
+        }
+        let ri = ri + 1
+    }
+    let responses = wrapped
+
+    let regime_info = classify_regime(reynolds)
+    let regime_code = dict_get(regime_info, "code")
+    let regime_name = dict_get(regime_info, "name")
+    let pattern = dict_get(regime_info, "pattern")
+    let ch_id = dict_get(CHANNEL_ID, upper(channel), 0)
+
+    // Encode all responses to ternary vectors
+    let vectors = []
+    let scores = []
+    let models = []
+    let ri = 0
+    while3 ri < len(responses) {
+        let r = dict_get(responses, ri)
+        let text = dict_get(r, "text", "")
+        let score = float(dict_get(r, "score", 0.5))
+        let vec = extract_topic_vector(text)
+        append(vectors, vec)
+        append(scores, score)
+        append(models, dict_get(r, "model", "unknown"))
+        let ri = ri + 1
+    }
+
+    if3 len(vectors) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "no responses to deliberate"}
+    }
+
+    // Apply viscous damping to scores (nu = 1/H7)
+    let nu = 1.0 / H7
+    let damped_scores = viscous_damp(scores, nu)
+
+    // Deliberation by regime
+    let consensus = []
+    let rounds_executed = 0
+
+    if3 regime_code == REGIME_LAMINAR {
+        if3 merge_mode != null {
+            let consensus = merge_vectors(vectors, damped_scores, merge_mode)
+        } else {
+            let consensus = merge_vectors(vectors, damped_scores, "majority")
+        }
+        let rounds_executed = 1
+    }
+
+    if3 regime_code == REGIME_TRANSITIONAL {
+        // Discuss: 2 rounds, merge3 then weighted
+        let r1 = merge_vectors(vectors, damped_scores, "merge3")
+        // Round 2: re-weight by trit agreement with round 1
+        let r2_weights = []
+        let i = 0
+        while3 i < len(vectors) {
+            let v = dict_get(vectors, i)
+            let agreement = 0
+            let d = 0
+            while3 d < min(len(v), len(r1)) {
+                if3 dict_get(v, d) == dict_get(r1, d) {
+                    let agreement = agreement + 1
+                }
+                let d = d + 1
+            }
+            let norm_agreement = agreement / max(len(r1), 1)
+            append(r2_weights, norm_agreement)
+            let i = i + 1
+        }
+        let consensus = merge_vectors_weighted(vectors, r2_weights)
+        let rounds_executed = 2
+    }
+
+    if3 regime_code == REGIME_TURBULENT {
+        // Debate: 3-5 rounds with viscous damping + convergence
+        let current = merge_vectors_weighted(vectors, damped_scores)
+        let rnd = 0
+        let converged = false
+        while3 rnd < 4 {
+            if3 converged == true {
+                // break out of loop
+            } else {
+                // Re-weight by agreement + score
+                let weights = []
+                let i = 0
+                while3 i < len(vectors) {
+                    let v = dict_get(vectors, i)
+                    let agreement = 0
+                    let d = 0
+                    while3 d < min(len(v), len(current)) {
+                        let a = dict_get(v, d)
+                        let b = dict_get(current, d)
+                        let agreement = agreement + trit_and3(a, b)
+                        let d = d + 1
+                    }
+                    let normalized = agreement / max(len(current), 1)
+                    let w = max(0.0, normalized * 0.6 + dict_get(damped_scores, i) * 0.4)
+                    append(weights, w)
+                    let i = i + 1
+                }
+                // Damp weights
+                let weights = viscous_damp(weights, 0.15)
+                let current = merge_vectors_weighted(vectors, weights)
+                let rounds_executed = rnd + 2
+
+                // Check convergence: all trits locked (no neutrals)
+                let all_locked = true
+                let ci = 0
+                while3 ci < len(current) {
+                    if3 abs(dict_get(current, ci)) != 1 {
+                        let all_locked = false
+                    }
+                    let ci = ci + 1
+                }
+                if3 all_locked == true {
+                    let converged = true
+                }
+            }
+            let rnd = rnd + 1
+        }
+        let consensus = current
+    }
+
+    if3 regime_code == REGIME_CHAOTIC {
+        // Storm: Japanese decomposition merge
+        let merge_result = japanese_merge(vectors, scores)
+        let consensus = dict_get(merge_result, 0)
+        let merge_info = dict_get(merge_result, 1)
+        let rounds_executed = dict_get(merge_info, "intersection_rounds", 3)
+    }
+
+    // Build consensus frame
+    let payload = json_encode({"v": consensus, "d": len(TOPIC_DIMS)})
+    let frame = encode_frame(regime_code, int(reynolds), ch_id, rounds_executed, payload)
+
+    // Compute stats
+    let original_size = 0
+    let ri = 0
+    while3 ri < len(responses) {
+        let r = dict_get(responses, ri)
+        let original_size = original_size + len(dict_get(r, "text", ""))
+        let ri = ri + 1
+    }
+    let tspeak_size = len(frame)
+
+    // Find best response based on consensus alignment
+    let best_idx = 0
+    let best_align = -1
+    let i = 0
+    while3 i < len(vectors) {
+        let v = dict_get(vectors, i)
+        let alignment = 0
+        let d = 0
+        while3 d < min(len(v), len(consensus)) {
+            if3 dict_get(v, d) == dict_get(consensus, d) {
+                let alignment = alignment + 1
+            }
+            let d = d + 1
+        }
+        let norm_align = alignment / max(len(consensus), 1)
+        if3 norm_align > best_align {
+            let best_align = norm_align
+            let best_idx = i
+        }
+        let i = i + 1
+    }
+
+    let best_model = "none"
+    if3 len(models) > 0 {
+        let best_model = dict_get(models, best_idx)
+    }
+    let best_text = ""
+    if3 len(responses) > 0 {
+        let r = dict_get(responses, best_idx)
+        let full_text = dict_get(r, "text", "")
+        let best_text = slice(full_text, 0, min(500, len(full_text)))
+    }
+
+    // Compute ratios
+    let agree_ratio = 0
+    let neutral_ratio = 0
+    let disagree_ratio = 0
+    if3 len(consensus) > 0 {
+        let ac = 0
+        let nc = 0
+        let dc = 0
+        let ci = 0
+        while3 ci < len(consensus) {
+            let c = dict_get(consensus, ci)
+            if3 c == 1 {
+                let ac = ac + 1
+            }
+            if3 c == 0 {
+                let nc = nc + 1
+            }
+            if3 c == -1 {
+                let dc = dc + 1
+            }
+            let ci = ci + 1
+        }
+        let agree_ratio = round(ac / len(consensus), 3)
+        let neutral_ratio = round(nc / len(consensus), 3)
+        let disagree_ratio = round(dc / len(consensus), 3)
+    }
+
+    let comp_ratio = "N/A"
+    if3 original_size > 0 {
+        if3 tspeak_size > 0 {
+            let comp_ratio = round(original_size / tspeak_size, 1)
+        }
+    }
+
+    let tokens_saved = 0
+    if3 original_size > tspeak_size {
+        let tokens_saved = int((original_size - tspeak_size) / 4)
+    }
+
+    // Update stats
+    stats_deliberations = stats_deliberations + 1
+    stats_total_original_bytes = stats_total_original_bytes + original_size
+    stats_total_tspeak_bytes = stats_total_tspeak_bytes + tspeak_size
+    bump_regime_stat(regime_name)
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "regime": regime_name,
+        "pattern": pattern,
+        "reynolds": reynolds,
+        "channel": channel,
+        "rounds": rounds_executed,
+        "models_count": len(responses),
+        "consensus_vector": consensus,
+        "dimensions": len(TOPIC_DIMS),
+        "agree_ratio": agree_ratio,
+        "neutral_ratio": neutral_ratio,
+        "disagree_ratio": disagree_ratio,
+        "best_model": best_model,
+        "best_alignment": round(best_align, 3),
+        "best_response": best_text,
+        "frame": frame,
+        "original_bytes": original_size,
+        "tspeak_bytes": tspeak_size,
+        "compression_ratio": comp_ratio,
+        "tokens_saved_estimate": tokens_saved
+    }
+}
+
+// POST /tspeak/merge -- Japanese multiplication merge on position dicts
+fn tspeak_merge(body) {
+    let positions = dict_get(body, "positions", [])
+    let vectors = []
+    let scores = []
+    let pi = 0
+    while3 pi < len(positions) {
+        let p = dict_get(positions, pi)
+        append(vectors, dict_get(p, "vector", []))
+        append(scores, float(dict_get(p, "score", 0.5)))
+        let pi = pi + 1
+    }
+
+    let merge_result = japanese_merge(vectors, scores)
+    let consensus = dict_get(merge_result, 0)
+    let info = dict_get(merge_result, 1)
+
+    let non_neutral = 0
+    let ci = 0
+    while3 ci < len(consensus) {
+        if3 dict_get(consensus, ci) != 0 {
+            let non_neutral = non_neutral + 1
+        }
+        let ci = ci + 1
+    }
+    let agreement_ratio = 0
+    if3 len(consensus) > 0 {
+        let agreement_ratio = round(non_neutral / len(consensus), 3)
+    }
+
+    stats_merges = stats_merges + 1
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "consensus": consensus,
+        "intersections": dict_get(info, "intersections", 0),
+        "agreement_ratio": agreement_ratio
+    }
+}
+
+// POST /tspeak/carry -- Soroban sequential carry
+fn tspeak_carry(body) {
+    let chain = dict_get(body, "chain", [])
+    if3 len(chain) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "empty chain"}
+    }
+
+    let alpha = 0.4   // momentum: carry 40% from previous, 60% new
+    let accumulated_vector = null
+
+    let si = 0
+    while3 si < len(chain) {
+        let step = dict_get(chain, si)
+        let text = dict_get(step, "text", "")
+        let vec = extract_topic_vector(text)
+
+        if3 accumulated_vector == null {
+            let accumulated_vector = vec
+        } else {
+            // Momentum: weighted blend of previous + new
+            let blended = []
+            let d = 0
+            while3 d < len(TOPIC_DIMS) {
+                let old_v = 0
+                if3 d < len(accumulated_vector) {
+                    let old_v = dict_get(accumulated_vector, d)
+                }
+                let new_v = 0
+                if3 d < len(vec) {
+                    let new_v = dict_get(vec, d)
+                }
+                let combined = old_v * alpha + new_v * (1 - alpha)
+                // Quantize using ternary thirds
+                if3 combined > 1.0 / H3 {
+                    append(blended, 1)
+                } else combined < -1.0 / H3 {
+                    append(blended, -1)
+                } else {
+                    append(blended, 0)
+                }
+                let d = d + 1
+            }
+            let accumulated_vector = blended
+        }
+        let si = si + 1
+    }
+
+    stats_carries = stats_carries + 1
+
+    return {
+        "ok": true,
+        "trit": T_TRUE,
+        "final_vector": accumulated_vector,
+        "dimensions": len(TOPIC_DIMS),
+        "steps": len(chain),
+        "momentum_alpha": alpha
+    }
+}
+
+// POST /tspeak/math -- Ternary arithmetic operations (Masterfile ops)
+fn tspeak_math(body) {
+    let op = dict_get(body, "op", "")
+    let a = dict_get(body, "a", [])
+    let b = dict_get(body, "b", [])
+    let vectors = dict_get(body, "vectors", [])
+
+    if3 op == "not3" {
+        return {"ok": true, "trit": T_TRUE, "result": vec_neg_bt(a)}
+    }
+
+    if3 op == "and3" {
+        let result = []
+        let i = 0
+        while3 i < min(len(a), len(b)) {
+            append(result, trit_and3(dict_get(a, i), dict_get(b, i)))
+            let i = i + 1
+        }
+        return {"ok": true, "trit": T_TRUE, "result": result}
+    }
+
+    if3 op == "or3" {
+        let result = []
+        let i = 0
+        while3 i < min(len(a), len(b)) {
+            append(result, trit_or3(dict_get(a, i), dict_get(b, i)))
+            let i = i + 1
+        }
+        return {"ok": true, "trit": T_TRUE, "result": result}
+    }
+
+    if3 op == "merge3" {
+        let result = []
+        let i = 0
+        while3 i < min(len(a), len(b)) {
+            append(result, trit_merge3(dict_get(a, i), dict_get(b, i)))
+            let i = i + 1
+        }
+        return {"ok": true, "trit": T_TRUE, "result": result}
+    }
+
+    if3 op == "bt_add" {
+        return {"ok": true, "trit": T_TRUE, "result": vec_add_bt(a, b)}
+    }
+
+    if3 op == "majority" {
+        return {"ok": true, "trit": T_TRUE, "result": vec_merge_ternary(vectors, "majority")}
+    }
+
+    if3 op == "consensus" {
+        let mode = dict_get(body, "mode", "majority")
+        return {"ok": true, "trit": T_TRUE, "result": vec_merge_ternary(vectors, mode)}
+    }
+
+    return {
+        "ok": false,
+        "trit": T_FALSE,
+        "error": "Unknown op: " + op,
+        "ops": ["not3", "and3", "or3", "merge3", "bt_add", "majority", "consensus"]
+    }
+}
+
+// ============================================================
+// Route Registration
+// ============================================================
+troute(server, "GET",  "/health",             "health")
+troute(server, "GET",  "/tspeak/status",      "tspeak_status")
+troute(server, "POST", "/tspeak/encode",      "tspeak_encode")
+troute(server, "POST", "/tspeak/decode",      "tspeak_decode")
+troute(server, "POST", "/tspeak/deliberate",  "tspeak_deliberate")
+troute(server, "POST", "/tspeak/classify",    "tspeak_classify")
+troute(server, "POST", "/tspeak/merge",       "tspeak_merge")
+troute(server, "POST", "/tspeak/carry",       "tspeak_carry")
+troute(server, "POST", "/tspeak/math",        "tspeak_math")
+
+print("[TSpeak] NovaLang TSpeak v2.0 - Ternary Inter-Model Communication Protocol")
+print("[TSpeak] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TSpeak] Dimensions: " + str(len(TOPIC_DIMS)) + " | Frame header: " + str(H13) + "B (conceptual)")
+print("[TSpeak] N-S Boundaries: Re<27=laminar | Re<125=transitional | Re<343=turbulent")
+print("[TSpeak] Harmonics: 3-5-7-13 | Masterfile ops: not3/and3/or3/merge3/bt_add/majority")
+print("[TSpeak] Routes: /health, /tspeak/status, /tspeak/encode, /tspeak/decode")
+print("[TSpeak]         /tspeak/deliberate, /tspeak/classify, /tspeak/merge, /tspeak/carry, /tspeak/math")
+print("[TSpeak] http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

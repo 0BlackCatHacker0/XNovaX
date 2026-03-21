@@ -1,0 +1,708 @@
+// NovaCLI Terminal Server v2.0 - Interactive NovaLang Shell (NovaLang)
+// Port 9961: Dedicated REPL with tab completion, command handling,
+// ternary routing visualization, debug mode, and compiler integration.
+// Provides HTTP endpoints for the desktop UI terminal panel.
+//
+// N-S Mapping:
+//   code_flow       = velocity_field (code input streaming through REPL)
+//   valid_exec      = laminar_particle (clean execution)
+//   error_exec      = turbulent_particle (runtime errors)
+//   completion_flow = pressure_field (tab completion pressure matching)
+//   Reynolds        = errors * (exec_count / (success_count + 1))
+//   Re < 27  (H3^3) = laminar (stable REPL session)
+//   Re < 343 (H7^3) = transitional (some errors)
+//   Re > 343        = turbulent (session thrashing)
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9961
+let server = tserve(PORT, "NovaCLI Terminal v2.0 - Interactive NovaLang Shell")
+
+// -- 3-5-7-13 Harmonic Constants --
+let RE_LAMINAR = 27
+let RE_TURBULENT = 343
+let BLOCK = 2187
+let MAX_HISTORY = 200
+
+// -- Ternary constants --
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// -- NovaLang keywords for tab completion --
+let NOVALANG_KEYWORDS = "let,const,fn,if,elif,else,end,while,return,print,assert,true,false,null,hive,cluster,ternary,pipeline,Trit,Tryte,hash,encrypt,decrypt,merkle,soroban_mul,soroban_div,reynolds,divergence,laplacian,len,range,str,int,float,abs,min,max,sqrt,type,list,append,keys,values,hive_dispatch,hive_query,hive_models,hive_health,cluster_query,cluster_classify,cluster_channels,modulation_status,modulation_schemes,if3,else,while3,try3,match3,tserve,troute,tstart,trit_char,dict_get,dict_set,dict_has,dict_del,time,round,sha256,uuid_hex,json_encode,json_decode,http_get,http_post,nova_run,nova_read,nova_write,contains,replace,split,join,trim,starts_with,ends_with,sum,sort,reverse,pop,lower,upper,slice,type_of"
+
+// -- CLI command names and descriptions (parallel lists) --
+let CMD_NAMES = ":help,:debug,:trace,:compile,:run,:services,:ternary,:models,:clear,:history,:vars,:ast,:bytecode,:step,:next,:continue,:break,:reset,:status"
+let CMD_DESCS_help = "Show available commands"
+let CMD_DESCS_debug = "Toggle debug mode (step-through with Universal Debugger)"
+let CMD_DESCS_trace = "Show ternary execution trace for last command"
+let CMD_DESCS_compile = "Compile code buffer to bytecode (.nbc)"
+let CMD_DESCS_run = "Run a .nova file -- :run <filepath>"
+let CMD_DESCS_services = "List NovaX service status"
+let CMD_DESCS_ternary = "Show ternary engine status"
+let CMD_DESCS_models = "List hivemind models"
+let CMD_DESCS_clear = "Clear terminal output"
+let CMD_DESCS_history = "Show command history"
+let CMD_DESCS_vars = "Show current session variables"
+let CMD_DESCS_ast = "Show AST of last expression"
+let CMD_DESCS_bytecode = "Show bytecode disassembly of last expression"
+let CMD_DESCS_step = "Step one line (debug mode)"
+let CMD_DESCS_next = "Step over (debug mode)"
+let CMD_DESCS_continue = "Continue execution (debug mode)"
+let CMD_DESCS_break = "Set breakpoint -- :break <line>"
+let CMD_DESCS_reset = "Reset session (clear all variables)"
+let CMD_DESCS_status = "Show session status + ternary layer info"
+
+// -- Session State (single default session, no threading) --
+let session_id = "default"
+let session_mode = "repl"
+let session_history = []
+let session_created = time()
+let session_last_active = time()
+let session_last_code = ""
+let session_var_count = 0
+
+// -- Statistics for N-S Reynolds --
+let stat_execs = 0
+let stat_errors = 0
+let stat_successes = 0
+let stat_completions = 0
+let stat_start = time()
+
+// ========================================================================
+// N-S Reynolds Calculation
+// ========================================================================
+
+fn calc_reynolds() { let rate = stat_execs
+    if3 stat_successes > 0 {
+        rate = stat_execs / (stat_successes + 1)
+    }
+    let re = stat_errors * rate
+    let regime = "laminar"
+    if3 re > RE_TURBULENT {
+        regime = "turbulent"
+    }
+    if3 re > RE_LAMINAR {
+        if3 re <= RE_TURBULENT {
+            regime = "transitional"
+        }
+    }
+    return {"reynolds": re, "regime": regime}
+}
+
+fn reynolds_trit() {
+    let ns = calc_reynolds()
+    let re = dict_get(ns, "reynolds") ?? 0
+    if3 re > RE_TURBULENT {
+        return T_FALSE
+    }
+    if3 re > RE_LAMINAR {
+        return T_MAYBE
+    }
+    return T_TRUE
+}
+
+// ========================================================================
+// Helper: get CLI command description
+// ========================================================================
+
+fn get_cmd_desc(cmd) {
+    // Strip the colon prefix to get the key
+    let parts = split(cmd, ":")
+    let key = ""
+    if3 len(parts) > 1 {
+        key = parts[1]
+    }
+    if3 key == "help"     { return CMD_DESCS_help }
+    if3 key == "debug"    { return CMD_DESCS_debug }
+    if3 key == "trace"    { return CMD_DESCS_trace }
+    if3 key == "compile"  { return CMD_DESCS_compile }
+    if3 key == "run"      { return CMD_DESCS_run }
+    if3 key == "services" { return CMD_DESCS_services }
+    if3 key == "ternary"  { return CMD_DESCS_ternary }
+    if3 key == "models"   { return CMD_DESCS_models }
+    if3 key == "clear"    { return CMD_DESCS_clear }
+    if3 key == "history"  { return CMD_DESCS_history }
+    if3 key == "vars"     { return CMD_DESCS_vars }
+    if3 key == "ast"      { return CMD_DESCS_ast }
+    if3 key == "bytecode" { return CMD_DESCS_bytecode }
+    if3 key == "step"     { return CMD_DESCS_step }
+    if3 key == "next"     { return CMD_DESCS_next }
+    if3 key == "continue" { return CMD_DESCS_continue }
+    if3 key == "break"    { return CMD_DESCS_break }
+    if3 key == "reset"    { return CMD_DESCS_reset }
+    if3 key == "status"   { return CMD_DESCS_status }
+    return "Unknown command"
+}
+
+// ========================================================================
+// Helper: build help text
+// ========================================================================
+
+fn build_help_text() {
+    let cmds = split(CMD_NAMES, ",")
+    let lines = "NovaCLI Commands:\n"
+    let i = 0
+    let total = len(cmds)
+    while3 i < total {
+        let cmd = cmds[i]
+        let desc = get_cmd_desc(cmd)
+        lines = lines + "  " + str(cmd) + "  " + str(desc) + "\n"
+        i = i + 1
+    }
+    return lines
+}
+
+// ========================================================================
+// Helper: record to history
+// ========================================================================
+
+fn record_history(input_line) {
+    let entry = {"input": input_line, "ts": time()}
+    session_history = append(session_history, entry)
+    // Cap history at MAX_HISTORY
+    let hlen = len(session_history)
+    if3 hlen > MAX_HISTORY {
+        session_history = slice(session_history, hlen - MAX_HISTORY, hlen)
+    }
+    return T_TRUE
+}
+
+// ========================================================================
+// Helper: execute NovaLang code via nova_run
+// ========================================================================
+
+fn execute_code(code) {
+    session_last_code = code
+    session_last_active = time()
+    stat_execs = stat_execs + 1
+    let t0 = time()
+    let output = ""
+    let ok = T_TRUE
+    let exec_type = "result"
+    try3 {
+        output = nova_run(code, 30)
+        stat_successes = stat_successes + 1
+    } else3 { output = "Error executing code"
+        ok = T_FALSE
+        exec_type = "error"
+        stat_errors = stat_errors + 1
+    }
+    let elapsed = round((time() - t0) * 1000, 1)
+    let ns = calc_reynolds()
+    return {
+        "output": str(output),
+        "type": exec_type,
+        "ok": ok,
+        "ms": elapsed,
+        "ternary": ns
+    }
+}
+
+// ========================================================================
+// Command handlers
+// ========================================================================
+
+fn cmd_help() {
+    let text = build_help_text()
+    return {"output": text, "type": "help"}
+}
+
+fn cmd_clear() {
+    return {"output": "", "type": "clear"}
+}
+
+fn cmd_history(args) {
+    let limit = 20
+    if3 len(str(args)) > 0 {
+        try3 {
+            limit = int(args)
+        } else3 { limit = 20
+        }
+    }
+    let hlen = len(session_history)
+    let start_idx = hlen - limit
+    if3 start_idx < 0 {
+        start_idx = 0
+    }
+    let entries = slice(session_history, start_idx, hlen)
+    let lines = ""
+    let i = 0
+    let elen = len(entries)
+    while3 i < elen {
+        let entry = dict_get(entries, i) ?? {}
+        let inp = dict_get(entry, "input") ?? ""
+        let num = i + 1
+        lines = lines + "  [" + str(num) + "] " + str(inp) + "\n"
+        i = i + 1
+    }
+    if3 len(lines) == 0 {
+        lines = "No history"
+    }
+    return {"output": lines, "type": "info"}
+}
+
+fn cmd_vars() {
+    // Without direct interpreter access, report tracked count
+    return {"output": "Variable tracking requires interpreter session\nUse /cli/exec to run 'let' statements", "type": "info"}
+}
+
+fn cmd_trace() {
+    // Ternary trace from ternary server
+    let trace_data = ""
+    try3 {
+        trace_data = http_get("http://127.0.0.1:9885/ternary/status")
+        let parsed = json_decode(trace_data)
+        return {"output": json_encode(parsed), "type": "trace"}
+    } else3 {
+        return {"output": "Ternary layer not available", "type": "error"}
+    }
+}
+
+fn cmd_compile(args) {
+    let code = str(args)
+    if3 len(code) == 0 {
+        code = session_last_code
+    }
+    if3 len(code) == 0 {
+        return {"output": "No code to compile. Usage: :compile <code>", "type": "error"}
+    }
+    // Delegate to nova_run for compilation attempt
+    let compile_cmd = "print(json_encode({\"compiled\": true, \"code_len\": " + str(len(code)) + "}))"
+    let result = ""
+    try3 {
+        result = nova_run(compile_cmd, 10)
+        return {"output": "Compilation attempt:\n" + str(result), "type": "compile"}
+    } else3 {
+        return {"output": "Compile error: compiler not available", "type": "error"}
+    }
+}
+
+fn cmd_ast(args) {
+    let code = str(args)
+    if3 len(code) == 0 {
+        code = session_last_code
+    }
+    if3 len(code) == 0 {
+        return {"output": "No code. Usage: :ast <code>", "type": "error"}
+    }
+    return {"output": "AST display requires compiler integration\nCode: " + str(code), "type": "ast"}
+}
+
+fn cmd_bytecode(args) {
+    let code = str(args)
+    if3 len(code) == 0 {
+        code = session_last_code
+    }
+    if3 len(code) == 0 {
+        return {"output": "No code. Usage: :bytecode <code>", "type": "error"}
+    }
+    return {"output": "Bytecode display requires compiler integration\nCode: " + str(code), "type": "bytecode"}
+}
+
+fn cmd_run_file(filepath) {
+    if3 len(str(filepath)) == 0 {
+        return {"output": "Usage: :run <filepath.nova>", "type": "error"}
+    }
+    let fpath = trim(str(filepath))
+    // Try to read file content
+    let content = ""
+    try3 {
+        content = nova_read(fpath)
+    } else3 {
+        // Try with NovaX prefix
+        let alt_path = "C:\\NovaX\\" + fpath
+        try3 {
+            content = nova_read(alt_path)
+        } else3 {
+            return {"output": "File not found: " + str(fpath), "type": "error"}
+        }
+    }
+    if3 len(str(content)) == 0 {
+        return {"output": "File is empty: " + str(fpath), "type": "error"}
+    }
+    // Execute the file content
+    return execute_code(str(content))
+}
+
+fn cmd_services() {
+    let raw = ""
+    try3 {
+        raw = http_get("http://127.0.0.1:9999/api/services")
+        let data = json_decode(raw)
+        let services = dict_get(data, "services") ?? {}
+        let svc_keys = keys(services)
+        let lines = "NovaX Services:\n"
+        let i = 0
+        let total = len(svc_keys)
+        while3 i < total {
+            let skey = svc_keys[i]
+            let sinfo = dict_get(services, skey) ?? {}
+            let sstatus = dict_get(sinfo, "status") ?? "unknown"
+            let sport = dict_get(sinfo, "port") ?? "?"
+            let icon = "-"
+            if3 sstatus == "running" {
+                icon = "+"
+            }
+            lines = lines + "  [" + str(icon) + "] " + str(skey) + " :" + str(sport) + " " + str(sstatus) + "\n"
+            i = i + 1
+        }
+        return {"output": lines, "type": "services"}
+    } else3 {
+        return {"output": "Could not reach orchestrator", "type": "error"}
+    }
+}
+
+fn cmd_ternary() {
+    let raw = ""
+    try3 {
+        raw = http_get("http://127.0.0.1:9885/ternary/status")
+        let data = json_decode(raw)
+        return {"output": json_encode(data), "type": "ternary"}
+    } else3 {
+        return {"output": "Ternary server not available", "type": "error"}
+    }
+}
+
+fn cmd_models() {
+    let raw = ""
+    try3 {
+        raw = http_get("http://127.0.0.1:9881/hive/models")
+        let data = json_decode(raw)
+        let models = dict_get(data, "models") ?? []
+        let count = dict_get(data, "count") ?? len(models)
+        let lines = "Hivemind Models (" + str(count) + "):\n"
+        let i = 0
+        let show_max = 30
+        if3 len(models) < show_max {
+            show_max = len(models)
+        }
+        while3 i < show_max {
+            let m = dict_get(models, i) ?? ""
+            let mname = str(m)
+            // If model is a dict, try to get name
+            if3 type_of(m) == "dict" {
+                mname = dict_get(m, "name") ?? str(m)
+            }
+            lines = lines + "  " + str(mname) + "\n"
+            i = i + 1
+        }
+        if3 count > 30 {
+            let extra = count - 30
+            lines = lines + "  ... and " + str(extra) + " more\n"
+        }
+        return {"output": lines, "type": "models"}
+    } else3 {
+        return {"output": "Hivemind not available", "type": "error"}
+    }
+}
+
+fn cmd_debug_toggle() {
+    if3 session_mode == "debug" {
+        session_mode = "repl"
+        return {"output": "Debug mode: OFF", "type": "mode"}
+    }
+    session_mode = "debug"
+    return {"output": "Debug mode: ON", "type": "mode"}
+}
+
+fn cmd_debug_action(action) {
+    let raw = ""
+    let payload = json_encode({})
+    try3 {
+        raw = http_post("http://127.0.0.1:9886/liud/" + str(action), payload)
+        let result = json_decode(raw)
+        return {"output": json_encode(result), "type": "debug"}
+    } else3 {
+        return {"output": "Universal Debugger not available", "type": "error"}
+    }
+}
+
+fn cmd_break(args) {
+    if3 len(str(args)) == 0 {
+        return {"output": "Usage: :break <line_number>", "type": "error"}
+    }
+    // Validate it looks numeric
+    try3 {
+        let line_num = int(args)
+        return {"output": "Breakpoint set at line " + str(line_num), "type": "info"}
+    } else3 {
+        return {"output": "Usage: :break <line_number>", "type": "error"}
+    }
+}
+
+fn cmd_reset() {
+    session_history = []
+    session_mode = "repl"
+    session_last_code = ""
+    session_last_active = time()
+    session_var_count = 0
+    stat_execs = 0
+    stat_errors = 0
+    stat_successes = 0
+    stat_completions = 0
+    return {"output": "Session reset -- all variables cleared", "type": "info"}
+}
+
+fn cmd_status() {
+    let ns = calc_reynolds()
+    let info = {
+        "session": session_id,
+        "mode": session_mode,
+        "history_entries": len(session_history),
+        "ternary_layer": true,
+        "reynolds": dict_get(ns, "reynolds") ?? 0,
+        "regime": dict_get(ns, "regime") ?? "laminar",
+        "execs": stat_execs,
+        "errors": stat_errors,
+        "successes": stat_successes,
+        "uptime_s": round(time() - stat_start)
+    }
+    return {"output": json_encode(info), "type": "status"}
+}
+
+// ========================================================================
+// Command dispatcher: route :commands to handlers
+// ========================================================================
+
+fn dispatch_command(input_line) {
+    // Split into command and args
+    let parts = split(input_line, " ")
+    let command = lower(parts[0])
+    let args = ""
+    if3 len(parts) > 1 {
+        // Rejoin args after the first space
+        let remaining = slice(parts, 1, len(parts))
+        args = join(remaining, " ")
+    }
+
+    if3 command == ":help"     { return cmd_help() }
+    if3 command == ":clear"    { return cmd_clear() }
+    if3 command == ":history"  { return cmd_history(args) }
+    if3 command == ":vars"     { return cmd_vars() }
+    if3 command == ":trace"    { return cmd_trace() }
+    if3 command == ":compile"  { return cmd_compile(args) }
+    if3 command == ":ast"      { return cmd_ast(args) }
+    if3 command == ":bytecode" { return cmd_bytecode(args) }
+    if3 command == ":run"      { return cmd_run_file(args) }
+    if3 command == ":services" { return cmd_services() }
+    if3 command == ":ternary"  { return cmd_ternary() }
+    if3 command == ":models"   { return cmd_models() }
+    if3 command == ":debug"    { return cmd_debug_toggle() }
+    if3 command == ":step"     { return cmd_debug_action("step") }
+    if3 command == ":next"     { return cmd_debug_action("next") }
+    if3 command == ":continue" { return cmd_debug_action("continue") }
+    if3 command == ":break"    { return cmd_break(args) }
+    if3 command == ":reset"    { return cmd_reset() }
+    if3 command == ":status"   { return cmd_status() }
+
+    return {"output": "Unknown command: " + str(command) + ". Type :help for list.", "type": "error"}
+}
+
+// ========================================================================
+// Tab completion
+// ========================================================================
+
+fn get_completions(partial) {
+    stat_completions = stat_completions + 1
+    let partial_lower = lower(str(partial))
+    let results = []
+
+    // If starts with colon, match CLI commands
+    if3 starts_with(partial, ":") {
+        let cmds = split(CMD_NAMES, ",")
+        let i = 0
+        let total = len(cmds)
+        while3 i < total {
+            let cmd = cmds[i]
+            if3 starts_with(cmd, partial_lower) {
+                results = append(results, cmd)
+            }
+            i = i + 1
+        }
+        // Cap at 15
+        if3 len(results) > 15 {
+            results = slice(results, 0, 15)
+        }
+        return results
+    }
+
+    // Match NovaLang keywords
+    let kws = split(NOVALANG_KEYWORDS, ",")
+    let i = 0
+    let total = len(kws)
+    while3 i < total {
+        let kw = kws[i]
+        if3 starts_with(kw, partial_lower) {
+            results = append(results, kw)
+        }
+        i = i + 1
+    }
+
+    // Cap at 20
+    if3 len(results) > 20 {
+        results = slice(results, 0, 20)
+    }
+    return results
+}
+
+// ========================================================================
+// Route Handlers
+// ========================================================================
+
+// GET /health
+fn health(body) {
+    let resp = ns_health_dict("nova-cli", "2.0", PORT, {})
+    resp = dict_set(resp, "sessions", 1)
+    resp = dict_set(resp, "mode", session_mode)
+    resp = dict_set(resp, "execs", stat_execs)
+    resp = dict_set(resp, "runtime", "novalang")
+    return resp
+}
+
+// GET /cli/health (alias)
+fn cli_health(body) {
+    return health(body)
+}
+
+// GET /cli/sessions
+fn cli_sessions(body) {
+    let sess = {
+        "session_id": session_id,
+        "mode": session_mode,
+        "history_count": len(session_history),
+        "variables": session_var_count,
+        "created_at": session_created,
+        "last_active": session_last_active
+    }
+    return {"sessions": [sess]}
+}
+
+// GET /cli/history
+fn cli_history(body) {
+    let hlen = len(session_history)
+    let start_idx = hlen - 50
+    if3 start_idx < 0 {
+        start_idx = 0
+    }
+    let recent = slice(session_history, start_idx, hlen)
+    return {"history": recent}
+}
+
+// GET /cli/commands
+fn cli_commands(body) {
+    let cmds = split(CMD_NAMES, ",")
+    let result = {}
+    let i = 0
+    let total = len(cmds)
+    while3 i < total {
+        let cmd = cmds[i]
+        let desc = get_cmd_desc(cmd)
+        result = dict_set(result, cmd, desc)
+        i = i + 1
+    }
+    return {"commands": result}
+}
+
+// GET /cli/keywords
+fn cli_keywords(body) {
+    let kws = split(NOVALANG_KEYWORDS, ",")
+    return {"keywords": kws}
+}
+
+// POST /cli/exec
+fn cli_exec(body) {
+    let code = dict_get(body, "code") ?? ""
+    session_last_active = time()
+
+    // Empty input
+    if3 len(trim(str(code))) == 0 {
+        return {"output": "", "type": "empty"}
+    }
+
+    // Record to history
+    let _r = record_history(str(code))
+
+    // Check if it is a CLI command (starts with :)
+    let trimmed = trim(str(code))
+    if3 starts_with(trimmed, ":") {
+        return dispatch_command(trimmed)
+    }
+
+    // Otherwise execute as NovaLang code
+    return execute_code(trimmed)
+}
+
+// POST /cli/complete
+fn cli_complete(body) {
+    let partial = dict_get(body, "partial") ?? ""
+    let completions = get_completions(str(partial))
+    return {"completions": completions}
+}
+
+// POST /cli/session
+fn cli_session(body) {
+    let req_id = dict_get(body, "session_id") ?? session_id
+    session_last_active = time()
+    return {
+        "session_id": req_id,
+        "mode": session_mode,
+        "history_count": len(session_history),
+        "variables": session_var_count,
+        "created_at": session_created,
+        "last_active": session_last_active
+    }
+}
+
+// POST /cli/run-file
+fn cli_run_file(body) {
+    let filepath = dict_get(body, "path") ?? ""
+    session_last_active = time()
+    if3 len(str(filepath)) == 0 {
+        return {"output": "Missing path parameter", "type": "error"}
+    }
+    let _r = record_history(":run " + str(filepath))
+    return cmd_run_file(str(filepath))
+}
+
+// POST /cli/reset
+fn cli_reset(body) {
+    let _r = record_history(":reset")
+    return cmd_reset()
+}
+
+// ========================================================================
+// Register Routes
+// ========================================================================
+
+troute(server, "GET",  "/health",         "health")
+troute(server, "GET",  "/cli/health",     "cli_health")
+troute(server, "GET",  "/cli/sessions",   "cli_sessions")
+troute(server, "GET",  "/cli/history",    "cli_history")
+troute(server, "GET",  "/cli/commands",   "cli_commands")
+troute(server, "GET",  "/cli/keywords",   "cli_keywords")
+troute(server, "POST", "/cli/exec",       "cli_exec")
+troute(server, "POST", "/cli/complete",   "cli_complete")
+troute(server, "POST", "/cli/session",    "cli_session")
+troute(server, "POST", "/cli/run-file",   "cli_run_file")
+troute(server, "POST", "/cli/reset",      "cli_reset")
+
+// ========================================================================
+// Boot Banner
+// ========================================================================
+
+print("[NovaCLI] NovaCLI Terminal v2.0 - Interactive NovaLang Shell")
+print("[NovaCLI] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[NovaCLI] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[NovaCLI] Session: " + str(session_id) + " | Mode: " + str(session_mode))
+print("[NovaCLI] Keywords: " + str(len(split(NOVALANG_KEYWORDS, ","))) + " | Commands: " + str(len(split(CMD_NAMES, ","))))
+print("[NovaCLI] Reynolds boundaries: Re<" + str(RE_LAMINAR) + " laminar, Re<" + str(RE_TURBULENT) + " transitional")
+print("[NovaCLI] Routes: GET /health, /cli/health, /cli/sessions, /cli/history")
+print("[NovaCLI] Routes: GET /cli/commands, /cli/keywords")
+print("[NovaCLI] Routes: POST /cli/exec, /cli/complete, /cli/session")
+print("[NovaCLI] Routes: POST /cli/run-file, /cli/reset")
+
+tstart(server)

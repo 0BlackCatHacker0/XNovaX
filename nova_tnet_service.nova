@@ -1,0 +1,1185 @@
+// nova_tnet_service.nova -- NovaX Ternary Network Toolkit v2.1
+// Port 9906 | 7 tools | 3-5-7-13 harmonics | Pure NovaLang (zero Python)
+//
+// FULLY FUNCTIONAL: All handlers use shell() with native Windows commands
+// (curl, powershell, netstat, nslookup, tracert). Zero Python dependencies.
+//
+// Every result is ternary-scored:
+//   +1 = open / fast / resolved / healthy
+//    0 = filtered / moderate / partial
+//   -1 = closed / timeout / failed / unreachable
+//
+// Reynolds boundaries (3^3 / 5^3 / 7^3) classify latency:
+//   < 27ms  = laminar (fast)
+//   < 125ms = transitional (ok)
+//   < 343ms = turbulent (slow)
+//   >= 343ms = chaotic (timeout/unreachable)
+//
+// Routes:
+//   POST /tnet/probe     -- TCP port probe via powershell Test-NetConnection
+//   POST /tnet/fetch     -- HTTP fetch via curl (status, headers, body_length)
+//   POST /tnet/scan      -- Multi-port TCP scan via NovaLang loop + shell
+//   POST /tnet/trace     -- Traceroute via tracert + NovaLang parser
+//   POST /tnet/bandwidth -- Bandwidth test: curl download, measure throughput
+//   POST /tnet/dns       -- DNS lookup via nslookup + NovaLang parser
+//   POST /tnet/health    -- TCP-level health check for URL/host+port
+//   GET  /tnet/status    -- Service status + balanced ternary health
+//   GET  /health         -- Health check
+
+// -- Server setup --------------------------------------------------------------
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9906
+let server = tserve(PORT, "nova-tnet")
+
+// -- 3-5-7-13 Ternary Constants -----------------------------------------------
+let BLOCK = 2187
+
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+let RE_LAMINAR = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT = 343
+
+let TOOLS_COUNT = 7
+let VERSION = "2.1"
+
+// Temp directory for intermediate files
+let TEMP_DIR = "C:/NovaX/memory/tfetch_temp"
+
+// -- State: stats counters -----------------------------------------------------
+let stats_ops = 0
+let stats_strong = 0
+let stats_partial = 0
+let stats_failed = 0
+let stats_t0 = time()
+
+// =============================================================================
+// Helper: latency trit scoring
+// =============================================================================
+fn latency_trit(ms) {
+    if3 ms < RE_LAMINAR {
+        return T_TRUE
+    } else if3 ms < RE_TRANSITION {
+        return T_MAYBE
+    } else3 {
+        return T_FALSE
+    }
+}
+
+// =============================================================================
+// Helper: flow regime string
+// =============================================================================
+fn flow_regime(re_num) {
+    if3 re_num < RE_LAMINAR {
+        return "laminar"
+    } else if3 re_num < RE_TRANSITION {
+        return "transitional"
+    } else if3 re_num < RE_TURBULENT {
+        return "turbulent"
+    } else3 {
+        return "chaotic"
+    }
+}
+
+// =============================================================================
+// Helper: trit to display char
+// =============================================================================
+fn trit_char(t) {
+    if3 t == T_TRUE {
+        return "1"
+    } else if3 t == T_MAYBE {
+        return "0"
+    } else3 {
+        return "T"
+    }
+}
+
+// =============================================================================
+// Helper: record a trit result into stats
+// =============================================================================
+fn record_trit(t) {
+    stats_ops = stats_ops + 1
+    if3 t == T_TRUE {
+        stats_strong = stats_strong + 1
+    } else if3 t == T_MAYBE {
+        stats_partial = stats_partial + 1
+    } else3 {
+        stats_failed = stats_failed + 1
+    }
+}
+
+// =============================================================================
+// Helper: build balanced ternary string from a list of trit dicts {t: val}
+// =============================================================================
+fn bt_from_list(trit_list) {
+    let bt = ""
+    let i = 0
+    let n = len(trit_list)
+    while3 i < n {
+        let item = dict_get(trit_list, i)
+        let tv = dict_get(item, "t") ?? T_FALSE
+        if3 tv == T_TRUE {
+            bt = join([bt, "1"], "")
+        } else if3 tv == T_MAYBE {
+            bt = join([bt, "0"], "")
+        } else3 {
+            bt = join([bt, "T"], "")
+        }
+        i = i + 1
+    }
+    return bt
+}
+
+// =============================================================================
+// Helper: TCP probe a single host:port via powershell Test-NetConnection
+// Returns dict: {port, open, error_code, ms, trit, char}
+// =============================================================================
+fn tcp_probe_one(host, port, timeout) {
+    // Use powershell Test-NetConnection for TCP probe with timing
+    // Outputs JSON: TcpTestSucceeded and latency
+    let ps_cmd = "powershell -NoProfile -Command \"$r=Test-NetConnection -ComputerName " + host + " -Port " + str(port) + " -WarningAction SilentlyContinue; $ms=if($r.PingReplyDetails){$r.PingReplyDetails.RoundtripTime}else{9999}; Write-Output ('{' + '\"open\":' + $(if($r.TcpTestSucceeded){'1'}else{'0'}) + ',\"ms\":' + $ms + ',\"host\":\"" + host + "\",\"port\":' + " + str(port) + " + '}')\" 2>NUL"
+
+    let shell_result = shell(ps_cmd)
+    let out = try3 { dict_get(shell_result, "stdout") } fail { "" }
+    let result = {}
+
+    try3 {
+        let parsed = json_decode(trim(out))
+        let is_open = dict_get(parsed, "open") ?? 0
+        let ms_val = dict_get(parsed, "ms") ?? 9999
+        let trit = T_FALSE
+        if3 is_open == 1 {
+            trit = latency_trit(ms_val)
+        } else3 {
+            trit = T_FALSE
+        }
+        result = dict_set(result, "port", port)
+        result = dict_set(result, "open", is_open)
+        result = dict_set(result, "error_code", 0)
+        result = dict_set(result, "ms", ms_val)
+        result = dict_set(result, "trit", trit)
+        result = dict_set(result, "char", trit_char(trit))
+        if3 is_open == 0 {
+            result = dict_set(result, "status", "closed")
+        } else3 {
+            result = dict_set(result, "status", "open")
+        }
+    } fail {
+        // Parse failed -- command error or no output
+        result = dict_set(result, "port", port)
+        result = dict_set(result, "open", 0)
+        result = dict_set(result, "error_code", -99)
+        result = dict_set(result, "ms", 9999)
+        result = dict_set(result, "trit", T_FALSE)
+        result = dict_set(result, "char", "T")
+        result = dict_set(result, "status", "error")
+        result = dict_set(result, "raw", trim(out))
+    }
+
+    return result
+}
+
+// =============================================================================
+// Helper: check service reachability via TCP connect (for /tnet/health)
+// Returns dict: {name, host, port, reachable, ms, trit, char}
+// =============================================================================
+fn tcp_health_check(svc_name, host, port, timeout) {
+    let r = tcp_probe_one(host, port, timeout)
+    let result = {}
+    result = dict_set(result, "name", svc_name)
+    result = dict_set(result, "host", host)
+    result = dict_set(result, "port", port)
+    result = dict_set(result, "reachable", dict_get(r, "open") ?? 0)
+    result = dict_set(result, "ms", dict_get(r, "ms") ?? 9999)
+    result = dict_set(result, "trit", dict_get(r, "trit") ?? T_FALSE)
+    result = dict_set(result, "char", dict_get(r, "char") ?? "T")
+    result = dict_set(result, "status", dict_get(r, "status") ?? "error")
+    return result
+}
+
+// =============================================================================
+// ROUTE: GET /health
+// =============================================================================
+fn handle_health(req) {
+    let up = round(time() - stats_t0, 0)
+    let self_trit = T_MAYBE
+    if3 up > 10 {
+        self_trit = T_TRUE
+    } else3 {
+        self_trit = T_MAYBE
+    }
+    let counters = {"strong": stats_strong, "partial": stats_partial, "failed": stats_failed}
+    let resp = ns_health_dict("nova-tnet", VERSION, PORT, counters)
+    resp = dict_set(resp, "tools", TOOLS_COUNT)
+    resp = dict_set(resp, "self_trit", self_trit)
+    resp = dict_set(resp, "char", trit_char(self_trit))
+    resp = dict_set(resp, "uptime", up)
+    return resp
+}
+troute(server, "GET", "/health", "handle_health")
+
+// =============================================================================
+// ROUTE: GET /tnet/status
+// =============================================================================
+fn handle_status(req) {
+    let up = round(time() - stats_t0, 0)
+    // Build health_bt from H13 trit slots based on strong vs failed ratio
+    let trit_list = []
+    let i = 0
+    while3 i < H13 {
+        let item = {}
+        if3 stats_strong > stats_failed {
+            item = dict_set(item, "t", T_TRUE)
+        } else if3 stats_failed > stats_strong {
+            item = dict_set(item, "t", T_FALSE)
+        } else3 {
+            item = dict_set(item, "t", T_MAYBE)
+        }
+        trit_list = append(trit_list, item)
+        i = i + 1
+    }
+    let bt = bt_from_list(trit_list)
+    let trits_summary = {}
+    trits_summary = dict_set(trits_summary, "strong", stats_strong)
+    trits_summary = dict_set(trits_summary, "partial", stats_partial)
+    trits_summary = dict_set(trits_summary, "failed", stats_failed)
+    let harmonics = {}
+    harmonics = dict_set(harmonics, "H3", H3)
+    harmonics = dict_set(harmonics, "H5", H5)
+    harmonics = dict_set(harmonics, "H7", H7)
+    harmonics = dict_set(harmonics, "H13", H13)
+    return {
+        "ok": T_TRUE,
+        "service": "nova-tnet",
+        "version": VERSION,
+        "port": PORT,
+        "uptime_s": up,
+        "total_ops": stats_ops,
+        "trits": trits_summary,
+        "health_bt": bt,
+        "harmonic_ports": "3,5,7,13,21,22,80,443,3000,5000,7700,8080,8888,9999,11434",
+        "novax_services": 13,
+        "harmonics": harmonics,
+        "runtime": "novalang",
+        "implementation": "fully-functional"
+    }
+}
+troute(server, "GET", "/tnet/status", "handle_status")
+
+// =============================================================================
+// ROUTE: POST /tnet/probe
+// TCP port probe via powershell Test-NetConnection (zero Python)
+// Body: {host, port, timeout}
+//   host    -- target hostname or IP (default: 127.0.0.1)
+//   port    -- single port number (required)
+//   timeout -- seconds (default: 3)
+// =============================================================================
+fn handle_probe(body) {
+    // Extract parameters
+    let host = "127.0.0.1"
+    if3 dict_has(body, "host") {
+        host = dict_get(body, "host")
+    } else3 {
+        host = "127.0.0.1"
+    }
+
+    let timeout = H3
+    if3 dict_has(body, "timeout") {
+        timeout = dict_get(body, "timeout")
+    } else3 {
+        timeout = H3
+    }
+
+    // Require port param
+    if3 dict_has(body, "port") == 0 {
+        record_trit(T_FALSE)
+        return {
+            "ok": T_FALSE,
+            "error": "port required",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    } else3 {
+        // continue below
+        timeout = timeout
+    }
+
+    let port = dict_get(body, "port")
+
+    // Perform real TCP probe via powershell Test-NetConnection
+    let r = tcp_probe_one(host, port, timeout)
+
+    let trit = dict_get(r, "trit") ?? T_FALSE
+    record_trit(trit)
+
+    return {
+        "ok": T_TRUE,
+        "host": host,
+        "port": port,
+        "open": dict_get(r, "open") ?? 0,
+        "status": dict_get(r, "status") ?? "error",
+        "ms": dict_get(r, "ms") ?? 9999,
+        "error_code": dict_get(r, "error_code") ?? -1,
+        "flow_regime": flow_regime(dict_get(r, "ms") ?? 9999),
+        "trit": trit,
+        "char": trit_char(trit)
+    }
+}
+troute(server, "POST", "/tnet/probe", "handle_probe")
+
+// =============================================================================
+// ROUTE: POST /tnet/fetch
+// HTTP fetch via curl (status code, headers, body_length, elapsed_ms)
+// Body: {url, method, headers, timeout}
+//   url     -- target URL (required)
+//   method  -- "get" or "post" (default: "get")
+//   headers -- dict of extra headers (optional)
+//   timeout -- seconds (default: 5)
+// =============================================================================
+}
+fn handle_fetch(body) {
+    if3 dict_has(body, "url") == 0 {
+        record_trit(T_FALSE)
+        return {
+            "ok": T_FALSE,
+            "error": "url required",
+            "trit": T_FALSE,
+            "char": "T"
+    } else3 {
+        // continue
+        let _x = 0
+    } else3 { _x = 0
+    }
+
+    let url = dict_get(body, "url")
+    let method = "get"
+    if3 dict_has(body, "method") {
+        method = dict_get(body, "method")
+    } else3 {
+        method = "get"
+    }
+
+    // Lowercase method
+    // NovaLang: lower() function
+    method = lower(method)
+    if3 method != "get" {
+        if3 method != "post" {
+            if3 method != "head" {
+                method = "get"
+            } else3 {
+                method = method
+            }
+        } else3 {
+            method = method
+        }
+    } else3 {
+        method = method
+    }
+
+    let timeout = H5
+    if3 dict_has(body, "timeout") {
+        timeout = dict_get(body, "timeout")
+    } else3 {
+        timeout = H5
+    }
+
+    // Ensure scheme present
+    let has_http = contains(url, "http://")
+    let has_https = contains(url, "https://")
+    if3 has_http == 0 {
+        if3 has_https == 0 {
+            url = "http://" + url
+        } else3 {
+            url = url
+        }
+    } else3 {
+        url = url
+    }
+
+    // Use curl for HTTP fetch with timing and header capture
+    // -s silent, -L follow redirects, -o NUL discard body for header-only, -w write-out format
+    let method_flag = ""
+    if3 method == "post" {
+        method_flag = "-X POST"
+    } else if3 method == "head" {
+        method_flag = "-I"
+    } else3 {
+        method_flag = ""
+    }
+
+    // curl with write-out to get status, size, time, final URL, headers
+    let curl_cmd = "curl -s -L " + method_flag + " --max-time " + str(timeout) + " -D - -o NUL -w \"\\n---CURLMETA---\\nstatus:%{http_code}\\nsize:%{size_download}\\ntime:%{time_total}\\nurl:%{url_effective}\" \"" + url + "\" 2>NUL"
+    let shell_result = shell(curl_cmd)
+    let raw_out = try3 { dict_get(shell_result, "stdout") } fail { "" }
+
+    // Parse curl output: headers above ---CURLMETA---, meta below
+    let meta_parts = split(raw_out, "---CURLMETA---")
+    let header_section = try3 { meta_parts[0] } fail { "" }
+    let meta_section = try3 { meta_parts[1] } fail { "" }
+
+    // Parse meta values
+    let meta_lines = split(meta_section, "\n")
+    let status_code = 0
+    let body_length = 0
+    let elapsed_ms = 9999
+    let final_url = url
+    for3 ml in meta_lines {
+        let ml_trimmed = trim(ml)
+        if3 starts_with(ml_trimmed, "status:") {
+            let _t1 = try3 { to_int(slice(ml_trimmed, 7, len(ml_trimmed))) } fail { 0 }
+            status_code = _t1
+        } else if3 starts_with(ml_trimmed, "size:") {
+            let _t2 = try3 { to_int(slice(ml_trimmed, 5, len(ml_trimmed))) } fail { 0 }
+            body_length = _t2
+        } else if3 starts_with(ml_trimmed, "time:") {
+            let time_str = slice(ml_trimmed, 5, len(ml_trimmed))
+            let time_f = try3 { to_float(time_str) } fail { 9.999 }
+            elapsed_ms = round(time_f * 1000, 0)
+        } else if3 starts_with(ml_trimmed, "url:") {
+            final_url = slice(ml_trimmed, 4, len(ml_trimmed))
+        }
+    }
+
+    // Parse response headers (first 7)
+    let hdrs = {}
+    let hdr_lines = split(header_section, "\n")
+    let hdr_count = 0
+    for3 hl in hdr_lines {
+        let hl_t = trim(hl)
+        if3 contains(hl_t, ": ") {
+            if3 hdr_count < 7 {
+                let colon_idx = 0
+                let ci = 0
+                while3 ci < len(hl_t) {
+                    if3 slice(hl_t, ci, ci + 2) == ": " {
+                        if3 colon_idx == 0 {
+                            colon_idx = ci
+                        }
+                    }
+                    ci = ci + 1
+                }
+                if3 colon_idx > 0 {
+                    let hname = slice(hl_t, 0, colon_idx)
+                    let hval = slice(hl_t, colon_idx + 2, len(hl_t))
+                    hdrs = dict_set(hdrs, hname, hval)
+                    hdr_count = hdr_count + 1
+                }
+            }
+        }
+    }
+
+    // Build output JSON string for parsing
+    let out = json_encode({"status": status_code, "headers": hdrs, "body_length": body_length, "elapsed_ms": elapsed_ms, "url": final_url, "ok": 1})
+
+    let resp = {}
+    try3 {
+        let parsed = json_decode(trim(out))
+        status_code = dict_get(parsed, "status") ?? 0
+        elapsed_ms = dict_get(parsed, "elapsed_ms") ?? 9999
+        let trit = latency_trit(elapsed_ms)
+        // Also factor in HTTP status: 5xx = T_FALSE, 4xx = T_MAYBE
+        if3 status_code >= 500 {
+            trit = T_FALSE
+        } else if3 status_code >= 400 {
+            if3 trit == T_TRUE {
+                trit = T_MAYBE
+            } else3 {
+                trit = trit
+            }
+        } else3 {
+            trit = trit
+        }
+
+        record_trit(trit)
+
+        resp = dict_set(resp, "ok", T_TRUE)
+        resp = dict_set(resp, "url", url)
+        resp = dict_set(resp, "final_url", dict_get(parsed, "url") ?? url)
+        resp = dict_set(resp, "method", method)
+        resp = dict_set(resp, "status", status_code)
+        resp = dict_set(resp, "headers", dict_get(parsed, "headers") ?? {})
+        resp = dict_set(resp, "body_length", dict_get(parsed, "body_length") ?? 0)
+        resp = dict_set(resp, "elapsed_ms", elapsed_ms)
+        resp = dict_set(resp, "reynolds", elapsed_ms)
+        resp = dict_set(resp, "regime", flow_regime(elapsed_ms))
+        resp = dict_set(resp, "trit", trit)
+        resp = dict_set(resp, "char", trit_char(trit))
+    } fail {
+        record_trit(T_FALSE)
+        resp = dict_set(resp, "ok", T_FALSE)
+        resp = dict_set(resp, "url", url)
+        resp = dict_set(resp, "method", method)
+        resp = dict_set(resp, "error", "fetch failed or timed out")
+        resp = dict_set(resp, "raw", trim(out))
+        resp = dict_set(resp, "elapsed_ms", 9999)
+        resp = dict_set(resp, "reynolds", 9999)
+        resp = dict_set(resp, "regime", "chaotic")
+        resp = dict_set(resp, "trit", T_FALSE)
+        resp = dict_set(resp, "char", "T")
+    }
+
+    return resp
+}
+troute(server, "POST", "/tnet/fetch", "handle_fetch")
+
+// =============================================================================
+// ROUTE: POST /tnet/scan
+// Multi-port TCP scan via NovaLang loop + tcp_probe_one (zero Python)
+// Body: {host, ports, port_range, timeout}
+//   host       -- target hostname or IP (default: 127.0.0.1)
+//   ports      -- list of port numbers, e.g. [80,443,8080]
+//   port_range -- string "start-end", e.g. "8000-8100"
+//   timeout    -- seconds per port (default: 1)
+// =============================================================================
+fn handle_scan(body) {
+    let host = "127.0.0.1"
+    if3 dict_has(body, "host") {
+        host = dict_get(body, "host")
+    } else3 {
+        host = "127.0.0.1"
+    }
+
+    let timeout = 1
+    if3 dict_has(body, "timeout") {
+        timeout = dict_get(body, "timeout")
+    } else3 {
+        timeout = 1
+    }
+
+    // Build the ports list
+    // We support: explicit [ports] list OR port_range "start-end" OR harmonic default
+    let ports = [3, 5, 7, 13, 21, 22, 80, 443, 3000, 5000, 7700, 8080, 8888, 9999, 11434]
+    if3 dict_has(body, "ports") {
+        ports = dict_get(body, "ports")
+    } else if3 dict_has(body, "port_range") {
+        let pr = dict_get(body, "port_range")
+        // Parse "start-end" -- find the dash separator
+        let parts = split(pr, "-")
+        let plen = len(parts)
+        if3 plen >= 2 {
+            let p_start = to_int(trim(parts[0]))
+            let p_end = to_int(trim(parts[1]))
+            ports = []
+            let pi = p_start
+            while3 pi <= p_end {
+                ports = append(ports, pi)
+                pi = pi + 1
+            }
+        } else3 {
+            ports = [80, 443, 8080, 8888, 9999]
+        }
+    } else3 {
+        ports = [3, 5, 7, 13, 21, 22, 80, 443, 3000, 5000, 7700, 8080, 8888, 9999, 11434]
+    }
+
+    // Pure NovaLang port scan using tcp_probe_one per port
+    let scan_results = []
+    let open_ports = []
+    for3 p in ports {
+        let probe_r = tcp_probe_one(host, p, timeout)
+        scan_results = append(scan_results, probe_r)
+        let is_open = dict_get(probe_r, "open") ?? 0
+        if3 is_open == 1 {
+            open_ports = append(open_ports, p)
+        }
+    }
+    let open_count = len(open_ports)
+    let total_scanned = len(ports)
+
+    // Build balanced ternary string from results
+    let trit_list = []
+    let si = 0
+    while3 si < len(scan_results) {
+        let sr = dict_get(scan_results, si)
+        let tv = dict_get(sr, "trit") ?? T_FALSE
+        let titem = {}
+        titem = dict_set(titem, "t", tv)
+        trit_list = append(trit_list, titem)
+        si = si + 1
+    }
+    let bt = bt_from_list(trit_list)
+
+    let overall = T_FALSE
+    if3 open_count == total_scanned {
+        overall = T_TRUE
+    } else if3 open_count > 0 {
+        overall = T_MAYBE
+    } else3 {
+        overall = T_FALSE
+    }
+
+    record_trit(overall)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", T_TRUE)
+    resp = dict_set(resp, "host", host)
+    resp = dict_set(resp, "port_map", scan_results)
+    resp = dict_set(resp, "open_ports", open_ports)
+    resp = dict_set(resp, "open_count", open_count)
+    resp = dict_set(resp, "total_scanned", total_scanned)
+    resp = dict_set(resp, "health_bt", bt)
+    resp = dict_set(resp, "trit", overall)
+    resp = dict_set(resp, "char", trit_char(overall))
+
+    return resp
+}
+troute(server, "POST", "/tnet/scan", "handle_scan")
+
+// =============================================================================
+// ROUTE: POST /tnet/trace
+// Traceroute with per-hop latency trits (uses tracert on Windows)
+// Body: {host, max_hops}
+//   host     -- target hostname or IP (default: 8.8.8.8)
+//   max_hops -- max TTL hops (default: 13 = H13)
+// =============================================================================
+}
+fn handle_trace(body) {
+    let host = "8.8.8.8"
+    if3 dict_has(body, "host") {
+        host = dict_get(body, "host")
+    } else3 {
+        host = "8.8.8.8"
+    }
+
+    let max_hops = H13
+    if3 dict_has(body, "max_hops") {
+        max_hops = dict_get(body, "max_hops")
+    } else3 {
+        max_hops = H13
+    }
+
+    // Pure NovaLang traceroute: run tracert via shell, parse output in NovaLang
+    let trace_result = shell("tracert -d -h " + str(max_hops) + " -w 1000 " + host + " 2>NUL")
+    let raw_out = try3 { dict_get(trace_result, "stdout") } fail { "" }
+
+    let hops = []
+    let bt = ""
+    let lines = split(raw_out, "\n")
+    for3 line in lines {
+        let l = trim(line)
+        if3 len(l) > 0 {
+            // Parse lines like: "  1    <1 ms    <1 ms    <1 ms  192.168.1.1"
+            let parts = split(l, " ")
+            // Filter empty parts
+            let cleaned = []
+            for3 pp in parts {
+                if3 len(trim(pp)) > 0 {
+                    cleaned = append(cleaned, trim(pp))
+                }
+            }
+            if3 len(cleaned) >= 2 {
+                // First token must be a hop number
+                let hop_num = try3 { to_int(cleaned[0]) } fail { -1 }
+                if3 hop_num > 0 {
+                    // Extract ms values: look for tokens before "ms"
+                    let ms_vals = []
+                    let mi = 1
+                    while3 mi < len(cleaned) {
+                        if3 lower(cleaned[mi]) == "ms" {
+                            if3 mi > 0 {
+                                let raw_ms = replace(cleaned[mi - 1], "<", "")
+                                let ms_v = try3 { to_int(raw_ms) } fail { -1 }
+                                if3 ms_v >= 0 {
+                                    ms_vals = append(ms_vals, ms_v)
+                                }
+                            }
+                        }
+                        mi = mi + 1
+                    }
+                    // Calculate average ms
+                    let avg_ms = 9999
+                    if3 len(ms_vals) > 0 {
+                        let ms_sum = 0
+                        for3 mv in ms_vals {
+                            ms_sum = ms_sum + mv
+                        }
+                        avg_ms = round(ms_sum / len(ms_vals), 2)
+                    }
+                    // Last token is the address (or * for timeout)
+                    let addr = cleaned[len(cleaned) - 1]
+                    if3 addr == "ms" {
+                        addr = "*"
+                    }
+                    let trit = latency_trit(avg_ms)
+                    let hop_item = {}
+                    hop_item = dict_set(hop_item, "hop", hop_num)
+                    hop_item = dict_set(hop_item, "address", addr)
+                    hop_item = dict_set(hop_item, "avg_ms", avg_ms)
+                    hop_item = dict_set(hop_item, "trit", trit)
+                    hop_item = dict_set(hop_item, "char", trit_char(trit))
+                    hop_item = dict_set(hop_item, "samples", ms_vals)
+                    hops = append(hops, hop_item)
+                    bt = bt + trit_char(trit)
+                }
+            }
+        }
+    }
+
+    let hop_count = len(hops)
+    let overall = T_FALSE
+    if3 hop_count > 0 {
+        overall = T_MAYBE
+    } else3 {
+        overall = T_FALSE
+    }
+
+    record_trit(overall)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", T_TRUE)
+    resp = dict_set(resp, "host", host)
+    resp = dict_set(resp, "hops", hops)
+    resp = dict_set(resp, "hop_count", hop_count)
+    resp = dict_set(resp, "health_bt", bt)
+    resp = dict_set(resp, "trit", overall)
+    resp = dict_set(resp, "char", trit_char(overall))
+
+    return resp
+}
+troute(server, "POST", "/tnet/trace", "handle_trace")
+
+// =============================================================================
+// ROUTE: POST /tnet/bandwidth
+// Bandwidth test: download a URL and measure throughput (bytes/sec)
+// Body: {url, timeout}
+//   url     -- URL to download for bandwidth test (required)
+//   timeout -- download timeout in seconds (default: 13 = H13)
+// =============================================================================
+fn handle_bandwidth(body) {
+    if3 dict_has(body, "url") == 0 {
+        record_trit(T_FALSE)
+        return {
+            "ok": T_FALSE,
+            "error": "url required",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    } else3 { _x = 0
+    }
+
+    let url = dict_get(body, "url")
+    let timeout = H13
+    if3 dict_has(body, "timeout") {
+        timeout = dict_get(body, "timeout")
+    } else3 {
+        timeout = H13
+    }
+
+    // Ensure scheme
+    let has_http = contains(url, "http://")
+    let has_https = contains(url, "https://")
+    if3 has_http == 0 {
+        if3 has_https == 0 {
+            url = "http://" + url
+        } else3 {
+            url = url
+        }
+    } else3 {
+        url = url
+    }
+
+    // Use curl to download URL content, measure bytes and time
+    // curl write-out gives us size_download and time_total
+    let curl_cmd = "curl -s -L --max-time " + str(timeout) + " -o NUL -w \"status:%{http_code}\\nsize:%{size_download}\\ntime:%{time_total}\" \"" + url + "\" 2>NUL"
+    let shell_result = shell(curl_cmd)
+    let curl_out = try3 { dict_get(shell_result, "stdout") } fail { "" }
+
+    // Parse curl write-out
+    let bw_lines = split(curl_out, "\n")
+    let status_code = 0
+    let body_bytes = 0
+    let elapsed_s = 0.0
+    let elapsed_ms = 9999
+    for3 bl in bw_lines {
+        let bl_t = trim(bl)
+        if3 starts_with(bl_t, "status:") {
+            let _t3 = try3 { to_int(slice(bl_t, 7, len(bl_t))) } fail { 0 }
+            status_code = _t3
+        } else if3 starts_with(bl_t, "size:") {
+            let _t4 = try3 { to_int(slice(bl_t, 5, len(bl_t))) } fail { 0 }
+            body_bytes = _t4
+        } else if3 starts_with(bl_t, "time:") {
+            let _t5 = try3 { to_float(slice(bl_t, 5, len(bl_t))) } fail { 9.999 }
+            elapsed_s = _t5
+            elapsed_ms = round(elapsed_s * 1000, 0)
+        }
+    }
+
+    // Calculate throughput
+    let bps = 0
+    let mbps = 0
+    if3 elapsed_s > 0 {
+        bps = round(body_bytes / elapsed_s, 0)
+        mbps = round(bps / 1048576, 3)
+    }
+
+    let out = json_encode({"ok": 1, "url": url, "status": status_code, "bytes": body_bytes, "elapsed_s": round(elapsed_s, 3), "bytes_per_sec": bps, "mbps": mbps, "elapsed_ms": elapsed_ms})
+    let resp = {}
+
+    try3 {
+        let parsed = json_decode(trim(out))
+        let elapsed_ms = dict_get(parsed, "elapsed_ms") ?? 9999
+        let bps = dict_get(parsed, "bytes_per_sec") ?? 0
+        let mbps = dict_get(parsed, "mbps") ?? 0
+        let bytes_downloaded = dict_get(parsed, "bytes") ?? 0
+        let status_code = dict_get(parsed, "status") ?? 0
+
+        // Trit based on throughput: >1MB/s = T_TRUE, >10KB/s = T_MAYBE, else T_FALSE
+        let trit = T_FALSE
+        let regime = "chaotic"
+        if3 bps > 1048576 {
+            trit = T_TRUE
+            regime = "laminar"
+        } else if3 bps > 10240 {
+            trit = T_MAYBE
+            regime = "transitional"
+        } else if3 bps > 0 {
+            trit = T_MAYBE
+            regime = "turbulent"
+        } else3 {
+            trit = T_FALSE
+            regime = "chaotic"
+        }
+
+        // HTTP error degrades trit
+        if3 status_code >= 400 {
+            trit = T_FALSE
+            regime = "chaotic"
+        } else3 {
+            trit = trit
+        }
+
+        record_trit(trit)
+
+        resp = dict_set(resp, "ok", T_TRUE)
+        resp = dict_set(resp, "url", url)
+        resp = dict_set(resp, "status", status_code)
+        resp = dict_set(resp, "bytes", bytes_downloaded)
+        resp = dict_set(resp, "elapsed_ms", elapsed_ms)
+        resp = dict_set(resp, "elapsed_s", dict_get(parsed, "elapsed_s") ?? 0)
+        resp = dict_set(resp, "bytes_per_sec", bps)
+        resp = dict_set(resp, "mbps", mbps)
+        resp = dict_set(resp, "reynolds", elapsed_ms)
+        resp = dict_set(resp, "regime", regime)
+        resp = dict_set(resp, "trit", trit)
+        resp = dict_set(resp, "char", trit_char(trit))
+    } else3 {
+        record_trit(T_FALSE)
+        resp = dict_set(resp, "ok", T_FALSE)
+        resp = dict_set(resp, "url", url)
+        resp = dict_set(resp, "error", "bandwidth test failed or timed out")
+        resp = dict_set(resp, "raw", trim(out))
+        resp = dict_set(resp, "bytes", 0)
+        resp = dict_set(resp, "bytes_per_sec", 0)
+        resp = dict_set(resp, "mbps", 0)
+        resp = dict_set(resp, "elapsed_ms", 9999)
+        resp = dict_set(resp, "regime", "chaotic")
+        resp = dict_set(resp, "trit", T_FALSE)
+        resp = dict_set(resp, "char", "T")
+    }
+
+    return resp
+}
+troute(server, "POST", "/tnet/bandwidth", "handle_bandwidth")
+
+// =============================================================================
+// ROUTE: POST /tnet/dns
+// DNS lookup via nslookup + NovaLang parser (zero Python)
+// Body: {hostname, record_type}
+//   hostname    -- domain to resolve (required)
+//   record_type -- "A", "AAAA", "ANY" etc (informational)
+// =============================================================================
+fn handle_dns(body) {
+    if3 dict_has(body, "hostname") == 0 {
+        record_trit(T_FALSE)
+        return {
+            "ok": T_FALSE,
+            "error": "hostname required",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    } else3 { _x = 0
+    }
+
+    let hostname = dict_get(body, "hostname")
+    let record_type = "A"
+    if3 dict_has(body, "record_type") {
+        record_type = dict_get(body, "record_type")
+    } else3 {
+        record_type = "A"
+    }
+
+    // Use nslookup via shell for DNS resolution with timing
+    let t0 = time()
+    let dns_result = shell("nslookup " + hostname + " 2>NUL")
+    let elapsed_ms = round((time() - t0) * 1000, 2)
+    let dns_out = try3 { dict_get(dns_result, "stdout") } fail { "" }
+
+    // Parse nslookup output for addresses
+    // nslookup returns lines like: "Addresses:  1.2.3.4" or "Address:  1.2.3.4"
+    let addresses = []
+    let record_types = []
+    let dns_lines = split(dns_out, "\n")
+    let past_server = 0
+    for3 dl in dns_lines {
+        let dl_t = trim(dl)
+        // Skip the server section (first Address: line is the DNS server)
+        if3 contains(dl_t, "Name:") {
+            past_server = 1
+        }
+        if3 past_server == 1 {
+            if3 starts_with(dl_t, "Address") {
+                // Extract IP after the colon
+                let addr_parts = split(dl_t, ":")
+                if3 len(addr_parts) >= 2 {
+                    let addr_val = trim(addr_parts[len(addr_parts) - 1])
+                    if3 len(addr_val) > 0 {
+                        // Check for multiple addresses on one line (space separated)
+                        let multi = split(addr_val, " ")
+                        for3 ma in multi {
+                            let ma_t = trim(ma)
+                            if3 len(ma_t) > 0 {
+                                addresses = append(addresses, ma_t)
+                                // Determine record type
+                                if3 contains(ma_t, ":") {
+                                    if3 contains(json_encode(record_types), "AAAA") == 0 {
+                                        record_types = append(record_types, "AAAA")
+                                    }
+                                } else3 {
+                                    if3 contains(json_encode(record_types), "A") == 0 {
+                                        record_types = append(record_types, "A")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let count = len(addresses)
+    let resolved = 0
+    if3 count > 0 {
+        resolved = 1
+    }
+
+    let resp = {}
+    if3 resolved == 1 {
+        let trit = latency_trit(elapsed_ms)
+        record_trit(trit)
+
+        resp = dict_set(resp, "ok", T_TRUE)
+        resp = dict_set(resp, "hostname", hostname)
+        resp = dict_set(resp, "resolved", resolved)
+        resp = dict_set(resp, "addresses", addresses)
+        resp = dict_set(resp, "record_types", record_types)
+        resp = dict_set(resp, "count", count)
+        resp = dict_set(resp, "elapsed_ms", elapsed_ms)
+        resp = dict_set(resp, "reynolds", elapsed_ms)
+        resp = dict_set(resp, "regime", flow_regime(elapsed_ms))
+        resp = dict_set(resp, "trit", trit)
+        resp = dict_set(resp, "char", trit_char(trit))
+    } else3 {
+        // DNS resolution failed
+        record_trit(T_FALSE)
+
+        resp = dict_set(resp, "ok", T_FALSE)
+        resp = dict_set(resp, "hostname", hostname)
+        resp = dict_set(resp, "resolved", 0)
+        resp = dict_set(resp, "addresses", [])
+        resp = dict_set(resp, "record_types", [])
+        resp = dict_set(resp, "count", 0)
+        resp = dict_set(resp, "elapsed_ms", elapsed_ms)
+        resp = dict_set(resp, "error", "DNS resolution failed for " + hostname)
+        resp = dict_set(resp, "raw", trim(dns_out))
+        resp = dict_set(resp, "reynolds", 9999)
+        resp = dict_set(resp, "regime", "chaotic")
+        resp = dict_set(resp, "trit", T_FALSE)
+        resp = dict_set(resp, "char", "T")
+    }
+
+    return resp
+}
+troute(server, "POST", "/tnet/dns", "handle_dns")
+
+// =============================================================================
+// ROUTE: POST /tnet/health
+// Check if a URL or host+port is reachable (TCP-level)
+// Body: {url} OR {host, port} with optional {timeout}
+//   url     -- full URL (extracts host+port from it for TCP check)
+//   host    -- target hostname (used with port if no url)
+//   port    -- target port (used with host if no url)
+//   timeout -- seconds (default: 3)
+// =============================================================================
+}
+fn handle_health_check(body) {
+    let timeout = H3
+    if3 dict_has(body, "timeout") {
+        timeout = dict_get(body, "timeout")
+    } else3 {
+        timeout = H3
+    }
+
+    // Determine host and port from either url or host+port
+    let check_host = "127.0.0.1"
+    let check_port = 80
+    let check_url = ""
+
+    if3 dict_has(body, "url") { url = dict_get(body, "url")
+        check_url = url
+        // Parse host and port from URL using NovaLang string ops (zero Python)
+        // Strip scheme prefix
+        let url_body = url
+        let is_https = 0
+        if3 starts_with(url, "https://") {
+            url_body = slice(url, 8, len(url))
+            is_https = 1
+        } else if3 starts_with(url, "http://") {
+            url_body = slice(url, 7, len(url))
+        }
+        // Remove path (everything after first /)
+        let slash_idx = -1
+        let si2 = 0
+        while3 si2 < len(url_body) {
+            if3 slice(url_body, si2, si2 + 1) == "/" {
+                if3 slash_idx == -1 {
+                    slash_idx = si2
+                }
+            }
+            si2 = si2 + 1
+        }
+        let host_port = url_body
+        if3 slash_idx > 0 {
+            host_port = slice(url_body, 0, slash_idx)
+        }
+        // Split host:port
+        let colon_idx = -1
+        let ci2 = len(host_port) - 1
+        while3 ci2 >= 0 {
+            if3 slice(host_port, ci2, ci2 + 1) == ":" {
+                colon_idx = ci2
+                ci2 = -1
+            }
+            ci2 = ci2 - 1
+        }
+        if3 colon_idx > 0 {
+            check_host = slice(host_port, 0, colon_idx)
+            let _t6 = try3 { to_int(slice(host_port, colon_idx + 1, len(host_port))) } fail { 80 }
+            check_port = _t6
+        } else3 {
+            check_host = host_port
+            if3 is_https == 1 {
+                check_port = 443
+            } else3 {
+                check_port = 80
+            }
+        }
+    } else if3 dict_has(body, "host") {
+        check_host = dict_get(body, "host")
+        if3 dict_has(body, "port") {
+            check_port = dict_get(body, "port")
+        } else3 {
+            check_port = 80
+        }
+    } else3 {
+        // Neither url nor host -- return error
+        record_trit(T_FALSE)
+        return {
+            "ok": T_FALSE,
+            "error": "url or host+port required",
+            "trit": T_FALSE,
+            "char": "T"
+        }
+    }
+
+    // Perform real TCP health check via tcp_probe_one
+    let r = tcp_probe_one(check_host, check_port, timeout)
+
+    let is_open = dict_get(r, "open") ?? 0
+    let ms_val = dict_get(r, "ms") ?? 9999
+    let trit = dict_get(r, "trit") ?? T_FALSE
+    let regime = flow_regime(ms_val)
+
+    record_trit(trit)
+
+    let resp = {}
+    resp = dict_set(resp, "ok", T_TRUE)
+    resp = dict_set(resp, "host", check_host)
+    resp = dict_set(resp, "port", check_port)
+    resp = dict_set(resp, "reachable", is_open)
+    resp = dict_set(resp, "ms", ms_val)
+    resp = dict_set(resp, "error_code", dict_get(r, "error_code") ?? -1)
+    resp = dict_set(resp, "status", dict_get(r, "status") ?? "error")
+    resp = dict_set(resp, "reynolds", ms_val)
+    resp = dict_set(resp, "regime", regime)
+    resp = dict_set(resp, "trit", trit)
+    resp = dict_set(resp, "char", trit_char(trit))
+
+    if3 len(check_url) > 0 {
+        resp = dict_set(resp, "url", check_url)
+    }
+
+    return resp
+}
+troute(server, "POST", "/tnet/health", "handle_health_check")
+
+// POST /tnet/netcat -- simple TCP send/receive via powershell TcpClient (zero Python)
+fn handle_netcat(body) {
+    let host = dict_get(body, "host") ?? ""
+    let port = dict_get(body, "port") ?? 0
+    let data = dict_get(body, "data") ?? ""
+    let timeout = dict_get(body, "timeout") ?? 5
+    if3 len(host) == 0 {
+        return {"ok": false, "error": "missing 'host'", "trit": -1}
+    }
+    if3 port == 0 {
+        return {"ok": false, "error": "missing 'port'", "trit": -1}
+    }
+    // Use powershell TcpClient for connect, send, and recv (zero Python)
+    let ps_send = ""
+    if3 len(data) > 0 {
+        ps_send = "$stream.Write([System.Text.Encoding]::ASCII.GetBytes('" + data + "'),0," + str(len(data)) + "); Start-Sleep -Milliseconds 500; "
+    }
+    let ps_cmd = "powershell -NoProfile -Command \"try { $c=New-Object System.Net.Sockets.TcpClient; $c.SendTimeout=" + str(timeout * 1000) + "; $c.ReceiveTimeout=" + str(timeout * 1000) + "; $c.Connect('" + host + "'," + str(port) + "); $stream=$c.GetStream(); " + ps_send + "$buf=New-Object byte[] 4096; $n=$stream.Read($buf,0,4096); [System.Text.Encoding]::UTF8.GetString($buf,0,$n); $c.Close() } catch { Write-Output $_.Exception.Message }\" 2>NUL"
+    let shell_result = shell(ps_cmd)
+    let out = try3 { dict_get(shell_result, "stdout") } fail { "" }
+    let trit = 1
+    if3 contains(out, "ConnectionRefused") {
+        trit = -1
+    }
+    if3 contains(out, "timed out") {
+        trit = 0
+    }
+    return {"ok": trit >= 0, "host": host, "port": port, "response": trim(out), "trit": trit, "char": trit_char(trit)}
+}
+
+troute(server, "POST", "/tnet/netcat", "handle_netcat")
+
+// =============================================================================
+// Startup banner
+// =============================================================================
+print("=========================================================")
+print("[TNet] NovaX Ternary Network Toolkit v2.1 -- port 9906 (zero Python)")
+print("[TNet] Runtime: NovaLang | Implementation: fully-functional")
+print("[TNet] Harmonics: 3-5-7-13 | Re=27/125/343")
+print("[TNet] Tools: 7 | Block: 2187 (3^7)")
+print("")
+print("[TNet] GET  /health")
+print("[TNet] GET  /tnet/status")
+print("[TNet] POST /tnet/probe     -- TCP port probe via powershell")
+print("[TNet] POST /tnet/fetch     -- HTTP fetch via curl")
+print("[TNet] POST /tnet/scan      -- Multi-port TCP scan (NovaLang loop)")
+print("[TNet] POST /tnet/trace     -- Traceroute via tracert + NovaLang parser")
+print("[TNet] POST /tnet/bandwidth -- Throughput test via curl")
+print("[TNet] POST /tnet/dns       -- DNS lookup via nslookup")
+print("[TNet] POST /tnet/health    -- TCP-level health check URL/host+port")
+print("=========================================================")
+
+// Start server -- MUST be last line
+tstart(server)

@@ -1,0 +1,112 @@
+## folder_watch.nova - Monitor a directory for new/changed files
+## Usage: nova folder_watch.nova <directory> [interval_seconds]
+##        nova folder_watch.nova C:/NovaX/scripts 5
+##        nova folder_watch.nova snapshot <directory>
+
+let args = argv()
+let argc = len(args)
+
+if3 argc < 2
+  print("Usage: folder_watch.nova <directory> [interval_seconds]")
+  print("       folder_watch.nova snapshot <directory>")
+  exit(-1)
+
+let state_dir = "C:/NovaX/data"
+shell("mkdir -p " + state_dir)
+
+if3 args[1] == "snapshot"
+  ## Take a one-time snapshot and report
+  if3 argc < 3
+    print("[-1] Usage: folder_watch.nova snapshot <directory>")
+    exit(-1)
+  let dir = args[2]
+  let snap_file = state_dir + "/watch_snapshot.txt"
+
+  let result = shell("find '" + dir + "' -type f -printf '%T@ %p\n' 2>/dev/null | sort")
+  if3 result["ok"] != 1
+    ## Windows fallback
+    let result = shell("find '" + dir + "' -type f -exec stat --format='%Y %n' {} \\; 2>/dev/null | sort")
+
+  let output = trim(result["stdout"])
+  write_file(snap_file, output)
+  let count_result = shell("echo '" + output + "' | wc -l")
+  let count = trim(count_result["stdout"])
+  print("=== Folder Snapshot ===")
+  print("Directory: " + dir)
+  print("Files:     " + count)
+  print("Saved to:  " + snap_file)
+  print("[TRIT: +1] Snapshot saved")
+  exit(0)
+
+let watch_dir = args[1]
+let interval = 5
+if3 argc >= 3
+  let interval = int(args[2])
+
+let is = str(interval)
+print("=== Folder Watch ===")
+print("Directory: " + watch_dir)
+print("Interval:  " + is + " seconds")
+print("Press Ctrl+C to stop")
+print("")
+
+## Check dir exists
+let check = shell("test -d '" + watch_dir + "' && echo 'OK' || echo 'MISSING'")
+if3 trim(check["stdout"]) == "MISSING"
+  print("[-1] Directory not found: " + watch_dir)
+  exit(-1)
+
+## Take initial snapshot
+let snap_cmd = "find '" + watch_dir + "' -type f -printf '%T@ %s %p\n' 2>/dev/null || find '" + watch_dir + "' -type f -exec stat --format='%Y %s %n' {} \\; 2>/dev/null"
+let initial = shell(snap_cmd)
+let prev_snapshot = trim(initial["stdout"])
+
+let cycle = 0
+let changes_total = 0
+
+while3 true
+  let cycle = cycle + 1
+  shell("sleep " + is)
+
+  ## Take new snapshot
+  let current = shell(snap_cmd)
+  let curr_snapshot = trim(current["stdout"])
+
+  if3 curr_snapshot != prev_snapshot
+    ## Find differences
+    let now_result = shell("date '+%H:%M:%S'")
+    let now = trim(now_result["stdout"])
+
+    ## Write snapshots to temp files for diff
+    write_file(state_dir + "/watch_prev.txt", prev_snapshot)
+    write_file(state_dir + "/watch_curr.txt", curr_snapshot)
+
+    let diff_result = shell("diff " + state_dir + "/watch_prev.txt " + state_dir + "/watch_curr.txt 2>/dev/null")
+    let diff_out = trim(diff_result["stdout"])
+
+    let diff_lines = split(diff_out, "\n")
+    let added = 0
+    let removed = 0
+    let modified = 0
+
+    for3 dl in diff_lines
+      if3 starts_with(dl, "> ")
+        let added = added + 1
+        let file_info = replace(dl, "> ", "")
+        print("[" + now + "] + " + file_info)
+      if3 starts_with(dl, "< ")
+        let removed = removed + 1
+
+    let changes_total = changes_total + added + removed
+    let as_ = str(added)
+    let rs = str(removed)
+    print("[" + now + "] Changes: +" + as_ + " -" + rs)
+
+    let prev_snapshot = curr_snapshot
+  else3
+    ## No changes, print dot every 12 cycles (1 min at 5s interval)
+    let remainder = cycle % 12
+    if3 remainder == 0
+      let cs = str(cycle)
+      let cts = str(changes_total)
+      print("[.] Cycle " + cs + " - no changes (total events: " + cts + ")")

@@ -1,0 +1,1687 @@
+// nova_tquery_service.nova -- NovaX TQuery v1.0 - Ternary Query & Analytics Engine
+// Port 9911: 7 ternary-native query tools built on 3-5-7-13 harmonic constants
+//
+// Tools:
+//   1. SQL        -- SQLite query executor (persistent DB)
+//   2. KV         -- Key-value store with TTL expiration
+//   3. Aggregate  -- Data aggregation pipeline (count/sum/avg/min/max/group/filter/sort)
+//   4. Analyze    -- Statistical analysis (mean/median/mode/stddev/percentiles/outliers)
+//   5. CSV        -- CSV file reader and column analyzer
+//   6. JsonQuery  -- Dot-notation JSONPath-like query engine
+//   7. Pivot      -- Pivot table generator
+//
+// N-S Mapping:
+//   query_flow   = velocity_field (data pipeline stream)
+//   reynolds     = complexity measure (joins * H13 + subqueries * H7*H3 + ...)
+//   Re < 27      = laminar  (simple queries)
+//   Re < 125     = transitional (moderate joins/filters)
+//   Re < 343     = turbulent (complex multi-join aggregations)
+//   Re >= 343    = chaotic  (deep subquery nesting)
+//
+// Ternary trit scoring:
+//   T_TRUE  (+1) = success with data
+//   T_MAYBE ( 0) = success but no data / partial match
+//   T_FALSE (-1) = error / not found
+//
+// Endpoints:
+//   POST /tquery/sql        -- Execute SQL on SQLite
+//   POST /tquery/kv         -- Key-value operations
+//   POST /tquery/aggregate  -- Aggregation pipeline
+//   POST /tquery/analyze    -- Statistical analysis
+//   POST /tquery/csv        -- Read and analyze CSV
+//   POST /tquery/json-query -- Dot-notation JSON query
+//   POST /tquery/pivot      -- Pivot table from records
+//   GET  /tquery/status     -- Service stats
+//   GET  /health            -- Health check
+
+let PORT = 9911
+let server = tserve(PORT, "TQuery v1.0 - Ternary Query & Analytics Engine")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+let BLOCK_SIZE     = 2187   // 3^7 = H3^H7
+let RE_LAMINAR     = 27     // H3^3
+let RE_TRANSITION  = 125    // H5^3
+let RE_TURBULENT   = 343    // H7^3
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Path Constants --
+let NOVAX_ROOT = "C:\\NovaX"
+let MEMORY_DIR = "C:\\NovaX\\memory\\tquery"
+let DB_PATH    = "C:\\NovaX\\memory\\tquery\\tquery.db"
+let KV_PATH    = "C:\\NovaX\\memory\\tquery\\kv.json"
+
+// -- Limits --
+let TOOLS_COUNT = 7     // H7 tools
+let MAX_ROWS    = 100   // max rows returned per query
+let SAMPLE_ROWS = 7     // H7 sample rows for CSV preview
+
+// -- Global Stats State --
+let _ops        = 0
+let _trit_true  = 0
+let _trit_maybe = 0
+let _trit_false = 0
+let _t0         = time()
+let _tool_counts = {}
+let _ts_by_tool  = {}    // tool -> last timestamp (simple recent tracking)
+
+// -- KV Store State --
+// _kv: key -> { "value": ..., "expire": timestamp_or_0 }
+let _kv = {}
+let _kv_write_count = 0
+
+// ============================================================
+// Shared Helper Functions
+// ============================================================
+
+// trit char display
+fn trit_char(t) {
+    if3 t == 1 {
+        return "1"
+    }
+    if3 t == 0 {
+        return "0"
+    }
+    return "T"
+}
+
+// trit scoring: ok + has_data -> T_TRUE, ok + no_data -> T_MAYBE, not ok -> T_FALSE
+fn score_trit(ok, has_data) {
+    if3 ok == false {
+        return T_FALSE
+    }
+    if3 has_data == true {
+        return T_TRUE
+    }
+    return T_MAYBE
+}
+
+// Balanced ternary string from 3 copies of a trit
+fn bt3(t) {
+    let ch = trit_char(t)
+    return ch + ch + ch
+}
+
+// Flow regime from Reynolds number
+fn flow_regime(re) {
+    if3 re < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re < RE_TRANSITION {
+        return "transitional"
+    }
+    if3 re < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+// Record an operation in global stats
+fn record_op(tool_name, trit_val) {
+    let _ops = _ops + 1
+    let _ts_by_tool = dict_set(_ts_by_tool, tool_name, time())
+    let prev_count = dict_get(_tool_counts, tool_name, 0)
+    let _tool_counts = dict_set(_tool_counts, tool_name, prev_count + 1)
+    if3 trit_val == T_TRUE {
+        let _trit_true = _trit_true + 1
+    }
+    if3 trit_val == T_MAYBE {
+        let _trit_maybe = _trit_maybe + 1
+    }
+    if3 trit_val == T_FALSE {
+        let _trit_false = _trit_false + 1
+    }
+    return T_TRUE
+}
+
+// SQL complexity Reynolds estimator
+// complexity = (joins * H13) + (subqueries * H7 * H3) + (wheres * H5) + (groups * H7) + (orders * H3)
+fn sql_reynolds(sql_upper) {
+    let joins      = 0
+    let subqs      = 0
+    let wheres     = 0
+    let groups     = 0
+    let orders     = 0
+    // Count occurrences by splitting on keyword and checking length difference
+    // joins: count " JOIN " occurrences
+    let parts_j    = split(sql_upper, " JOIN ")
+    let joins      = len(parts_j) - 1
+    // subqueries: count "SELECT" minus 1 (main SELECT)
+    let parts_s    = split(sql_upper, "SELECT")
+    let subqs_raw  = len(parts_s) - 1
+    let subqs      = subqs_raw - 1
+    if3 subqs < 0 {
+        let subqs = 0
+    }
+    let parts_w    = split(sql_upper, " WHERE ")
+    let wheres     = len(parts_w) - 1
+    let parts_g    = split(sql_upper, " GROUP BY ")
+    let groups     = len(parts_g) - 1
+    let parts_o    = split(sql_upper, " ORDER BY ")
+    let orders     = len(parts_o) - 1
+    let complexity = (joins * H13) + (subqs * H7 * H3) + (wheres * H5) + (groups * H7) + (orders * H3)
+    if3 complexity < 1 {
+        return 1
+    }
+    return complexity
+}
+
+// ============================================================
+// TOOL 1: SQL -- SQLite Query Executor
+// ============================================================
+
+fn tool_sql(body) {
+    let t0  = time()
+    let sql = dict_get(body, "sql", "")
+    let sql = replace(sql, "\n", " ")
+    let db  = dict_get(body, "db", "default")
+    let confirm_destructive = dict_get(body, "confirm_destructive", false)
+
+    if3 len(sql) == 0 {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "missing 'sql' field", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+
+    let sql_upper  = upper(sql)
+    let re_num     = sql_reynolds(sql_upper)
+    let regime     = flow_regime(re_num)
+
+    // Determine SQL type (first word)
+    let parts      = split(sql_upper, " ")
+    let sql_type   = dict_get(parts, 0, "UNKNOWN")
+
+    // Guard destructive SQL
+    if3 sql_type == "DROP" {
+        if3 confirm_destructive == false {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "trit": T_FALSE, "char": "T", "error": "Destructive SQL requires confirm_destructive:true", "ms": ms}
+        }
+    }
+    if3 sql_type == "TRUNCATE" {
+        if3 confirm_destructive == false {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "trit": T_FALSE, "char": "T", "error": "Destructive SQL requires confirm_destructive:true", "ms": ms}
+        }
+    }
+
+    // Execute via nova_run (delegates to SQLite shell or orchestrator SQL proxy)
+    let result = null
+    try3 {
+        // Write SQL to a temp file and execute via SQLite3 CLI
+        // nova_write / nova_run pattern for DB access
+        let sql_payload = json_encode({"sql": sql, "db": DB_PATH, "max_rows": MAX_ROWS})
+        let db_result   = http_post("http://127.0.0.1:9999/api/db/query", sql_payload, 10)
+        let ms = round((time() - t0) * 1000, 2)
+        if3 db_result == null {
+            return {"ok": false, "error": "DB proxy unavailable", "type": sql_type, "reynolds": re_num, "regime": regime, "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let rows     = dict_get(db_result, "rows", [])
+        let columns  = dict_get(db_result, "columns", [])
+        let affected = dict_get(db_result, "affected", 0)
+        let has_data = false
+        if3 sql_type == "SELECT" {
+            let row_count = len(rows)
+            if3 row_count > 0 {
+                let has_data = true
+            }
+            let trit_val = score_trit(true, has_data)
+            return {
+                "ok": true, "type": sql_type,
+                "columns": columns, "rows": rows, "row_count": row_count,
+                "reynolds": re_num, "regime": regime,
+                "trit": trit_val, "char": trit_char(trit_val),
+                "bt": bt3(trit_val), "ms": ms
+            }
+        }
+        let has_data = false
+        if3 affected > 0 {
+            let has_data = true
+        }
+        let trit_val = score_trit(true, has_data)
+        return {
+            "ok": true, "type": sql_type,
+            "affected": affected,
+            "reynolds": re_num, "regime": regime,
+            "trit": trit_val, "char": trit_char(trit_val),
+            "bt": bt3(trit_val), "ms": ms
+    } else {
+        let ms = round((time() - t0) * 1000, 2)
+        return {
+            "ok": false, "error": "SQL execution error", "type": sql_type,
+            "reynolds": re_num, "regime": regime,
+            "trit": T_FALSE, "char": "T",
+            "bt": "TTT", "ms": ms
+        }
+    }
+}
+
+// ============================================================
+// TOOL 2: KV -- Key-Value Store with TTL
+// ============================================================
+
+// Load KV from disk (called at startup)
+}
+fn kv_load() {
+    try3 {
+        let raw = nova_read(KV_PATH)
+        if3 len(raw) > 0 {
+            let loaded = json_decode(raw)
+            if3 loaded != null {
+                let now = time()
+                let all_k = keys(loaded)
+                let i = 0
+                while3 i < len(all_k) {
+                    let k  = dict_get(all_k, i)
+                    let v  = dict_get(loaded, k, {})
+                    let ex = dict_get(v, "expire", 0)
+                    if3 ex == 0 {
+                        let _kv = dict_set(_kv, k, v)
+                    }
+                    if3 ex > 0 {
+                        if3 ex > now {
+                            let _kv = dict_set(_kv, k, v)
+                        }
+                    }
+                    let i = i + 1
+                }
+            }
+        }
+        return T_TRUE
+    } else {
+        return T_MAYBE
+    }
+}
+
+// Persist KV to disk
+fn kv_persist() {
+    try3 {
+        let raw = json_encode(_kv)
+        let _wr = nova_write(KV_PATH, raw)
+        return T_TRUE
+    } else {
+        return T_FALSE
+    }
+}
+
+// Sweep expired KV entries
+fn kv_sweep() {
+    let now = time()
+    let all_k = keys(_kv)
+    let expired = []
+    let i = 0
+    while3 i < len(all_k) {
+        let k  = dict_get(all_k, i)
+        let v  = dict_get(_kv, k, {})
+        let ex = dict_get(v, "expire", 0)
+        if3 ex > 0 {
+            if3 ex <= now {
+                let expired = append(expired, k)
+            }
+        }
+        let i = i + 1
+    }
+    let j = 0
+    while3 j < len(expired) {
+        let ek = dict_get(expired, j)
+        let _kv = dict_del(_kv, ek)
+        let j = j + 1
+    }
+    if3 len(expired) > 0 {
+        let _p = kv_persist()
+    }
+    return len(expired)
+}
+
+fn tool_kv(body) {
+    let t0  = time()
+    let cmd = upper(dict_get(body, "cmd", ""))
+    let key = dict_get(body, "key", "")
+    let val = dict_get(body, "value", null)
+    let ttl_sec = dict_get(body, "ttl", 0)
+    let bkeys   = dict_get(body, "keys", [])
+    let pairs   = dict_get(body, "pairs", {})
+
+    if3 len(cmd) == 0 {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "missing 'cmd' field", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+
+    // Sweep expired on every op (lightweight -- O(n) but KV is small)
+    let _sw = kv_sweep()
+    let now = time()
+
+    // -- SET --
+    if3 cmd == "SET" {
+        if3 len(key) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'key'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let expire = 0
+        if3 ttl_sec > 0 {
+            let expire = now + ttl_sec
+        }
+        let entry = {"value": val, "expire": expire}
+        let _kv = dict_set(_kv, key, entry)
+        let _kv_write_count = _kv_write_count + 1
+        if3 _kv_write_count >= H13 {
+            let _p = kv_persist()
+            let _kv_write_count = 0
+        }
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "SET", "key": key, "trit": T_TRUE, "char": "1", "bt": "111", "ms": ms}
+    }
+
+    // -- GET --
+    if3 cmd == "GET" {
+        if3 len(key) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'key'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let entry = dict_get(_kv, key, null)
+        if3 entry == null {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": true, "cmd": "GET", "key": key, "value": null, "found": false, "trit": T_MAYBE, "char": "0", "bt": "000", "ms": ms}
+        }
+        let ex = dict_get(entry, "expire", 0)
+        if3 ex > 0 {
+            if3 ex <= now {
+                let _kv = dict_del(_kv, key)
+                let ms = round((time() - t0) * 1000, 2)
+                return {"ok": true, "cmd": "GET", "key": key, "value": null, "found": false, "trit": T_MAYBE, "char": "0", "bt": "000", "ms": ms}
+            }
+        }
+        let found_val = dict_get(entry, "value", null)
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "GET", "key": key, "value": found_val, "found": true, "trit": T_TRUE, "char": "1", "bt": "111", "ms": ms}
+    }
+
+    // -- DEL --
+    if3 cmd == "DEL" {
+        if3 len(key) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'key'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let existed = dict_has(_kv, key)
+        if3 existed == true {
+            let _kv = dict_del(_kv, key)
+            let _kv_write_count = _kv_write_count + 1
+            if3 _kv_write_count >= H13 {
+                let _p = kv_persist()
+                let _kv_write_count = 0
+            }
+        }
+        let trit_val = T_MAYBE
+        if3 existed == true {
+            let trit_val = T_TRUE
+        }
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "DEL", "key": key, "deleted": existed, "trit": trit_val, "char": trit_char(trit_val), "bt": bt3(trit_val), "ms": ms}
+    }
+
+    // -- KEYS --
+    if3 cmd == "KEYS" {
+        let pattern = dict_get(body, "pattern", "*")
+        let all_k   = keys(_kv)
+        let matched = []
+        let i = 0
+        while3 i < len(all_k) {
+            let k = dict_get(all_k, i)
+            let v = dict_get(_kv, k, {})
+            let ex = dict_get(v, "expire", 0)
+            // Skip expired
+            let skip = false
+            if3 ex > 0 {
+                if3 ex <= now {
+                    let skip = true
+                }
+            }
+            if3 skip == false {
+                if3 pattern == "*" {
+                    let matched = append(matched, k)
+                }
+                if3 pattern != "*" {
+                    if3 contains(k, replace(pattern, "*", "")) {
+                        let matched = append(matched, k)
+                    }
+                }
+            }
+            let i = i + 1
+        }
+        let trit_val = T_MAYBE
+        if3 len(matched) > 0 {
+            let trit_val = T_TRUE
+        }
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "KEYS", "keys": matched, "count": len(matched), "trit": trit_val, "char": trit_char(trit_val), "bt": bt3(trit_val), "ms": ms}
+    }
+
+    // -- EXISTS --
+    if3 cmd == "EXISTS" {
+        if3 len(key) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'key'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let entry = dict_get(_kv, key, null)
+        let exists = false
+        if3 entry != null {
+            let ex = dict_get(entry, "expire", 0)
+            if3 ex == 0 {
+                let exists = true
+            }
+            if3 ex > now {
+                let exists = true
+            }
+        }
+        let trit_val = T_MAYBE
+        if3 exists == true {
+            let trit_val = T_TRUE
+        }
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "EXISTS", "key": key, "exists": exists, "trit": trit_val, "char": trit_char(trit_val), "bt": bt3(trit_val), "ms": ms}
+    }
+
+    // -- EXPIRE --
+    if3 cmd == "EXPIRE" {
+        if3 len(key) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'key' or 'ttl'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        if3 ttl_sec == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'key' or 'ttl'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let entry = dict_get(_kv, key, null)
+        if3 entry != null {
+            let entry = dict_set(entry, "expire", now + ttl_sec)
+            let _kv   = dict_set(_kv, key, entry)
+            let _kv_write_count = _kv_write_count + 1
+            if3 _kv_write_count >= H13 {
+                let _p = kv_persist()
+                let _kv_write_count = 0
+            }
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": true, "cmd": "EXPIRE", "key": key, "ttl": ttl_sec, "trit": T_TRUE, "char": "1", "bt": "111", "ms": ms}
+        }
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "EXPIRE", "key": key, "found": false, "trit": T_MAYBE, "char": "0", "bt": "000", "ms": ms}
+    }
+
+    // -- TTL --
+    if3 cmd == "TTL" {
+        if3 len(key) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'key'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let entry = dict_get(_kv, key, null)
+        if3 entry == null {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": true, "cmd": "TTL", "key": key, "ttl": -2, "trit": T_MAYBE, "char": "0", "bt": "000", "ms": ms}
+        }
+        let ex = dict_get(entry, "expire", 0)
+        if3 ex == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": true, "cmd": "TTL", "key": key, "ttl": -1, "trit": T_TRUE, "char": "1", "bt": "111", "ms": ms}
+        }
+        let remaining = ex - now
+        if3 remaining < 0 {
+            let remaining = 0
+        }
+        let remaining = round(remaining, 2)
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "TTL", "key": key, "ttl": remaining, "trit": T_TRUE, "char": "1", "bt": "111", "ms": ms}
+    }
+
+    // -- INCR --
+    if3 cmd == "INCR" {
+        if3 len(key) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'key'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let entry = dict_get(_kv, key, null)
+        let new_val = 1
+        if3 entry != null {
+            let old = dict_get(entry, "value", 0)
+            let new_val = int(old) + 1
+        }
+        let entry = {"value": new_val, "expire": 0}
+        let _kv = dict_set(_kv, key, entry)
+        let _kv_write_count = _kv_write_count + 1
+        if3 _kv_write_count >= H13 {
+            let _p = kv_persist()
+            let _kv_write_count = 0
+        }
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "INCR", "key": key, "value": new_val, "trit": T_TRUE, "char": "1", "bt": "111", "ms": ms}
+    }
+
+    // -- DECR --
+    if3 cmd == "DECR" {
+        if3 len(key) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'key'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let entry = dict_get(_kv, key, null)
+        let new_val = -1
+        if3 entry != null {
+            let old = dict_get(entry, "value", 0)
+            let new_val = int(old) - 1
+        }
+        let entry = {"value": new_val, "expire": 0}
+        let _kv = dict_set(_kv, key, entry)
+        let _kv_write_count = _kv_write_count + 1
+        if3 _kv_write_count >= H13 {
+            let _p = kv_persist()
+            let _kv_write_count = 0
+        }
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "DECR", "key": key, "value": new_val, "trit": T_TRUE, "char": "1", "bt": "111", "ms": ms}
+    }
+
+    // -- MGET --
+    if3 cmd == "MGET" {
+        if3 len(bkeys) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'keys' array", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let result_vals = {}
+        let found_count = 0
+        let i = 0
+        while3 i < len(bkeys) {
+            let k = dict_get(bkeys, i)
+            let entry = dict_get(_kv, k, null)
+            if3 entry != null {
+                let ex = dict_get(entry, "expire", 0)
+                let valid = false
+                if3 ex == 0 {
+                    let valid = true
+                }
+                if3 ex > now {
+                    let valid = true
+                }
+                if3 valid == true {
+                    let result_vals = dict_set(result_vals, k, dict_get(entry, "value", null))
+                    let found_count = found_count + 1
+                }
+                if3 valid == false {
+                    let result_vals = dict_set(result_vals, k, null)
+                }
+            }
+            if3 entry == null {
+                let result_vals = dict_set(result_vals, k, null)
+            }
+            let i = i + 1
+        }
+        let total = len(bkeys)
+        let trit_val = T_FALSE
+        if3 found_count == total {
+            let trit_val = T_TRUE
+        }
+        if3 found_count > 0 {
+            if3 found_count < total {
+                let trit_val = T_MAYBE
+            }
+        }
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "MGET", "values": result_vals, "found": found_count, "total": total, "trit": trit_val, "char": trit_char(trit_val), "bt": bt3(trit_val), "ms": ms}
+    }
+
+    // -- MSET --
+    if3 cmd == "MSET" {
+        let pair_keys = keys(pairs)
+        if3 len(pair_keys) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'pairs' dict", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+        let i = 0
+        while3 i < len(pair_keys) {
+            let pk = dict_get(pair_keys, i)
+            let pv = dict_get(pairs, pk, null)
+            let _kv = dict_set(_kv, pk, {"value": pv, "expire": 0})
+            let i = i + 1
+        }
+        let _p = kv_persist()
+        let _kv_write_count = 0
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": true, "cmd": "MSET", "count": len(pair_keys), "trit": T_TRUE, "char": "1", "bt": "111", "ms": ms}
+    }
+
+    // -- Unknown command --
+    let ms = round((time() - t0) * 1000, 2)
+    return {
+        "ok": false,
+        "error": "unknown cmd: " + cmd,
+        "available": ["SET", "GET", "DEL", "KEYS", "EXISTS", "EXPIRE", "TTL", "INCR", "DECR", "MGET", "MSET"],
+        "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms
+    }
+}
+
+// ============================================================
+// TOOL 3: Aggregate -- Data Aggregation Pipeline
+// ============================================================
+
+fn agg_nums_from_records(records, field) {
+    let nums = []
+    let i = 0
+    while3 i < len(records) {
+        let r = dict_get(records, i)
+        let v = dict_get(r, field, null)
+        if3 v != null {
+            try3 {
+                let fv = float(v)
+                let nums = append(nums, fv)
+            } else {
+                // non-numeric -- skip
+            }
+        }
+        let i = i + 1
+    }
+    return nums
+}
+
+fn tool_aggregate(body) {
+    let t0      = time()
+    let records = dict_get(body, "records", [])
+    let ops     = dict_get(body, "ops", [])
+
+    if3 len(records) == 0 {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "missing 'records' array", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+    if3 len(ops) == 0 {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "missing 'ops' array", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+
+    let result_data = records
+    let input_count = len(records)
+    let ops_applied = 0
+
+    let oi = 0
+    while3 oi < len(ops) {
+        let op     = dict_get(ops, oi)
+        let action = lower(dict_get(op, "action", ""))
+        let field  = dict_get(op, "field", "")
+
+        if3 action == "count" {
+            let cnt = len(result_data)
+            let result_data = [{"count": cnt}]
+            let ops_applied = ops_applied + 1
+        }
+
+        if3 action == "sum" {
+            if3 len(field) > 0 {
+                let nums = agg_nums_from_records(result_data, field)
+                let s = sum(nums)
+                let result_data = [{"sum": s, "field": field, "n": len(nums)}]
+                let ops_applied = ops_applied + 1
+            }
+        }
+
+        if3 action == "avg" {
+            if3 len(field) > 0 {
+                let nums = agg_nums_from_records(result_data, field)
+                let avg_val = 0
+                if3 len(nums) > 0 {
+                    let avg_val = round(sum(nums) / len(nums), 4)
+                }
+                let result_data = [{"avg": avg_val, "field": field, "n": len(nums)}]
+                let ops_applied = ops_applied + 1
+            }
+        }
+
+        if3 action == "min" {
+            if3 len(field) > 0 {
+                let nums = agg_nums_from_records(result_data, field)
+                let min_val = null
+                if3 len(nums) > 0 {
+                    let min_val = min(nums)
+                }
+                let result_data = [{"min": min_val, "field": field}]
+                let ops_applied = ops_applied + 1
+            }
+        }
+
+        if3 action == "max" {
+            if3 len(field) > 0 {
+                let nums = agg_nums_from_records(result_data, field)
+                let max_val = null
+                if3 len(nums) > 0 {
+                    let max_val = max(nums)
+                }
+                let result_data = [{"max": max_val, "field": field}]
+                let ops_applied = ops_applied + 1
+            }
+        }
+
+        if3 action == "filter" {
+            let filter_op  = dict_get(op, "op", "eq")
+            let filter_val = dict_get(op, "value", null)
+            let filtered   = []
+            let fi = 0
+            while3 fi < len(result_data) {
+                let r  = dict_get(result_data, fi)
+                let rv = dict_get(r, field, null)
+                let keep = false
+                if3 filter_op == "eq" {
+                    if3 rv == filter_val {
+                        let keep = true
+                    }
+                }
+                if3 filter_op == "ne" {
+                    if3 rv != filter_val {
+                        let keep = true
+                    }
+                }
+                if3 filter_op == "contains" {
+                    if3 rv != null {
+                        if3 contains(str(rv), str(filter_val)) {
+                            let keep = true
+                        }
+                    }
+                }
+                if3 filter_op == "gt" {
+                    if3 rv != null {
+                        try3 {
+                            if3 float(rv) > float(filter_val) {
+                                let keep = true
+                        } else {
+                            // skip non-numeric
+                        }
+                    }
+                }
+                if3 filter_op == "gte" {
+                    if3 rv != null {
+                        try3 {
+                            if3 float(rv) >= float(filter_val) {
+                                let keep = true
+                        } else {
+                            // skip
+                        }
+                    }
+                }
+                if3 filter_op == "lt" {
+                    if3 rv != null {
+                        try3 {
+                            if3 float(rv) < float(filter_val) {
+                                let keep = true
+                        } else {
+                            // skip
+                        }
+                    }
+                }
+                if3 filter_op == "lte" {
+                    if3 rv != null {
+                        try3 {
+                            if3 float(rv) <= float(filter_val) {
+                                let keep = true
+                        } else {
+                            // skip
+                        }
+                    }
+                }
+                if3 keep == true {
+                    let filtered = append(filtered, r)
+                }
+                let fi = fi + 1
+            }
+            let result_data = filtered
+            let ops_applied = ops_applied + 1
+        }
+
+        if3 action == "sort" {
+            let result_data = sort(result_data, field)
+            let ops_applied = ops_applied + 1
+        }
+
+        if3 action == "group_by" {
+            if3 len(field) > 0 {
+                let agg_field = dict_get(op, "agg_field", "")
+                let agg_func  = dict_get(op, "agg_func", "count")
+                let groups    = {}
+                let gki = 0
+                while3 gki < len(result_data) {
+                    let r  = dict_get(result_data, gki)
+                    let gk = str(dict_get(r, field, "__null__"))
+                    let existing_g = dict_get(groups, gk, [])
+                    let existing_g = append(existing_g, r)
+                    let groups = dict_set(groups, gk, existing_g)
+                    let gki = gki + 1
+                }
+                let grouped = {}
+                let gks = keys(groups)
+                let gj = 0
+                while3 gj < len(gks) {
+                    let gk   = dict_get(gks, gj)
+                    let gv   = dict_get(groups, gk, [])
+                    let gval = len(gv)
+                    if3 agg_func == "count" {
+                        let gval = len(gv)
+                    }
+                    if3 agg_func == "sum" {
+                        if3 len(agg_field) > 0 {
+                            let gnums = agg_nums_from_records(gv, agg_field)
+                            let gval  = sum(gnums)
+                        }
+                    }
+                    if3 agg_func == "avg" {
+                        if3 len(agg_field) > 0 {
+                            let gnums = agg_nums_from_records(gv, agg_field)
+                            if3 len(gnums) > 0 {
+                                let gval = round(sum(gnums) / len(gnums), 4)
+                            }
+                        }
+                    }
+                    let grouped = dict_set(grouped, gk, gval)
+                    let gj = gj + 1
+                }
+                let result_data = [{"group_by": field, "groups": grouped}]
+                let ops_applied = ops_applied + 1
+            }
+        }
+
+        let oi = oi + 1
+    }
+
+    // Reynolds: record count / H7 + op count * H5
+    let re_num  = (input_count / H7) + (len(ops) * H5)
+    let regime  = flow_regime(re_num)
+    let has_data = false
+    if3 len(result_data) > 0 {
+        let has_data = true
+    }
+    let trit_val = score_trit(true, has_data)
+    let ms = round((time() - t0) * 1000, 2)
+
+    return {
+        "ok": true, "results": result_data,
+        "result_count": len(result_data),
+        "input_count": input_count, "ops_applied": ops_applied,
+        "reynolds": re_num, "regime": regime,
+        "trit": trit_val, "char": trit_char(trit_val),
+        "bt": bt3(trit_val), "ms": ms
+    }
+}
+
+// ============================================================
+// TOOL 4: Analyze -- Statistical Analysis
+// ============================================================
+
+// Compute percentile on a sorted list
+}
+}
+}
+}
+fn percentile(sorted_list, p) {
+    let n  = len(sorted_list)
+    if3 n == 0 {
+        return 0
+    }
+    let k  = float(n - 1) * (float(p) / 100)
+    let f  = int(k)
+    let c  = f + 1
+    if3 c >= n {
+        let c = n - 1
+    }
+    if3 f == c {
+        return dict_get(sorted_list, f, 0)
+    }
+    let vf = dict_get(sorted_list, f, 0)
+    let vc = dict_get(sorted_list, c, 0)
+    return float(vf) * (float(c) - k) + float(vc) * (k - float(f))
+}
+
+fn tool_analyze(body) {
+    let t0   = time()
+    let data = dict_get(body, "data", [])
+
+    if3 len(data) == 0 {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "missing 'data' array", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+
+    // Filter to numeric values only
+    let nums = []
+    let di = 0
+    while3 di < len(data) {
+        let x = dict_get(data, di, null)
+        if3 x != null {
+            try3 {
+                let fv = float(x)
+                let nums = append(nums, fv)
+            } else {
+                // skip non-numeric
+            }
+        }
+        let di = di + 1
+    }
+
+    if3 len(nums) == 0 {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "no numeric values in data", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+
+    let n       = len(nums)
+    let total   = sum(nums)
+    let mean    = total / float(n)
+    let sorted_nums = sort(nums)
+
+    // Median
+    let half    = n / 2
+    let median  = dict_get(sorted_nums, half, 0)
+    if3 (n - (n / 2) * 2) == 0 {
+        // even n: average of two middle
+        let m1     = dict_get(sorted_nums, half - 1, 0)
+        let m2     = dict_get(sorted_nums, half, 0)
+        let median = (float(m1) + float(m2)) / 2
+    }
+
+    // Mode: find value with highest frequency (simplified -- take first in sort)
+    let mode_val = dict_get(sorted_nums, 0, 0)
+
+    // Variance and stddev
+    let variance  = 0
+    let vi = 0
+    while3 vi < n {
+        let x   = dict_get(nums, vi, 0)
+        let diff = float(x) - mean
+        let variance = variance + (diff * diff)
+        let vi = vi + 1
+    }
+    let variance = variance / float(n)
+    let stddev   = sqrt(variance)
+
+    // Percentiles
+    let p25 = percentile(sorted_nums, 25)
+    let p50 = percentile(sorted_nums, 50)
+    let p75 = percentile(sorted_nums, 75)
+
+    // IQR and outlier fences
+    let iqr         = p75 - p25
+    let lower_fence = p25 - (1.5 * iqr)
+    let upper_fence = p75 + (1.5 * iqr)
+
+    // Outliers
+    let outliers = []
+    let li = 0
+    while3 li < n {
+        let x = dict_get(nums, li, 0)
+        if3 float(x) < lower_fence {
+            let outliers = append(outliers, x)
+        }
+        if3 float(x) > upper_fence {
+            let outliers = append(outliers, x)
+        }
+        let li = li + 1
+    }
+
+    // Histogram: H13=13 bins
+    let bin_count = H13
+    let data_min  = min(nums)
+    let data_max  = max(nums)
+    let bin_width = 1
+    if3 data_max != data_min {
+        let bin_width = (float(data_max) - float(data_min)) / float(bin_count)
+    }
+
+    let bins      = []
+    let bin_edges = []
+    let bi = 0
+    while3 bi < bin_count {
+        let bins      = append(bins, 0)
+        let edge      = float(data_min) + float(bi) * bin_width
+        let bin_edges = append(bin_edges, round(edge, 4))
+        let bi = bi + 1
+    }
+    let bin_edges = append(bin_edges, round(float(data_max), 4))
+
+    let xi = 0
+    while3 xi < n {
+        let x   = dict_get(nums, xi, 0)
+        let idx = 0
+        if3 bin_width > 0 {
+            let idx = int((float(x) - float(data_min)) / bin_width)
+        }
+        if3 idx >= bin_count {
+            let idx = bin_count - 1
+        }
+        if3 idx < 0 {
+            let idx = 0
+        }
+        let old_bin = dict_get(bins, idx, 0)
+        let bins    = dict_set(bins, idx, old_bin + 1)
+        let xi = xi + 1
+    }
+
+    // Quality trits
+    let n_trit_char      = "1"
+    let stddev_trit_char = "0"
+    let outlier_trit_char = "1"
+    let spread_trit_char  = "0"
+    if3 n < H7 {
+        let n_trit_char = "0"
+    }
+    if3 stddev > 0 {
+        let stddev_trit_char = "1"
+    }
+    if3 len(outliers) > 0 {
+        let outlier_trit_char = "0"
+    }
+    if3 iqr > 0 {
+        let spread_trit_char = "1"
+    }
+
+    let trit_val = T_TRUE
+    let ms = round((time() - t0) * 1000, 2)
+
+    return {
+        "ok": true,
+        "n": n, "mean": round(mean, 4), "median": round(median, 4),
+        "mode": mode_val,
+        "stddev": round(stddev, 4), "variance": round(variance, 4),
+        "min": data_min, "max": data_max,
+        "percentiles": {"p25": round(p25, 4), "p50": round(p50, 4), "p75": round(p75, 4)},
+        "iqr": round(iqr, 4),
+        "outliers": outliers, "outlier_count": len(outliers),
+        "histogram": {"bins": bins, "edges": bin_edges, "bin_count": bin_count},
+        "quality": {
+            "n_trit": n_trit_char,
+            "stddev_trit": stddev_trit_char,
+            "outlier_trit": outlier_trit_char,
+            "spread_trit": spread_trit_char
+        },
+        "lower_fence": round(lower_fence, 4),
+        "upper_fence": round(upper_fence, 4),
+        "trit": trit_val, "char": trit_char(trit_val),
+        "bt": bt3(trit_val), "ms": ms
+    }
+}
+
+// ============================================================
+// TOOL 5: CSV -- CSV File Reader & Analyzer
+// ============================================================
+
+fn tool_csv(body) {
+    let t0      = time()
+    let path    = dict_get(body, "path", "")
+    let content = dict_get(body, "content", "")
+
+    if3 len(path) == 0 {
+        if3 len(content) == 0 {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "missing 'path' or 'content'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+    }
+
+    try3 {
+        let raw = content
+        if3 len(path) > 0 {
+            let raw = nova_read(path)
+        }
+
+        if3 raw == null {
+            let ms = round((time() - t0) * 1000, 2)
+            return {"ok": false, "error": "could not read file: " + path, "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+        }
+
+        // Split into lines
+        let lines     = split(raw, "\n")
+        let row_count = len(lines) - 1   // subtract header
+        if3 row_count < 0 {
+            let row_count = 0
+        }
+
+        // Parse header (first line)
+        let header_line = dict_get(lines, 0, "")
+        let columns     = split(header_line, ",")
+        let col_count   = len(columns)
+
+        // Parse data rows (lines 1..N)
+        let rows   = []
+        let ri = 1
+        while3 ri < len(lines) {
+            let line = dict_get(lines, ri, "")
+            if3 len(line) > 0 {
+                let cells = split(line, ",")
+                let row   = {}
+                let ci = 0
+                while3 ci < col_count {
+                    let col_name = dict_get(columns, ci, "")
+                    let cell_val = dict_get(cells, ci, "")
+                    let row = dict_set(row, col_name, cell_val)
+                    let ci = ci + 1
+                }
+                let rows = append(rows, row)
+            }
+            let ri = ri + 1
+        }
+
+        let actual_row_count = len(rows)
+
+        // Detect column types and compute stats
+        let col_types = {}
+        let col_stats = {}
+        let cti = 0
+        while3 cti < col_count {
+            let col = dict_get(columns, cti, "")
+            // Collect values for this column
+            let col_vals = []
+            let rci = 0
+            while3 rci < actual_row_count {
+                let r = dict_get(rows, rci, {})
+                let v = dict_get(r, col, "")
+                if3 len(v) > 0 {
+                    let col_vals = append(col_vals, v)
+                }
+                let rci = rci + 1
+            }
+
+            if3 len(col_vals) == 0 {
+                let col_types = dict_set(col_types, col, "empty")
+            }
+            if3 len(col_vals) > 0 {
+                // Try int
+                let all_int = true
+                let ii = 0
+                let int_nums = []
+                while3 ii < len(col_vals) {
+                    let v = dict_get(col_vals, ii, "")
+                    try3 {
+                        let iv = int(v)
+                        let int_nums = append(int_nums, iv)
+                    } else {
+                        let all_int = false
+                    }
+                    let ii = ii + 1
+                }
+                if3 all_int == true {
+                    if3 len(int_nums) > 0 {
+                        let col_types = dict_set(col_types, col, "int")
+                        let cs = {
+                            "min":   min(int_nums),
+                            "max":   max(int_nums),
+                            "mean":  round(sum(int_nums) / len(int_nums), 2),
+                            "count": len(int_nums)
+                        }
+                        let col_stats = dict_set(col_stats, col, cs)
+                    }
+                }
+                if3 all_int == false {
+                    // Try float
+                    let all_float = true
+                    let fni = 0
+                    let float_nums = []
+                    while3 fni < len(col_vals) {
+                        let v = dict_get(col_vals, fni, "")
+                        try3 {
+                            let fv = float(v)
+                            let float_nums = append(float_nums, fv)
+                        } else {
+                            let all_float = false
+                        }
+                        let fni = fni + 1
+                    }
+                    if3 all_float == true {
+                        if3 len(float_nums) > 0 {
+                            let col_types = dict_set(col_types, col, "float")
+                            let cs = {
+                                "min":   round(min(float_nums), 4),
+                                "max":   round(max(float_nums), 4),
+                                "mean":  round(sum(float_nums) / len(float_nums), 4),
+                                "count": len(float_nums)
+                            }
+                            let col_stats = dict_set(col_stats, col, cs)
+                        }
+                    }
+                    if3 all_float == false {
+                        let col_types = dict_set(col_types, col, "string")
+                    }
+                }
+            }
+            let cti = cti + 1
+        }
+
+        // Sample rows (first SAMPLE_ROWS=7)
+        let sample = slice(rows, 0, SAMPLE_ROWS)
+
+        // Fill rate
+        let empty_cells = 0
+        let total_cells = actual_row_count * col_count
+        if3 total_cells == 0 {
+            let total_cells = 1
+        }
+        let frc = 0
+        while3 frc < actual_row_count {
+            let r = dict_get(rows, frc, {})
+            let fc = 0
+            while3 fc < col_count {
+                let col = dict_get(columns, fc, "")
+                let v   = dict_get(r, col, "")
+                if3 len(v) == 0 {
+                    let empty_cells = empty_cells + 1
+                }
+                let fc = fc + 1
+            }
+            let frc = frc + 1
+        }
+        let fill_rate = 1 - (float(empty_cells) / float(total_cells))
+        let fill_rate = round(fill_rate, 4)
+
+        // Quality trit: > 2/3 fill = T_TRUE, > 1/3 fill = T_MAYBE, else T_FALSE
+        let quality_trit = T_FALSE
+        if3 fill_rate > 0.333 {
+            let quality_trit = T_MAYBE
+        }
+        if3 fill_rate > 0.667 {
+            let quality_trit = T_TRUE
+        }
+
+        let has_data = false
+        if3 actual_row_count > 0 {
+            let has_data = true
+        }
+        let trit_val = score_trit(true, has_data)
+        let ms = round((time() - t0) * 1000, 2)
+
+        return {
+            "ok": true,
+            "columns": columns, "column_count": col_count,
+            "row_count": actual_row_count, "col_types": col_types,
+            "col_stats": col_stats, "sample": sample,
+            "fill_rate": fill_rate,
+            "quality_trit": trit_char(quality_trit),
+            "trit": trit_val, "char": trit_char(trit_val),
+            "bt": bt3(trit_val), "ms": ms
+    } else {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "CSV read/parse error", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+}
+
+// ============================================================
+// TOOL 6: JsonQuery -- Dot-notation Query Engine
+// ============================================================
+// Supports: "a.b.c", "a.0.b", array index notation
+// Wildcard "*" expands all dict values / list items
+}
+
+fn json_navigate(obj, path) {
+    // Split path on dots
+    let parts = split(path, ".")
+    let current_list = [obj]
+
+    let pi = 0
+    while3 pi < len(parts) {
+        let part     = dict_get(parts, pi, "")
+        let next     = []
+        let ci = 0
+        while3 ci < len(current_list) {
+            let item = dict_get(current_list, ci, null)
+            if3 item != null {
+                if3 part == "*" {
+                    // Wildcard: expand all dict values or list items
+                    if3 type_of(item) == "dict" {
+                        let item_vals = values(item)
+                        let wvi = 0
+                        while3 wvi < len(item_vals) {
+                            let next = append(next, dict_get(item_vals, wvi, null))
+                            let wvi = wvi + 1
+                        }
+                    }
+                    if3 type_of(item) == "list" {
+                        let wli = 0
+                        while3 wli < len(item) {
+                            let next = append(next, dict_get(item, wli, null))
+                            let wli = wli + 1
+                        }
+                    }
+                }
+                if3 part != "*" {
+                    // Try numeric index
+                    try3 {
+                        let idx = int(part)
+                        if3 type_of(item) == "list" {
+                            if3 idx >= 0 {
+                                if3 idx < len(item) {
+                                    let next = append(next, dict_get(item, idx, null))
+                    } else {
+                        // Dict key lookup
+                        if3 type_of(item) == "dict" {
+                            if3 dict_has(item, part) {
+                                let next = append(next, dict_get(item, part, null))
+                            }
+                        }
+                    }
+                }
+            }
+            let ci = ci + 1
+        }
+        let current_list = next
+        let pi = pi + 1
+    }
+
+    return current_list
+}
+}
+}
+}
+
+fn tool_json_query(body) {
+    let t0   = time()
+    let data = dict_get(body, "data", null)
+    let path = dict_get(body, "path", "")
+
+    if3 data == null {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "missing 'data' field", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+    if3 len(path) == 0 {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "missing 'path' field", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+
+    try3 {
+        let results    = json_navigate(data, path)
+        let total      = len(results)
+        let trit_val   = T_FALSE
+        if3 total > 0 {
+            let trit_val = T_TRUE
+        }
+
+        // Return single value or list depending on match count
+        let result_val = null
+        if3 total == 1 {
+            let result_val = dict_get(results, 0, null)
+        }
+        if3 total > 1 {
+            let result_val = results
+        }
+
+        let ms = round((time() - t0) * 1000, 2)
+        return {
+            "ok": true, "path": path,
+            "results": result_val,
+            "match_count": total,
+            "trit": trit_val, "char": trit_char(trit_val),
+            "bt": bt3(trit_val), "ms": ms
+    } else {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "JSON query error", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+}
+
+// ============================================================
+// TOOL 7: Pivot -- Pivot Table Generator
+// ============================================================
+
+// Apply aggregation to a list of numeric values
+}
+fn pivot_agg(vals, agg_func) {
+    if3 len(vals) == 0 {
+        return 0
+    }
+    if3 agg_func == "count" {
+        return len(vals)
+    }
+    if3 agg_func == "sum" {
+        return round(sum(vals), 4)
+    }
+    if3 agg_func == "avg" {
+        return round(sum(vals) / len(vals), 4)
+    }
+    if3 agg_func == "min" {
+        return min(vals)
+    }
+    if3 agg_func == "max" {
+        return max(vals)
+    }
+    return sum(vals)
+}
+
+fn tool_pivot(body) {
+    let t0          = time()
+    let records     = dict_get(body, "records", [])
+    let row_field   = dict_get(body, "row_field", "")
+    let col_field   = dict_get(body, "col_field", "")
+    let value_field = dict_get(body, "value_field", "")
+    let agg_func    = lower(dict_get(body, "agg_func", "sum"))
+
+    if3 len(records) == 0 {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "missing 'records'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+    if3 len(row_field) == 0 {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "missing 'row_field' or 'col_field'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+    if3 len(col_field) == 0 {
+        let ms = round((time() - t0) * 1000, 2)
+        return {"ok": false, "error": "missing 'row_field' or 'col_field'", "trit": T_FALSE, "char": "T", "bt": "TTT", "ms": ms}
+    }
+
+    // Collect unique row and col values
+    let row_set = {}
+    let col_set = {}
+    let cells   = {}
+
+    let ri = 0
+    while3 ri < len(records) {
+        let r  = dict_get(records, ri, {})
+        let rk = str(dict_get(r, row_field, ""))
+        let ck = str(dict_get(r, col_field, ""))
+        let vv = dict_get(r, value_field, 0)
+
+        let row_set = dict_set(row_set, rk, 1)
+        let col_set = dict_set(col_set, ck, 1)
+
+        let cell_key  = rk + "|" + ck
+        let cell_list = dict_get(cells, cell_key, [])
+        try3 {
+            let fv = float(vv)
+            let cell_list = append(cell_list, fv)
+        } else {
+            if3 len(value_field) > 0 {
+                let cell_list = append(cell_list, 1)
+            }
+        }
+        let cells = dict_set(cells, cell_key, cell_list)
+        let ri = ri + 1
+    }
+
+    let row_vals = sort(keys(row_set))
+    let col_vals = sort(keys(col_set))
+
+    // Build matrix
+    let matrix = []
+    let mri = 0
+    while3 mri < len(row_vals) {
+        let rv   = dict_get(row_vals, mri, "")
+        let row  = []
+        let mci  = 0
+        while3 mci < len(col_vals) {
+            let cv       = dict_get(col_vals, mci, "")
+            let cell_key = rv + "|" + cv
+            let cell_vals = dict_get(cells, cell_key, [])
+            let agg_val   = pivot_agg(cell_vals, agg_func)
+            let row = append(row, agg_val)
+            let mci = mci + 1
+        }
+        let matrix = append(matrix, row)
+        let mri = mri + 1
+    }
+
+    // Reynolds: pivot complexity = row_count * col_count / H7
+    let re_num  = (len(row_vals) * len(col_vals)) / H7
+    let regime  = flow_regime(re_num)
+
+    let has_data = false
+    if3 len(matrix) > 0 {
+        let has_data = true
+    }
+    let trit_val = score_trit(true, has_data)
+    let ms = round((time() - t0) * 1000, 2)
+
+    return {
+        "ok": true,
+        "row_headers": row_vals, "col_headers": col_vals,
+        "matrix": matrix,
+        "rows": len(row_vals), "cols": len(col_vals),
+        "agg_func": agg_func, "value_field": value_field,
+        "reynolds": re_num, "regime": regime,
+        "trit": trit_val, "char": trit_char(trit_val),
+        "bt": bt3(trit_val), "ms": ms
+    }
+}
+
+// ============================================================
+// Route Handlers (dispatch wrappers with stats recording)
+// ============================================================
+
+fn handle_sql(body) {
+    let result   = tool_sql(body)
+    let trit_val = dict_get(result, "trit", T_MAYBE)
+    let _rc = record_op("sql", trit_val)
+    return result
+}
+
+fn handle_kv(body) {
+    let result   = tool_kv(body)
+    let trit_val = dict_get(result, "trit", T_MAYBE)
+    let _rc = record_op("kv", trit_val)
+    return result
+}
+
+fn handle_aggregate(body) {
+    let result   = tool_aggregate(body)
+    let trit_val = dict_get(result, "trit", T_MAYBE)
+    let _rc = record_op("aggregate", trit_val)
+    return result
+}
+
+fn handle_analyze(body) {
+    let result   = tool_analyze(body)
+    let trit_val = dict_get(result, "trit", T_MAYBE)
+    let _rc = record_op("analyze", trit_val)
+    return result
+}
+
+fn handle_csv(body) {
+    let result   = tool_csv(body)
+    let trit_val = dict_get(result, "trit", T_MAYBE)
+    let _rc = record_op("csv", trit_val)
+    return result
+}
+
+fn handle_json_query(body) {
+    let result   = tool_json_query(body)
+    let trit_val = dict_get(result, "trit", T_MAYBE)
+    let _rc = record_op("json-query", trit_val)
+    return result
+}
+
+fn handle_pivot(body) {
+    let result   = tool_pivot(body)
+    let trit_val = dict_get(result, "trit", T_MAYBE)
+    let _rc = record_op("pivot", trit_val)
+    return result
+}
+
+// GET /health
+fn handle_health(body) {
+    let uptime   = round(time() - _t0, 2)
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        let self_trit = T_TRUE
+    }
+    return {
+        "ok": true, "service": "nova-tquery", "port": PORT,
+        "version": "1.0", "ternary": true, "runtime": "novalang",
+        "tools": ["sql", "kv", "aggregate", "analyze", "csv", "json-query", "pivot"],
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "self_trit": self_trit, "char": trit_char(self_trit),
+        "uptime": int(uptime),
+        "total_ops": _ops,
+        "quality": {
+            "strong": _trit_true,
+            "partial": _trit_maybe,
+            "failed": _trit_false
+        }
+    }
+}
+
+// GET /tquery/status
+fn handle_status(body) {
+    let uptime   = round(time() - _t0, 2)
+    let kv_size  = len(keys(_kv))
+    return {
+        "ok": true, "service": "nova-tquery", "version": "1.0",
+        "uptime": int(uptime),
+        "total_ops": _ops,
+        "queries_by_tool": _tool_counts,
+        "kv_size": kv_size, "kv_writes": _kv_write_count,
+        "db_path": DB_PATH, "kv_path": KV_PATH,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "tools": ["sql", "kv", "aggregate", "analyze", "csv", "json-query", "pivot"],
+        "tool_count": TOOLS_COUNT,
+        "quality": {
+            "strong": _trit_true,
+            "partial": _trit_maybe,
+            "failed": _trit_false
+        },
+        "bt": "11011011011"
+    }
+}
+
+// POST /tquery/clean -- manual KV sweep
+fn handle_clean(body) {
+    let purged = kv_sweep()
+    let _p     = kv_persist()
+    return {
+        "ok": true, "trit": T_TRUE, "char": "1",
+        "purged": purged, "kv_remaining": len(keys(_kv))
+    }
+}
+
+// ============================================================
+// Initialization
+// ============================================================
+
+// Load persisted KV data from disk
+let _kv_loaded = kv_load()
+
+// ============================================================
+// Route Registration
+// ============================================================
+troute(server, "GET",  "/health",              "handle_health")
+troute(server, "GET",  "/tquery/status",       "handle_status")
+troute(server, "POST", "/tquery/sql",          "handle_sql")
+troute(server, "POST", "/tquery/kv",           "handle_kv")
+troute(server, "POST", "/tquery/aggregate",    "handle_aggregate")
+troute(server, "POST", "/tquery/analyze",      "handle_analyze")
+troute(server, "POST", "/tquery/csv",          "handle_csv")
+troute(server, "POST", "/tquery/json-query",   "handle_json_query")
+troute(server, "POST", "/tquery/pivot",        "handle_pivot")
+troute(server, "POST", "/tquery/clean",        "handle_clean")
+
+// ============================================================
+// Startup Banner
+// ============================================================
+print("[TQuery] NovaLang TQuery v1.0 - Ternary Query & Analytics Engine")
+print("[TQuery] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TQuery] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TQuery] Re boundaries: laminar<" + str(RE_LAMINAR) + " | transitional<" + str(RE_TRANSITION) + " | turbulent<" + str(RE_TURBULENT))
+print("[TQuery] Tools (7): sql | kv | aggregate | analyze | csv | json-query | pivot")
+print("[TQuery] DB path: " + DB_PATH)
+print("[TQuery] KV path: " + KV_PATH + " | KV persist every H13=" + str(H13) + " writes")
+print("[TQuery] GET  /health | /tquery/status")
+print("[TQuery] POST /tquery/sql | /tquery/kv | /tquery/aggregate | /tquery/analyze")
+print("[TQuery] POST /tquery/csv | /tquery/json-query | /tquery/pivot | /tquery/clean")
+print("[TQuery] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

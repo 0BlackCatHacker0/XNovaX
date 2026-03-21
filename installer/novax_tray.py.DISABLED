@@ -1,0 +1,188 @@
+"""
+NovaX System Tray — Persistent tray icon with quick actions.
+Runs as a standalone background process.
+
+Menu:
+  - NovaX Desktop (open browser)
+  - Service Status (submenu)
+  - Restart Services
+  - Exit to Windows (restore explorer.exe)
+  - Quit Tray
+
+Usage: python novax_tray.py
+"""
+import os
+import sys
+import socket
+import subprocess
+import threading
+import time
+import json
+from pathlib import Path
+
+NOVAX_ROOT = r"C:\NovaX"
+PYTHON = str(Path(r"C:\NovaX\ai_env\Scripts\python.exe"))
+if not Path(PYTHON).exists():
+    PYTHON = sys.executable
+
+SERVICES = [
+    ("Orchestrator", 9999), ("Brain", 9990), ("Relay", 9877),
+    ("Cloud Router", 9878), ("VPN", 9880), ("Hivemind", 9881),
+    ("Nexus", 9882), ("Sentinel", 9883), ("STT", 9875), ("WS", 9998),
+    ("Redis", 6379), ("Meilisearch", 7700), ("Ollama", 11434),
+]
+
+
+def is_port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except (ConnectionRefusedError, OSError, TimeoutError):
+        return False
+
+
+def count_alive():
+    return sum(1 for _, p in SERVICES if is_port_open(p))
+
+
+def _find_brave():
+    """Find Brave browser path (preferred over Edge)."""
+    paths = [
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def open_desktop(_=None):
+    brave = _find_brave()
+    if brave:
+        subprocess.Popen([brave, "--app=http://localhost:9999/nova_desktop.html"],
+                         creationflags=0x08000000)
+    else:
+        subprocess.Popen(["cmd", "/c", "start", "", "http://localhost:9999/nova_desktop.html"],
+                         creationflags=0x08000000)
+
+
+def open_terminal(_=None):
+    brave = _find_brave()
+    if brave:
+        subprocess.Popen([brave, "--app=http://localhost:9999/nova_desktop.html#terminal"],
+                         creationflags=0x08000000)
+    else:
+        subprocess.Popen(["cmd", "/c", "start", "", "http://localhost:9999/nova_desktop.html#terminal"],
+                         creationflags=0x08000000)
+
+
+def restart_services(_=None):
+    subprocess.Popen([PYTHON, os.path.join(NOVAX_ROOT, "start_all.py")],
+                     cwd=NOVAX_ROOT,
+                     creationflags=0x08000000)
+
+
+def exit_to_windows(_=None):
+    """Restore explorer.exe and exit NovaX shell mode."""
+    # Show taskbar
+    try:
+        import ctypes
+        hwnd = ctypes.windll.user32.FindWindowW("Shell_TrayWnd", None)
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
+    except Exception:
+        pass
+
+    # Start explorer if not running
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq explorer.exe"],
+            capture_output=True, text=True, timeout=5)
+        if "explorer.exe" not in result.stdout:
+            subprocess.Popen(["explorer.exe"])
+    except Exception:
+        subprocess.Popen(["explorer.exe"])
+
+
+def create_icon_image():
+    """Create a simple NovaX tray icon."""
+    try:
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Cyan circle with N
+        draw.ellipse([4, 4, 60, 60], fill=(0, 229, 255, 255))
+        # Draw "N" in dark
+        draw.text((20, 12), "N", fill=(0, 0, 0, 255))
+        return img
+    except ImportError:
+        # Fallback: solid color square
+        from PIL import Image
+        img = Image.new("RGB", (64, 64), (0, 229, 255))
+        return img
+
+
+def run_tray():
+    """Main tray icon loop."""
+    try:
+        import pystray
+        from pystray import MenuItem, Menu
+    except ImportError:
+        print("[NovaX Tray] pystray not installed. Run: pip install pystray")
+        return
+
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[NovaX Tray] Pillow not installed. Run: pip install Pillow")
+        return
+
+    icon_image = create_icon_image()
+
+    def make_menu():
+        alive = count_alive()
+        total = len(SERVICES)
+        status_label = f"Services: {alive}/{total}"
+
+        # Build service submenu
+        svc_items = []
+        for name, port in SERVICES:
+            up = is_port_open(port)
+            mark = "\u2714" if up else "\u2716"
+            svc_items.append(MenuItem(f"{mark} {name} :{port}", lambda _: None, enabled=False))
+
+        return Menu(
+            MenuItem(status_label, lambda _: None, enabled=False),
+            Menu.SEPARATOR,
+            MenuItem("Open NovaX Desktop", open_desktop),
+            MenuItem("Open Terminal", open_terminal),
+            Menu.SEPARATOR,
+            MenuItem("Services", Menu(*svc_items)),
+            MenuItem("Restart Services", restart_services),
+            Menu.SEPARATOR,
+            MenuItem("Exit to Windows", exit_to_windows),
+            MenuItem("Quit Tray", lambda icon, _: icon.stop()),
+        )
+
+    icon = pystray.Icon("NovaX", icon_image, "NovaX OS", menu=make_menu())
+
+    # Background thread to refresh menu periodically
+    def refresh_loop():
+        while icon.visible:
+            time.sleep(30)
+            try:
+                icon.menu = make_menu()
+                alive = count_alive()
+                icon.title = f"NovaX OS — {alive}/{len(SERVICES)} services"
+            except Exception:
+                pass
+
+    t = threading.Thread(target=refresh_loop, daemon=True)
+    t.start()
+
+    icon.run()
+
+
+if __name__ == "__main__":
+    run_tray()

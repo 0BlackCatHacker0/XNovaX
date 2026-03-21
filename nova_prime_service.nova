@@ -1,0 +1,816 @@
+// nova_prime_service.nova -- NovaX Prime v1.0
+// Immortal AI Meta-Provider -- Port 9869
+//
+// Wraps ALL 11 providers with circuit breakers, rate-limit prediction,
+// health-weighted routing, response cache, and identity camouflage.
+// NEVER returns failure to caller -- always serves live, cached, or fallback.
+//
+// Ternary: +1 = live response, 0 = cached/fallback, -1 = impossible (never returned)
+//
+// N-S Mapping:
+//   query_flow       = velocity_field (queries flowing through ranked provider channels)
+//   provider_health  = pressure_field (circuit breaker backpressure per provider)
+//   routing_score    = Reynolds selection (health * quality / latency)
+//   cache_hits       = viscosity (cached responses = smoother flow)
+//
+// 3-5-7-13 Harmonic Design:
+//   H3=3   -- circuit breaker states (+1/0/-1), half-open max attempts
+//   H5=5   -- CB failure threshold, TZip cache key prefix (3^5=243)
+//   H7=7   -- max cascade depth, cache max = 3^7=2187
+//   H13=13 -- CB recovery (13*3=39s), cache TTL (13*30=390s)
+//
+// Endpoints:
+//   POST /api/v1/query     -- Main immortal query
+//   POST /query            -- Alias
+//   GET  /health           -- Health check
+//   GET  /status           -- Service status
+//   GET  /api/v1/stats     -- Detailed statistics
+//   GET  /api/v1/breakers  -- Circuit breaker states
+//   GET  /api/v1/ranking   -- Provider scores
+//   GET  /api/v1/rates     -- Rate-limit tracking
+//   GET  /api/v1/cache/stats -- Cache stats
+//   POST /api/v1/lockin    -- Toggle lock-in mode
+//   POST /api/v1/cache/flush -- Flush cache
+//   POST /api/v1/breaker/reset -- Reset a breaker
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+import3("C:/NovaX/lib/nova_tripple.nova")
+
+let PORT = 9869
+let SERVICE_NAME = "novax-prime"
+let VERSION = "1.0.0"
+
+// -- 3-5-7-13 Harmonic Constants --
+let BLOCK_SIZE = 2187
+
+// -- Circuit Breaker Constants --
+let CB_FAIL_THRESHOLD = 5
+let CB_RECOVERY_S = 39
+let CB_HALF_MAX = 3
+
+// -- Cache Constants --
+let MAX_CACHE = 2187
+let CACHE_TTL = 390
+
+// -- Rate Limit Constants --
+let RATE_WINDOW = 60
+let RATE_MAX_FREE = 10
+
+// -- Max Cascade --
+let MAX_CASCADE = 7
+
+// -- Paths --
+// Pure NovaLang cloud API (replaces Python bridge)
+import3("nova_cloud_api.nova")
+
+// -- Tripple Module (resonance-weighted scoring) --
+let _tripple = tripple_init()
+
+fn _prime_init_tripple() {
+    let provs = dict_get(_tripple, "providers")
+    provs = dict_set(provs, "ollama", tripple_init_provider("ollama", "local"))
+    provs = dict_set(provs, "openai", tripple_init_provider("openai", "cloud"))
+    provs = dict_set(provs, "anthropic", tripple_init_provider("anthropic", "cloud"))
+    provs = dict_set(provs, "google", tripple_init_provider("google", "cloud"))
+    provs = dict_set(provs, "mistral", tripple_init_provider("mistral", "cloud"))
+    provs = dict_set(provs, "groq", tripple_init_provider("groq", "cloud"))
+    provs = dict_set(provs, "deepseek", tripple_init_provider("deepseek", "cloud"))
+    provs = dict_set(provs, "cohere", tripple_init_provider("cohere", "cloud"))
+    provs = dict_set(provs, "together", tripple_init_provider("together", "cloud"))
+    provs = dict_set(provs, "openrouter", tripple_init_provider("openrouter", "cloud"))
+    provs = dict_set(provs, "cortex", tripple_init_provider("cortex", "fallback"))
+    _tripple = dict_set(_tripple, "providers", provs)
+}
+_prime_init_tripple()
+
+// ============================================================
+// PROVIDER REGISTRY
+// ============================================================
+// These are the providers Prime can route to (excludes itself to prevent loops)
+let _provider_names = ["ollama", "openai", "anthropic", "google", "mistral", "groq", "deepseek", "cohere", "together", "openrouter", "cortex"]
+
+// Default models per provider (mirrors cloud router)
+let _default_models = {
+    "ollama": "llama3.2",
+    "openai": "gpt-4o-mini",
+    "anthropic": "claude-sonnet-4-20250514",
+    "google": "google/gemma-3-4b-it:free",
+    "mistral": "mistralai/mistral-small-3.1-24b-instruct:free",
+    "groq": "meta-llama/llama-3.3-70b-instruct:free",
+    "deepseek": "deepseek/deepseek-r1-distill-llama-70b",
+    "cohere": "qwen/qwen3-coder:free",
+    "together": "arcee-ai/trinity-large-preview:free",
+    "openrouter": "auto",
+    "cortex": "novax-cortex"
+}
+
+// Provider quality scores (1-5 scale)
+let _quality = {
+    "ollama": 5, "openai": 5, "anthropic": 5,
+    "google": 4, "mistral": 4, "groq": 4,
+    "deepseek": 4, "cohere": 3, "together": 3,
+    "openrouter": 4, "cortex": 3
+}
+
+// Provider endpoints (for ollama and cortex, direct HTTP; rest use cloud_call() via nova_cloud_api.nova)
+let _endpoints = {
+    "ollama": "http://127.0.0.1:11434/api/generate",
+    "cortex": "http://127.0.0.1:9890/query"
+}
+
+// ============================================================
+// STATE DICTIONARIES
+// ============================================================
+
+// Per-provider circuit breaker + rate tracking state
+// cb_state: +1=CLOSED, 0=HALF-OPEN, -1=OPEN
+fn make_pstate(quality_val) {
+    return {
+        "cb_state": 1, "cb_failures": 0, "cb_last_fail": 0,
+        "cb_last_success": 0, "cb_trips": 0, "cb_half_attempts": 0,
+        "avg_ms": 500, "total_queries": 0, "total_success": 0, "total_fail": 0,
+        "last_429_time": 0, "rate_limit_hits": 0,
+        "rate_window_start": 0, "rate_window_count": 0,
+        "quality": quality_val
+    }
+}
+
+let _pstate = {
+    "ollama": make_pstate(5),
+    "openai": make_pstate(5),
+    "anthropic": make_pstate(5),
+    "google": make_pstate(4),
+    "mistral": make_pstate(4),
+    "groq": make_pstate(4),
+    "deepseek": make_pstate(4),
+    "cohere": make_pstate(3),
+    "together": make_pstate(3),
+    "openrouter": make_pstate(4),
+    "cortex": make_pstate(3)
+}
+
+// Response cache
+let _cache = {}
+let _cache_order = []
+let _cache_hits = 0
+let _cache_misses = 0
+
+// Global stats
+let _stats = {
+    "total": 0, "live": 0, "cached": 0, "fallback": 0,
+    "failed": 0, "cascades": 0, "t0": time()
+}
+
+// Lock-in mode (default ON)
+let _lock_in = true
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+fn trit_char(t) {
+    if3 t == 1 { return "1" }
+    if3 t == 0 { return "0" }
+    return "T"
+}
+
+fn pick_model(override_m, default_m) {
+    if3 len(override_m) > 0 { return override_m }
+    return default_m
+}
+
+// ============================================================
+// CIRCUIT BREAKER
+// ============================================================
+
+fn cb_allow(pname) {
+    let ps = dict_get(_pstate, pname) ?? {}
+    let state = dict_get(ps, "cb_state") ?? 1
+    if3 state == 1 { return true }
+    if3 state == -1 { last_fail = dict_get(ps, "cb_last_fail") ?? 0
+        let elapsed = int(time()) - last_fail
+        if3 elapsed >= CB_RECOVERY_S { ps = dict_set(ps, "cb_state", 0)
+            ps = dict_set(ps, "cb_half_attempts", 0)
+            _pstate = dict_set(_pstate, pname, ps)
+            return true
+        }
+        return false
+    }
+    // HALF-OPEN: limited test requests
+    let attempts = dict_get(ps, "cb_half_attempts") ?? 0
+    if3 attempts < CB_HALF_MAX { ps = dict_set(ps, "cb_half_attempts", attempts + 1)
+        _pstate = dict_set(_pstate, pname, ps)
+        return true
+    }
+    return false
+}
+
+fn cb_success(pname) {
+    let ps = dict_get(_pstate, pname) ?? {}
+    let state = dict_get(ps, "cb_state") ?? 1
+    ps = dict_set(ps, "cb_last_success", int(time()))
+    ps = dict_set(ps, "total_success", (dict_get(ps, "total_success") ?? 0) + 1)
+    // HALF-OPEN -> CLOSED on success
+    if3 state == 0 { ps = dict_set(ps, "cb_state", 1)
+        ps = dict_set(ps, "cb_failures", 0)
+    }
+    // CLOSED: decay failures
+    if3 state == 1 { fails = dict_get(ps, "cb_failures") ?? 0
+        if3 fails > 0 { ps = dict_set(ps, "cb_failures", fails - 1)
+        }
+    }
+    _pstate = dict_set(_pstate, pname, ps)
+}
+
+fn is_429_error(err_str) {
+    if3 len(err_str) == 0 { return false }
+    let has = try3 { contains(err_str, "429") } fail { 0 }
+    if3 has == 1 { return true }
+    return false
+}
+
+fn cb_failure(pname, error_str) {
+    let ps = dict_get(_pstate, pname) ?? {}
+    let state = dict_get(ps, "cb_state") ?? 1
+    ps = dict_set(ps, "cb_failures", (dict_get(ps, "cb_failures") ?? 0) + 1)
+    ps = dict_set(ps, "cb_last_fail", int(time()))
+    ps = dict_set(ps, "total_fail", (dict_get(ps, "total_fail") ?? 0) + 1)
+    // Track 429s specifically
+    let got_429 = is_429_error(error_str)
+    if3 got_429 == true { ps = dict_set(ps, "last_429_time", int(time()))
+        ps = dict_set(ps, "rate_limit_hits", (dict_get(ps, "rate_limit_hits") ?? 0) + 1)
+    }
+    // HALF-OPEN -> OPEN on failure
+    if3 state == 0 { ps = dict_set(ps, "cb_state", -1)
+        ps = dict_set(ps, "cb_trips", (dict_get(ps, "cb_trips") ?? 0) + 1)
+    }
+    // CLOSED: check if threshold reached
+    if3 state == 1 { fails = dict_get(ps, "cb_failures") ?? 0
+        if3 fails >= CB_FAIL_THRESHOLD { ps = dict_set(ps, "cb_state", -1)
+            ps = dict_set(ps, "cb_trips", (dict_get(ps, "cb_trips") ?? 0) + 1)
+        }
+    }
+    _pstate = dict_set(_pstate, pname, ps)
+}
+
+// ============================================================
+// RATE-LIMIT PREDICTION
+// ============================================================
+
+fn rate_safe(pname) {
+    let ps = dict_get(_pstate, pname) ?? {}
+    let last_429 = dict_get(ps, "last_429_time") ?? 0
+    let now = int(time())
+    let since = now - last_429
+    // If 429'd within last 60s, predict unsafe
+    if3 since < RATE_WINDOW { return false }
+    // Rolling window: cap at RATE_MAX_FREE per window
+    let wstart = dict_get(ps, "rate_window_start") ?? 0
+    let wcount = dict_get(ps, "rate_window_count") ?? 0
+    if3 (now - wstart) > RATE_WINDOW {
+        // Reset window
+        ps = dict_set(ps, "rate_window_start", now)
+        ps = dict_set(ps, "rate_window_count", 0)
+        _pstate = dict_set(_pstate, pname, ps)
+        return true
+    }
+    if3 wcount >= RATE_MAX_FREE { return false }
+    return true
+}
+
+fn rate_record(pname) {
+    let ps = dict_get(_pstate, pname) ?? {}
+    let now = int(time())
+    let wstart = dict_get(ps, "rate_window_start") ?? 0
+    if3 (now - wstart) > RATE_WINDOW { ps = dict_set(ps, "rate_window_start", now)
+        ps = dict_set(ps, "rate_window_count", 1)
+    } else3 {
+        ps = dict_set(ps, "rate_window_count", (dict_get(ps, "rate_window_count") ?? 0) + 1)
+    }
+    _pstate = dict_set(_pstate, pname, ps)
+}
+
+// ============================================================
+// RESPONSE CACHE
+// ============================================================
+
+fn cache_key(prompt) {
+    let trimmed = prompt
+    if3 len(prompt) > 243 { trimmed = slice3(prompt, 0, 243)
+    }
+    return sha256(trimmed)
+}
+
+fn cache_get(prompt) {
+    let k = cache_key(prompt)
+    let entry = dict_get(_cache, k) ?? {}
+    let resp = dict_get(entry, "response") ?? ""
+    if3 resp == "" { return {} }
+    let created = dict_get(entry, "created") ?? 0
+    let age = int(time()) - created
+    if3 age > CACHE_TTL { return {} }
+    return entry
+}
+
+fn cache_put(prompt, response, provider, model) {
+    let k = cache_key(prompt)
+    let entry = {
+        "response": response, "provider": provider,
+        "model": model, "created": int(time())
+    }
+    _cache = dict_set(_cache, k, entry)
+    _cache_order = append(_cache_order, k)
+    // LRU eviction
+    if3 len(_cache_order) > MAX_CACHE { oldest = _cache_order[0]
+        _cache = dict_set(_cache, oldest, {})
+        let new_order = []
+        let ci = 1
+        while3 ci < len(_cache_order) {
+            new_order = append(new_order, _cache_order[ci])
+            ci = ci + 1
+        }
+        _cache_order = new_order
+    }
+}
+
+// ============================================================
+// HEALTH-WEIGHTED ROUTING
+// ============================================================
+
+fn calc_route_score(pname) {
+    let ps = dict_get(_pstate, pname) ?? {}
+    let cb = dict_get(ps, "cb_state") ?? -1
+    // OPEN breaker = score 0 (skip entirely)
+    if3 cb == -1 { return 0 }
+    let quality = dict_get(ps, "quality") ?? 1
+    let avg_ms = dict_get(ps, "avg_ms") ?? 5000
+    // Prevent division by zero
+    if3 avg_ms < 1 { avg_ms = 1 }
+    // Get provider's current frequency from Tripple
+    let tp_provs = dict_get(_tripple, "providers")
+    let tp_prov = dict_get(tp_provs, pname) ?? null
+    let prov_freq = 500
+    if3 tp_prov != null { prov_freq = dict_get(tp_prov, "current_freq")
+    }
+    // Resonance-weighted score: (quality * 1000 * prov_freq) / (avg_ms * 1000)
+    let score = (quality * 1000 * prov_freq) / (avg_ms * 1000)
+    // HALF-OPEN: reduce score by half
+    if3 cb == 0 { score = score / 2 }
+    // Penalize if recently rate-limited
+    let last_429 = dict_get(ps, "last_429_time") ?? 0
+    let since_429 = int(time()) - last_429
+    if3 since_429 < RATE_WINDOW { score = score / H3
+    }
+    return score
+}
+
+// Build provider list sorted by score (descending)
+// N=11 providers, O(n^2) selection sort is fine
+fn build_ranked_list() {
+    let ranked = []
+    let used = {}
+    let round = 0
+    while3 round < len(_provider_names) {
+        let best_name = ""
+        let best_score = -1
+        let j = 0
+        while3 j < len(_provider_names) {
+            let pn = _provider_names[j]
+            let already = dict_get(used, pn) ?? false
+            if3 already != true { sc = calc_route_score(pn)
+                if3 sc > best_score { best_name = pn
+                    let best_score = sc
+                }
+            }
+            j = j + 1
+        }
+        if3 best_name != "" { ranked = append(ranked, best_name)
+            used = dict_set(used, best_name, true)
+        }
+        round = round + 1
+    }
+    return ranked
+}
+
+// ============================================================
+// PROVIDER CALLING
+// ============================================================
+
+fn try_cloud_provider(pname, prompt, model) {
+    // Ollama: direct HTTP
+    if3 pname == "ollama" { endpoint = dict_get(_endpoints, "ollama") ?? ""
+        let body_str = "{\"model\":\"" + model + "\",\"prompt\":\"" + replace(prompt, "\"", "\\\"") + "\",\"stream\":false}"
+        let t0 = time()
+        let result = try3 { http_post(endpoint, body_str) } fail { {"error": "ollama_unreachable"} }
+        let elapsed = int((time() - t0) * 1000)
+        let err = dict_get(result, "error") ?? ""
+        if3 err != "" { return {"ok": false, "error": err, "time_ms": elapsed} }
+        let resp = dict_get(result, "response") ?? ""
+        return {"ok": true, "response": resp, "time_ms": elapsed, "provider": pname, "model": model}
+    }
+
+    // Cortex: direct HTTP
+    if3 pname == "cortex" { endpoint = dict_get(_endpoints, "cortex") ?? ""
+        let body_str = json_encode({"prompt": prompt, "source": "novax-prime"})
+        let t0 = time()
+        let result = try3 { http_post(endpoint, body_str) } fail { {"error": "cortex_unreachable"} }
+        let elapsed = int((time() - t0) * 1000)
+        let err = dict_get(result, "error") ?? ""
+        if3 err != "" { return {"ok": false, "error": err, "time_ms": elapsed} }
+        let resp = dict_get(result, "response") ?? ""
+        return {"ok": true, "response": resp, "time_ms": elapsed, "provider": pname, "model": model}
+    }
+
+    // Cloud providers: pure NovaLang (no Python subprocess)
+    let result = cloud_call(pname, model, prompt, "")
+    let ok = dict_get(result, "ok") ?? false
+    let resp = dict_get(result, "response") ?? ""
+    let ms = dict_get(result, "time_ms") ?? 0
+    if3 ok == false { err = dict_get(result, "error") ?? "cloud_call_failed"
+        return {"ok": false, "error": err, "time_ms": ms}
+    }
+    return {"ok": true, "response": resp, "time_ms": ms, "provider": pname, "model": model}
+}
+
+fn update_avg_ms(pname, new_ms) {
+    let ps = dict_get(_pstate, pname) ?? {}
+    let old_avg = dict_get(ps, "avg_ms") ?? 500
+    // Exponential moving average: 70% old + 30% new
+    let new_avg = (old_avg * 7 + new_ms * 3) / 10
+    ps = dict_set(ps, "avg_ms", new_avg)
+    ps = dict_set(ps, "total_queries", (dict_get(ps, "total_queries") ?? 0) + 1)
+    _pstate = dict_set(_pstate, pname, ps)
+}
+
+// ============================================================
+// IMMORTAL QUERY ENGINE
+// ============================================================
+
+fn prime_query(prompt, preferred, model_override) {
+    _stats = dict_set(_stats, "total", (dict_get(_stats, "total") ?? 0) + 1)
+
+    // Step 1: Check cache
+    let cached = cache_get(prompt)
+    let cached_resp = dict_get(cached, "response") ?? ""
+
+    // Step 2: Build ranked provider list
+    let ranked = build_ranked_list()
+
+    // Step 3: If preferred provider, put it first
+    // (handled by trying it before the ranked list)
+    let tried_preferred = false
+    if3 preferred != "" { allowed = cb_allow(preferred)
+        if3 allowed == true { safe = rate_safe(preferred)
+            if3 safe == true { def_model = dict_get(_default_models, preferred) ?? ""
+                let model = pick_model(model_override, def_model)
+                rate_record(preferred)
+                let result = try_cloud_provider(preferred, prompt, model)
+                let ok = dict_get(result, "ok") ?? false
+                if3 ok == true {
+                    cb_success(preferred)
+                    let ms = dict_get(result, "time_ms") ?? 500
+                    update_avg_ms(preferred, ms)
+                    _tripple = tripple_ripple(_tripple, preferred, 1, ms)
+                    let resp_text = dict_get(result, "response") ?? ""
+                    cache_put(prompt, resp_text, preferred, model)
+                    _stats = dict_set(_stats, "live", (dict_get(_stats, "live") ?? 0) + 1)
+                    return {"ok": true, "trit": 1, "response": resp_text, "provider": preferred, "model": model, "source": "live", "cascade_depth": 0, "time_ms": ms}
+                } else3 {
+                    let err = dict_get(result, "error") ?? ""
+                    cb_failure(preferred, err)
+                    let ms = dict_get(result, "time_ms") ?? 500
+                    _tripple = tripple_ripple(_tripple, preferred, -1, ms)
+                }
+                let tried_preferred = true
+            }
+        }
+    }
+
+    // Step 4: Cascade through ranked providers
+    let depth = 0
+    if3 tried_preferred == true { depth = 1 }
+    let last_error = ""
+    let i = 0
+    while3 i < len(ranked) {
+        let pname = ranked[i]
+        // Skip preferred if already tried
+        if3 pname != preferred {
+            if3 depth < MAX_CASCADE { allowed = cb_allow(pname)
+                if3 allowed == true { safe = rate_safe(pname)
+                    if3 safe == true { def_model = dict_get(_default_models, pname) ?? ""
+                        let model = pick_model(model_override, def_model)
+                        rate_record(pname)
+                        let result = try_cloud_provider(pname, prompt, model)
+                        let ok = dict_get(result, "ok") ?? false
+                        if3 ok == true {
+                            cb_success(pname)
+                            let ms = dict_get(result, "time_ms") ?? 500
+                            update_avg_ms(pname, ms)
+                            _tripple = tripple_ripple(_tripple, pname, 1, ms)
+                            let resp_text = dict_get(result, "response") ?? ""
+                            cache_put(prompt, resp_text, pname, model)
+                            _stats = dict_set(_stats, "live", (dict_get(_stats, "live") ?? 0) + 1)
+                            if3 depth > 0 {
+                                _stats = dict_set(_stats, "cascades", (dict_get(_stats, "cascades") ?? 0) + 1)
+                            }
+                            return {"ok": true, "trit": 1, "response": resp_text, "provider": pname, "model": model, "source": "live", "cascade_depth": depth, "time_ms": ms}
+                        } else3 {
+                            let err = dict_get(result, "error") ?? ""
+                            cb_failure(pname, err)
+                            let ms = dict_get(result, "time_ms") ?? 500
+                            _tripple = tripple_ripple(_tripple, pname, -1, ms)
+                            let last_error = err
+                            depth = depth + 1
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // Step 5: ALL providers failed -- serve from cache
+    if3 cached_resp != "" {
+        _stats = dict_set(_stats, "cached", (dict_get(_stats, "cached") ?? 0) + 1)
+        _cache_hits = _cache_hits + 1
+        let cp = dict_get(cached, "provider") ?? "cache"
+        let cm = dict_get(cached, "model") ?? "cached"
+        return {"ok": true, "trit": 0, "response": cached_resp, "provider": cp, "model": cm, "source": "cache", "cascade_depth": depth}
+    }
+
+    // Step 6: No cache -- generate fallback message
+    _stats = dict_set(_stats, "fallback", (dict_get(_stats, "fallback") ?? 0) + 1)
+    let pcount = str(len(ranked))
+    let retry_s = str(CB_RECOVERY_S)
+    let fallback_msg = "[NovaX Prime] All " + pcount + " providers unavailable. Last error: " + last_error + ". Retry in " + retry_s + "s."
+    return {"ok": true, "trit": 0, "response": fallback_msg, "provider": "novax-prime-fallback", "model": "none", "source": "fallback", "cascade_depth": depth}
+}
+
+// ============================================================
+// ROUTE HANDLERS
+// ============================================================
+
+// -- POST /api/v1/query and /query --
+fn handle_query(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let prompt = dict_get(body, "prompt") ?? (dict_get(req, "prompt") ?? "")
+    if3 prompt == "" {
+        return {"ok": false, "error": "missing prompt", "trit": -1}
+    }
+    let preferred = dict_get(body, "provider") ?? (dict_get(req, "provider") ?? "")
+    let model = dict_get(body, "model") ?? (dict_get(req, "model") ?? "")
+    let result = prime_query(prompt, preferred, model)
+    return result
+}
+
+// -- GET /health --
+fn handle_health(req) {
+    let uptime = round(time() - (dict_get(_stats, "t0") ?? 0))
+    let total_q = dict_get(_stats, "total") ?? 0
+    let live = dict_get(_stats, "live") ?? 0
+    // Count providers with CLOSED breakers
+    let healthy_providers = 0
+    let i = 0
+    while3 i < len(_provider_names) {
+        let pname = _provider_names[i]
+        let ps = dict_get(_pstate, pname) ?? {}
+        let cb = dict_get(ps, "cb_state") ?? -1
+        if3 cb == 1 { healthy_providers = healthy_providers + 1
+        }
+        i = i + 1
+    }
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "uptime_s", uptime)
+    resp = dict_set(resp, "total_queries", total_q)
+    resp = dict_set(resp, "live_responses", live)
+    resp = dict_set(resp, "cached_responses", dict_get(_stats, "cached") ?? 0)
+    resp = dict_set(resp, "fallback_responses", dict_get(_stats, "fallback") ?? 0)
+    resp = dict_set(resp, "healthy_providers", healthy_providers)
+    resp = dict_set(resp, "total_providers", len(_provider_names))
+    resp = dict_set(resp, "lock_in", _lock_in)
+    resp = dict_set(resp, "cache_size", len(_cache_order))
+    return resp
+}
+
+// -- GET /status --
+fn handle_status(req) {
+    let uptime = round(time() - (dict_get(_stats, "t0") ?? 0))
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "providers": _provider_names,
+        "total_providers": len(_provider_names),
+        "lock_in": _lock_in,
+        "uptime_s": uptime,
+        "trit": 1,
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// -- GET /api/v1/stats --
+fn handle_stats(req) {
+    let uptime = round(time() - (dict_get(_stats, "t0") ?? 0))
+    let total = dict_get(_stats, "total") ?? 0
+    let live = dict_get(_stats, "live") ?? 0
+    let cached = dict_get(_stats, "cached") ?? 0
+    let fallback = dict_get(_stats, "fallback") ?? 0
+    let cascades = dict_get(_stats, "cascades") ?? 0
+    // Success rate
+    let rate = 0
+    if3 total > 0 { rate = ((live + cached) * 100) / total }
+    return {
+        "ok": true,
+        "total_queries": total,
+        "live_responses": live,
+        "cached_responses": cached,
+        "fallback_responses": fallback,
+        "cascades": cascades,
+        "success_rate_pct": rate,
+        "cache_size": len(_cache_order),
+        "cache_hits": _cache_hits,
+        "cache_misses": _cache_misses,
+        "lock_in": _lock_in,
+        "uptime_s": uptime,
+        "ternary": true
+    }
+}
+
+// -- GET /api/v1/breakers --
+fn handle_breakers(req) {
+    let breakers = {}
+    let i = 0
+    while3 i < len(_provider_names) {
+        let pname = _provider_names[i]
+        let ps = dict_get(_pstate, pname) ?? {}
+        let cb_state = dict_get(ps, "cb_state") ?? 1
+        let state_name = "CLOSED"
+        if3 cb_state == 0 { state_name = "HALF-OPEN" }
+        if3 cb_state == -1 { state_name = "OPEN" }
+        let entry = {
+            "state": state_name,
+            "trit": cb_state,
+            "failures": dict_get(ps, "cb_failures") ?? 0,
+            "trips": dict_get(ps, "cb_trips") ?? 0,
+            "last_fail": dict_get(ps, "cb_last_fail") ?? 0,
+            "last_success": dict_get(ps, "cb_last_success") ?? 0,
+            "total_success": dict_get(ps, "total_success") ?? 0,
+            "total_fail": dict_get(ps, "total_fail") ?? 0
+        }
+        breakers = dict_set(breakers, pname, entry)
+        i = i + 1
+    }
+    return {"ok": true, "breakers": breakers, "ternary": true}
+}
+
+// -- GET /api/v1/ranking --
+fn handle_ranking(req) {
+    let rankings = []
+    let ranked = build_ranked_list()
+    let i = 0
+    while3 i < len(ranked) {
+        let pname = ranked[i]
+        let score = calc_route_score(pname)
+        let ps = dict_get(_pstate, pname) ?? {}
+        let entry = {
+            "rank": i + 1,
+            "provider": pname,
+            "score": score,
+            "cb_state": dict_get(ps, "cb_state") ?? 1,
+            "avg_ms": dict_get(ps, "avg_ms") ?? 500,
+            "quality": dict_get(ps, "quality") ?? 0,
+            "rate_safe": rate_safe(pname)
+        }
+        rankings = append(rankings, entry)
+        i = i + 1
+    }
+    let resp = {"ok": true, "rankings": rankings, "ternary": true}
+    resp = dict_set(resp, "tripple_prime", tripple_prime_state(_tripple))
+    resp = dict_set(resp, "resonance_score", dict_get(_tripple, "resonance_score"))
+    return resp
+}
+
+// -- GET /api/v1/rates --
+fn handle_rates(req) {
+    let rates = {}
+    let i = 0
+    while3 i < len(_provider_names) {
+        let pname = _provider_names[i]
+        let ps = dict_get(_pstate, pname) ?? {}
+        let entry = {
+            "last_429_time": dict_get(ps, "last_429_time") ?? 0,
+            "rate_limit_hits": dict_get(ps, "rate_limit_hits") ?? 0,
+            "window_count": dict_get(ps, "rate_window_count") ?? 0,
+            "window_start": dict_get(ps, "rate_window_start") ?? 0,
+            "safe": rate_safe(pname)
+        }
+        rates = dict_set(rates, pname, entry)
+        i = i + 1
+    }
+    return {"ok": true, "rates": rates, "window_s": RATE_WINDOW, "max_free": RATE_MAX_FREE, "ternary": true}
+}
+
+// -- GET /api/v1/cache/stats --
+fn handle_cache_stats(req) {
+    return {
+        "ok": true,
+        "cache_size": len(_cache_order),
+        "max_cache": MAX_CACHE,
+        "cache_ttl_s": CACHE_TTL,
+        "hits": _cache_hits,
+        "misses": _cache_misses,
+        "ternary": true
+    }
+}
+
+// -- POST /api/v1/lockin --
+fn handle_lockin(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let enabled = dict_get(body, "enabled") ?? true
+    _lock_in = enabled
+    return {"ok": true, "lock_in": _lock_in, "ternary": true}
+}
+
+// -- POST /api/v1/cache/flush --
+fn handle_cache_flush(req) {
+    let old_size = len(_cache_order)
+    _cache = {}
+    _cache_order = []
+    return {"ok": true, "flushed": old_size, "ternary": true}
+}
+
+// -- POST /api/v1/breaker/reset --
+fn handle_breaker_reset(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let target = dict_get(body, "provider") ?? ""
+    if3 target == "" {
+        // Reset ALL breakers
+        let i = 0
+        while3 i < len(_provider_names) {
+            let pname = _provider_names[i]
+            let ps = dict_get(_pstate, pname) ?? {}
+            ps = dict_set(ps, "cb_state", 1)
+            ps = dict_set(ps, "cb_failures", 0)
+            ps = dict_set(ps, "cb_half_attempts", 0)
+            _pstate = dict_set(_pstate, pname, ps)
+            i = i + 1
+        }
+        return {"ok": true, "reset": "all", "count": len(_provider_names), "ternary": true}
+    }
+    // Reset specific provider
+    let ps = dict_get(_pstate, target) ?? {}
+    ps = dict_set(ps, "cb_state", 1)
+    ps = dict_set(ps, "cb_failures", 0)
+    ps = dict_set(ps, "cb_half_attempts", 0)
+    _pstate = dict_set(_pstate, target, ps)
+    return {"ok": true, "reset": target, "ternary": true}
+}
+
+// ============================================================
+// SERVER SETUP
+// ============================================================
+let server = tserve(PORT, SERVICE_NAME)
+
+// Health and status
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/status", "handle_status")
+troute(server, "GET", "/api/v1/status", "handle_status")
+
+// Stats and monitoring
+troute(server, "GET", "/api/v1/stats", "handle_stats")
+troute(server, "GET", "/api/v1/breakers", "handle_breakers")
+troute(server, "GET", "/api/v1/ranking", "handle_ranking")
+troute(server, "GET", "/api/v1/rates", "handle_rates")
+troute(server, "GET", "/api/v1/cache/stats", "handle_cache_stats")
+
+// Query routing (immortal gateway)
+troute(server, "POST", "/api/v1/query", "handle_query")
+troute(server, "POST", "/query", "handle_query")
+
+// Control
+troute(server, "POST", "/api/v1/lockin", "handle_lockin")
+troute(server, "POST", "/api/v1/cache/flush", "handle_cache_flush")
+troute(server, "POST", "/api/v1/breaker/reset", "handle_breaker_reset")
+
+// ============================================================
+// BOOT
+// ============================================================
+print("[NovaPrime] NovaX Prime v" + VERSION + " -- Immortal AI Meta-Provider")
+print("[NovaPrime] Port: " + str(PORT) + " | Lock-In: " + str(_lock_in))
+print("[NovaPrime] Providers: " + join(_provider_names, ", "))
+print("[NovaPrime] Circuit Breaker: threshold=" + str(CB_FAIL_THRESHOLD) + " recovery=" + str(CB_RECOVERY_S) + "s half-open=" + str(CB_HALF_MAX))
+print("[NovaPrime] Cache: max=" + str(MAX_CACHE) + " ttl=" + str(CACHE_TTL) + "s key=sha256(first 243 chars)")
+print("[NovaPrime] Rate Limit: window=" + str(RATE_WINDOW) + "s max_free=" + str(RATE_MAX_FREE) + "/window")
+print("[NovaPrime] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[NovaPrime] Routes: /health /status /api/v1/query /api/v1/stats /api/v1/breakers")
+print("[NovaPrime] Routes: /api/v1/ranking /api/v1/rates /api/v1/cache/stats")
+print("[NovaPrime] Routes: /api/v1/lockin /api/v1/cache/flush /api/v1/breaker/reset")
+print("[NovaPrime] Tripple: resonance-weighted provider scoring ACTIVE")
+print("[NovaPrime] IMMORTAL MODE: ok=true ALWAYS. trit +1=live, 0=cache/fallback. Never -1.")
+
+tstart(server)

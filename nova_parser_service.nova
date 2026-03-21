@@ -1,0 +1,1199 @@
+// nova_parser_service.nova -- NovaX Self-Hosting Parser (port 9897)
+//
+// A NovaLang parser written IN NovaLang. This is the bootstrap
+// that proves self-hosting: the language can parse itself.
+//
+// Endpoints:
+//   POST /parser/parse   -- source code to AST (JSON)
+//   POST /parser/lint    -- source code to warnings list
+//   POST /parser/tokens  -- source code to token list
+//   GET  /parser/grammar -- supported grammar rules
+//   GET  /health         -- standard health
+//
+// N-S Mapping:
+//   parsing = flow through grammar rules
+//   Re < 27  = simple expressions (laminar)
+//   Re < 125 = nested blocks (transitional)
+//   Re < 343 = deep recursion (turbulent)
+//
+// 3-5-7-13 Harmonics:
+//   MAX_TOKENS = BLOCK * H5 = 10935
+//   MAX_DEPTH  = H13 = 13
+//   TOOL_COUNT = H7 = 7
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9996
+let server = tserve(PORT, "NovaParser v1.0 - Self-Hosting Bootstrap")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3   = 3
+let H5   = 5
+let H7   = 7
+let H13  = 13
+let BLOCK = 2187
+
+// -- Service Constants --
+let VERSION     = "1.0"
+let MAX_TOKENS  = 10935
+let MAX_DEPTH   = 13
+let MAX_SOURCE  = 28431
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Stats (global, bare reassignment inside fns) --
+let _parse_count  = 0
+let _lint_count   = 0
+let _token_count  = 0
+let _error_count  = 0
+let _ns = ns_init_counters()
+
+// ============================================================================
+// TOKEN TYPE CONSTANTS
+// ============================================================================
+let TK_LET       = "Let"
+let TK_FN        = "Fn"
+let TK_IF3       = "If3"
+let TK_ELSE3     = "Else3"
+let TK_ELSE      = "Else"
+let TK_MAYBE     = "Maybe"
+let TK_WHILE3    = "While3"
+let TK_FOR3      = "For3"
+let TK_TRY3      = "Try3"
+let TK_FAIL      = "Fail"
+let TK_RETURN    = "Return"
+let TK_BREAK3    = "Break3"
+let TK_CONT3     = "Continue3"
+let TK_MATCH3    = "Match3"
+let TK_IMPORT3   = "Import3"
+let TK_CLASS3    = "Class3"
+let TK_INT       = "Int"
+let TK_FLOAT     = "Float"
+let TK_STR       = "Str"
+let TK_TRUE      = "True"
+let TK_FALSE     = "False"
+let TK_NULL      = "Null"
+let TK_IDENT     = "Ident"
+let TK_PLUS      = "Plus"
+let TK_MINUS     = "Minus"
+let TK_STAR      = "Star"
+let TK_SLASH     = "Slash"
+let TK_EQ        = "Eq"
+let TK_EQEQ      = "EqEq"
+let TK_NEQ       = "Neq"
+let TK_LT        = "Lt"
+let TK_GT        = "Gt"
+let TK_LTE       = "Lte"
+let TK_GTE       = "Gte"
+let TK_AND       = "And"
+let TK_OR        = "Or"
+let TK_NOT       = "Not"
+let TK_NULLCO    = "NullCoalesce"
+let TK_LPAREN    = "LParen"
+let TK_RPAREN    = "RParen"
+let TK_LBRACE    = "LBrace"
+let TK_RBRACE    = "RBrace"
+let TK_LBRACK    = "LBrack"
+let TK_RBRACK    = "RBrack"
+let TK_COMMA     = "Comma"
+let TK_DOT       = "Dot"
+let TK_EOF       = "EOF"
+let TK_NEWLINE   = "Newline"
+let TK_COMMENT   = "Comment"
+
+// ============================================================================
+// HELPER: check single character type
+// ============================================================================
+fn _is_alpha(c) {
+    if3 c == "a" { return 1 }
+    if3 c == "b" { return 1 }
+    if3 c == "c" { return 1 }
+    if3 c == "d" { return 1 }
+    if3 c == "e" { return 1 }
+    if3 c == "f" { return 1 }
+    if3 c == "g" { return 1 }
+    if3 c == "h" { return 1 }
+    if3 c == "i" { return 1 }
+    if3 c == "j" { return 1 }
+    if3 c == "k" { return 1 }
+    if3 c == "l" { return 1 }
+    if3 c == "m" { return 1 }
+    if3 c == "n" { return 1 }
+    if3 c == "o" { return 1 }
+    if3 c == "p" { return 1 }
+    if3 c == "q" { return 1 }
+    if3 c == "r" { return 1 }
+    if3 c == "s" { return 1 }
+    if3 c == "t" { return 1 }
+    if3 c == "u" { return 1 }
+    if3 c == "v" { return 1 }
+    if3 c == "w" { return 1 }
+    if3 c == "x" { return 1 }
+    if3 c == "y" { return 1 }
+    if3 c == "z" { return 1 }
+    if3 c == "A" { return 1 }
+    if3 c == "B" { return 1 }
+    if3 c == "C" { return 1 }
+    if3 c == "D" { return 1 }
+    if3 c == "E" { return 1 }
+    if3 c == "F" { return 1 }
+    if3 c == "G" { return 1 }
+    if3 c == "H" { return 1 }
+    if3 c == "I" { return 1 }
+    if3 c == "J" { return 1 }
+    if3 c == "K" { return 1 }
+    if3 c == "L" { return 1 }
+    if3 c == "M" { return 1 }
+    if3 c == "N" { return 1 }
+    if3 c == "O" { return 1 }
+    if3 c == "P" { return 1 }
+    if3 c == "Q" { return 1 }
+    if3 c == "R" { return 1 }
+    if3 c == "S" { return 1 }
+    if3 c == "T" { return 1 }
+    if3 c == "U" { return 1 }
+    if3 c == "V" { return 1 }
+    if3 c == "W" { return 1 }
+    if3 c == "X" { return 1 }
+    if3 c == "Y" { return 1 }
+    if3 c == "Z" { return 1 }
+    if3 c == "_" { return 1 }
+    return 0
+}
+
+fn _is_digit(c) {
+    if3 c == "0" { return 1 }
+    if3 c == "1" { return 1 }
+    if3 c == "2" { return 1 }
+    if3 c == "3" { return 1 }
+    if3 c == "4" { return 1 }
+    if3 c == "5" { return 1 }
+    if3 c == "6" { return 1 }
+    if3 c == "7" { return 1 }
+    if3 c == "8" { return 1 }
+    if3 c == "9" { return 1 }
+    return 0
+}
+
+fn _is_alnum(c) {
+    if3 _is_alpha(c) == 1 { return 1 }
+    if3 _is_digit(c) == 1 { return 1 }
+    return 0
+}
+
+fn _is_space(c) {
+    if3 c == " " { return 1 }
+    if3 c == "\t" { return 1 }
+    if3 c == "\r" { return 1 }
+    return 0
+}
+
+// ============================================================================
+// HELPER: safe char access (avoids try3 inside loops)
+// ============================================================================
+fn _char_at(src, idx) {
+    let slen = len(src)
+    if3 idx >= slen { return "" }
+    if3 idx < 0 { return "" }
+    return substr(src, idx, 1)
+}
+
+fn _substr_safe(src, start, count) {
+    let slen = len(src)
+    if3 start >= slen { return "" }
+    if3 start < 0 { return "" }
+    let avail = slen - start
+    if3 count > avail { count = avail }
+    return substr(src, start, count)
+}
+
+// ============================================================================
+// HELPER: keyword lookup
+// ============================================================================
+fn _keyword_type(word) {
+    if3 word == "let" { return TK_LET }
+    if3 word == "fn" { return TK_FN }
+    if3 word == "if3" { return TK_IF3 }
+    if3 word == "else3" { return TK_ELSE3 }
+    if3 word == "else" { return TK_ELSE }
+    if3 word == "maybe" { return TK_MAYBE }
+    if3 word == "while3" { return TK_WHILE3 }
+    if3 word == "for3" { return TK_FOR3 }
+    if3 word == "try3" { return TK_TRY3 }
+    if3 word == "fail" { return TK_FAIL }
+    if3 word == "return" { return TK_RETURN }
+    if3 word == "break3" { return TK_BREAK3 }
+    if3 word == "continue3" { return TK_CONT3 }
+    if3 word == "match3" { return TK_MATCH3 }
+    if3 word == "import3" { return TK_IMPORT3 }
+    if3 word == "class3" { return TK_CLASS3 }
+    if3 word == "true" { return TK_TRUE }
+    if3 word == "false" { return TK_FALSE }
+    if3 word == "null" { return TK_NULL }
+    return ""
+}
+
+// ============================================================================
+// HELPER: make a token dict (avoids large dict literals)
+// ============================================================================
+fn _mk_tok(typ, val, pos) {
+    let t = {"type": typ, "value": val}
+    t = dict_set(t, "pos", pos)
+    return t
+}
+
+// ============================================================================
+// TOKENIZER: fn tokenize(source) -> list of token dicts
+// ============================================================================
+fn tokenize(source) {
+    let tokens = []
+    let i = 0
+    let slen = len(source)
+
+    while3 i < slen {
+        let c = _char_at(source, i)
+
+        // skip whitespace (not newlines)
+        if3 _is_space(c) == 1 {
+            i = i + 1
+        } else c == "\n" {
+            tokens = append(tokens, _mk_tok(TK_NEWLINE, "\\n", i))
+            i = i + 1
+        } else c == "/" {
+            let c2 = _char_at(source, i + 1)
+            if3 c2 == "/" {
+                // line comment -- skip to end of line
+                let cmt_done = 0
+                while3 cmt_done == 0 {
+                    if3 i >= slen { cmt_done = 1 }
+                    if3 cmt_done == 0 {
+                        let cc = _char_at(source, i)
+                        if3 cc == "\n" { cmt_done = 1 }
+                        if3 cmt_done == 0 { i = i + 1 }
+                    }
+                }
+            } else {
+                tokens = append(tokens, _mk_tok(TK_SLASH, "/", i))
+                i = i + 1
+            }
+        } else c == "\\" {
+            // NovaLang backslash comment -- skip to newline
+            let bcmt_done = 0
+            while3 bcmt_done == 0 {
+                if3 i >= slen { bcmt_done = 1 }
+                if3 bcmt_done == 0 {
+                    let cc = _char_at(source, i)
+                    if3 cc == "\n" { bcmt_done = 1 }
+                    if3 bcmt_done == 0 { i = i + 1 }
+                }
+            }
+        } else c == "\"" {
+            // string literal
+            let start = i
+            i = i + 1
+            let s = ""
+            let str_done = 0
+            while3 str_done == 0 {
+                if3 i >= slen {
+                    str_done = 1
+                } else {
+                    let sc = _char_at(source, i)
+                    if3 sc == "\\" {
+                        i = i + 2
+                        s = s + "\\"
+                    } else sc == "\"" {
+                        str_done = 1
+                        i = i + 1
+                    } else {
+                        s = s + sc
+                        i = i + 1
+                    }
+                }
+            }
+            tokens = append(tokens, _mk_tok(TK_STR, s, start))
+        } else _is_digit(c) == 1 {
+            // number literal
+            let start = i
+            let num_str = ""
+            let is_float = 0
+            let num_done = 0
+            while3 num_done == 0 {
+                if3 i >= slen { num_done = 1 }
+                if3 num_done == 0 {
+                    let nc = _char_at(source, i)
+                    if3 _is_digit(nc) == 1 {
+                        num_str = num_str + nc
+                        i = i + 1
+                    } else nc == "." {
+                        is_float = 1
+                        num_str = num_str + nc
+                        i = i + 1
+                    } else {
+                        num_done = 1
+                    }
+                }
+            }
+            if3 is_float == 1 {
+                tokens = append(tokens, _mk_tok(TK_FLOAT, num_str, start))
+            } else {
+                tokens = append(tokens, _mk_tok(TK_INT, num_str, start))
+            }
+        } else _is_alpha(c) == 1 {
+            // identifier or keyword
+            let start = i
+            let word = ""
+            let id_done = 0
+            while3 id_done == 0 {
+                if3 i >= slen { id_done = 1 }
+                if3 id_done == 0 {
+                    let wc = _char_at(source, i)
+                    if3 _is_alnum(wc) == 1 {
+                        word = word + wc
+                        i = i + 1
+                    } else {
+                        id_done = 1
+                    }
+                }
+            }
+            let kw = _keyword_type(word)
+            if3 kw != "" {
+                tokens = append(tokens, _mk_tok(kw, word, start))
+            } else {
+                tokens = append(tokens, _mk_tok(TK_IDENT, word, start))
+            }
+        } else c == "+" {
+            tokens = append(tokens, _mk_tok(TK_PLUS, "+", i))
+            i = i + 1
+        } else c == "-" {
+            tokens = append(tokens, _mk_tok(TK_MINUS, "-", i))
+            i = i + 1
+        } else c == "*" {
+            tokens = append(tokens, _mk_tok(TK_STAR, "*", i))
+            i = i + 1
+        } else c == "=" {
+            let c2 = _char_at(source, i + 1)
+            if3 c2 == "=" {
+                tokens = append(tokens, _mk_tok(TK_EQEQ, "==", i))
+                i = i + 2
+            } else {
+                tokens = append(tokens, _mk_tok(TK_EQ, "=", i))
+                i = i + 1
+            }
+        } else c == "!" {
+            let c2 = _char_at(source, i + 1)
+            if3 c2 == "=" {
+                tokens = append(tokens, _mk_tok(TK_NEQ, "!=", i))
+                i = i + 2
+            } else {
+                tokens = append(tokens, _mk_tok(TK_NOT, "!", i))
+                i = i + 1
+            }
+        } else c == "<" {
+            let c2 = _char_at(source, i + 1)
+            if3 c2 == "=" {
+                tokens = append(tokens, _mk_tok(TK_LTE, "<=", i))
+                i = i + 2
+            } else {
+                tokens = append(tokens, _mk_tok(TK_LT, "<", i))
+                i = i + 1
+            }
+        } else c == ">" {
+            let c2 = _char_at(source, i + 1)
+            if3 c2 == "=" {
+                tokens = append(tokens, _mk_tok(TK_GTE, ">=", i))
+                i = i + 2
+            } else {
+                tokens = append(tokens, _mk_tok(TK_GT, ">", i))
+                i = i + 1
+            }
+        } else c == "?" {
+            let c2 = _char_at(source, i + 1)
+            if3 c2 == "?" {
+                tokens = append(tokens, _mk_tok(TK_NULLCO, "??", i))
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        } else c == "&" {
+            let c2 = _char_at(source, i + 1)
+            if3 c2 == "&" {
+                tokens = append(tokens, _mk_tok(TK_AND, "&&", i))
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        } else c == "|" {
+            let c2 = _char_at(source, i + 1)
+            if3 c2 == "|" {
+                tokens = append(tokens, _mk_tok(TK_OR, "||", i))
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        } else c == "(" {
+            tokens = append(tokens, _mk_tok(TK_LPAREN, "(", i))
+            i = i + 1
+        } else c == ")" {
+            tokens = append(tokens, _mk_tok(TK_RPAREN, ")", i))
+            i = i + 1
+        } else c == "{" {
+            tokens = append(tokens, _mk_tok(TK_LBRACE, "{", i))
+            i = i + 1
+        } else c == "}" {
+            tokens = append(tokens, _mk_tok(TK_RBRACE, "}", i))
+            i = i + 1
+        } else c == "[" {
+            tokens = append(tokens, _mk_tok(TK_LBRACK, "[", i))
+            i = i + 1
+        } else c == "]" {
+            tokens = append(tokens, _mk_tok(TK_RBRACK, "]", i))
+            i = i + 1
+        } else c == "," {
+            tokens = append(tokens, _mk_tok(TK_COMMA, ",", i))
+            i = i + 1
+        } else c == "." {
+            tokens = append(tokens, _mk_tok(TK_DOT, ".", i))
+            i = i + 1
+        } else {
+            // unknown char -- skip
+            i = i + 1
+        }
+
+        // safety: cap token count
+        if3 len(tokens) >= MAX_TOKENS {
+            return tokens
+        }
+    }
+
+    tokens = append(tokens, _mk_tok(TK_EOF, "", slen))
+    return tokens
+}
+
+// ============================================================================
+// PARSER STATE: global cursor into token list
+// We use globals because NovaLang closures have scope limits.
+// ============================================================================
+let _tokens = []
+let _pos = 0
+
+fn _cur_tok() {
+    if3 _pos >= len(_tokens) {
+        return _mk_tok(TK_EOF, "", 0)
+    }
+    return _tokens[_pos]
+}
+
+fn _peek_type() {
+    let t = _cur_tok()
+    return dict_get(t, "type", TK_EOF) ?? TK_EOF
+}
+
+fn _peek_val() {
+    let t = _cur_tok()
+    return dict_get(t, "value", "") ?? ""
+}
+
+fn _advance() {
+    _pos = _pos + 1
+}
+
+fn _skip_newlines() {
+    while3 _peek_type() == TK_NEWLINE {
+        _advance()
+    }
+}
+
+fn _expect(typ) {
+    let ct = _peek_type()
+    if3 ct == typ {
+        let val = _peek_val()
+        _advance()
+        return val
+    }
+    return null
+}
+
+// ============================================================================
+// HELPER: make AST node (avoids 6+ key dict literal)
+// ============================================================================
+fn _mk_node(ntype, props) {
+    let n = dict_set(props, "node", ntype)
+    return n
+}
+
+// ============================================================================
+// PARSER: Recursive Descent
+// ============================================================================
+
+// -- parse_primary: literals, identifiers, parens, lists, dicts --
+fn parse_primary() {
+    _skip_newlines()
+    let typ = _peek_type()
+    let val = _peek_val()
+
+    if3 typ == TK_INT {
+        _advance()
+        return _mk_node("LiteralExpr", {"kind": "int", "value": val})
+    }
+    if3 typ == TK_FLOAT {
+        _advance()
+        return _mk_node("LiteralExpr", {"kind": "float", "value": val})
+    }
+    if3 typ == TK_STR {
+        _advance()
+        return _mk_node("LiteralExpr", {"kind": "str", "value": val})
+    }
+    if3 typ == TK_TRUE {
+        _advance()
+        return _mk_node("LiteralExpr", {"kind": "bool", "value": "true"})
+    }
+    if3 typ == TK_FALSE {
+        _advance()
+        return _mk_node("LiteralExpr", {"kind": "bool", "value": "false"})
+    }
+    if3 typ == TK_NULL {
+        _advance()
+        return _mk_node("LiteralExpr", {"kind": "null", "value": "null"})
+    }
+    if3 typ == TK_MINUS {
+        _advance()
+        let inner = parse_primary()
+        return _mk_node("UnaryExpr", {"op": "-", "expr": inner})
+    }
+    if3 typ == TK_NOT {
+        _advance()
+        let inner = parse_primary()
+        return _mk_node("UnaryExpr", {"op": "!", "expr": inner})
+    }
+    if3 typ == TK_LPAREN {
+        _advance()
+        let inner = parse_expr()
+        _expect(TK_RPAREN)
+        return inner
+    }
+    if3 typ == TK_LBRACK {
+        _advance()
+        let items = []
+        _skip_newlines()
+        while3 _peek_type() != TK_RBRACK {
+            if3 _peek_type() == TK_EOF { return _mk_node("ListExpr", {"items": items}) }
+            let item = parse_expr()
+            items = append(items, item)
+            _skip_newlines()
+            if3 _peek_type() == TK_COMMA { _advance() }
+            _skip_newlines()
+        }
+        _expect(TK_RBRACK)
+        return _mk_node("ListExpr", {"items": items})
+    }
+    if3 typ == TK_LBRACE {
+        _advance()
+        let pairs = []
+        _skip_newlines()
+        while3 _peek_type() != TK_RBRACE {
+            if3 _peek_type() == TK_EOF { return _mk_node("DictExpr", {"pairs": pairs}) }
+            let key = parse_expr()
+            _skip_newlines()
+            // expect colon -- in NovaLang dicts use : between key and value
+            // but NovaLang actually uses "key": val syntax already parsed as str
+            let pair_entry = {"key": key}
+            _skip_newlines()
+            // NovaLang uses "key": value in dict literal
+            // After parsing key (a string), we look for the value
+            // The tokenizer already consumed the quotes, so the : is next
+            // Actually in NovaLang dict syntax {"k": v}, the colon is part of the token stream
+            // We skip unknown chars including colon in tokenizer, so just parse the value
+            let vnode = parse_expr()
+            pair_entry = dict_set(pair_entry, "value", vnode)
+            pairs = append(pairs, pair_entry)
+            _skip_newlines()
+            if3 _peek_type() == TK_COMMA { _advance() }
+            _skip_newlines()
+        }
+        _expect(TK_RBRACE)
+        return _mk_node("DictExpr", {"pairs": pairs})
+    }
+    if3 typ == TK_IDENT {
+        let name = val
+        _advance()
+        // check call expr
+        if3 _peek_type() == TK_LPAREN {
+            _advance()
+            let args = []
+            _skip_newlines()
+            while3 _peek_type() != TK_RPAREN {
+                if3 _peek_type() == TK_EOF { return _mk_node("CallExpr", {"name": name, "args": args}) }
+                let arg = parse_expr()
+                args = append(args, arg)
+                _skip_newlines()
+                if3 _peek_type() == TK_COMMA { _advance() }
+                _skip_newlines()
+            }
+            _expect(TK_RPAREN)
+            return _mk_node("CallExpr", {"name": name, "args": args})
+        }
+        // check index expr
+        if3 _peek_type() == TK_LBRACK {
+            _advance()
+            let idx = parse_expr()
+            _expect(TK_RBRACK)
+            return _mk_node("IndexExpr", {"target": name, "index": idx})
+        }
+        return _mk_node("IdentExpr", {"name": name})
+    }
+    // fallback: skip and return error node
+    _advance()
+    return _mk_node("ErrorExpr", {"value": val, "token_type": typ})
+}
+
+// -- parse_binop: handles +, -, *, /, comparisons --
+fn _is_binop(typ) {
+    if3 typ == TK_PLUS { return 1 }
+    if3 typ == TK_MINUS { return 1 }
+    if3 typ == TK_STAR { return 1 }
+    if3 typ == TK_SLASH { return 1 }
+    if3 typ == TK_EQEQ { return 1 }
+    if3 typ == TK_NEQ { return 1 }
+    if3 typ == TK_LT { return 1 }
+    if3 typ == TK_GT { return 1 }
+    if3 typ == TK_LTE { return 1 }
+    if3 typ == TK_GTE { return 1 }
+    if3 typ == TK_NULLCO { return 1 }
+    if3 typ == TK_AND { return 1 }
+    if3 typ == TK_OR { return 1 }
+    if3 typ == TK_DOT { return 1 }
+    return 0
+}
+
+fn parse_expr() {
+    _skip_newlines()
+    let left = parse_primary()
+
+    while3 _is_binop(_peek_type()) == 1 {
+        let op_type = _peek_type()
+        let op_val = _peek_val()
+        _advance()
+        _skip_newlines()
+        let right = parse_primary()
+        let new_left = {"node": "BinOpExpr", "op": op_val}
+        new_left = dict_set(new_left, "left", left)
+        new_left = dict_set(new_left, "right", right)
+        left = new_left
+    }
+
+    return left
+}
+
+// -- parse_block: { stmts... } --
+fn parse_block() {
+    _skip_newlines()
+    _expect(TK_LBRACE)
+    let stmts = []
+    _skip_newlines()
+    while3 _peek_type() != TK_RBRACE {
+        if3 _peek_type() == TK_EOF { return _mk_node("BlockStmt", {"body": stmts}) }
+        _skip_newlines()
+        if3 _peek_type() == TK_RBRACE {
+            // empty remaining -- exit
+            _expect(TK_RBRACE)
+            return _mk_node("BlockStmt", {"body": stmts})
+        }
+        let s = parse_stmt()
+        if3 s != null {
+            stmts = append(stmts, s)
+        }
+        _skip_newlines()
+    }
+    _expect(TK_RBRACE)
+    return _mk_node("BlockStmt", {"body": stmts})
+}
+
+// -- parse_stmt: dispatches on current token --
+fn parse_stmt() {
+    _skip_newlines()
+    let typ = _peek_type()
+
+    if3 typ == TK_EOF { return null }
+
+    if3 typ == TK_NEWLINE {
+        _advance()
+        return null
+    }
+
+    if3 typ == TK_LET {
+        return parse_let_stmt()
+    }
+    if3 typ == TK_FN {
+        return parse_fn_def()
+    }
+    if3 typ == TK_IF3 {
+        return parse_if3_stmt()
+    }
+    if3 typ == TK_WHILE3 {
+        return parse_while3_stmt()
+    }
+    if3 typ == TK_FOR3 {
+        return parse_for3_stmt()
+    }
+    if3 typ == TK_RETURN {
+        return parse_return_stmt()
+    }
+    if3 typ == TK_IMPORT3 {
+        return parse_import3_stmt()
+    }
+    if3 typ == TK_MATCH3 {
+        return parse_match3_stub()
+    }
+    if3 typ == TK_BREAK3 {
+        _advance()
+        return _mk_node("Break3Stmt", {"value": "break3"})
+    }
+    if3 typ == TK_CONT3 {
+        _advance()
+        return _mk_node("Continue3Stmt", {"value": "continue3"})
+    }
+
+    // expression statement (assignment or bare call)
+    return parse_expr_stmt()
+}
+
+// -- parse_let_stmt: let x = expr --
+fn parse_let_stmt() {
+    _expect(TK_LET)
+    _skip_newlines()
+    let name = _expect(TK_IDENT)
+    _skip_newlines()
+    _expect(TK_EQ)
+    _skip_newlines()
+
+    // check if next is try3 (special desugaring)
+    if3 _peek_type() == TK_TRY3 {
+        _advance()
+        let try_block = parse_block()
+        _skip_newlines()
+        // fail block (anonymous second block)
+        let fail_block = parse_block()
+        let r = {"name": name, "try_body": try_block}
+        r = dict_set(r, "fail_body", fail_block)
+        return _mk_node("LetTry3Stmt", r)
+    }
+
+    let value = parse_expr()
+    let r = {"name": name, "value": value}
+    return _mk_node("LetStmt", r)
+}
+
+// -- parse_fn_def: fn name(args) { body } --
+fn parse_fn_def() {
+    _expect(TK_FN)
+    _skip_newlines()
+    let name = _expect(TK_IDENT)
+    _skip_newlines()
+    _expect(TK_LPAREN)
+    let params = []
+    _skip_newlines()
+    while3 _peek_type() != TK_RPAREN {
+        if3 _peek_type() == TK_EOF { return _mk_node("FnDef", {"name": name, "params": params, "body": null}) }
+        let pname = _expect(TK_IDENT)
+        if3 pname != null {
+            params = append(params, pname)
+        }
+        _skip_newlines()
+        if3 _peek_type() == TK_COMMA { _advance() }
+        _skip_newlines()
+    }
+    _expect(TK_RPAREN)
+    _skip_newlines()
+    let body = parse_block()
+    let r = {"name": name, "params": params}
+    r = dict_set(r, "body", body)
+    return _mk_node("FnDef", r)
+}
+
+// -- parse_if3_stmt: if3 cond { } maybe { } else { } --
+fn parse_if3_stmt() {
+    _expect(TK_IF3)
+    _skip_newlines()
+    let cond = parse_expr()
+    _skip_newlines()
+    let then_block = parse_block()
+    let branches = []
+    let else_block = null
+    _skip_newlines()
+
+    // check maybe / else3 / else branches
+    let checking = 1
+    while3 checking == 1 {
+        _skip_newlines()
+        let nt = _peek_type()
+        if3 nt == TK_MAYBE {
+            _advance()
+            _skip_newlines()
+            let mb = parse_block()
+            let entry = {"kind": "maybe", "body": mb}
+            branches = append(branches, entry)
+        } else nt == TK_ELSE3 {
+            _advance()
+            _skip_newlines()
+            let econd = parse_expr()
+            _skip_newlines()
+            let eb = parse_block()
+            let entry = {"kind": "else3", "cond": econd}
+            entry = dict_set(entry, "body", eb)
+            branches = append(branches, entry)
+        } else nt == TK_ELSE {
+            _advance()
+            _skip_newlines()
+            // check if this is else3 written as "else" or unconditional
+            let elt = _peek_type()
+            if3 elt == TK_LBRACE {
+                else_block = parse_block()
+                checking = 0
+            } else {
+                let econd = parse_expr()
+                _skip_newlines()
+                let eb = parse_block()
+                let entry = {"kind": "else", "cond": econd}
+                entry = dict_set(entry, "body", eb)
+                branches = append(branches, entry)
+            }
+        } else {
+            checking = 0
+        }
+    }
+
+    let r = {"cond": cond, "then": then_block}
+    r = dict_set(r, "branches", branches)
+    r = dict_set(r, "else", else_block)
+    return _mk_node("If3Stmt", r)
+}
+
+// -- parse_while3_stmt: while3 cond { body } --
+fn parse_while3_stmt() {
+    _expect(TK_WHILE3)
+    _skip_newlines()
+    let cond = parse_expr()
+    _skip_newlines()
+    let body = parse_block()
+    let r = {"cond": cond, "body": body}
+    return _mk_node("While3Stmt", r)
+}
+
+// -- parse_for3_stmt: for3 item in expr { body } --
+fn parse_for3_stmt() {
+    _expect(TK_FOR3)
+    _skip_newlines()
+    let var_name = _expect(TK_IDENT)
+    _skip_newlines()
+    // expect "in" as an identifier
+    let in_word = _expect(TK_IDENT)
+    _skip_newlines()
+    let iter_expr = parse_expr()
+    _skip_newlines()
+    let body = parse_block()
+    let r = {"var": var_name, "iter": iter_expr}
+    r = dict_set(r, "body", body)
+    return _mk_node("For3Stmt", r)
+}
+
+// -- parse_return_stmt --
+fn parse_return_stmt() {
+    _expect(TK_RETURN)
+    _skip_newlines()
+    let typ = _peek_type()
+    if3 typ == TK_NEWLINE { return _mk_node("ReturnStmt", {"value": null}) }
+    if3 typ == TK_RBRACE { return _mk_node("ReturnStmt", {"value": null}) }
+    if3 typ == TK_EOF { return _mk_node("ReturnStmt", {"value": null}) }
+    let val = parse_expr()
+    return _mk_node("ReturnStmt", {"value": val})
+}
+
+// -- parse_import3_stmt --
+fn parse_import3_stmt() {
+    _expect(TK_IMPORT3)
+    _skip_newlines()
+    _expect(TK_LPAREN)
+    let path = _expect(TK_STR)
+    _expect(TK_RPAREN)
+    return _mk_node("Import3Stmt", {"path": path})
+}
+
+// -- parse_match3_stub: simplified match3 --
+fn parse_match3_stub() {
+    _expect(TK_MATCH3)
+    _skip_newlines()
+    let subject = parse_expr()
+    _skip_newlines()
+    let body = parse_block()
+    let r = {"subject": subject, "body": body}
+    return _mk_node("Match3Stmt", r)
+}
+
+// -- parse_expr_stmt: assignment or bare expression --
+fn parse_expr_stmt() {
+    let expr = parse_expr()
+    _skip_newlines()
+    // check assignment: ident = expr
+    if3 _peek_type() == TK_EQ {
+        _advance()
+        _skip_newlines()
+        let rhs = parse_expr()
+        let r = {"target": expr, "value": rhs}
+        return _mk_node("AssignStmt", r)
+    }
+    return _mk_node("ExprStmt", {"expr": expr})
+}
+
+// ============================================================================
+// TOP-LEVEL: parse_program -- returns list of AST nodes
+// ============================================================================
+fn parse_program(source) {
+    _tokens = tokenize(source)
+    _pos = 0
+    let stmts = []
+
+    _skip_newlines()
+    while3 _peek_type() != TK_EOF {
+        let s = parse_stmt()
+        if3 s != null {
+            stmts = append(stmts, s)
+        }
+        _skip_newlines()
+        // safety cap
+        if3 len(stmts) > BLOCK {
+            return stmts
+        }
+    }
+    return stmts
+}
+
+// ============================================================================
+// LINTER: fn lint_code(source) -> list of warning dicts
+// ============================================================================
+fn _mk_warn(msg, pos, severity) {
+    let w = {"message": msg, "pos": pos}
+    w = dict_set(w, "severity", severity)
+    return w
+}
+
+fn lint_code(source) {
+    let toks = tokenize(source)
+    let warnings = []
+    let i = 0
+    let n = len(toks)
+
+    while3 i < n {
+        let t = toks[i]
+        let typ = dict_get(t, "type", "") ?? ""
+        let val = dict_get(t, "value", "") ?? ""
+        let pos = dict_get(t, "pos", 0) ?? 0
+
+        // WARN: bare "if" (not if3)
+        if3 typ == TK_IDENT {
+            if3 val == "if" {
+                warnings = append(warnings, _mk_warn("Use if3 instead of bare if", pos, "error"))
+            }
+            if3 val == "while" {
+                warnings = append(warnings, _mk_warn("Use while3 instead of bare while", pos, "error"))
+            }
+            if3 val == "for" {
+                warnings = append(warnings, _mk_warn("Use for3 instead of bare for", pos, "error"))
+            }
+            if3 val == "try" {
+                warnings = append(warnings, _mk_warn("Use try3 instead of bare try", pos, "error"))
+            }
+            // WARN: dict_get with 3 args (should use ?? instead)
+            if3 val == "dict_get" {
+                let depth = 0
+                let arg_count = 0
+                let j = i + 1
+                // scan ahead to count args in call
+                if3 j < n {
+                    let nt2 = toks[j]
+                    let ntyp = dict_get(nt2, "type", "") ?? ""
+                    if3 ntyp == TK_LPAREN {
+                        let j2 = j + 1
+                        depth = 1
+                        arg_count = 1
+                        while3 j2 < n {
+                            let st = toks[j2]
+                            let stt = dict_get(st, "type", "") ?? ""
+                            if3 stt == TK_LPAREN { depth = depth + 1 }
+                            if3 stt == TK_RPAREN { depth = depth - 1 }
+                            if3 depth == 0 { j2 = n + 1 }
+                            if3 stt == TK_COMMA {
+                                if3 depth == 1 { arg_count = arg_count + 1 }
+                            }
+                            if3 depth > 0 { j2 = j2 + 1 }
+                        }
+                        if3 arg_count >= 3 {
+                            warnings = append(warnings, _mk_warn("dict_get with 3+ args: use dict_get(d, k) ?? default instead", pos, "warning"))
+                        }
+                    }
+                }
+            }
+        }
+
+        // WARN: let shadowing hint (let inside while3/for3 context)
+        // This is a simplified check -- just warn on let x = x patterns
+        if3 typ == TK_LET {
+            if3 i + 4 < n {
+                let t2 = toks[i + 1]
+                let t3 = toks[i + 2]
+                let t4 = toks[i + 3]
+                let vname = dict_get(t2, "value", "") ?? ""
+                let eq_check = dict_get(t3, "type", "") ?? ""
+                let rhs_name = dict_get(t4, "value", "") ?? ""
+                if3 eq_check == TK_EQ {
+                    if3 vname == rhs_name {
+                        warnings = append(warnings, _mk_warn("Possible let-shadowing: let " + vname + " = " + vname + " ...", pos, "info"))
+                    }
+                }
+            }
+        }
+
+        i = i + 1
+    }
+
+    return warnings
+}
+
+// ============================================================================
+// GRAMMAR RULES (static description)
+// ============================================================================
+fn get_grammar() {
+    let rules = []
+    rules = append(rules, "LetStmt: let IDENT = Expr")
+    rules = append(rules, "LetTry3Stmt: let IDENT = try3 Block Block")
+    rules = append(rules, "AssignStmt: Expr = Expr")
+    rules = append(rules, "FnDef: fn IDENT ( Params ) Block")
+    rules = append(rules, "If3Stmt: if3 Expr Block [maybe Block] [else Block]")
+    rules = append(rules, "While3Stmt: while3 Expr Block")
+    rules = append(rules, "For3Stmt: for3 IDENT in Expr Block")
+    rules = append(rules, "ReturnStmt: return [Expr]")
+    rules = append(rules, "Break3Stmt: break3")
+    rules = append(rules, "Continue3Stmt: continue3")
+    rules = append(rules, "Match3Stmt: match3 Expr Block")
+    rules = append(rules, "Import3Stmt: import3( STR )")
+    rules = append(rules, "CallExpr: IDENT ( Args )")
+    rules = append(rules, "BinOpExpr: Expr OP Expr")
+    rules = append(rules, "UnaryExpr: OP Expr")
+    rules = append(rules, "LiteralExpr: INT | FLOAT | STR | true | false | null")
+    rules = append(rules, "IdentExpr: IDENT")
+    rules = append(rules, "ListExpr: [ Exprs ]")
+    rules = append(rules, "DictExpr: { Pairs }")
+    rules = append(rules, "IndexExpr: IDENT [ Expr ]")
+    rules = append(rules, "BlockStmt: { Stmts }")
+    rules = append(rules, "ExprStmt: Expr")
+    return rules
+}
+
+// ============================================================================
+// ROUTE HANDLERS
+// ============================================================================
+
+fn handle_health(req) {
+    let t0 = time()
+    let resp = ns_health_dict("NovaParser", VERSION, PORT, _ns)
+    resp = dict_set(resp, "parse_count", _parse_count)
+    resp = dict_set(resp, "lint_count", _lint_count)
+    resp = dict_set(resp, "token_count", _token_count)
+    resp = dict_set(resp, "self_hosting", 1)
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, 0)
+    return resp
+}
+
+fn handle_parse(req) {
+    let t0 = time()
+    let body = try3 { json_decode(req["body"]) } { req }
+    let code = dict_get(body, "code", "") ?? ""
+
+    if3 len(code) == 0 {
+        _error_count = _error_count + 1
+        return {"ok": -1, "error": "no code provided"}
+    }
+    if3 len(code) > MAX_SOURCE {
+        _error_count = _error_count + 1
+        return {"ok": -1, "error": "source too large"}
+    }
+
+    let ast = parse_program(code)
+    _parse_count = _parse_count + 1
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, 0)
+
+    let r = {"ok": 1, "ast": ast}
+    r = dict_set(r, "node_count", len(ast))
+    r = dict_set(r, "elapsed_ms", elapsed)
+    return r
+}
+
+fn handle_lint(req) {
+    let t0 = time()
+    let body = try3 { json_decode(req["body"]) } { req }
+    let code = dict_get(body, "code", "") ?? ""
+
+    if3 len(code) == 0 {
+        return {"ok": -1, "error": "no code provided"}
+    }
+
+    let warns = lint_code(code)
+    _lint_count = _lint_count + 1
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, 0)
+
+    let r = {"ok": 1, "warnings": warns}
+    r = dict_set(r, "count", len(warns))
+    r = dict_set(r, "elapsed_ms", elapsed)
+    return r
+}
+
+fn handle_tokens(req) {
+    let t0 = time()
+    let body = try3 { json_decode(req["body"]) } { req }
+    let code = dict_get(body, "code", "") ?? ""
+
+    if3 len(code) == 0 {
+        return {"ok": -1, "error": "no code provided"}
+    }
+
+    let toks = tokenize(code)
+    _token_count = _token_count + 1
+    let elapsed = time() - t0
+    _ns = ns_record(_ns, elapsed, 0)
+
+    let r = {"ok": 1, "tokens": toks}
+    r = dict_set(r, "count", len(toks))
+    r = dict_set(r, "elapsed_ms", elapsed)
+    return r
+}
+
+fn handle_grammar(req) {
+    let rules = get_grammar()
+    let r = {"ok": 1, "rules": rules}
+    r = dict_set(r, "count", len(rules))
+    r = dict_set(r, "version", VERSION)
+    return r
+}
+
+// ============================================================================
+// ROUTES
+// ============================================================================
+troute(server, "GET",  "/health",          "handle_health")
+troute(server, "POST", "/parser/parse",    "handle_parse")
+troute(server, "POST", "/parser/lint",     "handle_lint")
+troute(server, "POST", "/parser/tokens",   "handle_tokens")
+troute(server, "GET",  "/parser/grammar",  "handle_grammar")
+
+// ============================================================================
+// BOOT
+// ============================================================================
+print("[NovaParser] Self-hosting bootstrap on port " + str(PORT))
+print("[NovaParser] Endpoints: /parser/parse, /parser/lint, /parser/tokens, /parser/grammar")
+tstart(server)

@@ -1,0 +1,182 @@
+// NovaX Brain Server v2.0
+// Port 9990 | Central brain/thinking service
+// Routes queries through reasoning chains, memory integration, context routing
+// Cascading intelligence: local → hivemind → cloud
+
+let PORT = 9990
+let SERVICE_NAME = "nova-brain"
+let VERSION = "2.0.0"
+
+// 3-5-7-13 Harmonic Constants
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+
+// N-S Reynolds boundaries
+let RE_LAMINAR = 27       // H3^3 — simple queries
+let RE_TRANSITION = 125   // H5^3 — moderate complexity
+let RE_TURBULENT = 343    // H7^3 — complex reasoning
+
+// State
+let _stats = {"queries": 0, "local_hits": 0, "hive_hits": 0, "cloud_hits": 0, "errors": 0, "t0": time()}
+let _memory = {}
+let _context_window = []
+let MAX_CONTEXT = H13 * H3  // 39 entries in rolling context
+
+// ── Reynolds Classification ──
+fn classify_query(text) {
+    let l = len(text)
+    let words = len(split(text, " "))
+    let re = (l * words) / (H7 * H13)
+    if3 re < RE_LAMINAR {
+        return {"reynolds": round(re, 2), "regime": "laminar", "trit": 1}
+    } else3 re < RE_TRANSITION {
+        return {"reynolds": round(re, 2), "regime": "transitional", "trit": 0}
+    } else3 re < RE_TURBULENT {
+        return {"reynolds": round(re, 2), "regime": "turbulent", "trit": 0}
+    } else3 {
+        return {"reynolds": round(re, 2), "regime": "chaotic", "trit": -1}
+    }
+}
+
+// ── Think: main reasoning endpoint ──
+fn handle_think(req) {
+    let text = dict_get(req, "text") ?? dict_get(req, "prompt") ?? ""
+    if3 text == "" {
+        return {"ok": false, "error": "missing text/prompt", "trit": -1}
+    }
+    _stats = dict_set(_stats, "queries", (dict_get(_stats, "queries") ?? 0) + 1)
+    let classification = classify_query(text)
+    let regime = dict_get(classification, "regime") ?? "laminar"
+    push(_context_window, {"text": text, "time": time(), "regime": regime})
+    if3 len(_context_window) > MAX_CONTEXT {
+        _context_window = slice(_context_window, len(_context_window) - MAX_CONTEXT, len(_context_window))
+    }
+    // Cascade: ollama → hivemind → cloud
+    let r1 = try3 { http_post("http://127.0.0.1:11434/api/generate", {"model": "llama3.2:1b", "prompt": text, "stream": false}) } { null }
+    if3 r1 != null {
+        _stats = dict_set(_stats, "local_hits", (dict_get(_stats, "local_hits") ?? 0) + 1)
+        return {"ok": true, "reply": r1, "source": "ollama-local", "regime": regime, "reynolds": dict_get(classification, "reynolds") ?? 0, "trit": 1}
+    }
+    let r2 = try3 { http_post("http://127.0.0.1:9881/query", {"prompt": text, "regime": regime}) } { null }
+    if3 r2 != null {
+        _stats = dict_set(_stats, "hive_hits", (dict_get(_stats, "hive_hits") ?? 0) + 1)
+        return {"ok": true, "reply": r2, "source": "hivemind", "regime": regime, "reynolds": dict_get(classification, "reynolds") ?? 0, "trit": 1}
+    }
+    let r3 = try3 { http_post("http://127.0.0.1:9878/api/v1/query", {"prompt": text}) } { null }
+    if3 r3 != null {
+        _stats = dict_set(_stats, "cloud_hits", (dict_get(_stats, "cloud_hits") ?? 0) + 1)
+        return {"ok": true, "reply": r3, "source": "cloud-router", "regime": regime, "reynolds": dict_get(classification, "reynolds") ?? 0, "trit": 1}
+    }
+    _stats = dict_set(_stats, "errors", (dict_get(_stats, "errors") ?? 0) + 1)
+    return {"ok": false, "error": "all providers unreachable", "regime": regime, "trit": -1}
+}
+
+// ── Memory Store ──
+fn handle_remember(req) {
+    let key = dict_get(req, "key") ?? ""
+    let value = dict_get(req, "value") ?? ""
+    if3 key == "" {
+        return {"ok": false, "error": "missing key", "trit": -1}
+    } else3 {
+        _memory = dict_set(_memory, key, {"value": value, "time": time()})
+        return {"ok": true, "stored": key, "trit": 1}
+    }
+}
+
+// ── Memory Recall ──
+fn handle_recall(req) {
+    let key = dict_get(req, "key") ?? ""
+    if3 key == "" {
+        return {"ok": true, "memory": _memory, "count": len(dict_keys(_memory)), "trit": 1}
+    } else3 {
+        let entry = dict_get(_memory, key) ?? null
+        if3 entry != null {
+            return {"ok": true, "key": key, "value": entry, "trit": 1}
+        } else3 {
+            return {"ok": false, "error": "key not found: " + key, "trit": -1}
+        }
+    }
+}
+
+// ── Context Window ──
+fn handle_context(req) {
+    return {
+        "ok": true,
+        "context": _context_window,
+        "size": len(_context_window),
+        "max": MAX_CONTEXT,
+        "trit": 1
+    }
+}
+
+// ── Health ──
+fn handle_health(req) {
+    let up = round(time() - (dict_get(_stats, "t0") ?? 0))
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "self_trit": 1,
+        "char": "1",
+        "uptime": up,
+        "queries": dict_get(_stats, "queries") ?? 0,
+        "memory_keys": len(dict_keys(_memory)),
+        "context_size": len(_context_window),
+        "routing": {
+            "local": dict_get(_stats, "local_hits") ?? 0,
+            "hive": dict_get(_stats, "hive_hits") ?? 0,
+            "cloud": dict_get(_stats, "cloud_hits") ?? 0
+        }
+    }
+}
+
+// ── Status ──
+fn handle_status(req) {
+    return {
+        "ok": true,
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "stats": _stats,
+        "memory_keys": len(dict_keys(_memory)),
+        "context_size": len(_context_window),
+        "reynolds_boundaries": {
+            "laminar": RE_LAMINAR,
+            "transitional": RE_TRANSITION,
+            "turbulent": RE_TURBULENT
+        },
+        "trit": 1
+    }
+}
+
+// ── Reynolds endpoint ──
+fn handle_reynolds(req) {
+    let text = dict_get(req, "text") ?? ""
+    if3 text == "" {
+        return {"ok": false, "error": "missing text", "trit": -1}
+    } else3 {
+        return classify_query(text)
+    }
+}
+
+// Server setup
+let server = tserve(PORT, SERVICE_NAME)
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/status", "handle_status")
+troute(server, "GET", "/context", "handle_context")
+troute(server, "GET", "/memory", "handle_recall")
+troute(server, "POST", "/think", "handle_think")
+troute(server, "POST", "/query", "handle_think")
+troute(server, "POST", "/remember", "handle_remember")
+troute(server, "POST", "/recall", "handle_recall")
+troute(server, "POST", "/reynolds", "handle_reynolds")
+
+print("[Brain] v" + VERSION + " on port " + str(PORT))
+print("[Brain] N-S routing: laminar(<" + str(RE_LAMINAR) + ") transitional(<" + str(RE_TRANSITION) + ") turbulent(<" + str(RE_TURBULENT) + ")")
+print("[Brain] Cascading: ollama → hivemind → cloud-router")
+
+tstart(server)

@@ -1,0 +1,59 @@
+// nova_restart_orch.nova — Restart the NovaX orchestrator
+// Kills old process on :9999, waits, starts new one, verifies health
+// NovaLang conversion of restart_orchestrator.py
+
+print("=== NovaX Orchestrator Restart ===")
+print("")
+
+let python_exe = "C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
+let script = "C:\\NovaX\\core\\orchestrator.py"
+let log_file = "C:\\NovaX\\logs\\orchestrator_restart.log"
+
+// Phase 1: Find orchestrator PID by port 9999
+print("[restart] Finding orchestrator on port 9999...")
+let find_cmd = "powershell -NoProfile -Command \"Get-NetTCPConnection -LocalPort 9999 -ErrorAction SilentlyContinue | Select OwningProcess | ConvertTo-Json\""
+let find_raw = shell(find_cmd)
+let find_trimmed = trim(find_raw)
+
+fn try_kill_port() {
+  let kill_cmd = "powershell -NoProfile -Command \"$p = Get-NetTCPConnection -LocalPort 9999 -ErrorAction SilentlyContinue | Select -First 1 -ExpandProperty OwningProcess; if ($p) { taskkill /F /PID $p /T }\""
+  let result = shell(kill_cmd)
+  print("[restart] Kill result: " + str(result))
+  return 1
+}
+
+print("[restart] Killing current orchestrator...")
+try_kill_port()
+
+print("[restart] Waiting 3 seconds for port release...")
+sleep(3)
+
+// Phase 2: Start new orchestrator
+print("[restart] Starting new orchestrator...")
+let start_cmd = "powershell -NoProfile -Command \"Start-Process -FilePath '" + python_exe + "' -ArgumentList '" + script + "' -WindowStyle Hidden -RedirectStandardOutput '" + log_file + "'\""
+shell(start_cmd)
+print("[restart] Launch command sent")
+
+// Phase 3: Wait and verify health
+print("[restart] Waiting 5 seconds for startup...")
+sleep(5)
+
+fn check_orch_health() {
+  let result = "UNKNOWN"
+  try3 {
+    let resp = http_get("http://127.0.0.1:9999/health")
+    let data = json_decode(resp)
+    let svc = dict_get(data, "service") ?? "?"
+    let result = "OK — service: " + svc
+  } uncertain {
+    let result = "DEGRADED"
+  } fail3 {
+    let result = "FAILED — not responding"
+  }
+  return result
+}
+
+let health = check_orch_health()
+print("[restart] Health check: " + health)
+print("")
+print("=== Orchestrator Restart Complete ===")

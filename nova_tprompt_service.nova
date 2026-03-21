@@ -1,0 +1,1480 @@
+// nova_tprompt_service.nova -- NovaX Ternary Prompt Engineering (port 9977)
+//
+// Optimize and manage prompts for AI models. Template library, variable
+// substitution, prompt scoring, A/B testing, and prompt chaining.
+// Makes the hivemind smarter by engineering better prompts.
+//
+// Every prompt is a flow -- clarity determines Reynolds number.
+// A well-structured prompt is laminar: it flows through the model
+// without turbulence. A vague prompt is chaotic: the model thrashes.
+//
+// Harmonics:
+//   MAX_TEMPLATES = H13 * H7 = 91  (carrier * composition)
+//   Scoring: 0-100 mapped to ternary (>=70 TRUE, >=40 MAYBE, <40 FALSE)
+//   Template variable pattern: {var_name}
+//   Persist: C:\NovaX\data\tprompts.json
+
+// -- Server setup --
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9977
+let server = tserve(PORT, "TPrompt v1.0 - NovaX Ternary Prompt Engineering")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3   = 3
+let H5   = 5
+let H7   = 7
+let H13  = 13
+let BLOCK = 2187      // 3^7
+
+// -- Sizing constants --
+let VERSION          = "1.0"
+let MAX_TEMPLATES    = 91        // H13 * H7 = 13 * 7
+let MAX_TEMPLATE_SIZE = 2187     // BLOCK chars per template body
+let MAX_VAR_NAME_LEN = 64        // max variable name length
+let MAX_VAR_VALUE_LEN = 6561     // BLOCK * H3 = 2187 * 3
+let MAX_PROMPT_LEN   = 10935     // BLOCK * H5 = 2187 * 5
+let PERSIST_PATH     = "C:\\NovaX\\data\\tprompts.json"
+
+// -- Prompt scoring thresholds --
+let SCORE_TRUE  = 70   // >= 70 = TRUE (+1)  -- good prompt
+let SCORE_MAYBE = 40   // >= 40 = MAYBE (0)  -- mediocre prompt
+                       //  < 40 = FALSE (-1) -- poor prompt
+
+// -- Ternary constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Template store: name -> entry dict --
+// entry dict fields: name, template, variables, description,
+//                    created, updated, renders, hash
+let _templates = {}
+let _torder    = []    // insertion order list for eviction
+
+// -- Global counters --
+let _render_count   = 0
+let _optimize_count = 0
+let _score_count    = 0
+let _chain_count    = 0
+
+// -- Specific action verbs used in scoring --
+// Stored as a flat list; membership tested with contains(join(...), word)
+let SPECIFIC_VERBS = "analyze review compare list explain summarize classify extract generate convert validate optimize refactor debug test implement describe calculate translate format evaluate rank filter parse identify map transform merge split sort"
+
+// -- Structure marker words --
+let STRUCTURE_MARKERS = "step steps first then next finally output input format example constraint rule context role goal task criteria requirements note important focus avoid include exclude"
+
+// -- Ambiguous pronouns --
+let AMBIGUOUS_PRONOUNS = "it this that these those they them something anything stuff things whatever"
+
+// ==========================================================================
+// Helper: extract variables from a template string
+// Variables follow pattern {var_name} -- letters, digits, underscores
+// We scan char by char: collect runs inside { } that are valid identifiers
+// ==========================================================================
+fn extract_variables(tmpl) {
+    let vars = []
+    let i = 0
+    let tlen = len(tmpl)
+    while3 i < tlen {
+        let ch = slice(tmpl, i, i + 1)
+        if3 ch == "{" {
+            // Scan forward for matching }
+            let j = i + 1
+            let name = ""
+            let valid = T_TRUE
+            while3 j < tlen {
+                let c = slice(tmpl, j, j + 1)
+                if3 c == "}" {
+                    // End of variable
+                    let j = tlen + 1     // break
+                } else {
+                    // Check if c is alphanumeric or underscore (simple ASCII check)
+                    let is_alpha = contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789", c)
+                    if3 is_alpha == T_TRUE { name = name + c
+                    } else { valid = T_FALSE
+                        let j = tlen + 1   // break -- invalid char
+                    }
+                    j = j + 1
+                }
+            }
+            if3 valid == T_TRUE {
+                if3 len(name) > 0 {
+                    // Only append if not already in vars
+                    let already = contains(join(vars, "|"), "|" + name + "|")
+                    let at_start = contains(join(vars, "|"), name + "|")
+                    let is_head = T_FALSE
+                    if3 len(vars) > 0 { is_head = vars[0] == name
+                    } else { is_head = T_FALSE
+                    }
+                    if3 already == T_TRUE {
+                        // already included
+                    } else {
+                        if3 at_start == T_TRUE {
+                            // already included (head match)
+                        } else {
+                            if3 is_head == T_TRUE {
+                                // already included
+                            } else {
+                                vars = append(vars, name)
+            } else {
+                // not a valid var pattern -- skip
+        } else {
+            // not a brace -- move on
+        }
+        i = i + 1
+    }
+    return vars
+}
+
+// ==========================================================================
+// Helper: deduplicate a list (returns list with unique items)
+// ==========================================================================
+}
+}
+}
+}
+}
+fn dedup_list(lst) {
+    let out = []
+    let i = 0
+    while3 i < len(lst) {
+        let item = lst[i]
+        let marker = "|" + item + "|"
+        let joined = "|" + join(out, "|") + "|"
+        if3 contains(joined, marker) == T_TRUE {
+            // already present -- skip
+        } else {
+            out = append(out, item)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ==========================================================================
+// Helper: validate template name chars (alphanumeric + hyphens + underscores)
+// ==========================================================================
+fn valid_name(name) {
+    let i = 0
+    let nlen = len(name)
+    if3 nlen == 0 {
+        return T_FALSE
+    } else {
+        while3 i < nlen {
+            let ch = slice(name, i, i + 1)
+            let ok = contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_", ch)
+            if3 ok == T_FALSE {
+                return T_FALSE
+            } else {
+                // keep scanning
+            }
+            i = i + 1
+        }
+        return T_TRUE
+    }
+}
+
+// ==========================================================================
+// Helper: create a template entry dict
+// ==========================================================================
+fn make_entry(name, tmpl, variables, description) {
+    let now = time()
+    let hash_val = sha256(tmpl)
+    let hash13 = slice(hash_val, 0, H13)
+    return {
+        "name":        name,
+        "template":    tmpl,
+        "variables":   variables,
+        "description": description,
+        "created":     now,
+        "updated":     now,
+        "renders":     0,
+        "hash":        hash13
+    }
+}
+
+// ==========================================================================
+// Persistence: load templates from disk (on-demand at startup)
+// ==========================================================================
+fn load_templates() {
+    // Seed defaults first
+    let dv1 = ["query", "channel"]
+    let de1 = make_entry("nova-query",
+        "You are NovaX, a ternary AI system. Answer using +1/0/-1 confidence.\n\nQuery: {query}\nChannel: {channel}",
+        dv1,
+        "Standard NovaX hivemind query format")
+    _templates = dict_set(_templates, "nova-query", de1)
+    _torder = append(_torder, "nova-query")
+
+    let dv2 = ["language", "code"]
+    let de2 = make_entry("code-analyze",
+        "Analyze this code. Rate quality as +1 (good), 0 (okay), -1 (bad).\n\n```{language}\n{code}\n```",
+        dv2,
+        "Code analysis with ternary quality rating")
+    _templates = dict_set(_templates, "code-analyze", de2)
+    _torder = append(_torder, "code-analyze")
+
+    let dv3 = ["length", "text"]
+    let de3 = make_entry("summarize",
+        "Summarize in {length} words or less:\n\n{text}",
+        dv3,
+        "Text summarization with word limit")
+    _templates = dict_set(_templates, "summarize", de3)
+    _torder = append(_torder, "summarize")
+
+    let dv4 = ["statement"]
+    let de4 = make_entry("ternary-classify",
+        "Classify as TRUE (+1), MAYBE (0), or FALSE (-1):\n\n{statement}",
+        dv4,
+        "Ternary classification of any statement")
+    _templates = dict_set(_templates, "ternary-classify", de4)
+    _torder = append(_torder, "ternary-classify")
+
+    // Try to load persisted templates from disk (overlay over defaults)
+    try3 {
+        let raw = nova_read(PERSIST_PATH)
+        if3 len(raw) > 0 { saved = json_decode(raw)
+            let skeys = keys(saved)
+            let i = 0
+            while3 i < len(skeys) {
+                let sname = skeys[i]
+                let sentry = dict_get(saved, sname) ?? {}
+                // Only load if it has a template field
+                if3 dict_has(sentry, "template") == T_TRUE {
+                    _templates = dict_set(_templates, sname, sentry)
+                    // Add to order list if not already present
+                    let marker = "|" + sname + "|"
+                    let joined = "|" + join(_torder, "|") + "|"
+                    if3 contains(joined, marker) == T_TRUE {
+                        // already in order
+                    } else {
+                        _torder = append(_torder, sname)
+                } else {
+                    // skip malformed entry
+                }
+                i = i + 1
+            }
+            print("[TPrompt] Loaded " + str(len(skeys)) + " templates from disk")
+        } else {
+            // no persisted file yet
+    } else {
+        print("[TPrompt] No persisted templates found -- using defaults")
+    }
+    return T_TRUE
+}
+
+// ==========================================================================
+// Persistence: save templates to disk (on-demand)
+// ==========================================================================
+}
+}
+fn save_templates() {
+    try3 {
+        let snapshot = {}
+        let tkeys = keys(_templates)
+        let i = 0
+        while3 i < len(tkeys) {
+            let tname = tkeys[i]
+            let tentry = dict_get(_templates, tname) ?? {}
+            snapshot = dict_set(snapshot, tname, tentry)
+            i = i + 1
+        }
+        let raw = json_encode(snapshot)
+        nova_write(PERSIST_PATH, raw)
+        return T_TRUE
+    } else {
+        print("[TPrompt] Warning: could not save templates to disk")
+        return T_FALSE
+    }
+}
+
+// ==========================================================================
+// Scoring helpers
+// Each returns 0-25; total 0-100
+// ==========================================================================
+
+fn score_length(prompt) {
+    let plen = len(prompt)
+    if3 plen == 0 {
+        return 0
+    } else {
+        if3 plen >= 10 {
+            if3 plen <= 500 {
+                return 25
+            } else {
+                if3 plen <= 2000 {
+                    // gradual decay from 500 to 2000
+                    let decay = 25 * (1 - (plen - 500) / 1500)
+                    let scored = int(decay)
+                    if3 scored < 5 {
+                        return 5
+                    } else {
+                        return scored
+                } else {
+                    return 3
+        } else {
+            // too short: scale 0-25 linearly up to 10 chars
+            let short_score = int(25 * plen / 10)
+            if3 short_score < 0 {
+                return 0
+            } else {
+                return short_score
+            }
+        }
+    }
+}
+}
+}
+}
+
+fn score_specificity(prompt) {
+    // Count how many specific action verbs appear in the prompt
+    let prompt_lower = lower(prompt)
+    // Split prompt into words by spaces
+    let words = split(prompt_lower, " ")
+    let hits = 0
+    let i = 0
+    while3 i < len(words) {
+        let w = words[i]
+        // Strip leading/trailing non-alpha by checking contains in verb list
+        let marker = " " + w + " "
+        let verb_list = " " + SPECIFIC_VERBS + " "
+        if3 contains(verb_list, marker) == T_TRUE { hits = hits + 1
+        } else {
+            // not a specific verb
+        }
+        i = i + 1
+    }
+    if3 hits == 0 {
+        return 5
+    } else {
+        if3 hits == 1 {
+            return 15
+        } else {
+            if3 hits == 2 {
+                return 20
+            } else {
+                return 25
+            }
+        }
+    }
+}
+
+fn score_structure(prompt) {
+    let scored = 0
+    let prompt_lower = lower(prompt)
+    let words = split(prompt_lower, " ")
+
+    // Count structure marker hits
+    let hits = 0
+    let i = 0
+    while3 i < len(words) {
+        let w = words[i]
+        let marker = " " + w + " "
+        let slist = " " + STRUCTURE_MARKERS + " "
+        if3 contains(slist, marker) == T_TRUE { hits = hits + 1
+        } else {
+            // not a marker
+        }
+        i = i + 1
+    }
+    let marker_pts = hits * 3
+    if3 marker_pts > 10 { marker_pts = 10
+    } else {
+        // keep
+    }
+    scored = scored + marker_pts
+
+    // Newlines
+    let nl_count = len(split(prompt, "\n")) - 1
+    if3 nl_count >= 1 { scored = scored + 5
+    } else {
+        // no newlines
+    }
+    if3 nl_count >= 3 { scored = scored + 3
+    } else {
+        // fewer than 3 newlines
+    }
+
+    // Code blocks or triple-quotes
+    if3 contains(prompt, "```") == T_TRUE { scored = scored + 3
+    } else {
+        // no code blocks
+    }
+
+    // Colon present
+    if3 contains(prompt, ":") == T_TRUE { scored = scored + 2
+    } else {
+        // no colon
+    }
+
+    // Starts with bullet-like char
+    let first_char = slice(prompt, 0, 1)
+    if3 first_char == "-" { scored = scored + 2
+    } else {
+        if3 first_char == "*" { scored = scored + 2
+        } else {
+            // no bullet
+        }
+    }
+
+    if3 scored > 25 {
+        return 25
+    } else {
+        return scored
+    }
+}
+
+fn score_clarity(prompt) {
+    let scored = 25
+    let prompt_lower = lower(prompt)
+    let words = split(prompt_lower, " ")
+
+    if3 len(words) == 0 {
+        return 0
+    } else {
+        // Penalize if first word is an ambiguous pronoun
+        let first_w = words[0]
+        let pronoun_list = " " + AMBIGUOUS_PRONOUNS + " "
+        let first_marker = " " + first_w + " "
+        if3 contains(pronoun_list, first_marker) == T_TRUE { scored = scored - 8
+        } else {
+            // first word OK
+        }
+
+        // Count ambiguous pronouns overall
+        let amb_count = 0
+        let wi = 0
+        while3 wi < len(words) {
+            let ww = words[wi]
+            let wmarker = " " + ww + " "
+            if3 contains(pronoun_list, wmarker) == T_TRUE { amb_count = amb_count + 1
+            } else {
+                // not ambiguous
+            }
+            wi = wi + 1
+        }
+
+        // Compute ratio (integer math: ratio_pct = amb_count * 100 / total)
+        let total_words = len(words)
+        let ratio_pct = 0
+        if3 total_words > 0 { ratio_pct = amb_count * 100 / total_words
+        } else {
+            // keep 0
+        }
+        if3 ratio_pct > 15 { scored = scored - 7
+        } else {
+            if3 ratio_pct > 8 { scored = scored - 3
+            } else {
+                // clear enough
+            }
+        }
+
+        // Double negative patterns (simple string search, no regex)
+        if3 contains(prompt_lower, "not un") == T_TRUE { scored = scored - 5
+        } else {
+            // ok
+        }
+        if3 contains(prompt_lower, "not in") == T_TRUE { scored = scored - 5
+        } else {
+            // ok
+        }
+        if3 contains(prompt_lower, "don't not") == T_TRUE { scored = scored - 5
+        } else {
+            // ok
+        }
+        if3 contains(prompt_lower, "never not") == T_TRUE { scored = scored - 5
+        } else {
+            // ok
+        }
+        if3 contains(prompt_lower, "never no ") == T_TRUE { scored = scored - 5
+        } else {
+            // ok
+        }
+
+        if3 scored < 0 {
+            return 0
+        } else {
+            return scored
+        }
+    }
+}
+
+// ==========================================================================
+// Main scoring function: returns {score, breakdown, trit}
+// ==========================================================================
+fn score_prompt_full(prompt) {
+    let s_len     = score_length(prompt)
+    let s_spec    = score_specificity(prompt)
+    let s_struct  = score_structure(prompt)
+    let s_clarity = score_clarity(prompt)
+    let total     = s_len + s_spec + s_struct + s_clarity
+
+    let t = T_FALSE
+    if3 total >= SCORE_TRUE { t = T_TRUE
+    } else {
+        if3 total >= SCORE_MAYBE { t = T_MAYBE
+        } else {
+            // keep T_FALSE
+        }
+    }
+
+    let breakdown = {
+        "length":      s_len,
+        "specificity": s_spec,
+        "structure":   s_struct,
+        "clarity":     s_clarity
+    }
+    return {"score": total, "breakdown": breakdown, "trit": t}
+}
+
+// ==========================================================================
+// Optimizer helpers
+// ==========================================================================
+
+fn optimize_concise(prompt) {
+    // Remove common filler phrases line by line
+    let lines = split(prompt, "\n")
+    let result = []
+    let i = 0
+    while3 i < len(lines) {
+        let line = lines[i]
+        let ltrim = line
+        // Simple filler removal via string replacement (lowercase check)
+        let ll = lower(ltrim)
+        // Remove "please can you " / "can you " / "could you " patterns
+        if3 contains(ll, "can you ") == T_TRUE { idx_end = 8
+            let rest = slice(ltrim, idx_end, len(ltrim))
+            let ltrim = rest
+        } else {
+            if3 contains(ll, "could you ") == T_TRUE { idx_end = 10
+                let rest = slice(ltrim, idx_end, len(ltrim))
+                let ltrim = rest
+            } else {
+                if3 contains(ll, "please ") == T_TRUE { idx_end = 7
+                    let rest = slice(ltrim, idx_end, len(ltrim))
+                    let ltrim = rest
+                } else {
+                    if3 contains(ll, "i want you to ") == T_TRUE { idx_end = 14
+                        let rest = slice(ltrim, idx_end, len(ltrim))
+                        let ltrim = rest
+                    } else {
+                        if3 contains(ll, "i need you to ") == T_TRUE { idx_end = 14
+                            let rest = slice(ltrim, idx_end, len(ltrim))
+                            let ltrim = rest
+                        } else {
+                            if3 contains(ll, "basically ") == T_TRUE { idx_end = 10
+                                let rest = slice(ltrim, idx_end, len(ltrim))
+                                let ltrim = rest
+                            } else {
+                                if3 contains(ll, "essentially ") == T_TRUE { idx_end = 12
+                                    let rest = slice(ltrim, idx_end, len(ltrim))
+                                    let ltrim = rest
+                                } else {
+                                    if3 contains(ll, "just ") == T_TRUE { first5 = slice(ll, 0, 5)
+                                        if3 first5 == "just " { rest = slice(ltrim, 5, len(ltrim))
+                                            let ltrim = rest
+                                        } else {
+                                            // "just" mid-sentence -- keep
+                                    } else {
+                                        // no filler found -- keep as-is
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Trim whitespace from cleaned line
+        // Capitalize first char if non-empty
+        if3 len(ltrim) > 0 { fc = upper(slice(ltrim, 0, 1))
+            let rest2 = slice(ltrim, 1, len(ltrim))
+            let ltrim = fc + rest2
+            result = append(result, ltrim)
+        } else {
+            // skip blank lines produced by filler removal
+        }
+        i = i + 1
+    }
+    return join(result, "\n")
+}
+}
+
+fn optimize_detailed(prompt) {
+    // Build a structured prompt with Role / Task / Context / Output sections
+    let lines = split(prompt, "\n")
+    let sections = []
+    let pl = lower(prompt)
+
+    // Add role if not present
+    let has_role = T_FALSE
+    if3 contains(pl, "you are") == T_TRUE { has_role = T_TRUE } else {}
+    if3 contains(pl, "act as") == T_TRUE  { has_role = T_TRUE } else {}
+    if3 contains(pl, "role:") == T_TRUE   { has_role = T_TRUE } else {}
+    if3 has_role == T_FALSE {
+        sections = append(sections, "Role: You are an expert assistant.")
+    } else {
+        // role already present
+    }
+
+    // Add task marker if not present
+    let has_task = T_FALSE
+    if3 contains(pl, "task:") == T_TRUE      { has_task = T_TRUE } else {}
+    if3 contains(pl, "goal:") == T_TRUE      { has_task = T_TRUE } else {}
+    if3 contains(pl, "objective:") == T_TRUE { has_task = T_TRUE } else {}
+    if3 has_task == T_FALSE { first_line = lines[0]
+        sections = append(sections, "Task: " + first_line)
+        // Remaining lines as context
+        if3 len(lines) > 1 { rest_lines = slice(lines, 1, len(lines))
+            let rest_text = join(rest_lines, "\n")
+            if3 len(rest_text) > 0 {
+                sections = append(sections, "Context:\n" + rest_text)
+            } else {
+                // no remaining content
+        } else {
+            // single-line prompt
+    } else {
+        sections = append(sections, prompt)
+    }
+
+    // Add output format if not present
+    let has_format = T_FALSE
+    if3 contains(pl, "format:") == T_TRUE       { has_format = T_TRUE } else {}
+    if3 contains(pl, "output:") == T_TRUE       { has_format = T_TRUE } else {}
+    if3 contains(pl, "respond with") == T_TRUE  { has_format = T_TRUE } else {}
+    if3 has_format == T_FALSE {
+        sections = append(sections, "Output: Provide a clear, structured response.")
+    } else {
+        // format already present
+    }
+
+    return join(sections, "\n\n")
+}
+}
+}
+
+fn optimize_ternary(prompt) {
+    // Prepend ternary confidence header
+    let header = "Use ternary confidence in your response:\n  +1 = confident/true/positive\n   0 = uncertain/maybe/neutral\n  -1 = unlikely/false/negative"
+    let pl = lower(prompt)
+    let result = header + "\n\n" + prompt
+    // Append rating reminder if no score/rate instruction
+    let has_rate = T_FALSE
+    if3 contains(pl, "rate") == T_TRUE  { has_rate = T_TRUE } else {}
+    if3 contains(pl, "score") == T_TRUE { has_rate = T_TRUE } else {}
+    if3 has_rate == T_FALSE { result = result + "\n\nRate your confidence as +1, 0, or -1."
+    } else {
+        // rating instruction already present
+    }
+    return result
+}
+
+// ==========================================================================
+// trit char helper
+// ==========================================================================
+fn trit_char(t) {
+    if3 t == T_TRUE {
+        return "+"
+    } else {
+        if3 t == T_MAYBE {
+            return "0"
+        } else {
+            return "-"
+        }
+    }
+}
+
+// ==========================================================================
+// ORDER LIST helpers (no Set in NovaLang)
+// ==========================================================================
+fn order_remove(key) {
+    let new_order = []
+    let i = 0
+    while3 i < len(_torder) {
+        let k = _torder[i]
+        if3 k == key {
+            // skip -- removes it
+        } else {
+            new_order = append(new_order, k)
+        }
+        i = i + 1
+    }
+    _torder = new_order
+}
+
+fn order_push(key) {
+    _torder = append(_torder, key)
+}
+
+// Evict oldest template if at capacity
+fn evict_if_full(new_name) {
+    if3 len(_torder) >= MAX_TEMPLATES {
+        // Check if new_name is already in store (update, not insert)
+        if3 dict_has(_templates, new_name) == T_TRUE {
+            // update -- no eviction needed
+        } else {
+            // evict oldest (front of _torder)
+            if3 len(_torder) > 0 { oldest = _torder[0]
+                dict_del(_templates, oldest)
+                order_remove(oldest)
+            } else {
+                // nothing to evict
+    } else {
+        // capacity available
+    }
+}
+
+// ==========================================================================
+// Route: GET /tprompt/health
+// ==========================================================================
+}
+}
+fn tprompt_health() {
+    let count = len(_torder)
+    let resp = ns_health_dict("nova-tprompt", VERSION, PORT, {})
+    resp = dict_set(resp, "templates", count)
+    resp = dict_set(resp, "max_templates", MAX_TEMPLATES)
+    return resp
+}
+
+// ==========================================================================
+// Route: GET /tprompt/template/list
+// ==========================================================================
+fn tprompt_template_list() {
+    let items = []
+    let tkeys = keys(_templates)
+    let i = 0
+    while3 i < len(tkeys) {
+        let tname = tkeys[i]
+        let entry = dict_get(_templates, tname) ?? {}
+        let tmpl_body = dict_get(entry, "template") ?? ""
+        append(items, {
+            "name":        tname,
+            "variables":   dict_get(entry, "variables") ?? [],
+            "description": dict_get(entry, "description") ?? "",
+            "renders":     dict_get(entry, "renders") ?? 0,
+            "hash":        dict_get(entry, "hash") ?? "",
+            "created":     dict_get(entry, "created") ?? 0,
+            "updated":     dict_get(entry, "updated") ?? 0,
+            "char_count":  len(tmpl_body)
+        })
+        i = i + 1
+    }
+    let count = len(items)
+    let fill_pct = round(float(count) / float(MAX_TEMPLATES) * 100, 2)
+    return {
+        "ok":           true,
+        "trit":         T_TRUE,
+        "count":        count,
+        "max_templates": MAX_TEMPLATES,
+        "fill_pct":     fill_pct,
+        "templates":    items
+    }
+}
+
+// ==========================================================================
+// Route: GET /tprompt/stats
+// ==========================================================================
+fn tprompt_stats() {
+    let count = len(_torder)
+    // Sum all render counts
+    let total_renders = 0
+    let rkeys = keys(_templates)
+    let ri = 0
+    while3 ri < len(rkeys) {
+        let rname = rkeys[ri]
+        let rentry = dict_get(_templates, rname) ?? {}
+        total_renders = total_renders + dict_get(rentry, "renders") ?? 0
+        ri = ri + 1
+    }
+    let fill_pct = round(float(count) / float(MAX_TEMPLATES) * 100, 2)
+    return {
+        "ok":           true,
+        "trit":         T_TRUE,
+        "templates":    count,
+        "max_templates": MAX_TEMPLATES,
+        "fill_pct":     fill_pct,
+        "total_renders": total_renders,
+        "optimizations": _optimize_count,
+        "scorings":     _score_count,
+        "chains":       _chain_count,
+        "persist_path": PERSIST_PATH,
+        "runtime":      "novalang",
+        "harmonics": {
+            "max_templates":    "H13*H7=91",
+            "max_template_size": "BLOCK=2187",
+            "score_thresholds": "TRUE>=70, MAYBE>=40"
+        }
+    }
+}
+
+// ==========================================================================
+// Route: GET /tprompt/template/nova-query
+// ==========================================================================
+fn tprompt_get_nova_query() {
+    let entry = dict_get(_templates, "nova-query") ?? {}
+    if3 len(keys(entry)) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "template not found"}
+    } else {
+        return {
+            "ok":          true,
+            "trit":        T_TRUE,
+            "name":        "nova-query",
+            "template":    dict_get(entry, "template") ?? "",
+            "variables":   dict_get(entry, "variables") ?? [],
+            "description": dict_get(entry, "description") ?? "",
+            "renders":     dict_get(entry, "renders") ?? 0,
+            "hash":        dict_get(entry, "hash") ?? "",
+            "created":     dict_get(entry, "created") ?? 0,
+            "updated":     dict_get(entry, "updated") ?? 0
+        }
+    }
+}
+
+// ==========================================================================
+// Route: GET /tprompt/template/code-analyze
+// ==========================================================================
+fn tprompt_get_code_analyze() {
+    let entry = dict_get(_templates, "code-analyze") ?? {}
+    if3 len(keys(entry)) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "template not found"}
+    } else {
+        return {
+            "ok":          true,
+            "trit":        T_TRUE,
+            "name":        "code-analyze",
+            "template":    dict_get(entry, "template") ?? "",
+            "variables":   dict_get(entry, "variables") ?? [],
+            "description": dict_get(entry, "description") ?? "",
+            "renders":     dict_get(entry, "renders") ?? 0,
+            "hash":        dict_get(entry, "hash") ?? "",
+            "created":     dict_get(entry, "created") ?? 0,
+            "updated":     dict_get(entry, "updated") ?? 0
+        }
+    }
+}
+
+// ==========================================================================
+// Route: GET /tprompt/template/summarize
+// ==========================================================================
+fn tprompt_get_summarize() {
+    let entry = dict_get(_templates, "summarize") ?? {}
+    if3 len(keys(entry)) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "template not found"}
+    } else {
+        return {
+            "ok":          true,
+            "trit":        T_TRUE,
+            "name":        "summarize",
+            "template":    dict_get(entry, "template") ?? "",
+            "variables":   dict_get(entry, "variables") ?? [],
+            "description": dict_get(entry, "description") ?? "",
+            "renders":     dict_get(entry, "renders") ?? 0,
+            "hash":        dict_get(entry, "hash") ?? "",
+            "created":     dict_get(entry, "created") ?? 0,
+            "updated":     dict_get(entry, "updated") ?? 0
+        }
+    }
+}
+
+// ==========================================================================
+// Route: GET /tprompt/template/ternary-classify
+// ==========================================================================
+fn tprompt_get_ternary_classify() {
+    let entry = dict_get(_templates, "ternary-classify") ?? {}
+    if3 len(keys(entry)) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "template not found"}
+    } else {
+        return {
+            "ok":          true,
+            "trit":        T_TRUE,
+            "name":        "ternary-classify",
+            "template":    dict_get(entry, "template") ?? "",
+            "variables":   dict_get(entry, "variables") ?? [],
+            "description": dict_get(entry, "description") ?? "",
+            "renders":     dict_get(entry, "renders") ?? 0,
+            "hash":        dict_get(entry, "hash") ?? "",
+            "created":     dict_get(entry, "created") ?? 0,
+            "updated":     dict_get(entry, "updated") ?? 0
+        }
+    }
+}
+
+// ==========================================================================
+// Route: POST /tprompt/template/create
+// ==========================================================================
+fn tprompt_template_create(body) {
+    let name        = dict_get(body, "name") ?? ""
+    let tmpl        = dict_get(body, "template") ?? ""
+    let description = dict_get(body, "description") ?? ""
+
+    if3 len(name) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "name required"}
+    } else {
+        if3 len(tmpl) == 0 {
+            return {"ok": false, "trit": T_FALSE, "error": "template required"}
+        } else {
+            // Validate name chars
+            if3 valid_name(name) == T_FALSE {
+                return {"ok": false, "trit": T_FALSE, "error": "name must be alphanumeric with hyphens/underscores only"}
+            } else {
+                if3 len(name) > MAX_VAR_NAME_LEN {
+                    return {"ok": false, "trit": T_FALSE, "error": "name too long (max 64 chars)"}
+                } else {
+                    if3 len(tmpl) > MAX_TEMPLATE_SIZE {
+                        return {"ok": false, "trit": T_FALSE, "error": "template too large (max 2187 chars)"}
+                    } else {
+                        // Extract variables from template
+                        let extracted_vars = extract_variables(tmpl)
+                        let variables = extracted_vars
+
+                        // Check if declared vars were passed
+                        let declared = dict_get(body, "variables") ?? []
+                        if3 len(declared) > 0 {
+                            // Validate declared vars exist in template
+                            let di = 0
+                            let missing_in_tmpl = []
+                            while3 di < len(declared) {
+                                let dvar = declared[di]
+                                let found = T_FALSE
+                                let ei = 0
+                                while3 ei < len(extracted_vars) {
+                                    if3 extracted_vars[ei] == dvar { found = T_TRUE
+                                    } else {
+                                        // keep scanning
+                                    }
+                                    ei = ei + 1
+                                }
+                                if3 found == T_FALSE {
+                                    missing_in_tmpl = append(missing_in_tmpl, dvar)
+                                } else {
+                                    // declared var found in template
+                                }
+                                di = di + 1
+                            }
+                            if3 len(missing_in_tmpl) > 0 {
+                                return {
+                                    "ok": false,
+                                    "trit": T_MAYBE,
+                                    "error": "declared variables not in template",
+                                    "missing": missing_in_tmpl,
+                                    "found_variables": extracted_vars
+                            } else { variables = declared
+                        } else {
+                            // use extracted vars
+                        }
+
+                        // Evict oldest if at capacity and this is a new entry
+                        evict_if_full(name)
+
+                        let existed = dict_has(_templates, name)
+                        let old_created = 0
+                        let old_renders = 0
+                        if3 existed == T_TRUE { old_entry = dict_get(_templates, name) ?? {}
+                            let old_created = dict_get(old_entry, "created") ?? 0
+                            let old_renders = dict_get(old_entry, "renders") ?? 0
+                        } else {
+                            // new entry -- defaults already 0
+                        }
+
+                        let new_entry = make_entry(name, tmpl, variables, description)
+                        if3 existed == T_TRUE {
+                            new_entry = dict_set(new_entry, "created", old_created)
+                            new_entry = dict_set(new_entry, "renders", old_renders)
+                        } else {
+                            order_push(name)
+                        }
+                        _templates = dict_set(_templates, name, new_entry)
+
+                        // Persist on-demand
+                        save_templates()
+
+                        let hash_val = dict_get(new_entry, "hash") ?? ""
+                        return {
+                            "ok":          true,
+                            "trit":        T_TRUE,
+                            "name":        name,
+                            "variables":   variables,
+                            "replaced":    existed,
+                            "hash":        hash_val,
+                            "description": description
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==========================================================================
+// Route: POST /tprompt/template/render
+// ==========================================================================
+}
+}
+fn tprompt_template_render(body) {
+    let name = dict_get(body, "name") ?? ""
+    let vars = dict_get(body, "vars") ?? {}
+
+    if3 len(name) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "name required"}
+    } else { entry = dict_get(_templates, name) ?? {}
+        if3 len(keys(entry)) == 0 {
+            return {"ok": false, "trit": T_FALSE, "error": "template not found: " + name}
+        } else { tmpl        = dict_get(entry, "template") ?? ""
+            let req_vars    = dict_get(entry, "variables") ?? []
+            let old_renders = dict_get(entry, "renders") ?? 0
+            entry = dict_set(entry, "renders", old_renders + 1)
+            _templates = dict_set(_templates, name, entry)
+            _render_count = _render_count + 1
+
+            // Validate variable value lengths
+            let vkeys = keys(vars)
+            let vi = 0
+            while3 vi < len(vkeys) {
+                let vname = vkeys[vi]
+                let vval  = str(vars[vname])
+                if3 len(vval) > MAX_VAR_VALUE_LEN {
+                    return {"ok": false, "trit": T_FALSE, "error": "variable value too large: " + vname}
+                } else {
+                    // ok
+                }
+                vi = vi + 1
+            }
+
+            // Check for missing required variables
+            let missing = []
+            let ri = 0
+            while3 ri < len(req_vars) {
+                let rv = req_vars[ri]
+                if3 dict_has(vars, rv) == T_TRUE {
+                    // provided
+                } else {
+                    missing = append(missing, rv)
+                }
+                ri = ri + 1
+            }
+            if3 len(missing) > 0 {
+                return {
+                    "ok":      false,
+                    "trit":    T_MAYBE,
+                    "error":   "missing variables",
+                    "missing": missing,
+                    "required": req_vars
+            } else {
+                // Perform substitution
+                let rendered = tmpl
+                let ski = 0
+                while3 ski < len(vkeys) {
+                    let svname = vkeys[ski]
+                    let svval  = str(vars[svname])
+                    let rendered = replace(rendered, "{" + svname + "}", svval)
+                    ski = ski + 1
+                }
+
+                // Check for unresolved variables (still has { in rendered)
+                let result_trit = T_TRUE
+                if3 contains(rendered, "{") == T_TRUE {
+                    let result_trit = T_MAYBE
+                } else {
+                    // fully resolved
+                }
+
+                // Persist updated render count on-demand
+                save_templates()
+
+                return {
+                    "ok":        true,
+                    "trit":      result_trit,
+                    "name":      name,
+                    "rendered":  rendered,
+                    "char_count": len(rendered)
+                }
+            }
+        }
+    }
+}
+
+// ==========================================================================
+// Route: POST /tprompt/template/get  (dynamic lookup by name)
+// ==========================================================================
+}
+fn tprompt_template_get(body) {
+    let name = dict_get(body, "name") ?? ""
+    if3 len(name) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "name required"}
+    } else { entry = dict_get(_templates, name) ?? {}
+        if3 len(keys(entry)) == 0 {
+            return {"ok": false, "trit": T_FALSE, "error": "template not found: " + name}
+        } else {
+            return {
+                "ok":          true,
+                "trit":        T_TRUE,
+                "name":        name,
+                "template":    dict_get(entry, "template") ?? "",
+                "variables":   dict_get(entry, "variables") ?? [],
+                "description": dict_get(entry, "description") ?? "",
+                "renders":     dict_get(entry, "renders") ?? 0,
+                "hash":        dict_get(entry, "hash") ?? "",
+                "created":     dict_get(entry, "created") ?? 0,
+                "updated":     dict_get(entry, "updated") ?? 0
+            }
+        }
+    }
+}
+
+// ==========================================================================
+// Route: POST /tprompt/template/delete
+// ==========================================================================
+fn tprompt_template_delete(body) {
+    let name = dict_get(body, "name") ?? ""
+    if3 len(name) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "name required"}
+    } else {
+        if3 dict_has(_templates, name) == T_TRUE {
+            dict_del(_templates, name)
+            order_remove(name)
+            save_templates()
+            return {"ok": true, "trit": T_TRUE, "name": name, "deleted": true}
+        } else {
+            return {"ok": true, "trit": T_MAYBE, "name": name, "deleted": false, "msg": "template not found"}
+        }
+    }
+}
+
+// ==========================================================================
+// Route: POST /tprompt/optimize
+// ==========================================================================
+fn tprompt_optimize(body) {
+    let prompt = dict_get(body, "prompt") ?? ""
+    let mode   = dict_get(body, "mode") ?? "concise"
+
+    if3 len(prompt) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "prompt required"}
+    } else {
+        if3 len(prompt) > MAX_PROMPT_LEN {
+            return {"ok": false, "trit": T_FALSE, "error": "prompt too large (max 10935 chars)"}
+        } else {
+            // Validate mode
+            let mode_ok = T_FALSE
+            if3 mode == "concise"  { mode_ok = T_TRUE } else {}
+            if3 mode == "detailed" { mode_ok = T_TRUE } else {}
+            if3 mode == "ternary"  { mode_ok = T_TRUE } else {}
+            if3 mode_ok == T_FALSE {
+                return {"ok": false, "trit": T_FALSE, "error": "mode must be: concise, detailed, or ternary"}
+            } else {
+                // Score before
+                let before_result  = score_prompt_full(prompt)
+                let score_before   = dict_get(before_result, "score") ?? 0
+                let trit_before    = dict_get(before_result, "trit") ?? T_FALSE
+                let breakdown_before = dict_get(before_result, "breakdown") ?? {}
+
+                // Apply optimization
+                let optimized = prompt
+                if3 mode == "concise" { optimized = optimize_concise(prompt)
+                } else {
+                    if3 mode == "detailed" { optimized = optimize_detailed(prompt)
+                    } else {
+                        if3 mode == "ternary" { optimized = optimize_ternary(prompt)
+                        } else {
+                            // keep original
+                        }
+                    }
+                }
+
+                // Score after
+                let after_result   = score_prompt_full(optimized)
+                let score_after    = dict_get(after_result, "score") ?? 0
+                let trit_after     = dict_get(after_result, "trit") ?? T_FALSE
+                let breakdown_after = dict_get(after_result, "breakdown") ?? {}
+
+                _optimize_count = _optimize_count + 1
+                let improvement = score_after - score_before
+
+                return {
+                    "ok":              true,
+                    "trit":            trit_after,
+                    "original":        prompt,
+                    "optimized":       optimized,
+                    "mode":            mode,
+                    "score_before":    score_before,
+                    "score_after":     score_after,
+                    "improvement":     improvement,
+                    "trit_before":     trit_before,
+                    "trit_after":      trit_after,
+                    "breakdown_before": breakdown_before,
+                    "breakdown_after": breakdown_after
+                }
+            }
+        }
+    }
+}
+
+// ==========================================================================
+// Route: POST /tprompt/score
+// ==========================================================================
+fn tprompt_score(body) {
+    let prompt = dict_get(body, "prompt") ?? ""
+    if3 len(prompt) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "prompt required"}
+    } else {
+        if3 len(prompt) > MAX_PROMPT_LEN {
+            return {"ok": false, "trit": T_FALSE, "error": "prompt too large (max 10935 chars)"}
+        } else { result    = score_prompt_full(prompt)
+            let total     = dict_get(result, "score") ?? 0
+            let t         = dict_get(result, "trit") ?? T_FALSE
+            let breakdown = dict_get(result, "breakdown") ?? {}
+            _score_count = _score_count + 1
+
+            // Generate suggestions
+            let suggestions = []
+            let s_len  = dict_get(breakdown, "length") ?? 0
+            let s_spec = dict_get(breakdown, "specificity") ?? 0
+            let s_st   = dict_get(breakdown, "structure") ?? 0
+            let s_cl   = dict_get(breakdown, "clarity") ?? 0
+
+            if3 s_len < 15 {
+                if3 len(prompt) < 10 {
+                    suggestions = append(suggestions, "Prompt is too short. Aim for 10-500 characters.")
+                } else {
+                    suggestions = append(suggestions, "Prompt is very long. Consider being more concise.")
+            } else {
+                // length OK
+            }
+            if3 s_spec < 15 {
+                suggestions = append(suggestions, "Use specific action verbs (analyze, compare, list, etc.)")
+            } else {
+                // specificity OK
+            }
+            if3 s_st < 15 {
+                suggestions = append(suggestions, "Add structure: use sections, examples, or clear delimiters.")
+            } else {
+                // structure OK
+            }
+            if3 s_cl < 15 {
+                suggestions = append(suggestions, "Improve clarity: avoid ambiguous pronouns and double negatives.")
+            } else {
+                // clarity OK
+            }
+
+            return {
+                "ok":           true,
+                "trit":         t,
+                "score":        total,
+                "max_score":    100,
+                "char":         trit_char(t),
+                "breakdown":    breakdown,
+                "suggestions":  suggestions,
+                "prompt_length": len(prompt)
+            }
+        }
+    }
+}
+
+// ==========================================================================
+// Route: POST /tprompt/chain
+// ==========================================================================
+}
+fn tprompt_chain(body) {
+    let prompts = dict_get(body, "prompts") ?? []
+    let ctx     = dict_get(body, "context") ?? {}
+
+    if3 len(prompts) == 0 {
+        return {"ok": false, "trit": T_FALSE, "error": "prompts must be a non-empty list"}
+    } else {
+        if3 len(prompts) > H13 {
+            return {"ok": false, "trit": T_FALSE, "error": "too many prompts in chain (max 13)"}
+        } else { chain_results   = []
+            let running_context = {}
+            // Copy initial context into running_context
+            let ckeys = keys(ctx)
+            let ci = 0
+            while3 ci < len(ckeys) {
+                let ck = ckeys[ci]
+                let cv = dict_get(ctx, ck) ?? ""
+                running_context = dict_set(running_context, ck, cv)
+                ci = ci + 1
+            }
+
+            let total_score = 0
+            let step_num    = 0
+
+            while3 step_num < len(prompts) {
+                let prompt_spec = prompts[step_num]
+                let step_label  = step_num + 1
+                let rendered    = ""
+                let step_ok     = T_TRUE
+
+                // Determine if prompt_spec is a string or dict
+                // NovaLang type_of() returns "string" / "dict" / etc.
+                let spec_type = type_of(prompt_spec)
+
+                if3 spec_type == "string" {
+                    // Raw prompt -- substitute running_context variables
+                    let rendered = prompt_spec
+                    let rckeys   = keys(running_context)
+                    let rci = 0
+                    while3 rci < len(rckeys) {
+                        let rck = rckeys[rci]
+                        let rcv = str(dict_get(running_context, rck) ?? "")
+                        let rendered = replace(rendered, "{" + rck + "}", rcv)
+                        rci = rci + 1
+                } else {
+                    // dict spec -- check for "template" or "prompt" key
+                    let tname = dict_get(prompt_spec, "template") ?? ""
+                    if3 len(tname) > 0 {
+                        // Render from template: merge running_context + step vars
+                        let merge_vars = {}
+                        let mkeys = keys(running_context)
+                        let mi = 0
+                        while3 mi < len(mkeys) {
+                            let mk = mkeys[mi]
+                            let mv = dict_get(running_context, mk) ?? ""
+                            merge_vars = dict_set(merge_vars, mk, mv)
+                            mi = mi + 1
+                        }
+                        let step_vars = dict_get(prompt_spec, "vars") ?? {}
+                        let svkeys = keys(step_vars)
+                        let svi = 0
+                        while3 svi < len(svkeys) {
+                            let svk = svkeys[svi]
+                            let svv = dict_get(step_vars, svk) ?? ""
+                            merge_vars = dict_set(merge_vars, svk, svv)
+                            svi = svi + 1
+                        }
+
+                        // Call render inline
+                        let render_body = {"name": tname, "vars": merge_vars}
+                        let render_res = tprompt_template_render(render_body)
+                        if3 dict_get(render_res, "ok") ?? false == true { rendered = dict_get(render_res, "rendered") ?? ""
+                        } else { step_ok = T_FALSE
+                            append(chain_results, {
+                                "step":  step_label,
+                                "ok":    false,
+                                "trit":  T_FALSE,
+                                "error": dict_get(render_res, "error") ?? "render failed"
+                            })
+                            step_num = step_num + 1
+                            // continue to next step
+                    } else {
+                        // Use "prompt" key
+                        let raw_prompt = dict_get(prompt_spec, "prompt") ?? ""
+                        if3 len(raw_prompt) == 0 { step_ok = T_FALSE
+                            append(chain_results, {
+                                "step":  step_label,
+                                "ok":    false,
+                                "trit":  T_FALSE,
+                                "error": "step must have prompt or template key"
+                            })
+                        } else { rendered = raw_prompt
+                            let rckeys2  = keys(running_context)
+                            let rci2 = 0
+                            while3 rci2 < len(rckeys2) {
+                                let rck2 = rckeys2[rci2]
+                                let rcv2 = str(dict_get(running_context, rck2) ?? "")
+                                let rendered = replace(rendered, "{" + rck2 + "}", rcv2)
+                                rci2 = rci2 + 1
+                            }
+                        }
+                    }
+                }
+
+                // Score step if rendering succeeded
+                if3 step_ok == T_TRUE { step_res   = score_prompt_full(rendered)
+                    let step_score = dict_get(step_res, "score") ?? 0
+                    let step_trit  = dict_get(step_res, "trit") ?? T_FALSE
+                    total_score = total_score + step_score
+
+                    // Add rendered prompt and score to running context
+                    running_context = dict_set(running_context, "step" + str(step_label) + "_prompt", rendered)
+                    running_context = dict_set(running_context, "step" + str(step_label) + "_score", step_score)
+
+                    append(chain_results, {
+                        "step":       step_label,
+                        "ok":         true,
+                        "trit":       step_trit,
+                        "rendered":   rendered,
+                        "score":      step_score,
+                        "char_count": len(rendered)
+                    })
+                } else {
+                    // step_ok was FALSE -- result already appended above
+                }
+
+                step_num = step_num + 1
+            }
+
+            _chain_count = _chain_count + 1
+
+            let n_prompts = len(prompts)
+            let avg_score = 0
+            if3 n_prompts > 0 { avg_score = round(float(total_score) / float(n_prompts), 1)
+            } else {
+                // keep 0
+            }
+
+            let chain_trit = T_FALSE
+            if3 avg_score >= SCORE_TRUE { chain_trit = T_TRUE
+            } else {
+                if3 avg_score >= SCORE_MAYBE { chain_trit = T_MAYBE
+                } else {
+                    // keep T_FALSE
+                }
+            }
+
+            let final_ctx_keys = keys(running_context)
+
+            return {
+                "ok":               true,
+                "trit":             chain_trit,
+                "steps":            n_prompts,
+                "avg_score":        avg_score,
+                "chain":            chain_results,
+                "final_context_keys": final_ctx_keys
+            }
+        }
+    }
+}
+
+// ==========================================================================
+// Route registration
+// ==========================================================================
+}
+}
+troute(server, "GET",  "/tprompt/health",                     "tprompt_health")
+troute(server, "GET",  "/tprompt/template/list",              "tprompt_template_list")
+troute(server, "GET",  "/tprompt/stats",                      "tprompt_stats")
+troute(server, "GET",  "/tprompt/template/nova-query",        "tprompt_get_nova_query")
+troute(server, "GET",  "/tprompt/template/code-analyze",      "tprompt_get_code_analyze")
+troute(server, "GET",  "/tprompt/template/summarize",         "tprompt_get_summarize")
+troute(server, "GET",  "/tprompt/template/ternary-classify",  "tprompt_get_ternary_classify")
+troute(server, "POST", "/tprompt/template/create",            "tprompt_template_create")
+troute(server, "POST", "/tprompt/template/render",            "tprompt_template_render")
+troute(server, "POST", "/tprompt/template/get",               "tprompt_template_get")
+troute(server, "POST", "/tprompt/template/delete",            "tprompt_template_delete")
+troute(server, "POST", "/tprompt/optimize",                   "tprompt_optimize")
+troute(server, "POST", "/tprompt/score",                      "tprompt_score")
+troute(server, "POST", "/tprompt/chain",                      "tprompt_chain")
+
+// ==========================================================================
+// Startup: load templates then print banner
+// ==========================================================================
+let _boot_ok = load_templates()
+
+print("[TPrompt] NovaX Ternary Prompt Engineering starting in NovaLang...")
+print("[TPrompt] Port: " + str(PORT) + " | Version: " + VERSION + " | Runtime: NovaLang")
+print("[TPrompt] MAX_TEMPLATES=H13*H7=" + str(MAX_TEMPLATES) + " | PERSIST=" + PERSIST_PATH)
+print("[TPrompt] Scoring: TRUE>=" + str(SCORE_TRUE) + ", MAYBE>=" + str(SCORE_MAYBE) + ", FALSE<" + str(SCORE_MAYBE))
+print("[TPrompt] 3-5-7-13: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13) + " BLOCK=" + str(BLOCK))
+print("[TPrompt] GET  /tprompt/health | /tprompt/template/list | /tprompt/stats")
+print("[TPrompt] GET  /tprompt/template/{nova-query|code-analyze|summarize|ternary-classify}")
+print("[TPrompt] POST /tprompt/template/create | render | get | delete")
+print("[TPrompt] POST /tprompt/optimize | /tprompt/score | /tprompt/chain")
+
+troute(server, "GET", "/health", fn(req) { return json_decode(http_get("http://127.0.0.1:9977/tprompt/health")) })
+
+tstart(server)

@@ -1,0 +1,1144 @@
+// nova_tpipeline_service.nova -- NovaX Ternary Pipeline Engine
+// Port 9966 | NovaLang conversion of nova_tpipeline.py
+//
+// Chain multiple service calls into sequential workflows.
+// Each step's output feeds into the next.
+// Ternary short-circuit: if any step returns T_FALSE, the pipeline stops.
+//
+// Step format (dict fields):
+//   name       -- step identifier (string)
+//   url        -- HTTP endpoint (string)
+//   method     -- GET or POST (string, default POST)
+//   input_map  -- dict mapping param names to $refs or literals
+//   output_key -- where to store result in context (string)
+//   on_fail    -- stop | continue | retry:N (string, default stop)
+//
+// $-reference syntax in input_map values:
+//   $input.field    -- original pipeline input field
+//   $stepname.field -- output field from a previous step
+//   $stepname       -- whole output of a previous step
+//   literal         -- passed through unchanged
+//
+// Pipeline trit = product of all step trits.
+// Any T_FALSE makes the whole pipeline T_FALSE.
+// T_MAYBE degrades from T_TRUE. All T_TRUE = T_TRUE.
+//
+// Harmonics:
+//   Step timeout  = H13 (13) seconds
+//   History depth = 1000 runs
+//   Max pipelines = H3^H7 / H3 = 729
+//   Max steps     = H13 * H3 = 39
+//
+// Papers/foundations:
+//   Unix pipeline composition (McIlroy, 1964)
+//   Ternary short-circuit evaluation (Kleene, 1938)
+//   Saga pattern for distributed workflows (Garcia-Molina and Salem, 1987)
+//   Navier-Stokes: pipeline = laminar channel flow, failure = turbulent breakup
+
+// ---------------------------------------------------------------------------
+// Server bootstrap
+// ---------------------------------------------------------------------------
+
+let PORT = 9966
+let server = tserve(PORT, "nova-tpipeline")
+
+// ---------------------------------------------------------------------------
+// Harmonic constants (3-5-7-13)
+// ---------------------------------------------------------------------------
+
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK = 2187
+
+// ---------------------------------------------------------------------------
+// Pipeline constants
+// ---------------------------------------------------------------------------
+
+let VERSION = "1.0"
+let STEP_TIMEOUT = 13
+let MAX_PIPELINES = 729
+let MAX_STEPS = 39
+let HISTORY_DEPTH = 1000
+let MAX_BODY = 10935
+
+// ---------------------------------------------------------------------------
+// Ternary truth values
+// ---------------------------------------------------------------------------
+
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// ---------------------------------------------------------------------------
+// Service state
+// ---------------------------------------------------------------------------
+
+// _pipelines: dict of pipeline_name -> pipeline_definition dict
+let _pipelines = {}
+
+// _history: list of execution records (capped at HISTORY_DEPTH)
+let _history = []
+
+// _history_count: how many records are stored (for cap enforcement)
+let _history_count = 0
+
+// _ops: total operations recorded
+let _ops = 0
+
+// _start_time: service start epoch
+let _start_time = time()
+
+// ---------------------------------------------------------------------------
+// Helper: trit character
+// Returns "+" for T_TRUE, "?" for T_MAYBE, "-" for T_FALSE
+// ---------------------------------------------------------------------------
+
+fn tchar(t) {
+    let result = "?"
+    if3 (t > 0) {
+        let result = "+"
+    } else3 if3 (t < 0) {
+        let result = "-"
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Helper: clamp integer between lo and hi
+// ---------------------------------------------------------------------------
+
+fn clamp_int(val, lo, hi) {
+    let out = val
+    if3 (val < lo) {
+        let out = lo
+    }
+    if3 (val > hi) {
+        let out = hi
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Helper: record stats for an operation
+// ---------------------------------------------------------------------------
+
+fn record_stat(t) {
+    let _ops = _ops + 1
+    T_TRUE
+}
+
+// ---------------------------------------------------------------------------
+// Helper: health dict
+// ---------------------------------------------------------------------------
+
+fn build_health(pipeline_count, history_len) {
+    let up = time() - _start_time
+    let h = {}
+    let h = dict_set(h, "ok", 1)
+    let h = dict_set(h, "trit", T_TRUE)
+    let h = dict_set(h, "service", "nova-tpipeline")
+    let h = dict_set(h, "version", VERSION)
+    let h = dict_set(h, "port", PORT)
+    let h = dict_set(h, "uptime_s", round(up, 1))
+    let h = dict_set(h, "ops", _ops)
+    let h = dict_set(h, "pipelines_defined", pipeline_count)
+    let h = dict_set(h, "executions_recorded", history_len)
+    let h = dict_set(h, "harmonics", "3-5-7-13")
+    h
+}
+
+// ---------------------------------------------------------------------------
+// Helper: resolve a $-prefixed reference against pipeline context
+//
+// Supports:
+//   $input        -> dict_get(context, "input")
+//   $input.field  -> dict_get(dict_get(context, "input"), "field")
+//   $step         -> dict_get(context, "step")
+//   $step.field   -> dict_get(dict_get(context, "step"), "field")
+//   anything else -> returned as-is (literal)
+//
+// NovaLang note: no recursive dotted drilling beyond one level --
+// the spec allows $step.field (one dot). Deeper nesting is not
+// expressible without list[i] syntax, so we stop at one dot level.
+// ---------------------------------------------------------------------------
+
+fn resolve_ref(ref, context) {
+    let resolved = ref
+    if3 (type_of(ref) == "string") {
+        if3 (contains(ref, "$") == 1) {
+            // Check that ref starts with $
+            let first_char = slice(ref, 0, 1)
+            if3 (first_char == "$") {
+                let path = slice(ref, 1, len(ref))
+                let dot_pos = -1
+                // Find first dot by checking split
+                let parts = split(path, ".")
+                let key = dict_get(parts, 0)
+                let has_key = dict_has(context, key)
+                if3 (has_key == 1) {
+                    let val = dict_get(context, key)
+                    let parts_len = len(parts)
+                    if3 (parts_len > 1) {
+                        // One-level field access
+                        let field = dict_get(parts, 1)
+                        if3 (type_of(val) == "dict") {
+                            let has_field = dict_has(val, field)
+                            if3 (has_field == 1) {
+                                let resolved = dict_get(val, field)
+                            } else3 {
+                                let resolved = ""
+                        } else3 {
+                            let resolved = ""
+                    } else3 {
+                        let resolved = val
+                } else3 {
+                    let resolved = ""
+                }
+            }
+        }
+    }
+    resolved
+}
+
+// ---------------------------------------------------------------------------
+// Helper: build step input dict from input_map and context
+// Resolves all $-refs. Non-dict / missing input_map passes context input.
+// ---------------------------------------------------------------------------
+}
+}
+}
+
+fn build_step_input(input_map, context) {
+    let result = {}
+    if3 (type_of(input_map) == "dict") {
+        let map_keys = keys(input_map)
+        let ki = 0
+        let mk_len = len(map_keys)
+        while3 (ki < mk_len) {
+            let k = dict_get(map_keys, ki)
+            let v = dict_get(input_map, k)
+            if3 (type_of(v) == "string") {
+                let first_char = slice(v, 0, 1)
+                if3 (first_char == "$") {
+                    let resolved_v = resolve_ref(v, context)
+                    let result = dict_set(result, k, resolved_v)
+                } else3 {
+                    let result = dict_set(result, k, v)
+            } else3 {
+                let result = dict_set(result, k, v)
+            }
+            let ki = ki + 1
+    } else3 {
+        // No input_map -- pass through the original input
+        let has_input = dict_has(context, "input")
+        if3 (has_input == 1) {
+            let ctx_input = dict_get(context, "input")
+            if3 (type_of(ctx_input) == "dict") {
+                let ctx_keys = keys(ctx_input)
+                let ci = 0
+                let ck_len = len(ctx_keys)
+                while3 (ci < ck_len) {
+                    let ck = dict_get(ctx_keys, ci)
+                    let cv = dict_get(ctx_input, ck)
+                    let result = dict_set(result, ck, cv)
+                    let ci = ci + 1
+                }
+            }
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Helper: execute one pipeline step via HTTP
+// Returns a step_result dict with fields:
+//   step_trit  -- T_TRUE / T_MAYBE / T_FALSE
+//   step_out   -- parsed response dict (or empty dict)
+//   step_error -- error string (or "")
+//
+// on_fail handling:
+//   "stop"     -- return T_FALSE on any error
+//   "continue" -- return T_MAYBE on error so pipeline keeps going
+//   "retry:N"  -- retry up to N times (capped at H7=7), then T_FALSE
+// ---------------------------------------------------------------------------
+}
+}
+
+fn execute_step(step, context) {
+    let url = dict_get(step, "url")
+    let method_raw = "POST"
+    if3 (dict_has(step, "method") == 1) {
+        let method_raw = dict_get(step, "method")
+    }
+    let method = upper(method_raw)
+
+    let on_fail = "stop"
+    if3 (dict_has(step, "on_fail") == 1) {
+        let on_fail = dict_get(step, "on_fail")
+    }
+
+    let input_map = ""
+    if3 (dict_has(step, "input_map") == 1) {
+        let input_map = dict_get(step, "input_map")
+    }
+
+    // Determine max_retries from on_fail
+    let max_retries = 1
+    if3 (type_of(on_fail) == "string") {
+        if3 (contains(on_fail, "retry:") == 1) {
+            let parts = split(on_fail, ":")
+            let retry_str = dict_get(parts, 1)
+            let parsed_n = int(retry_str)
+            let max_retries = clamp_int(parsed_n, 1, H7)
+        }
+    }
+
+    // Build request body
+    let step_body = build_step_input(input_map, context)
+    let body_str = json_encode(step_body)
+
+    // Attempt loop
+    let attempt = 0
+    let step_trit = T_FALSE
+    let step_out = {}
+    let step_error = ""
+
+    while3 (attempt < max_retries) {
+        let call_result = {}
+        if3 (method == "GET") {
+            let call_result = http_get(url)
+        } else3 {
+            let call_result = http_post(url, body_str)
+        }
+
+        // http_get/http_post return dict with "ok", "body", "status", "error"
+        let call_ok = dict_get(call_result, "ok")
+        if3 (call_ok == 1) {
+            let raw_body = dict_get(call_result, "body")
+            let parsed = {}
+            try3 {
+                let parsed = json_decode(raw_body)
+            } catch3 {
+                let parsed = dict_set(parsed, "raw", raw_body)
+            }
+
+            // Extract trit from response
+            let resp_trit = T_TRUE
+            if3 (type_of(parsed) == "dict") {
+                if3 (dict_has(parsed, "trit") == 1) {
+                    let resp_trit = int(dict_get(parsed, "trit"))
+                } else3 if3 (dict_has(parsed, "ok") == 1) {
+                    let ok_val = dict_get(parsed, "ok")
+                    if3 (ok_val == 0) {
+                        let resp_trit = T_FALSE
+                    }
+                }
+            }
+
+            let step_trit = resp_trit
+            let step_out = parsed
+            let step_error = ""
+            // Success -- break out of retry loop by setting attempt = max_retries
+            let attempt = max_retries
+        } else3 {
+            let step_error = dict_get(call_result, "error")
+            let step_trit = T_FALSE
+            let attempt = attempt + 1
+        }
+    }
+
+    // If on_fail == "continue" and we failed, soften to T_MAYBE
+    if3 (step_trit < 0) {
+        if3 (on_fail == "continue") {
+            let step_trit = T_MAYBE
+        }
+    }
+
+    let out = {}
+    let out = dict_set(out, "step_trit", step_trit)
+    let out = dict_set(out, "step_out", step_out)
+    let out = dict_set(out, "step_error", step_error)
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Helper: validate a single step dict
+// Returns dict with "ok" (1/0) and "err" (string)
+// ---------------------------------------------------------------------------
+
+fn validate_step(step, index) {
+    let ok = 1
+    let err = ""
+
+    if3 (type_of(step) != "dict") {
+        let ok = 0
+        let idx_str = str(index)
+        let err = join(["step ", idx_str, ": must be a dict"], "")
+    } else3 {
+        let has_name = dict_has(step, "name")
+        if3 (has_name == 0) {
+            let ok = 0
+            let idx_str = str(index)
+            let err = join(["step ", idx_str, ": name required"], "")
+        } else3 {
+            let sname = dict_get(step, "name")
+            let has_url = dict_has(step, "url")
+            if3 (has_url == 0) {
+                let ok = 0
+                let err = join(["step ", sname, ": url required"], "")
+            } else3 {
+                let surl = dict_get(step, "url")
+                let url_ok = 0
+                if3 (contains(surl, "http://") == 1) {
+                    let url_ok = 1
+                }
+                if3 (contains(surl, "https://") == 1) {
+                    let url_ok = 1
+                }
+                if3 (url_ok == 0) {
+                    let ok = 0
+                    let err = join(["step ", sname, ": url must be http or https"], "")
+                }
+            }
+        }
+    }
+
+    let r = {}
+    let r = dict_set(r, "ok", ok)
+    let r = dict_set(r, "err", err)
+    r
+}
+
+// ---------------------------------------------------------------------------
+// Helper: validate a full pipeline definition
+// Returns dict with "ok" (1/0) and "err" (string)
+// ---------------------------------------------------------------------------
+
+fn validate_pipeline(definition) {
+    let ok = 1
+    let err = ""
+
+    if3 (dict_has(definition, "name") == 0) {
+        let ok = 0
+        let err = "name required (string)"
+    } else3 {
+        let pname = dict_get(definition, "name")
+        let pname_len = len(pname)
+        if3 (pname_len > 128) {
+            let ok = 0
+            let err = "name too long (max 128 chars)"
+        } else3 {
+            if3 (dict_has(definition, "steps") == 0) {
+                let ok = 0
+                let err = "steps required (non-empty list)"
+            } else3 {
+                let steps = dict_get(definition, "steps")
+                let steps_len = len(steps)
+                if3 (steps_len == 0) {
+                    let ok = 0
+                    let err = "steps required (non-empty list)"
+                } else3 if3 (steps_len > MAX_STEPS) {
+                    let ok = 0
+                    let max_str = str(MAX_STEPS)
+                    let err = join(["too many steps (max ", max_str, ")"], "")
+                } else3 {
+                    // Validate each step
+                    let si = 0
+                    while3 (si < steps_len) {
+                        let st = dict_get(steps, si)
+                        let sv = validate_step(st, si)
+                        let sv_ok = dict_get(sv, "ok")
+                        if3 (sv_ok == 0) {
+                            let ok = 0
+                            let err = dict_get(sv, "err")
+                        }
+                        let si = si + 1
+                    }
+                }
+            }
+        }
+    }
+
+    let r = {}
+    let r = dict_set(r, "ok", ok)
+    let r = dict_set(r, "err", err)
+    r
+}
+
+// ---------------------------------------------------------------------------
+// Core: run a full pipeline, return an execution record dict
+// ---------------------------------------------------------------------------
+
+fn run_pipeline(pipeline_def, user_input) {
+    let run_id = uuid_hex()
+    let run_id = slice(run_id, 0, 13)
+
+    let pname = "unknown"
+    if3 (dict_has(pipeline_def, "name") == 1) {
+        let pname = dict_get(pipeline_def, "name")
+    }
+
+    let steps = []
+    if3 (dict_has(pipeline_def, "steps") == 1) {
+        let steps = dict_get(pipeline_def, "steps")
+    }
+
+    let started = time()
+
+    // Build initial context
+    let context = {}
+    let context = dict_set(context, "input", user_input)
+
+    // Pipeline-level trit accumulator
+    let pipeline_trit = T_TRUE
+
+    // Step records list
+    let step_records = []
+
+    // Stopped-at name (empty = not stopped early)
+    let stopped_at = ""
+    let stop_error = ""
+
+    let steps_len = len(steps)
+    let si = 0
+    let pipeline_done = 0
+
+    while3 (si < steps_len) {
+        if3 (pipeline_done == 0) {
+            let step = dict_get(steps, si)
+
+            let step_name = join(["step_", str(si)], "")
+            if3 (dict_has(step, "name") == 1) {
+                let step_name = dict_get(step, "name")
+            }
+
+            let output_key = step_name
+            if3 (dict_has(step, "output_key") == 1) {
+                let output_key = dict_get(step, "output_key")
+            }
+
+            let on_fail = "stop"
+            if3 (dict_has(step, "on_fail") == 1) {
+                let on_fail = dict_get(step, "on_fail")
+            }
+
+            let t0 = time()
+            let step_result = execute_step(step, context)
+            let t1 = time()
+            let elapsed_ms = round((t1 - t0) * 1000, 1)
+
+            let step_trit = dict_get(step_result, "step_trit")
+            let step_out = dict_get(step_result, "step_out")
+            let step_error = dict_get(step_result, "step_error")
+
+            // Store step output in context for subsequent steps
+            if3 (type_of(step_out) == "dict") {
+                let context = dict_set(context, output_key, step_out)
+            }
+
+            // Build step record
+            let step_url = ""
+            if3 (dict_has(step, "url") == 1) {
+                let step_url = dict_get(step, "url")
+            }
+            let step_rec = {}
+            let step_rec = dict_set(step_rec, "index", si)
+            let step_rec = dict_set(step_rec, "name", step_name)
+            let step_rec = dict_set(step_rec, "url", step_url)
+            let step_rec = dict_set(step_rec, "trit", step_trit)
+            let step_rec = dict_set(step_rec, "char", tchar(step_trit))
+            let step_rec = dict_set(step_rec, "elapsed_ms", elapsed_ms)
+            let step_rec = dict_set(step_rec, "error", step_error)
+            let step_records = append(step_records, step_rec)
+
+            // Update pipeline trit (product logic)
+            if3 (step_trit < 0) {
+                let pipeline_trit = T_FALSE
+            } else3 if3 (step_trit == 0) {
+                if3 (pipeline_trit > 0) {
+                    let pipeline_trit = T_MAYBE
+                }
+            }
+
+            // Short-circuit on failure
+            if3 (step_trit < 0) {
+                if3 (on_fail == "stop") {
+                    let stopped_at = step_name
+                    let stop_error = step_error
+                    let pipeline_done = 1
+                } else3 {
+                    if3 (contains(on_fail, "retry:") == 1) {
+                        let stopped_at = step_name
+                        let stop_error = step_error
+                        let pipeline_done = 1
+                    }
+                }
+            }
+        }
+        let si = si + 1
+    }
+
+    let finished = time()
+    let duration_ms = round((finished - started) * 1000, 1)
+
+    // Build final output from context (exclude input key)
+    let final_output = {}
+    let ctx_keys = keys(context)
+    let cki = 0
+    let ck_len = len(ctx_keys)
+    while3 (cki < ck_len) {
+        let ck = dict_get(ctx_keys, cki)
+        if3 (ck != "input") {
+            let cv = dict_get(context, ck)
+            let final_output = dict_set(final_output, ck, cv)
+        }
+        let cki = cki + 1
+    }
+
+    // Assemble record
+    let record = {}
+    let record = dict_set(record, "run_id", run_id)
+    let record = dict_set(record, "pipeline", pname)
+    let record = dict_set(record, "started", started)
+    let record = dict_set(record, "finished", finished)
+    let record = dict_set(record, "duration_ms", duration_ms)
+    let record = dict_set(record, "input", user_input)
+    let record = dict_set(record, "steps", step_records)
+    let record = dict_set(record, "trit", pipeline_trit)
+    let record = dict_set(record, "char", tchar(pipeline_trit))
+    let record = dict_set(record, "stopped_at", stopped_at)
+    let record = dict_set(record, "error", stop_error)
+    let record = dict_set(record, "output", final_output)
+    record
+}
+
+// ---------------------------------------------------------------------------
+// Helper: append execution record to history, respecting HISTORY_DEPTH cap
+// ---------------------------------------------------------------------------
+
+fn push_history(record) {
+    let _history = append(_history, record)
+    let _history_count = _history_count + 1
+    // Trim oldest entries when over cap
+    if3 (_history_count > HISTORY_DEPTH) {
+        let trim = _history_count - HISTORY_DEPTH
+        let _history = slice(_history, trim, _history_count)
+        let _history_count = HISTORY_DEPTH
+    }
+    T_TRUE
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /health
+// Route: GET /tpipeline/health
+// ---------------------------------------------------------------------------
+
+fn handle_health() {
+    let pipeline_count = len(keys(_pipelines))
+    build_health(pipeline_count, _history_count)
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /tpipeline/list
+// ---------------------------------------------------------------------------
+
+fn handle_list() {
+    let pipeline_names = keys(_pipelines)
+    let pn_len = len(pipeline_names)
+    let pipeline_summaries = {}
+    let ni = 0
+    while3 (ni < pn_len) {
+        let pname = dict_get(pipeline_names, ni)
+        let pdef = dict_get(_pipelines, pname)
+        let pdesc = ""
+        if3 (dict_has(pdef, "description") == 1) {
+            let pdesc = dict_get(pdef, "description")
+        }
+        let psteps = []
+        if3 (dict_has(pdef, "steps") == 1) {
+            let psteps = dict_get(pdef, "steps")
+        }
+        let pstep_count = len(psteps)
+
+        // Collect step names
+        let step_names = []
+        let sni = 0
+        while3 (sni < pstep_count) {
+            let sn_step = dict_get(psteps, sni)
+            let sn_name = join(["step_", str(sni)], "")
+            if3 (dict_has(sn_step, "name") == 1) {
+                let sn_name = dict_get(sn_step, "name")
+            }
+            let step_names = append(step_names, sn_name)
+            let sni = sni + 1
+        }
+
+        let pcreated = 0
+        if3 (dict_has(pdef, "created") == 1) {
+            let pcreated = dict_get(pdef, "created")
+        }
+
+        let summary = {}
+        let summary = dict_set(summary, "description", pdesc)
+        let summary = dict_set(summary, "steps", pstep_count)
+        let summary = dict_set(summary, "step_names", step_names)
+        let summary = dict_set(summary, "created", pcreated)
+        let pipeline_summaries = dict_set(pipeline_summaries, pname, summary)
+        let ni = ni + 1
+    }
+
+    let resp = {}
+    let resp = dict_set(resp, "ok", 1)
+    let resp = dict_set(resp, "trit", T_TRUE)
+    let resp = dict_set(resp, "pipelines", pipeline_summaries)
+    let resp = dict_set(resp, "count", pn_len)
+    resp
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /tpipeline/get -- expects "name" query param in body
+//        POST /tpipeline/get -- body: {"name": "<pipeline_name>"}
+// ---------------------------------------------------------------------------
+
+fn handle_get(body) {
+    let pname = ""
+    if3 (dict_has(body, "name") == 1) {
+        let pname = dict_get(body, "name")
+    }
+
+    let resp = {}
+    if3 (len(pname) == 0) {
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pipeline name required")
+    } else3 {
+        if3 (dict_has(_pipelines, pname) == 0) {
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", join(["pipeline '", pname, "' not found"], ""))
+        } else3 {
+            let pdef = dict_get(_pipelines, pname)
+            let resp = dict_set(resp, "ok", 1)
+            let resp = dict_set(resp, "trit", T_TRUE)
+            let resp = dict_set(resp, "pipeline", pdef)
+        }
+    }
+    return resp
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /tpipeline/history
+// ---------------------------------------------------------------------------
+
+fn handle_history() {
+    // Return last 100 records, most recent first
+    let hist_len = _history_count
+    let start_idx = 0
+    if3 (hist_len > 100) {
+        let start_idx = hist_len - 100
+    }
+
+    let recent = slice(_history, start_idx, hist_len)
+
+    // Reverse to most-recent-first
+    let recent = reverse(recent)
+
+    // Build slim records
+    let slim = []
+    let ri = 0
+    let recent_len = len(recent)
+    while3 (ri < recent_len) {
+        let r = dict_get(recent, ri)
+
+        let rr_steps = []
+        if3 (dict_has(r, "steps") == 1) {
+            let rr_steps = dict_get(r, "steps")
+        }
+
+        let sr = {}
+        let sr = dict_set(sr, "run_id", dict_get(r, "run_id"))
+        let sr = dict_set(sr, "pipeline", dict_get(r, "pipeline"))
+        let sr = dict_set(sr, "trit", dict_get(r, "trit"))
+        let sr = dict_set(sr, "char", dict_get(r, "char"))
+        let sr = dict_set(sr, "started", dict_get(r, "started"))
+        let sr = dict_set(sr, "duration_ms", dict_get(r, "duration_ms"))
+        let sr = dict_set(sr, "steps_executed", len(rr_steps))
+        let sr = dict_set(sr, "stopped_at", dict_get(r, "stopped_at"))
+        let sr = dict_set(sr, "error", dict_get(r, "error"))
+        let slim = append(slim, sr)
+        let ri = ri + 1
+    }
+
+    let resp = {}
+    let resp = dict_set(resp, "ok", 1)
+    let resp = dict_set(resp, "trit", T_TRUE)
+    let resp = dict_set(resp, "executions", slim)
+    let resp = dict_set(resp, "count", len(slim))
+    resp
+}
+
+// ---------------------------------------------------------------------------
+// Route: POST /tpipeline/run
+// Body: {"pipeline": "<name>", "input": {...}}
+// ---------------------------------------------------------------------------
+
+fn handle_run(body) {
+    let pname = ""
+    if3 (dict_has(body, "pipeline") == 1) {
+        let pname = dict_get(body, "pipeline")
+    }
+
+    let user_input = {}
+    if3 (dict_has(body, "input") == 1) {
+        let user_input = dict_get(body, "input")
+    }
+
+    let resp = {}
+    if3 (len(pname) == 0) {
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pipeline name required")
+    } else3 {
+        if3 (dict_has(_pipelines, pname) == 0) {
+            let avail = keys(_pipelines)
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", join(["pipeline '", pname, "' not found"], ""))
+            let resp = dict_set(resp, "available", avail)
+        } else3 {
+            let pipeline_def = dict_get(_pipelines, pname)
+            let record = run_pipeline(pipeline_def, user_input)
+            let push_ok = push_history(record)
+            let stat_ok = record_stat(dict_get(record, "trit"))
+
+            let rec_steps = dict_get(record, "steps")
+            let pipeline_steps = []
+            if3 (dict_has(pipeline_def, "steps") == 1) {
+                let pipeline_steps = dict_get(pipeline_def, "steps")
+            }
+            let rtrit = dict_get(record, "trit")
+            let ok_val = 0
+            if3 (rtrit >= 0) {
+                let ok_val = 1
+            }
+
+            let resp = dict_set(resp, "ok", ok_val)
+            let resp = dict_set(resp, "trit", rtrit)
+            let resp = dict_set(resp, "char", dict_get(record, "char"))
+            let resp = dict_set(resp, "run_id", dict_get(record, "run_id"))
+            let resp = dict_set(resp, "pipeline", pname)
+            let resp = dict_set(resp, "steps_total", len(pipeline_steps))
+            let resp = dict_set(resp, "steps_executed", len(rec_steps))
+            let resp = dict_set(resp, "stopped_at", dict_get(record, "stopped_at"))
+            let resp = dict_set(resp, "duration_ms", dict_get(record, "duration_ms"))
+            let resp = dict_set(resp, "step_results", rec_steps)
+            let resp = dict_set(resp, "output", dict_get(record, "output"))
+            let resp = dict_set(resp, "error", dict_get(record, "error"))
+        }
+    }
+    return resp
+}
+
+// ---------------------------------------------------------------------------
+// Route: POST /tpipeline/define
+// Body: {"name": "...", "steps": [...], "description": "..."}
+// ---------------------------------------------------------------------------
+
+fn handle_define(body) {
+    let pname = ""
+    if3 (dict_has(body, "name") == 1) {
+        let pname = dict_get(body, "name")
+    }
+
+    let pdesc = ""
+    if3 (dict_has(body, "description") == 1) {
+        let pdesc = dict_get(body, "description")
+    }
+
+    let psteps = []
+    if3 (dict_has(body, "steps") == 1) {
+        let psteps = dict_get(body, "steps")
+    }
+
+    let resp = {}
+    if3 (len(pname) == 0) {
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "name required")
+    } else3 {
+        let definition = {}
+        let definition = dict_set(definition, "name", pname)
+        let definition = dict_set(definition, "description", pdesc)
+        let definition = dict_set(definition, "steps", psteps)
+        let definition = dict_set(definition, "created", time())
+
+        let vr = validate_pipeline(definition)
+        let vr_ok = dict_get(vr, "ok")
+        if3 (vr_ok == 0) {
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", dict_get(vr, "err"))
+        } else3 {
+            let pipeline_count = len(keys(_pipelines))
+            let is_update = dict_has(_pipelines, pname)
+            if3 (is_update == 0) {
+                if3 (pipeline_count >= MAX_PIPELINES) {
+                    let max_str = str(MAX_PIPELINES)
+                    let resp = dict_set(resp, "ok", 0)
+                    let resp = dict_set(resp, "trit", T_FALSE)
+                    let resp = dict_set(resp, "error", join(["max pipelines (", max_str, ") reached"], ""))
+                } else3 {
+                    let _pipelines = dict_set(_pipelines, pname, definition)
+                    let stat_ok = record_stat(T_TRUE)
+                    let resp = dict_set(resp, "ok", 1)
+                    let resp = dict_set(resp, "trit", T_TRUE)
+                    let resp = dict_set(resp, "action", "created")
+                    let resp = dict_set(resp, "pipeline", pname)
+                    let resp = dict_set(resp, "steps", len(psteps))
+            } else3 {
+                let _pipelines = dict_set(_pipelines, pname, definition)
+                let stat_ok = record_stat(T_TRUE)
+                let resp = dict_set(resp, "ok", 1)
+                let resp = dict_set(resp, "trit", T_TRUE)
+                let resp = dict_set(resp, "action", "updated")
+                let resp = dict_set(resp, "pipeline", pname)
+                let resp = dict_set(resp, "steps", len(psteps))
+            }
+        }
+    }
+    return resp
+}
+
+// ---------------------------------------------------------------------------
+// Route: POST /tpipeline/delete
+// Body: {"name": "<pipeline_name>"}
+// ---------------------------------------------------------------------------
+}
+
+fn handle_delete(body) {
+    let pname = ""
+    if3 (dict_has(body, "name") == 1) {
+        let pname = dict_get(body, "name")
+    }
+
+    let resp = {}
+    if3 (len(pname) == 0) {
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "name required")
+    } else3 {
+        if3 (dict_has(_pipelines, pname) == 0) {
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", join(["pipeline '", pname, "' not found"], ""))
+        } else3 {
+            let _pipelines = dict_del(_pipelines, pname)
+            let stat_ok = record_stat(T_TRUE)
+            let resp = dict_set(resp, "ok", 1)
+            let resp = dict_set(resp, "trit", T_TRUE)
+            let resp = dict_set(resp, "deleted", pname)
+        }
+    }
+    return resp
+}
+
+// ---------------------------------------------------------------------------
+// Register routes
+// ---------------------------------------------------------------------------
+
+let _r0 = troute(server, "GET",  "/health",             handle_health)
+let _r1 = troute(server, "GET",  "/tpipeline/health",   handle_health)
+let _r2 = troute(server, "GET",  "/tpipeline/list",     handle_list)
+let _r3 = troute(server, "GET",  "/tpipeline/history",  handle_history)
+let _r4 = troute(server, "POST", "/tpipeline/get",      handle_get)
+let _r5 = troute(server, "POST", "/tpipeline/run",      handle_run)
+let _r6 = troute(server, "POST", "/tpipeline/define",   handle_define)
+let _r7 = troute(server, "POST", "/tpipeline/delete",   handle_delete)
+
+// ---------------------------------------------------------------------------
+// Load default pipelines into _pipelines state
+// ---------------------------------------------------------------------------
+
+// Default pipeline 1: ai-query
+let _step_validate_aq = {}
+let _step_validate_aq = dict_set(_step_validate_aq, "name", "validate")
+let _step_validate_aq = dict_set(_step_validate_aq, "url", "http://127.0.0.1:9964/tvalidator/validate")
+let _step_validate_aq = dict_set(_step_validate_aq, "method", "POST")
+let _step_validate_aq = dict_set(_step_validate_aq, "output_key", "validated")
+let _step_validate_aq = dict_set(_step_validate_aq, "on_fail", "stop")
+let _im_validate_aq = {}
+let _im_validate_aq = dict_set(_im_validate_aq, "input", "$input.prompt")
+let _im_validate_aq = dict_set(_im_validate_aq, "rules", ["no_html", "max_length:5000"])
+let _step_validate_aq = dict_set(_step_validate_aq, "input_map", _im_validate_aq)
+
+let _step_cache_check = {}
+let _step_cache_check = dict_set(_step_cache_check, "name", "cache-check")
+let _step_cache_check = dict_set(_step_cache_check, "url", "http://127.0.0.1:9956/tcache/get")
+let _step_cache_check = dict_set(_step_cache_check, "method", "POST")
+let _step_cache_check = dict_set(_step_cache_check, "output_key", "cached")
+let _step_cache_check = dict_set(_step_cache_check, "on_fail", "continue")
+let _im_cache_check = {}
+let _im_cache_check = dict_set(_im_cache_check, "key", "$input.prompt")
+let _step_cache_check = dict_set(_step_cache_check, "input_map", _im_cache_check)
+
+let _step_hivemind = {}
+let _step_hivemind = dict_set(_step_hivemind, "name", "hivemind-query")
+let _step_hivemind = dict_set(_step_hivemind, "url", "http://127.0.0.1:9881/hivemind/query")
+let _step_hivemind = dict_set(_step_hivemind, "method", "POST")
+let _step_hivemind = dict_set(_step_hivemind, "output_key", "ai_response")
+let _step_hivemind = dict_set(_step_hivemind, "on_fail", "stop")
+let _im_hivemind = {}
+let _im_hivemind = dict_set(_im_hivemind, "prompt", "$input.prompt")
+let _im_hivemind = dict_set(_im_hivemind, "model", "$input.model")
+let _step_hivemind = dict_set(_step_hivemind, "input_map", _im_hivemind)
+
+let _step_cache_store = {}
+let _step_cache_store = dict_set(_step_cache_store, "name", "cache-store")
+let _step_cache_store = dict_set(_step_cache_store, "url", "http://127.0.0.1:9956/tcache/set")
+let _step_cache_store = dict_set(_step_cache_store, "method", "POST")
+let _step_cache_store = dict_set(_step_cache_store, "output_key", "cache_result")
+let _step_cache_store = dict_set(_step_cache_store, "on_fail", "continue")
+let _im_cache_store = {}
+let _im_cache_store = dict_set(_im_cache_store, "key", "$input.prompt")
+let _im_cache_store = dict_set(_im_cache_store, "value", "$ai_response")
+let _step_cache_store = dict_set(_step_cache_store, "input_map", _im_cache_store)
+
+let _step_respond_aq = {}
+let _step_respond_aq = dict_set(_step_respond_aq, "name", "respond")
+let _step_respond_aq = dict_set(_step_respond_aq, "url", "http://127.0.0.1:9999/api/echo")
+let _step_respond_aq = dict_set(_step_respond_aq, "method", "POST")
+let _step_respond_aq = dict_set(_step_respond_aq, "output_key", "response")
+let _step_respond_aq = dict_set(_step_respond_aq, "on_fail", "continue")
+let _im_respond_aq = {}
+let _im_respond_aq = dict_set(_im_respond_aq, "result", "$ai_response")
+let _im_respond_aq = dict_set(_im_respond_aq, "cached", "$cached")
+let _im_respond_aq = dict_set(_im_respond_aq, "source", "tpipeline:ai-query")
+let _step_respond_aq = dict_set(_step_respond_aq, "input_map", _im_respond_aq)
+
+let _pl_ai_query = {}
+let _pl_ai_query = dict_set(_pl_ai_query, "name", "ai-query")
+let _pl_ai_query = dict_set(_pl_ai_query, "description", "Full AI query pipeline: validate, cache-check, hivemind, cache-store, respond")
+let _pl_ai_query = dict_set(_pl_ai_query, "steps", [_step_validate_aq, _step_cache_check, _step_hivemind, _step_cache_store, _step_respond_aq])
+let _pl_ai_query = dict_set(_pl_ai_query, "created", time())
+let _pipelines = dict_set(_pipelines, "ai-query", _pl_ai_query)
+
+// Default pipeline 2: semantic-search
+let _step_validate_ss = {}
+let _step_validate_ss = dict_set(_step_validate_ss, "name", "validate")
+let _step_validate_ss = dict_set(_step_validate_ss, "url", "http://127.0.0.1:9964/tvalidator/validate")
+let _step_validate_ss = dict_set(_step_validate_ss, "method", "POST")
+let _step_validate_ss = dict_set(_step_validate_ss, "output_key", "validated")
+let _step_validate_ss = dict_set(_step_validate_ss, "on_fail", "stop")
+let _im_validate_ss = {}
+let _im_validate_ss = dict_set(_im_validate_ss, "input", "$input.query")
+let _im_validate_ss = dict_set(_im_validate_ss, "rules", ["no_html", "max_length:2000"])
+let _step_validate_ss = dict_set(_step_validate_ss, "input_map", _im_validate_ss)
+
+let _step_embed = {}
+let _step_embed = dict_set(_step_embed, "name", "embed")
+let _step_embed = dict_set(_step_embed, "url", "http://127.0.0.1:9960/tembed/embed")
+let _step_embed = dict_set(_step_embed, "method", "POST")
+let _step_embed = dict_set(_step_embed, "output_key", "embedding")
+let _step_embed = dict_set(_step_embed, "on_fail", "stop")
+let _im_embed = {}
+let _im_embed = dict_set(_im_embed, "text", "$input.query")
+let _step_embed = dict_set(_step_embed, "input_map", _im_embed)
+
+let _step_search = {}
+let _step_search = dict_set(_step_search, "name", "search")
+let _step_search = dict_set(_step_search, "url", "http://127.0.0.1:9960/tembed/search")
+let _step_search = dict_set(_step_search, "method", "POST")
+let _step_search = dict_set(_step_search, "output_key", "results")
+let _step_search = dict_set(_step_search, "on_fail", "stop")
+let _im_search = {}
+let _im_search = dict_set(_im_search, "embedding", "$embedding.embedding")
+let _im_search = dict_set(_im_search, "top_k", "$input.top_k")
+let _step_search = dict_set(_step_search, "input_map", _im_search)
+
+let _step_rank = {}
+let _step_rank = dict_set(_step_rank, "name", "rank")
+let _step_rank = dict_set(_step_rank, "url", "http://127.0.0.1:9999/api/echo")
+let _step_rank = dict_set(_step_rank, "method", "POST")
+let _step_rank = dict_set(_step_rank, "output_key", "ranked")
+let _step_rank = dict_set(_step_rank, "on_fail", "continue")
+let _im_rank = {}
+let _im_rank = dict_set(_im_rank, "results", "$results")
+let _im_rank = dict_set(_im_rank, "query", "$input.query")
+let _step_rank = dict_set(_step_rank, "input_map", _im_rank)
+
+let _step_respond_ss = {}
+let _step_respond_ss = dict_set(_step_respond_ss, "name", "respond")
+let _step_respond_ss = dict_set(_step_respond_ss, "url", "http://127.0.0.1:9999/api/echo")
+let _step_respond_ss = dict_set(_step_respond_ss, "method", "POST")
+let _step_respond_ss = dict_set(_step_respond_ss, "output_key", "response")
+let _step_respond_ss = dict_set(_step_respond_ss, "on_fail", "continue")
+let _im_respond_ss = {}
+let _im_respond_ss = dict_set(_im_respond_ss, "results", "$ranked")
+let _im_respond_ss = dict_set(_im_respond_ss, "source", "tpipeline:semantic-search")
+let _step_respond_ss = dict_set(_step_respond_ss, "input_map", _im_respond_ss)
+
+let _pl_semantic = {}
+let _pl_semantic = dict_set(_pl_semantic, "name", "semantic-search")
+let _pl_semantic = dict_set(_pl_semantic, "description", "Semantic search pipeline: validate, embed, search, rank, respond")
+let _pl_semantic = dict_set(_pl_semantic, "steps", [_step_validate_ss, _step_embed, _step_search, _step_rank, _step_respond_ss])
+let _pl_semantic = dict_set(_pl_semantic, "created", time())
+let _pipelines = dict_set(_pipelines, "semantic-search", _pl_semantic)
+
+// Default pipeline 3: health-sweep
+let _step_snapshot = {}
+let _step_snapshot = dict_set(_step_snapshot, "name", "snapshot")
+let _step_snapshot = dict_set(_step_snapshot, "url", "http://127.0.0.1:9999/api/services/health")
+let _step_snapshot = dict_set(_step_snapshot, "method", "GET")
+let _step_snapshot = dict_set(_step_snapshot, "output_key", "health_snapshot")
+let _step_snapshot = dict_set(_step_snapshot, "on_fail", "stop")
+let _im_snapshot = {}
+let _step_snapshot = dict_set(_step_snapshot, "input_map", _im_snapshot)
+
+let _step_compare = {}
+let _step_compare = dict_set(_step_compare, "name", "compare-last")
+let _step_compare = dict_set(_step_compare, "url", "http://127.0.0.1:9999/api/echo")
+let _step_compare = dict_set(_step_compare, "method", "POST")
+let _step_compare = dict_set(_step_compare, "output_key", "comparison")
+let _step_compare = dict_set(_step_compare, "on_fail", "continue")
+let _im_compare = {}
+let _im_compare = dict_set(_im_compare, "current", "$health_snapshot")
+let _im_compare = dict_set(_im_compare, "action", "compare")
+let _step_compare = dict_set(_step_compare, "input_map", _im_compare)
+
+let _step_alert = {}
+let _step_alert = dict_set(_step_alert, "name", "alert-if-degraded")
+let _step_alert = dict_set(_step_alert, "url", "http://127.0.0.1:9945/tbus/publish")
+let _step_alert = dict_set(_step_alert, "method", "POST")
+let _step_alert = dict_set(_step_alert, "output_key", "alert")
+let _step_alert = dict_set(_step_alert, "on_fail", "continue")
+let _im_alert = {}
+let _im_alert = dict_set(_im_alert, "topic", "health-alert")
+let _im_alert = dict_set(_im_alert, "data", "$comparison")
+let _im_alert = dict_set(_im_alert, "priority", 1)
+let _step_alert = dict_set(_step_alert, "input_map", _im_alert)
+
+let _pl_health = {}
+let _pl_health = dict_set(_pl_health, "name", "health-sweep")
+let _pl_health = dict_set(_pl_health, "description", "Health sweep pipeline: snapshot services, compare, alert if degraded")
+let _pl_health = dict_set(_pl_health, "steps", [_step_snapshot, _step_compare, _step_alert])
+let _pl_health = dict_set(_pl_health, "created", time())
+let _pipelines = dict_set(_pipelines, "health-sweep", _pl_health)
+
+// ---------------------------------------------------------------------------
+// Startup banner
+// ---------------------------------------------------------------------------
+
+print("[TPipeline] NovaX Ternary Pipeline Engine v1.0 on 127.0.0.1:9966")
+print("[TPipeline] ternary=true | harmonics=3-5-7-13 | step_timeout=13s")
+print("[TPipeline] max_pipelines=729 | max_steps=39 | history=1000")
+print("[TPipeline] defaults=ai-query,semantic-search,health-sweep")
+print("[TPipeline] routes: GET /tpipeline/list /tpipeline/history")
+print("[TPipeline] routes: POST /tpipeline/run /tpipeline/define /tpipeline/delete /tpipeline/get")
+
+// ---------------------------------------------------------------------------
+// Start server
+// ---------------------------------------------------------------------------
+
+tstart(server)

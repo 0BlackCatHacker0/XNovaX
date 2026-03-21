@@ -1,0 +1,1151 @@
+// Nova Simulation Engine v1.0 - Ternary Simulation Micro-Tools (NovaLang)
+// Port 9853: 7 simulation tools on 3-5-7-13 harmonic constants
+//
+// Tools:
+//   1. POST /sim/automata  -- Cellular automata (1d, 2d, life)
+//   2. POST /sim/agents    -- Agent-based simulation (spawn, step, observe)
+//   3. POST /sim/monte     -- Monte Carlo methods (pi, walk, integrate)
+//   4. POST /sim/network   -- Network simulations (sir, cascade, spread)
+//   5. POST /sim/evolve    -- Evolutionary algorithms (init, step, best)
+//   6. POST /sim/terrain   -- Terrain generation (heightmap, erode, biome)
+//   7. POST /sim/swarm     -- Swarm intelligence (boids, pso)
+//
+// N-S Mapping:
+//   agent_flow          = velocity_field (agents moving through space)
+//   population_pressure = turbulent_energy (crowding, interaction density)
+//   Reynolds(sim)       = agent_count * step_count * H5
+//   RE_LAMINAR=27       = small sim (few agents, few steps)
+//   RE_TRANSITION=125   = medium sim (moderate interactions)
+//   RE_TURBULENT=343    = heavy sim (many agents, complex rules)
+//
+// Endpoints:
+//   GET  /health               -- Health check
+//   GET  /sim/service-status   -- Full service status with stats
+//   POST /sim/automata         -- Cellular automata
+//   POST /sim/agents           -- Agent-based simulation
+//   POST /sim/monte            -- Monte Carlo methods
+//   POST /sim/network          -- Network simulations
+//   POST /sim/evolve           -- Evolutionary algorithms
+//   POST /sim/terrain          -- Terrain generation
+//   POST /sim/swarm            -- Swarm intelligence
+
+let PORT = 9853
+let server = tserve(PORT, "Simulation Engine v1.0 - Ternary Simulation Micro-Tools")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+
+// -- Ternary State Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds Boundaries (N-S) --
+let BLOCK_SIZE    = 2187
+let RE_LAMINAR    = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT  = 343
+
+// -- Service Constants --
+let TOOLS_COUNT  = 7
+let VERSION      = "1.0.0"
+let SERVICE_NAME = "simulation-engine"
+
+// -- Global Stats --
+let _stats = {"total": 0, "t0": 0}
+let _stats = dict_set(_stats, "t0", time())
+let stat_automata = 0
+let stat_agents   = 0
+let stat_monte    = 0
+let stat_network  = 0
+let stat_evolve   = 0
+let stat_terrain  = 0
+let stat_swarm    = 0
+
+// ===========================================================================
+// PSEUDO-RANDOM (LCG)
+// ===========================================================================
+fn pseudo_random(seed) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483647
+    let next = (a * seed + c) % m
+    if3 next < 0 { next = 0 - next }
+    return next
+}
+
+fn rand_float(seed, lo, hi) {
+    let r = pseudo_random(seed)
+    let range = hi - lo
+    let frac = (r % 10000) / 10000
+    return lo + frac * range
+}
+
+fn rand_int(seed, lo, hi) {
+    let r = pseudo_random(seed)
+    let range = hi - lo + 1
+    return lo + (r % range)
+}
+
+// ===========================================================================
+// HELPER: increment stats
+// ===========================================================================
+fn bump_stats() {
+    _stats = dict_set(_stats, "total", (dict_get(_stats, "total") ?? 0) + 1)
+    return T_TRUE
+}
+
+// ===========================================================================
+// HELPER: abs, min, max, clamp
+// ===========================================================================
+fn abs_val(x) {
+    if3 x < 0 { return 0 - x }
+    return x
+}
+
+fn max2(a, b) {
+    if3 a >= b { return a }
+    return b
+}
+
+fn min2(a, b) {
+    if3 a <= b { return a }
+    return b
+}
+
+fn clamp(v, lo, hi) {
+    if3 v < lo { return lo }
+    if3 v > hi { return hi }
+    return v
+}
+
+// ===========================================================================
+// TOOL 1: AUTOMATA - POST /sim/automata
+// ===========================================================================
+fn automata_1d_step(cells, rule) {
+    let n = len(cells)
+    let next = []
+    let i = 0
+    while3 i < n {
+        // get left, center, right (wrap boundaries)
+        let li = i - 1
+        if3 li < 0 { li = n - 1 }
+        let ri = i + 1
+        if3 ri >= n { ri = 0 }
+        let l = dict_get(cells, li) ?? 0
+        let c = dict_get(cells, i) ?? 0
+        let r = dict_get(cells, ri) ?? 0
+        // combine into 3-bit index: l*4 + c*2 + r
+        let idx = l * 4 + c * 2 + r
+        // extract bit from rule number
+        let bit = (rule / (1)) % 2
+        // compute 2^idx to extract the bit
+        let power = 1
+        let pi = 0
+        while3 pi < idx {
+            let power = power * 2
+            pi = pi + 1
+        }
+        let bit = (rule / power) % 2
+        next = append(next, bit)
+        i = i + 1
+    }
+    return next
+}
+
+fn cells_to_str(cells) {
+    let s = ""
+    let i = 0
+    while3 i < len(cells) {
+        let v = dict_get(cells, i) ?? 0
+        if3 v == 1 { s = s + "#" }
+        if3 v == 0 { s = s + "." }
+        i = i + 1
+    }
+    return s
+}
+
+fn life_step(grid, size) {
+    // Conway's Game of Life step
+    let next = []
+    let y = 0
+    while3 y < size {
+        let x = 0
+        while3 x < size {
+            let idx = y * size + x
+            let cell = dict_get(grid, idx) ?? 0
+            // count neighbors
+            let neighbors = 0
+            let dy = -1
+            while3 dy <= 1 {
+                let dx = -1
+                while3 dx <= 1 {
+                    if3 (dx != 0) + (dy != 0) > 0 { nx = (x + dx + size) % size
+                        let ny = (y + dy + size) % size
+                        let ni = ny * size + nx
+                        let nv = dict_get(grid, ni) ?? 0
+                        let neighbors = neighbors + nv
+                    }
+                    let dx = dx + 1
+                }
+                let dy = dy + 1
+            }
+            // apply rules
+            let alive = 0
+            if3 cell == 1 {
+                if3 neighbors == 2 { alive = 1 }
+                if3 neighbors == 3 { alive = 1 }
+            }
+            if3 cell == 0 {
+                if3 neighbors == 3 { alive = 1 }
+            }
+            next = append(next, alive)
+            let x = x + 1
+        }
+        let y = y + 1
+    }
+    return next
+}
+
+fn handle_automata(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_automata = stat_automata + 1
+    let atype = dict_get(body, "type") ?? "1d"
+    let size = dict_get(body, "size") ?? 20
+    let steps = dict_get(body, "steps") ?? 5
+    if3 atype == "1d" { rule = dict_get(body, "rule") ?? 30
+        // init: single cell in center
+        let cells = []
+        let i = 0
+        while3 i < size {
+            cells = append(cells, 0)
+            i = i + 1
+        }
+        let mid = size / 2
+        let cells = list_set(cells, mid, 1)
+        // run steps
+        let history = []
+        history = append(history, cells_to_str(cells))
+        let si = 0
+        while3 si < steps {
+            let cells = automata_1d_step(cells, rule)
+            history = append(history, cells_to_str(cells))
+            si = si + 1
+        }
+        return {"trit": T_TRUE, "type": "1d", "rule": rule, "size": size, "steps": steps, "history": history, "final": cells}
+    }
+    if3 atype == "life" { grid = dict_get(body, "grid") ?? []
+        // if no grid, create random one
+        if3 len(grid) == 0 { seed = dict_get(body, "seed") ?? 42
+            let total = size * size
+            let i = 0
+            while3 i < total {
+                let seed = pseudo_random(seed)
+                let v = seed % 2
+                grid = append(grid, v)
+                i = i + 1
+            }
+        }
+        // run steps
+        let si = 0
+        while3 si < steps {
+            let grid = life_step(grid, size)
+            si = si + 1
+        }
+        // count alive
+        let alive = 0
+        let i = 0
+        while3 i < len(grid) {
+            let alive = alive + dict_get(grid, i) ?? 0
+            i = i + 1
+        }
+        return {"trit": T_TRUE, "type": "life", "size": size, "steps": steps, "grid": grid, "alive": alive, "total": size * size}
+    }
+    if3 atype == "2d" {
+        // generic 2D automaton: same as life for now but with custom rules
+        let grid = dict_get(body, "grid") ?? []
+        if3 len(grid) == 0 { seed = dict_get(body, "seed") ?? 99
+            let total = size * size
+            let i = 0
+            while3 i < total {
+                let seed = pseudo_random(seed)
+                let v = seed % 2
+                grid = append(grid, v)
+                i = i + 1
+            }
+        }
+        let si = 0
+        while3 si < steps {
+            let grid = life_step(grid, size)
+            si = si + 1
+        }
+        return {"trit": T_TRUE, "type": "2d", "size": size, "steps": steps, "grid": grid}
+    }
+    return {"trit": T_FALSE, "error": "unknown automata type", "valid": ["1d", "2d", "life"]}
+}
+
+// ===========================================================================
+// TOOL 2: AGENTS - POST /sim/agents
+// ===========================================================================
+fn handle_agents(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_agents = stat_agents + 1
+    let op = dict_get(body, "op") ?? "spawn"
+    let bounds = dict_get(body, "bounds", {"w": 100, "h": 100})
+    let bw = dict_get(bounds, "w") ?? 100
+    let bh = dict_get(bounds, "h") ?? 100
+    if3 op == "spawn" { count = dict_get(body, "count") ?? 10
+        let agents = []
+        let seed = time() * 1000
+        let i = 0
+        while3 i < count {
+            let seed = pseudo_random(seed)
+            let x = rand_float(seed, 0, bw)
+            let seed = pseudo_random(seed)
+            let y = rand_float(seed, 0, bh)
+            let seed = pseudo_random(seed)
+            let vx = rand_float(seed, -2, 2)
+            let seed = pseudo_random(seed)
+            let vy = rand_float(seed, -2, 2)
+            let agent = {"id": i, "x": x, "y": y, "vx": vx, "vy": vy}
+            agents = append(agents, agent)
+            i = i + 1
+        }
+        return {"trit": T_TRUE, "op": "spawn", "count": count, "agents": agents}
+    }
+    if3 op == "step" { agents = dict_get(body, "agents") ?? []
+        let dt = dict_get(body, "dt") ?? 1
+        let updated = []
+        let i = 0
+        while3 i < len(agents) {
+            let a = dict_get(agents, i)
+            let x = (dict_get(a, "x") ?? 0) + (dict_get(a, "vx") ?? 0) * dt
+            let y = (dict_get(a, "y") ?? 0) + (dict_get(a, "vy") ?? 0) * dt
+            let vx = dict_get(a, "vx") ?? 0
+            let vy = dict_get(a, "vy") ?? 0
+            // wall bounce
+            if3 x < 0   { x = 0   let vx = abs_val(vx) }
+            if3 x > bw  { x = bw  let vx = 0 - abs_val(vx) }
+            if3 y < 0   { y = 0   let vy = abs_val(vy) }
+            if3 y > bh  { y = bh  let vy = 0 - abs_val(vy) }
+            let na = {"id": dict_get(a, "id") ?? i, "x": x, "y": y, "vx": vx, "vy": vy}
+            updated = append(updated, na)
+            i = i + 1
+        }
+        return {"trit": T_TRUE, "op": "step", "count": len(updated), "agents": updated, "dt": dt}
+    }
+    if3 op == "observe" { agents = dict_get(body, "agents") ?? []
+        let n = len(agents)
+        // compute centroid
+        let sx = 0
+        let sy = 0
+        let i = 0
+        while3 i < n {
+            let a = dict_get(agents, i)
+            let sx = sx + dict_get(a, "x") ?? 0
+            let sy = sy + dict_get(a, "y") ?? 0
+            i = i + 1
+        }
+        let cx = 0
+        let cy = 0
+        if3 n > 0 { cx = sx / n
+            let cy = sy / n
+        }
+        return {"trit": T_TRUE, "op": "observe", "count": n, "centroid": {"x": cx, "y": cy}}
+    }
+    return {"trit": T_FALSE, "error": "unknown agent op", "valid": ["spawn", "step", "observe"]}
+}
+
+// ===========================================================================
+// TOOL 3: MONTE CARLO - POST /sim/monte
+// ===========================================================================
+fn handle_monte(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_monte = stat_monte + 1
+    let mtype = dict_get(body, "type") ?? "pi"
+    let samples = dict_get(body, "samples") ?? 1000
+    if3 mtype == "pi" { inside = 0
+        let seed = dict_get(body, "seed") ?? 42
+        let i = 0
+        while3 i < samples {
+            let seed = pseudo_random(seed)
+            let x = (seed % 10000) / 10000
+            let seed = pseudo_random(seed)
+            let y = (seed % 10000) / 10000
+            let d2 = x * x + y * y
+            if3 d2 <= 1 { inside = inside + 1
+            }
+            i = i + 1
+        }
+        let pi_est = 4 * inside / samples
+        return {"trit": T_TRUE, "type": "pi", "samples": samples, "inside": inside, "pi_estimate": pi_est}
+    }
+    if3 mtype == "walk" { nsteps = dict_get(body, "steps") ?? 100
+        let walkers = dict_get(body, "walkers") ?? 5
+        let seed = dict_get(body, "seed") ?? 77
+        let results = []
+        let wi = 0
+        while3 wi < walkers {
+            let x = 0
+            let y = 0
+            let si = 0
+            while3 si < nsteps {
+                let seed = pseudo_random(seed)
+                let dir = seed % 4
+                if3 dir == 0 { x = x + 1 }
+                if3 dir == 1 { x = x - 1 }
+                if3 dir == 2 { y = y + 1 }
+                if3 dir == 3 { y = y - 1 }
+                si = si + 1
+            }
+            let dist = abs_val(x) + abs_val(y)
+            let w = {"walker": wi, "x": x, "y": y, "manhattan_dist": dist}
+            results = append(results, w)
+            wi = wi + 1
+        }
+        return {"trit": T_TRUE, "type": "walk", "walkers": walkers, "steps": nsteps, "results": results}
+    }
+    if3 mtype == "integrate" {
+        // Monte Carlo integration of x^2 over [0,1]
+        let seed = dict_get(body, "seed") ?? 123
+        let total = 0
+        let i = 0
+        while3 i < samples {
+            let seed = pseudo_random(seed)
+            let x = (seed % 10000) / 10000
+            // simple: x^2 (default fn)
+            let fx = x * x
+            let total = total + fx
+            i = i + 1
+        }
+        let integral = total / samples
+        return {"trit": T_TRUE, "type": "integrate", "samples": samples, "fn": "x^2", "integral": integral, "expected": 0.333}
+    }
+    return {"trit": T_FALSE, "error": "unknown monte type", "valid": ["pi", "walk", "integrate"]}
+}
+
+// ===========================================================================
+// TOOL 4: NETWORK - POST /sim/network
+// ===========================================================================
+fn handle_network(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_network = stat_network + 1
+    let ntype = dict_get(body, "type") ?? "sir"
+    let nodes = dict_get(body, "nodes") ?? 100
+    let steps = dict_get(body, "steps") ?? 10
+    let beta = dict_get(body, "beta") ?? 0.1
+    let gamma = dict_get(body, "gamma") ?? 0.05
+    let infected_init = dict_get(body, "infected") ?? [0]
+    if3 ntype == "sir" {
+        // SIR model: S=0, I=1, R=2
+        let state = []
+        let i = 0
+        while3 i < nodes {
+            state = append(state, 0)
+            i = i + 1
+        }
+        // set initially infected
+        let ii = 0
+        while3 ii < len(infected_init) {
+            let idx = dict_get(infected_init, ii) ?? 0
+            if3 idx < nodes { state = list_set(state, idx, 1)
+            }
+            let ii = ii + 1
+        }
+        let history = []
+        let seed = 42
+        let si = 0
+        while3 si < steps {
+            let new_state = []
+            let s_count = 0
+            let i_count = 0
+            let r_count = 0
+            let ni = 0
+            while3 ni < nodes {
+                let cur = dict_get(state, ni) ?? 0
+                if3 cur == 0 {
+                    // susceptible: chance of infection from neighbors
+                    let seed = pseudo_random(seed)
+                    let roll = (seed % 1000) / 1000
+                    // check if any neighbor is infected (use simple ring topology)
+                    let left = (ni - 1 + nodes) % nodes
+                    let right = (ni + 1) % nodes
+                    let neighbor_infected = 0
+                    if3 (dict_get(state, left) ?? 0) == 1 { neighbor_infected = 1 }
+                    if3 (dict_get(state, right) ?? 0) == 1 { neighbor_infected = 1 }
+                    if3 neighbor_infected == 1 {
+                        if3 roll < beta { new_state = append(new_state, 1)
+                            let i_count = i_count + 1
+                        }
+                        if3 roll >= beta { new_state = append(new_state, 0)
+                            let s_count = s_count + 1
+                        }
+                    }
+                    if3 neighbor_infected == 0 { new_state = append(new_state, 0)
+                        let s_count = s_count + 1
+                    }
+                }
+                if3 cur == 1 {
+                    // infected: chance of recovery
+                    let seed = pseudo_random(seed)
+                    let roll = (seed % 1000) / 1000
+                    if3 roll < gamma { new_state = append(new_state, 2)
+                        let r_count = r_count + 1
+                    }
+                    if3 roll >= gamma { new_state = append(new_state, 1)
+                        let i_count = i_count + 1
+                    }
+                }
+                if3 cur == 2 {
+                    // recovered: stays recovered
+                    new_state = append(new_state, 2)
+                    let r_count = r_count + 1
+                }
+                ni = ni + 1
+            }
+            let state = new_state
+            let snapshot = {"step": si, "S": s_count, "I": i_count, "R": r_count}
+            history = append(history, snapshot)
+            si = si + 1
+        }
+        return {"trit": T_TRUE, "type": "sir", "nodes": nodes, "steps": steps, "beta": beta, "gamma": gamma, "history": history, "final_state": state}
+    }
+    if3 ntype == "cascade" {
+        // information cascade: activated nodes spread to neighbors
+        let active = []
+        let i = 0
+        while3 i < nodes {
+            active = append(active, 0)
+            i = i + 1
+        }
+        // seed initial active
+        let ii = 0
+        while3 ii < len(infected_init) {
+            let idx = dict_get(infected_init, ii) ?? 0
+            if3 idx < nodes { active = list_set(active, idx, 1)
+            }
+            let ii = ii + 1
+        }
+        let seed = 55
+        let si = 0
+        while3 si < steps {
+            let next = []
+            let ni = 0
+            while3 ni < nodes {
+                let cur = dict_get(active, ni) ?? 0
+                if3 cur == 1 { next = append(next, 1)
+                }
+                if3 cur == 0 { left = (ni - 1 + nodes) % nodes
+                    let right = (ni + 1) % nodes
+                    let has_active = 0
+                    if3 (dict_get(active, left) ?? 0) == 1 { has_active = 1 }
+                    if3 (dict_get(active, right) ?? 0) == 1 { has_active = 1 }
+                    if3 has_active == 1 { seed = pseudo_random(seed)
+                        let roll = (seed % 1000) / 1000
+                        if3 roll < beta { next = append(next, 1)
+                        }
+                        if3 roll >= beta { next = append(next, 0)
+                        }
+                    }
+                    if3 has_active == 0 { next = append(next, 0)
+                    }
+                }
+                ni = ni + 1
+            }
+            let active = next
+            si = si + 1
+        }
+        // count active
+        let total_active = 0
+        let i = 0
+        while3 i < nodes {
+            let total_active = total_active + dict_get(active, i) ?? 0
+            i = i + 1
+        }
+        return {"trit": T_TRUE, "type": "cascade", "nodes": nodes, "steps": steps, "active_count": total_active, "active": active}
+    }
+    if3 ntype == "spread" {
+        // simple propagation: value spreads from source with decay
+        let values = []
+        let i = 0
+        while3 i < nodes {
+            values = append(values, 0)
+            i = i + 1
+        }
+        // seed initial
+        let ii = 0
+        while3 ii < len(infected_init) {
+            let idx = dict_get(infected_init, ii) ?? 0
+            if3 idx < nodes { values = list_set(values, idx, 100)
+            }
+            let ii = ii + 1
+        }
+        let si = 0
+        while3 si < steps {
+            let next = []
+            let ni = 0
+            while3 ni < nodes {
+                let cur = dict_get(values, ni) ?? 0
+                let left = (ni - 1 + nodes) % nodes
+                let right = (ni + 1) % nodes
+                let lv = dict_get(values, left) ?? 0
+                let rv = dict_get(values, right) ?? 0
+                let avg = (cur + lv * beta + rv * beta) / (1 + 2 * beta)
+                next = append(next, avg)
+                ni = ni + 1
+            }
+            let values = next
+            si = si + 1
+        }
+        return {"trit": T_TRUE, "type": "spread", "nodes": nodes, "steps": steps, "values": values}
+    }
+    return {"trit": T_FALSE, "error": "unknown network type", "valid": ["sir", "cascade", "spread"]}
+}
+
+// ===========================================================================
+// TOOL 5: EVOLVE - POST /sim/evolve
+// ===========================================================================
+fn fitness(genome, target) {
+    let score = 0
+    let n = min2(len(genome), len(target))
+    let i = 0
+    while3 i < n {
+        if3 (dict_get(genome, i) ?? 0) == (dict_get(target, i) ?? 0) { score = score + 1
+        }
+        i = i + 1
+    }
+    return score
+}
+
+fn handle_evolve(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_evolve = stat_evolve + 1
+    let op = dict_get(body, "op") ?? "init"
+    let pop_size = dict_get(body, "pop_size") ?? 20
+    let genome_len = dict_get(body, "genome_len") ?? 10
+    let mutation_rate = dict_get(body, "mutation_rate") ?? 0.1
+    let target = dict_get(body, "target", [1, 0, 1, 1, 0])
+    if3 op == "init" { population = []
+        let seed = dict_get(body, "seed") ?? 42
+        let pi = 0
+        while3 pi < pop_size {
+            let genome = []
+            let gi = 0
+            while3 gi < genome_len {
+                let seed = pseudo_random(seed)
+                let gene = seed % 2
+                genome = append(genome, gene)
+                gi = gi + 1
+            }
+            let individual = {"id": pi, "genome": genome, "fitness": fitness(genome, target)}
+            population = append(population, individual)
+            pi = pi + 1
+        }
+        return {"trit": T_TRUE, "op": "init", "pop_size": pop_size, "genome_len": genome_len, "population": population}
+    }
+    if3 op == "step" { population = dict_get(body, "population") ?? []
+        let n = len(population)
+        if3 n == 0 { return {"trit": T_FALSE, "error": "empty population"} }
+        // evaluate fitness
+        let i = 0
+        while3 i < n {
+            let ind = dict_get(population, i)
+            let g = dict_get(ind, "genome") ?? []
+            let f = fitness(g, target)
+            ind = dict_set(ind, "fitness", f)
+            let population = list_set(population, i, ind)
+            i = i + 1
+        }
+        // sort by fitness (simple bubble sort top 2)
+        let best_idx = 0
+        let best_fit = 0
+        let second_idx = 1
+        let second_fit = 0
+        let i = 0
+        while3 i < n {
+            let ind = dict_get(population, i)
+            let f = dict_get(ind, "fitness") ?? 0
+            if3 f > best_fit { second_idx = best_idx
+                let second_fit = best_fit
+                let best_idx = i
+                let best_fit = f
+            }
+            if3 f <= best_fit {
+                if3 f > second_fit { second_idx = i
+                    let second_fit = f
+                }
+            }
+            i = i + 1
+        }
+        // crossover + mutate to create new population
+        let p1 = dict_get(dict_get(population, best_idx), "genome") ?? []
+        let p2 = dict_get(dict_get(population, second_idx), "genome") ?? []
+        let new_pop = []
+        let seed = time() * 1000
+        let pi = 0
+        while3 pi < pop_size {
+            let child = []
+            let gi = 0
+            while3 gi < genome_len {
+                // crossover: pick from p1 or p2
+                let seed = pseudo_random(seed)
+                let pick = seed % 2
+                let gene = 0
+                if3 pick == 0 {
+                    if3 gi < len(p1) { gene = dict_get(p1, gi) ?? 0 }
+                }
+                if3 pick == 1 {
+                    if3 gi < len(p2) { gene = dict_get(p2, gi) ?? 0 }
+                }
+                // mutate
+                let seed = pseudo_random(seed)
+                let mroll = (seed % 1000) / 1000
+                if3 mroll < mutation_rate { gene = 1 - gene
+                }
+                child = append(child, gene)
+                gi = gi + 1
+            }
+            let ind = {"id": pi, "genome": child, "fitness": fitness(child, target)}
+            new_pop = append(new_pop, ind)
+            pi = pi + 1
+        }
+        return {"trit": T_TRUE, "op": "step", "pop_size": pop_size, "best_fitness": best_fit, "population": new_pop}
+    }
+    if3 op == "best" { population = dict_get(body, "population") ?? []
+        let best_idx = 0
+        let best_fit = -1
+        let i = 0
+        while3 i < len(population) {
+            let ind = dict_get(population, i)
+            let g = dict_get(ind, "genome") ?? []
+            let f = fitness(g, target)
+            if3 f > best_fit { best_fit = f
+                let best_idx = i
+            }
+            i = i + 1
+        }
+        let best = dict_get(population, best_idx) ?? {}
+        return {"trit": T_TRUE, "op": "best", "best_index": best_idx, "best_fitness": best_fit, "individual": best}
+    }
+    return {"trit": T_FALSE, "error": "unknown evolve op", "valid": ["init", "step", "best"]}
+}
+
+// ===========================================================================
+// TOOL 6: TERRAIN - POST /sim/terrain
+// ===========================================================================
+fn handle_terrain(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_terrain = stat_terrain + 1
+    let op = dict_get(body, "op") ?? "heightmap"
+    let size = dict_get(body, "size") ?? 16
+    let seed_val = dict_get(body, "seed") ?? 42
+    if3 op == "heightmap" {
+        // diamond-square algorithm (simplified)
+        let total = size * size
+        let terrain = []
+        let i = 0
+        while3 i < total {
+            terrain = append(terrain, 0)
+            i = i + 1
+        }
+        // seed corners
+        let seed = seed_val
+        let seed = pseudo_random(seed)
+        let terrain = list_set(terrain, 0, rand_float(seed, 0, 100))
+        let seed = pseudo_random(seed)
+        let terrain = list_set(terrain, size - 1, rand_float(seed, 0, 100))
+        let seed = pseudo_random(seed)
+        let terrain = list_set(terrain, (size - 1) * size, rand_float(seed, 0, 100))
+        let seed = pseudo_random(seed)
+        let terrain = list_set(terrain, total - 1, rand_float(seed, 0, 100))
+        // fill with interpolation + noise
+        let step = size - 1
+        let roughness = dict_get(body, "roughness") ?? 50
+        while3 step > 1 {
+            let half = step / 2
+            if3 half < 1 { half = 1 }
+            // diamond step
+            let y = 0
+            while3 y < size - 1 {
+                let x = 0
+                while3 x < size - 1 {
+                    let tl = dict_get(terrain, y * size + x) ?? 0
+                    let tr = dict_get(terrain, y * size + min2(x + step, size - 1)) ?? 0
+                    let bl = dict_get(terrain, min2(y + step, size - 1) * size + x) ?? 0
+                    let br = dict_get(terrain, min2(y + step, size - 1) * size + min2(x + step, size - 1)) ?? 0
+                    let avg = (tl + tr + bl + br) / 4
+                    let seed = pseudo_random(seed)
+                    let noise = rand_float(seed, 0 - roughness, roughness)
+                    let mid_x = min2(x + half, size - 1)
+                    let mid_y = min2(y + half, size - 1)
+                    let terrain = list_set(terrain, mid_y * size + mid_x, avg + noise)
+                    let x = x + step
+                }
+                let y = y + step
+            }
+            let roughness = roughness * 0.6
+            let step = half
+        }
+        // compute stats
+        let mn = 9999
+        let mx = -9999
+        let sm = 0
+        let i = 0
+        while3 i < total {
+            let v = dict_get(terrain, i) ?? 0
+            let mn = min2(mn, v)
+            let mx = max2(mx, v)
+            let sm = sm + v
+            i = i + 1
+        }
+        let avg = sm / total
+        return {"trit": T_TRUE, "op": "heightmap", "size": size, "terrain": terrain, "stats": {"min": mn, "max": mx, "avg": avg}}
+    }
+    if3 op == "erode" { terrain = dict_get(body, "terrain") ?? []
+        let iterations = dict_get(body, "iterations") ?? 5
+        if3 len(terrain) == 0 { return {"trit": T_FALSE, "error": "terrain required for erosion"} }
+        // simple hydraulic erosion: move material from high to low
+        let seed = seed_val
+        let it = 0
+        while3 it < iterations {
+            let y = 1
+            while3 y < size - 1 {
+                let x = 1
+                while3 x < size - 1 {
+                    let idx = y * size + x
+                    let h = dict_get(terrain, idx) ?? 0
+                    // find lowest neighbor
+                    let low = h
+                    let dx_arr = [-1, 0, 1, 0]
+                    let dy_arr = [0, -1, 0, 1]
+                    let di = 0
+                    while3 di < 4 {
+                        let nx = x + dict_get(dx_arr, di) ?? 0
+                        let ny = y + dict_get(dy_arr, di) ?? 0
+                        let ni = ny * size + nx
+                        let nh = dict_get(terrain, ni) ?? 0
+                        let low = min2(low, nh)
+                        di = di + 1
+                    }
+                    // erode: reduce height slightly toward lowest
+                    if3 h > low { diff = (h - low) * 0.1
+                        let terrain = list_set(terrain, idx, h - diff)
+                    }
+                    let x = x + 1
+                }
+                let y = y + 1
+            }
+            let it = it + 1
+        }
+        return {"trit": T_TRUE, "op": "erode", "size": size, "iterations": iterations, "terrain": terrain}
+    }
+    if3 op == "biome" { terrain = dict_get(body, "terrain") ?? []
+        if3 len(terrain) == 0 { return {"trit": T_FALSE, "error": "terrain required for biome assignment"} }
+        let biomes = []
+        let total = len(terrain)
+        // find range for normalization
+        let mn = 9999
+        let mx = -9999
+        let i = 0
+        while3 i < total {
+            let v = dict_get(terrain, i) ?? 0
+            let mn = min2(mn, v)
+            let mx = max2(mx, v)
+            i = i + 1
+        }
+        let range = mx - mn
+        if3 range == 0 { range = 1 }
+        let seed = seed_val
+        let i = 0
+        while3 i < total {
+            let v = dict_get(terrain, i) ?? 0
+            let norm = (v - mn) / range
+            let seed = pseudo_random(seed)
+            let moisture = (seed % 100) / 100
+            let biome = "plains"
+            if3 norm < 0.2 { biome = "ocean" }
+            if3 norm >= 0.2 { if3 norm < 0.3 { biome = "beach" } }
+            if3 norm >= 0.3 { if3 norm < 0.6 {
+                if3 moisture > 0.5 { biome = "forest" }
+                if3 moisture <= 0.5 { biome = "plains" }
+            } }
+            if3 norm >= 0.6 { if3 norm < 0.8 { biome = "hills" } }
+            if3 norm >= 0.8 { biome = "mountain" }
+            biomes = append(biomes, biome)
+            i = i + 1
+        }
+        return {"trit": T_TRUE, "op": "biome", "size": size, "biomes": biomes, "count": total}
+    }
+    return {"trit": T_FALSE, "error": "unknown terrain op", "valid": ["heightmap", "erode", "biome"]}
+}
+
+// ===========================================================================
+// TOOL 7: SWARM - POST /sim/swarm
+// ===========================================================================
+fn handle_swarm(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let bump_stats()
+    let stat_swarm = stat_swarm + 1
+    let stype = dict_get(body, "type") ?? "boids"
+    let bounds = dict_get(body, "bounds", {"w": 100, "h": 100})
+    let bw = dict_get(bounds, "w") ?? 100
+    let bh = dict_get(bounds, "h") ?? 100
+    let steps = dict_get(body, "steps") ?? 10
+    if3 stype == "boids" { agents = dict_get(body, "agents") ?? []
+        let count = dict_get(body, "count") ?? 20
+        // if no agents, spawn them
+        if3 len(agents) == 0 { seed = time() * 1000
+            let i = 0
+            while3 i < count {
+                let seed = pseudo_random(seed)
+                let x = rand_float(seed, 0, bw)
+                let seed = pseudo_random(seed)
+                let y = rand_float(seed, 0, bh)
+                let seed = pseudo_random(seed)
+                let vx = rand_float(seed, -1, 1)
+                let seed = pseudo_random(seed)
+                let vy = rand_float(seed, -1, 1)
+                let a = {"x": x, "y": y, "vx": vx, "vy": vy}
+                agents = append(agents, a)
+                i = i + 1
+            }
+        }
+        let n = len(agents)
+        // run boids steps
+        let si = 0
+        while3 si < steps {
+            let new_agents = []
+            let i = 0
+            while3 i < n {
+                let a = dict_get(agents, i)
+                let ax = dict_get(a, "x") ?? 0
+                let ay = dict_get(a, "y") ?? 0
+                let avx = dict_get(a, "vx") ?? 0
+                let avy = dict_get(a, "vy") ?? 0
+                // compute separation, alignment, cohesion
+                let sep_x = 0
+                let sep_y = 0
+                let ali_x = 0
+                let ali_y = 0
+                let coh_x = 0
+                let coh_y = 0
+                let neighbors = 0
+                let j = 0
+                while3 j < n {
+                    if3 j != i { b = dict_get(agents, j)
+                        let bx = dict_get(b, "x") ?? 0
+                        let by = dict_get(b, "y") ?? 0
+                        let dx = bx - ax
+                        let dy = by - ay
+                        let dist = abs_val(dx) + abs_val(dy)
+                        if3 dist < 30 { neighbors = neighbors + 1
+                            // separation: push away from close neighbors
+                            if3 dist < 10 {
+                                if3 dist > 0 { sep_x = sep_x - dx / dist
+                                    let sep_y = sep_y - dy / dist
+                                }
+                            }
+                            // alignment: match velocity
+                            let ali_x = ali_x + dict_get(b, "vx") ?? 0
+                            let ali_y = ali_y + dict_get(b, "vy") ?? 0
+                            // cohesion: move toward center of neighbors
+                            let coh_x = coh_x + bx
+                            let coh_y = coh_y + by
+                        }
+                    }
+                    j = j + 1
+                }
+                if3 neighbors > 0 { ali_x = ali_x / neighbors
+                    let ali_y = ali_y / neighbors
+                    let coh_x = coh_x / neighbors - ax
+                    let coh_y = coh_y / neighbors - ay
+                }
+                // apply forces (weights: sep=1.5, ali=1.0, coh=0.5)
+                let nvx = avx + sep_x * 1.5 + (ali_x - avx) * 0.1 + coh_x * 0.01
+                let nvy = avy + sep_y * 1.5 + (ali_y - avy) * 0.1 + coh_y * 0.01
+                // clamp velocity
+                let speed = abs_val(nvx) + abs_val(nvy)
+                if3 speed > 5 { nvx = nvx * 5 / speed
+                    let nvy = nvy * 5 / speed
+                }
+                let nx = ax + nvx
+                let ny = ay + nvy
+                // wrap boundaries
+                if3 nx < 0  { nx = nx + bw }
+                if3 nx > bw { nx = nx - bw }
+                if3 ny < 0  { ny = ny + bh }
+                if3 ny > bh { ny = ny - bh }
+                let na = {"x": nx, "y": ny, "vx": nvx, "vy": nvy}
+                new_agents = append(new_agents, na)
+                i = i + 1
+            }
+            let agents = new_agents
+            si = si + 1
+        }
+        return {"trit": T_TRUE, "type": "boids", "count": n, "steps": steps, "agents": agents}
+    }
+    if3 stype == "pso" {
+        // Particle Swarm Optimization
+        let agents = dict_get(body, "agents") ?? []
+        let count = dict_get(body, "count") ?? 20
+        let target = dict_get(body, "target", {"x": 50, "y": 50})
+        let tx = dict_get(target, "x") ?? 50
+        let ty = dict_get(target, "y") ?? 50
+        // if no agents, spawn them
+        if3 len(agents) == 0 { seed = time() * 1000
+            let i = 0
+            while3 i < count {
+                let seed = pseudo_random(seed)
+                let x = rand_float(seed, 0, bw)
+                let seed = pseudo_random(seed)
+                let y = rand_float(seed, 0, bh)
+                let seed = pseudo_random(seed)
+                let vx = rand_float(seed, -2, 2)
+                let seed = pseudo_random(seed)
+                let vy = rand_float(seed, -2, 2)
+                let a = {"x": x, "y": y, "vx": vx, "vy": vy, "best_x": x, "best_y": y}
+                agents = append(agents, a)
+                i = i + 1
+            }
+        }
+        let n = len(agents)
+        // find global best
+        let gbest_x = dict_get(dict_get(agents, 0, {}), "x") ?? 0
+        let gbest_y = dict_get(dict_get(agents, 0, {}), "y") ?? 0
+        let gbest_dist = abs_val(gbest_x - tx) + abs_val(gbest_y - ty)
+        let i = 0
+        while3 i < n {
+            let a = dict_get(agents, i)
+            let d = abs_val((dict_get(a, "x") ?? 0) - tx) + abs_val((dict_get(a, "y") ?? 0) - ty)
+            if3 d < gbest_dist { gbest_x = dict_get(a, "x") ?? 0
+                let gbest_y = dict_get(a, "y") ?? 0
+                let gbest_dist = d
+            }
+            i = i + 1
+        }
+        // run PSO steps
+        let seed = time() * 1000
+        let si = 0
+        while3 si < steps {
+            let new_agents = []
+            let i = 0
+            while3 i < n {
+                let a = dict_get(agents, i)
+                let px = dict_get(a, "x") ?? 0
+                let py = dict_get(a, "y") ?? 0
+                let pvx = dict_get(a, "vx") ?? 0
+                let pvy = dict_get(a, "vy") ?? 0
+                let bx = dict_get(a, "best_x") ?? px
+                let by = dict_get(a, "best_y") ?? py
+                // PSO velocity update
+                let seed = pseudo_random(seed)
+                let r1 = (seed % 100) / 100
+                let seed = pseudo_random(seed)
+                let r2 = (seed % 100) / 100
+                let w = 0.7
+                let c1 = 1.5
+                let c2 = 1.5
+                let nvx = w * pvx + c1 * r1 * (bx - px) + c2 * r2 * (gbest_x - px)
+                let nvy = w * pvy + c1 * r1 * (by - py) + c2 * r2 * (gbest_y - py)
+                let nx = px + nvx
+                let ny = py + nvy
+                // clamp to bounds
+                let nx = clamp(nx, 0, bw)
+                let ny = clamp(ny, 0, bh)
+                // update personal best
+                let new_dist = abs_val(nx - tx) + abs_val(ny - ty)
+                let old_dist = abs_val(bx - tx) + abs_val(by - ty)
+                let nbx = bx
+                let nby = by
+                if3 new_dist < old_dist { nbx = nx
+                    let nby = ny
+                }
+                // update global best
+                if3 new_dist < gbest_dist { gbest_x = nx
+                    let gbest_y = ny
+                    let gbest_dist = new_dist
+                }
+                let na = {"x": nx, "y": ny, "vx": nvx, "vy": nvy, "best_x": nbx, "best_y": nby}
+                new_agents = append(new_agents, na)
+                i = i + 1
+            }
+            let agents = new_agents
+            si = si + 1
+        }
+        return {"trit": T_TRUE, "type": "pso", "count": n, "steps": steps, "target": target, "global_best": {"x": gbest_x, "y": gbest_y, "dist": gbest_dist}, "agents": agents}
+    }
+    return {"trit": T_FALSE, "error": "unknown swarm type", "valid": ["boids", "pso"]}
+}
+
+// ===========================================================================
+// HEALTH + STATUS
+// ===========================================================================
+fn handle_health(req) {
+    return {"status": "ok", "service": SERVICE_NAME, "version": VERSION, "port": PORT, "trit": T_TRUE}
+}
+
+fn handle_status(req) {
+    let uptime = time() - dict_get(_stats, "t0") ?? 0
+    return {
+        "service": SERVICE_NAME,
+        "version": VERSION,
+        "port": PORT,
+        "trit": T_TRUE,
+        "tools": TOOLS_COUNT,
+        "uptime_s": uptime,
+        "total_requests": dict_get(_stats, "total") ?? 0,
+        "by_tool": {
+            "automata": stat_automata,
+            "agents": stat_agents,
+            "monte": stat_monte,
+            "network": stat_network,
+            "evolve": stat_evolve,
+            "terrain": stat_terrain,
+            "swarm": stat_swarm
+        },
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13, "BLOCK_SIZE": BLOCK_SIZE},
+        "reynolds": {"laminar": RE_LAMINAR, "transition": RE_TRANSITION, "turbulent": RE_TURBULENT}
+    }
+}
+
+// ===========================================================================
+// ROUTES
+// ===========================================================================
+troute(server, "GET",  "/health",             "handle_health")
+troute(server, "GET",  "/sim/service-status", "handle_status")
+troute(server, "POST", "/sim/automata",       "handle_automata")
+troute(server, "POST", "/sim/agents",         "handle_agents")
+troute(server, "POST", "/sim/monte",          "handle_monte")
+troute(server, "POST", "/sim/network",        "handle_network")
+troute(server, "POST", "/sim/evolve",         "handle_evolve")
+troute(server, "POST", "/sim/terrain",        "handle_terrain")
+troute(server, "POST", "/sim/swarm",          "handle_swarm")
+
+print("=== Nova Simulation Engine v1.0 ===")
+print("  Port:    9853")
+print("  Service: " + SERVICE_NAME)
+print("  Tools:   7 simulation micro-tools")
+print("  Routes:")
+print("    GET  /health")
+print("    GET  /sim/service-status")
+print("    POST /sim/automata  (1d, 2d, life)")
+print("    POST /sim/agents    (spawn, step, observe)")
+print("    POST /sim/monte     (pi, walk, integrate)")
+print("    POST /sim/network   (sir, cascade, spread)")
+print("    POST /sim/evolve    (init, step, best)")
+print("    POST /sim/terrain   (heightmap, erode, biome)")
+print("    POST /sim/swarm     (boids, pso)")
+print("  Harmonics: H3=3 H5=5 H7=7 H13=13 BLOCK=2187")
+print("  Reynolds:  laminar=27 transition=125 turbulent=343")
+print("==================================")
+
+tstart(server)

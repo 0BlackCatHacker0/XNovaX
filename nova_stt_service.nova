@@ -1,0 +1,250 @@
+// nova_stt_service.nova -- NovaX STT v2.0 - Pure Ternary (Zero Python)
+// Port 9875 | PowerShell System.Speech + Cloud API cascade
+//
+// Engine cascade (N-S Reynolds routed):
+//   Tier 1: Windows System.Speech via shell() + PowerShell (local, fast, free)
+//   Tier 2: OpenAI Whisper API via Cloud Router (cloud, accurate, uses quota)
+//   Tier 3: HiveMind STT delegation (cloud, multi-provider)
+//
+// N-S Mapping:
+//   audio = velocity_field (input data)
+//   confidence = reynolds_number (quality scoring)
+//   Re < 27 = LAMINAR = high confidence trit +1
+//   Re < 125 = TRANSITIONAL = partial trit 0
+//   Re >= 125 = TURBULENT = low/no confidence trit -1
+//
+// Endpoints:
+//   POST /transcribe   -- Transcribe audio file or live mic
+//   POST /stt/mic      -- Live microphone capture (3s window)
+//   GET  /health       -- Health check
+//   GET  /stt/status   -- Extended status
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9875
+let server = tserve(PORT, "Nova STT v2.0")
+
+// -- 3-5-7-13 Harmonic Constants --
+let BLOCK_SIZE = 2187
+let RE_LAMINAR = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT = 343
+
+// -- Ternary Constants --
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// -- Config --
+let PS_HELPER = "C:\\NovaX\\scripts\\stt_transcribe.ps1"
+let WHISPER_HELPER = "C:\\NovaX\\scripts\\stt_whisper.py"
+let WHISPER_MODEL = "base"
+
+// -- Stats --
+let stats_transcriptions = 0
+let stats_strong = 0
+let stats_partial = 0
+let stats_failed = 0
+let stats_t0 = time()
+
+// ============================================================
+// Helper: trit char
+// ============================================================
+fn trit_char(t) {
+    if3 t == 1 { return "1" }
+    if3 t == 0 { return "0" }
+    return "T"
+}
+
+// ============================================================
+// Helper: record trit into stats
+// ============================================================
+fn record_trit(t) {
+    if3 t == T_TRUE { stats_strong = stats_strong + 1 }
+    if3 t == T_MAYBE { stats_partial = stats_partial + 1 }
+    if3 t == T_FALSE { stats_failed = stats_failed + 1 }
+    return t
+}
+
+// ============================================================
+// Helper: build error response dict
+// ============================================================
+fn err_resp(msg) {
+    let r = {"ok": -1, "text": "", "trit": -1, "char": "T"}
+    r = dict_set(r, "error", msg)
+    return r
+}
+
+// ============================================================
+// Helper: build success response dict
+// ============================================================
+fn ok_resp(text, trit, dur, engine) {
+    let r = {"ok": 1}
+    r = dict_set(r, "text", text)
+    r = dict_set(r, "trit", trit)
+    r = dict_set(r, "char", trit_char(trit))
+    r = dict_set(r, "duration", dur)
+    r = dict_set(r, "engine", engine)
+    return r
+}
+
+// ============================================================
+// Tier 0: Local faster-whisper via Python (GPU-accelerated)
+// CTranslate2 int8 quantization, auto GPU/CPU detection
+// ============================================================
+fn transcribe_whisper(audio_path, mode) {
+    let cmd = ""
+    if3 mode == "mic" {
+        cmd = "\"" + WHISPER_HELPER + "\" --mic --model " + WHISPER_MODEL
+    } else {
+        cmd = "\"" + WHISPER_HELPER + "\" --file \"" + audio_path + "\" --model " + WHISPER_MODEL
+    }
+    let result = shell(cmd)
+    let raw = dict_get(result, "stdout") ?? ""
+    let trimmed = trim(raw)
+    if3 len(trimmed) < 3 { return err_resp("Whisper returned empty") }
+    let parsed = try3 { json_decode(trimmed) } fail { {} }
+    let text = dict_get(parsed, "text") ?? ""
+    let trit = dict_get(parsed, "trit") ?? -1
+    let dur = dict_get(parsed, "duration") ?? 0
+    if3 len(text) > 0 {
+        let _ = record_trit(trit)
+        return ok_resp(text, trit, dur, "faster-whisper")
+    }
+    return err_resp("Whisper: no speech detected")
+}
+
+// ============================================================
+// Tier 1: Windows System.Speech via PowerShell (Zero Python)
+// Uses shell() not nova_run -- gotcha from Session 73
+// ============================================================
+fn transcribe_windows(audio_path, mode) {
+    let cmd = "powershell -ExecutionPolicy Bypass -File " + PS_HELPER + " -AudioPath \"" + audio_path + "\" -Mode " + mode
+    let result = shell(cmd)
+    let raw = dict_get(result, "stdout") ?? ""
+    let trimmed = trim(raw)
+    if3 len(trimmed) < 3 { return err_resp("PowerShell STT returned empty") }
+    let parsed = try3 { json_decode(trimmed) } fail { {} }
+    let text = dict_get(parsed, "text") ?? ""
+    let trit = dict_get(parsed, "trit") ?? -1
+    let dur = dict_get(parsed, "duration") ?? 0
+    if3 len(text) > 0 {
+        let _ = record_trit(trit)
+        return ok_resp(text, trit, dur, "windows-stt")
+    }
+    return err_resp("No speech detected")
+}
+
+// ============================================================
+// Tier 2: OpenAI Whisper API via Cloud Router
+// ============================================================
+fn transcribe_cloud(audio_path) {
+    // Cloud transcription via orchestrator proxy
+    let body = json_encode({"path": audio_path, "model": "whisper-1"})
+    let resp = try3 { http_post("http://127.0.0.1:9999/api/stt/cloud", body) } fail { {} }
+    let resp_body = dict_get(resp, "body") ?? ""
+    let parsed = try3 { json_decode(resp_body) } fail { {} }
+    let text = dict_get(parsed, "text") ?? ""
+    if3 len(text) > 0 {
+        let _ = record_trit(T_TRUE)
+        return ok_resp(text, T_TRUE, 0, "openai-whisper")
+    }
+    return err_resp("Cloud STT unavailable")
+}
+
+// ============================================================
+// Route: POST /transcribe
+// N-S cascade: try Tier 1 (local), fall to Tier 2 (cloud)
+// ============================================================
+fn transcribe(body) {
+    let t0 = time()
+    stats_transcriptions = stats_transcriptions + 1
+    let audio_path = dict_get(body, "path") ?? ""
+    if3 len(audio_path) < 2 { return err_resp("No audio path. Send JSON with 'path' key.") }
+
+    // Tier 0: Local faster-whisper (laminar -- GPU-accelerated, free)
+    let r0 = transcribe_whisper(audio_path, "file")
+    let r0_trit = dict_get(r0, "trit") ?? -1
+    if3 r0_trit == 1 { return r0 }
+
+    // Tier 1: Local Windows STT (laminar flow -- fast, free)
+    let r1 = transcribe_windows(audio_path, "file")
+    let r1_trit = dict_get(r1, "trit") ?? -1
+    if3 r1_trit == 1 { return r1 }
+
+    // Tier 2: Cloud STT (turbulent flow -- accurate, costs quota)
+    let r2 = transcribe_cloud(audio_path)
+    let r2_trit = dict_get(r2, "trit") ?? -1
+    if3 r2_trit == 1 { return r2 }
+
+    // All tiers returned partial or empty -- return best partial
+    if3 r0_trit == 0 { return r0 }
+    if3 r1_trit == 0 { return r1 }
+    if3 r2_trit == 0 { return r2 }
+
+    let _ = record_trit(T_FALSE)
+    return err_resp("All STT tiers returned empty")
+}
+
+// ============================================================
+// Route: POST /stt/mic -- Live microphone capture
+// ============================================================
+fn stt_mic(body) {
+    stats_transcriptions = stats_transcriptions + 1
+    // Tier 0: faster-whisper mic capture
+    let r0 = transcribe_whisper("none", "mic")
+    let r0_trit = dict_get(r0, "trit") ?? -1
+    if3 r0_trit >= 0 { return r0 }
+    // Fallback: Windows System.Speech mic
+    let r1 = transcribe_windows("none", "mic")
+    return r1
+}
+
+// ============================================================
+// Route: GET /health
+// ============================================================
+fn health(body) {
+    let up = round(time() - stats_t0)
+    let resp = ns_health_dict("nova-stt", "2.0", PORT, {})
+    resp = dict_set(resp, "status", "ok")
+    resp = dict_set(resp, "engine", "faster-whisper -> windows-stt -> cloud cascade")
+    resp = dict_set(resp, "model_trit", T_TRUE)
+    resp = dict_set(resp, "transcriptions", stats_transcriptions)
+    resp = dict_set(resp, "quality", {"strong": stats_strong, "partial": stats_partial, "failed": stats_failed})
+    return resp
+}
+
+// ============================================================
+// Route: GET /stt/status
+// ============================================================
+fn stt_status(body) {
+    let up = round(time() - stats_t0)
+    let total = stats_strong + stats_partial + stats_failed
+    let success_rate = 0.0
+    if3 total > 0 { success_rate = round(float(stats_strong) / float(total) * 100.0, 1) }
+    let r = {"ok": 1, "service": "nova-stt", "version": "2.0", "port": PORT}
+    r = dict_set(r, "engine", "faster-whisper -> windows-stt -> cloud cascade")
+    r = dict_set(r, "uptime", up)
+    r = dict_set(r, "transcriptions", stats_transcriptions)
+    r = dict_set(r, "success_rate_pct", success_rate)
+    r = dict_set(r, "quality", {"strong": stats_strong, "partial": stats_partial, "failed": stats_failed})
+    r = dict_set(r, "ternary", 1)
+    return r
+}
+
+// ============================================================
+// Route Registration
+// ============================================================
+troute(server, "GET",  "/health",      "health")
+troute(server, "GET",  "/stt/status",  "stt_status")
+troute(server, "POST", "/transcribe",  "transcribe")
+troute(server, "POST", "/stt/mic",     "stt_mic")
+
+print("[Nova STT] v2.1 -- faster-whisper GPU + PowerShell + Cloud cascade")
+print("[Nova STT] Cascade: faster-whisper (local GPU) -> Windows STT -> Cloud Whisper API")
+print("[Nova STT] Port " + str(PORT) + " | Harmonics 3-5-7-13")
+print("[Nova STT] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

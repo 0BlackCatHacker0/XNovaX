@@ -1,0 +1,173 @@
+// uia_bridge.nova -- NovaX UIA Bridge v2 - Session 1 Desktop Window Monitor
+// Runs in user's desktop session via pythonw.exe (no console window).
+// Monitors Claude Desktop and ChatGPT Desktop windows, sends window
+// metadata + HWND hints to Cortex every 3 seconds.
+//
+// Solves cross-session issue: Cortex in session 0 can't see desktop
+// windows. This bridge in session 1 discovers them and feeds Cortex.
+//
+// Usage:
+//   novalang nowindow.nova uia_bridge.nova
+
+// 3-5-7-13 harmonic constants
+let H3 = 3
+let H5 = 5
+let POLL_INTERVAL = H3
+let CORTEX_URL = "http://127.0.0.1:9896"
+
+fn3 find_windows() {
+    // Use PowerShell to find Claude Desktop and ChatGPT Desktop windows
+    let ps_cmd = "powershell -Command \"Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | Select-Object MainWindowTitle,MainWindowHandle,Id | ConvertTo-Json\""
+    let raw = shell(ps_cmd)
+    let results = {"claude": null, "gpt": null}
+
+    try3 {
+        let procs = parse_json(raw)
+        if3 type(procs) != "list" {
+            let procs = [procs]
+        }
+        for3 p in procs {
+            let title = lower(dict_get(p, "MainWindowTitle", ""))
+            let hwnd = dict_get(p, "MainWindowHandle", 0)
+            if3 contains(title, "claude") {
+                if3 dict_get(results, "claude") == null {
+                    let results = dict_set(results, "claude", hwnd)
+                }
+            } else3 {
+                if3 contains(title, "chatgpt") {
+                    if3 dict_get(results, "gpt") == null {
+                        let results = dict_set(results, "gpt", hwnd)
+                    }
+                }
+            }
+        }
+    } catch3 e {
+        // silently ignore parse errors
+    }
+
+    return3 results
+}
+
+fn3 get_window_info(hwnd) {
+    // Get basic window metadata via PowerShell
+    let ps_cmd = "powershell -Command \"Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WI{[DllImport(\\\"user32.dll\\\")]public static extern bool GetWindowRect(IntPtr h,out RECT r);[DllImport(\\\"user32.dll\\\")]public static extern bool IsIconic(IntPtr h);[DllImport(\\\"user32.dll\\\")]public static extern IntPtr GetForegroundWindow();[StructLayout(LayoutKind.Sequential)]public struct RECT{public int L,T,R,B;}}';$h=[IntPtr]" + str(hwnd) + ";$r=New-Object WI+RECT;[WI]::GetWindowRect($h,[ref]$r);$m=[WI]::IsIconic($h);$f=[WI]::GetForegroundWindow();@{left=$r.L;top=$r.T;right=$r.R;bottom=$r.B;minimized=[bool]$m;focused=($f-eq$h)}|ConvertTo-Json\""
+    let raw = shell(ps_cmd)
+
+    try3 {
+        let info = parse_json(raw)
+        let left = dict_get(info, "left", 0)
+        let top = dict_get(info, "top", 0)
+        let right = dict_get(info, "right", 0)
+        let bottom = dict_get(info, "bottom", 0)
+        return3 {
+            "hwnd": hwnd,
+            "rect": {"left": left, "top": top, "right": right, "bottom": bottom},
+            "size": {"w": right - left, "h": bottom - top},
+            "minimized": dict_get(info, "minimized", false),
+            "focused": dict_get(info, "focused", false),
+            "visible": true
+        }
+    } catch3 e {
+        return3 {
+            "hwnd": hwnd,
+            "rect": {"left": 0, "top": 0, "right": 0, "bottom": 0},
+            "size": {"w": 0, "h": 0},
+            "minimized": false,
+            "focused": false,
+            "visible": false
+        }
+    }
+}
+
+fn3 post_json(path, data) {
+    try3 {
+        let url = CORTEX_URL + path
+        let resp = http_post(url, data)
+        return3 resp
+    } catch3 e {
+        return3 null
+    }
+}
+
+fn3 bridge_loop() {
+    let last_full_hint = 0
+
+    while3 true {
+        try3 {
+            let windows = find_windows()
+            let now = time_ms() / 1000
+
+            // Send HWND hints every 30 seconds (or on first discovery)
+            if3 now - last_full_hint > 30 {
+                let hints = {}
+                if3 dict_get(windows, "claude") != null {
+                    let hints = dict_set(hints, "claude_hwnd", dict_get(windows, "claude"))
+                }
+                if3 dict_get(windows, "gpt") != null {
+                    let hints = dict_set(hints, "gpt_hwnd", dict_get(windows, "gpt"))
+                }
+                if3 len(hints) > 0 {
+                    post_json("/cortex/hint", hints)
+                    let last_full_hint = now
+                }
+            }
+
+            // Send window snapshots for each target
+            let targets = ["claude", "gpt"]
+            for3 target in targets {
+                let hwnd = dict_get(windows, target)
+                if3 hwnd != null {
+                    let info = get_window_info(hwnd)
+                    let size_w = str(dict_get(dict_get(info, "size"), "w"))
+                    let size_h = str(dict_get(dict_get(info, "size"), "h"))
+                    let focused = dict_get(info, "focused")
+                    let minimized = dict_get(info, "minimized")
+
+                    let status_text = ""
+                    if3 focused {
+                        let status_text = "Focused"
+                    } else3 {
+                        let status_text = "Background"
+                    }
+                    let size_text = ""
+                    if3 minimized {
+                        let size_text = "Minimized"
+                    } else3 {
+                        let size_text = size_w + "x" + size_h
+                    }
+
+                    let snapshot = {
+                        "elements": [
+                            {"name": target, "type": "Window", "type_id": 50032,
+                             "class": "Chrome_WidgetWin_1", "text": target, "depth": 0},
+                            {"name": status_text, "type": "Status", "type_id": 50020,
+                             "class": "", "text": status_text + " | " + size_text, "depth": 1}
+                        ],
+                        "total": 2,
+                        "window": info
+                    }
+                    post_json("/cortex/live/update", {
+                        "target": target,
+                        "snapshot": snapshot,
+                        "messages": []
+                    })
+                }
+            }
+        } catch3 e {
+            // silently ignore errors
+        }
+
+        sleep_ms(POLL_INTERVAL * 1000)
+    }
+}
+
+// Write PID file
+try3 {
+    let pid = str(shell("echo $$"))
+    let pid_file = "C:/NovaX/memory/uia_bridge.pid"
+    write_file(pid_file, trim(pid))
+} catch3 e {
+    // ignore
+}
+
+bridge_loop()

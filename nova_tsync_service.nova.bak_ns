@@ -1,0 +1,1129 @@
+// nova_tsync_service.nova
+// NovaX TSync -- Ternary State Synchronization Micro-Tool
+// Port 9976 | Keeps distributed service state in sync across NovaX cluster.
+// Conflict resolution uses ternary consensus: majority trit wins.
+// Architecture:
+//   State store: dict of key -> entry dict
+//   Version monotonically increasing per key
+//   CAS (compare-and-swap) for optimistic concurrency
+//   Conflict detection: two sources updating same key at same version
+//   Resolution: majority trit (2-of-3 agreement), or manual override
+//   Subscriber notification: on-demand POST endpoint (no background threads)
+//   Glob-style subscriptions stored as sentinel keys
+
+// ============================================================
+// Server bootstrap
+// ============================================================
+let PORT   = 9976
+let server = tserve(PORT, "tsync")
+
+// ============================================================
+// Harmonic constants (3-5-7-13)
+// ============================================================
+let H3   = 3
+let H5   = 5
+let H7   = 7
+let H13  = 13
+let BLOCK = 2187    // 3^7 -- harmonic block boundary
+
+// Ternary truth values
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// Service identity
+let SERVICE = "tsync"
+let VERSION = "1.0.0"
+
+// Domain limits derived from harmonics
+let MAX_KEYS         = 2187   // H3^H7 = 3^7
+let MAX_SUBS_PER_KEY = 13     // H13 carrier frame limit
+let NOTIFY_TIMEOUT   = 3      // H3 seconds fire-and-forget
+let CONFLICT_WINDOW  = 13     // H13 seconds same-version window = conflict
+let MAX_CONFLICTS    = 243    // H3^H5 = 3^5
+
+// ============================================================
+// Reynolds flow regime boundaries
+// ============================================================
+let RE_LAMINAR      = 27    // 3^3 -- smooth, deterministic
+let RE_TRANSITIONAL = 125   // 5^3 -- unstable region
+let RE_TURBULENT    = 343   // 7^3 -- chaotic threshold
+
+// ============================================================
+// Mutable state store
+// _store       : dict, key -> entry dict (serialized as JSON string per key)
+// _conflicts   : list of conflict dicts (serialized per slot)
+// _sub_counter : int, monotonic subscriber ID
+// _conflict_ct : int, current conflict list length
+// ============================================================
+let _store       = dict_set({}, "__init__", "1")
+let _conflicts   = []
+let _sub_counter = 0
+let _conflict_ct = 0
+let _key_count   = 0
+
+// ============================================================
+// Startup stats baseline
+// ============================================================
+let _start_time = time()
+let _ops        = 0
+
+// ============================================================
+// Helper: current timestamp
+// ============================================================
+fn now() {
+    let t = time()
+    t
+}
+
+// ============================================================
+// Helper: build a new state entry dict and return as JSON string
+// ============================================================
+fn make_entry(ekey, evalue, esource, eversion) {
+    let entry = {}
+    let entry = dict_set(entry, "key",         ekey)
+    let entry = dict_set(entry, "value",       evalue)
+    let entry = dict_set(entry, "version",     eversion)
+    let entry = dict_set(entry, "source",      esource)
+    let entry = dict_set(entry, "timestamp",   now())
+    let entry = dict_set(entry, "subs_json",   "[]")
+    let entry = dict_set(entry, "sub_count",   0)
+    json_encode(entry)
+}
+
+// ============================================================
+// Helper: record a conflict into _conflicts list
+//   Returns the conflict id string
+// ============================================================
+fn record_conflict(ckey, ex_json, in_value, in_source, in_version) {
+    let existing  = json_decode(ex_json)
+    let cid       = uuid_hex()
+    let cid_short = slice(cid, 0, 13)
+    let conflict  = {}
+    let conflict  = dict_set(conflict, "id",              cid_short)
+    let conflict  = dict_set(conflict, "key",             ckey)
+    let conflict  = dict_set(conflict, "existing_value",  dict_get(existing, "value"))
+    let conflict  = dict_set(conflict, "existing_source", dict_get(existing, "source"))
+    let conflict  = dict_set(conflict, "incoming_value",  in_value)
+    let conflict  = dict_set(conflict, "incoming_source", in_source)
+    let conflict  = dict_set(conflict, "version",         in_version)
+    let conflict  = dict_set(conflict, "timestamp",       now())
+    let conflict  = dict_set(conflict, "resolved",        0)
+    let conflict  = dict_set(conflict, "resolution_json", "null")
+    let c_json    = json_encode(conflict)
+    // Append and trim if over max
+    let _conflicts   = append(_conflicts, c_json)
+    let _conflict_ct = _conflict_ct + 1
+    if3 (_conflict_ct > MAX_CONFLICTS) {
+        // Evict oldest: pop index 0
+        let _conflicts   = slice(_conflicts, 1, _conflict_ct)
+        let _conflict_ct = _conflict_ct - 1
+    } {
+        // no-op
+        let _conflict_ct = _conflict_ct
+    } {
+        let _conflict_ct = _conflict_ct
+    }
+    cid_short
+}
+
+// ============================================================
+// Helper: pattern match -- simple prefix/suffix/contains check
+// Replaces fnmatch. Supports: "*", "prefix.*", "*.suffix", "*middle*"
+// NovaLang has no fnmatch, so we implement basic glob logic.
+// ============================================================
+fn glob_match(pattern, subject) {
+    // Exact match
+    if3 (pattern == subject) {
+        T_TRUE
+    } {
+        // Wildcard-only pattern matches everything
+        if3 (pattern == "*") {
+            T_TRUE
+        } {
+            // Check: pattern ends with ".*" -- prefix match
+            let pat_len  = len(pattern)
+            let subj_len = len(subject)
+            // Use contains() for the common "prefix.*" case
+            // and "*.suffix" case by examining star position via split
+            let parts = split(pattern, "*")
+            let pcount = len(parts)
+            // If pattern has no star, already checked exact above
+            if3 (pcount == 1) {
+                T_FALSE
+            } {
+                // Two parts: "prefix*suffix"
+                if3 (pcount == 2) {
+                    let prefix = dict_get(parts, 0)
+                    let suffix = dict_get(parts, 1)
+                    let pre_ok  = 1
+                    let suf_ok  = 1
+                    if3 (len(prefix) > 0) {
+                        if3 (contains(subject, prefix)) {
+                            let pre_ok = 1
+                        } {
+                            let pre_ok = 0
+                        } {
+                            let pre_ok = 0
+                        }
+                    } {
+                        let pre_ok = 1
+                    } {
+                        let pre_ok = 1
+                    }
+                    if3 (len(suffix) > 0) {
+                        if3 (contains(subject, suffix)) {
+                            let suf_ok = 1
+                        } {
+                            let suf_ok = 0
+                        } {
+                            let suf_ok = 0
+                        }
+                    } {
+                        let suf_ok = 1
+                    } {
+                        let suf_ok = 1
+                    }
+                    if3 (pre_ok == 1) {
+                        if3 (suf_ok == 1) {
+                            T_TRUE
+                        } {
+                            T_FALSE
+                        } {
+                            T_FALSE
+                        }
+                    } {
+                        T_FALSE
+                    } {
+                        T_FALSE
+                    }
+                } {
+                    // 3+ parts: fall back to contains check on first and last
+                    let first = dict_get(parts, 0)
+                    let last  = dict_get(parts, pcount - 1)
+                    let f_ok  = 1
+                    let l_ok  = 1
+                    if3 (len(first) > 0) {
+                        if3 (contains(subject, first)) {
+                            let f_ok = 1
+                        } {
+                            let f_ok = 0
+                        } {
+                            let f_ok = 0
+                        }
+                    } {
+                        let f_ok = 1
+                    } {
+                        let f_ok = 1
+                    }
+                    if3 (len(last) > 0) {
+                        if3 (contains(subject, last)) {
+                            let l_ok = 1
+                        } {
+                            let l_ok = 0
+                        } {
+                            let l_ok = 0
+                        }
+                    } {
+                        let l_ok = 1
+                    } {
+                        let l_ok = 1
+                    }
+                    if3 (f_ok == 1) {
+                        if3 (l_ok == 1) {
+                            T_TRUE
+                        } {
+                            T_FALSE
+                        } {
+                            T_FALSE
+                        }
+                    } {
+                        T_FALSE
+                    } {
+                        T_FALSE
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// Helper: notify subscribers for a given key (on-demand, sync)
+// Collects callback_urls from all sentinels whose pattern matches key,
+// then fires http_post to each. Fire-and-forget: errors ignored.
+// NOTE: No background threads in NovaLang -- called after state writes.
+// ============================================================
+fn notify_subscribers(nkey, entry_json) {
+    let entry   = json_decode(entry_json)
+    let payload = {}
+    let payload = dict_set(payload, "event",     "state_update")
+    let payload = dict_set(payload, "key",       nkey)
+    let payload = dict_set(payload, "value",     dict_get(entry, "value"))
+    let payload = dict_set(payload, "version",   dict_get(entry, "version"))
+    let payload = dict_set(payload, "source",    dict_get(entry, "source"))
+    let payload = dict_set(payload, "timestamp", dict_get(entry, "timestamp"))
+    let pbody   = json_encode(payload)
+    // Walk all store keys looking for sentinel subscribers whose pattern matches nkey
+    let all_store_keys = keys(_store)
+    let idx            = 0
+    let total_keys     = len(all_store_keys)
+    while3 (idx < total_keys) {
+        let sk = dict_get(all_store_keys, idx)
+        if3 (contains(sk, "__sub_sentinel__")) {
+            let sent_json  = dict_get(_store, sk)
+            let sent_entry = json_decode(sent_json)
+            let subs_raw   = dict_get(sent_entry, "subs_json")
+            let subs_list  = json_decode(subs_raw)
+            let si         = 0
+            let slen       = len(subs_list)
+            while3 (si < slen) {
+                let sub_json = dict_get(subs_list, si)
+                let sub      = json_decode(sub_json)
+                let spat     = dict_get(sub, "pattern")
+                let curl     = dict_get(sub, "callback_url")
+                let matched  = glob_match(spat, nkey)
+                if3 (matched == T_TRUE) {
+                    try3 {
+                        let _r = http_post(curl, pbody)
+                    }
+                } {
+                    // no-op -- no match
+                    let _r = 0
+                } {
+                    let _r = 0
+                }
+                let si = si + 1
+            }
+        } {
+            // Not a sentinel -- check direct subscribers on entry
+            let e_json  = dict_get(_store, sk)
+            let e       = json_decode(e_json)
+            let e_subs  = json_decode(dict_get(e, "subs_json"))
+            let si      = 0
+            let slen    = len(e_subs)
+            while3 (si < slen) {
+                let sub_json = dict_get(e_subs, si)
+                let sub      = json_decode(sub_json)
+                let spat     = dict_get(sub, "pattern")
+                let curl     = dict_get(sub, "callback_url")
+                let matched  = glob_match(spat, nkey)
+                if3 (matched == T_TRUE) {
+                    try3 {
+                        let _r = http_post(curl, pbody)
+                    }
+                } {
+                    let _r = 0
+                } {
+                    let _r = 0
+                }
+                let si = si + 1
+            }
+        } {
+            let _r = 0
+        }
+        let idx = idx + 1
+    }
+    T_TRUE
+}
+
+// ============================================================
+// Route: GET /health  (standard)
+// ============================================================
+fn handle_health(req) {
+    let unresolved = 0
+    let idx        = 0
+    while3 (idx < _conflict_ct) {
+        let c_json = dict_get(_conflicts, idx)
+        let c      = json_decode(c_json)
+        if3 (dict_get(c, "resolved") == 0) {
+            let unresolved = unresolved + 1
+        } {
+            let unresolved = unresolved
+        } {
+            let unresolved = unresolved
+        }
+        let idx = idx + 1
+    }
+    // Count non-sentinel keys
+    let real_keys  = 0
+    let all_sk     = keys(_store)
+    let sk_total   = len(all_sk)
+    let si         = 0
+    while3 (si < sk_total) {
+        let k = dict_get(all_sk, si)
+        if3 (contains(k, "__sub_sentinel__")) {
+            let real_keys = real_keys
+        } {
+            if3 (k == "__init__") {
+                let real_keys = real_keys
+            } {
+                let real_keys = real_keys + 1
+            } {
+                let real_keys = real_keys + 1
+            }
+        } {
+            let real_keys = real_keys
+        }
+        let si = si + 1
+    }
+    let uptime = now() - _start_time
+    let resp   = {}
+    let resp   = dict_set(resp, "ok",               1)
+    let resp   = dict_set(resp, "trit",             T_TRUE)
+    let resp   = dict_set(resp, "service",          SERVICE)
+    let resp   = dict_set(resp, "version",          VERSION)
+    let resp   = dict_set(resp, "port",             PORT)
+    let resp   = dict_set(resp, "uptime",           uptime)
+    let resp   = dict_set(resp, "ops",              _ops)
+    let resp   = dict_set(resp, "keys",             real_keys)
+    let resp   = dict_set(resp, "max_keys",         MAX_KEYS)
+    let resp   = dict_set(resp, "active_conflicts", unresolved)
+    let resp   = dict_set(resp, "harmonics",        "3-5-7-13")
+    return resp
+}
+
+// ============================================================
+// Route: POST /tsync/publish
+// Body JSON: {"key":"...","value":...,"source":"...","version":N}
+// ============================================================
+fn handle_publish(req) {
+    let _ops  = _ops + 1
+    let body  = json_decode(dict_get(req, "body"))
+    let pkey  = dict_get(body, "key")
+    let pval  = dict_get(body, "value")
+    let psrc  = dict_get(body, "source")
+    let pver  = dict_get(body, "version")
+
+    // Validate key
+    if3 (pkey == "") {
+        let err = {}
+        let err = dict_set(err, "ok",   0)
+        let err = dict_set(err, "trit", T_FALSE)
+        let err = dict_set(err, "error","key required")
+        json_encode(err)
+    } {
+        if3 (len(pkey) > 512) {
+            let err = {}
+            let err = dict_set(err, "ok",   0)
+            let err = dict_set(err, "trit", T_FALSE)
+            let err = dict_set(err, "error","key too long (max 512)")
+            json_encode(err)
+        } {
+            if3 (dict_has(_store, pkey)) {
+                // Existing key
+                let ex_json  = dict_get(_store, pkey)
+                let existing = json_decode(ex_json)
+                let cur_ver  = dict_get(existing, "version")
+                let cur_src  = dict_get(existing, "source")
+                let new_ver  = pver
+                if3 (pver == "") {
+                    let new_ver = cur_ver + 1
+                } {
+                    let new_ver = pver
+                } {
+                    let new_ver = pver
+                }
+                // Conflict check 1: older/same version from different source
+                if3 (new_ver <= cur_ver) {
+                    if3 (cur_src == psrc) {
+                        // Same source overwrite -- allow
+                        let existing = dict_set(existing, "value",     pval)
+                        let existing = dict_set(existing, "version",   new_ver)
+                        let existing = dict_set(existing, "source",    psrc)
+                        let existing = dict_set(existing, "timestamp", now())
+                        let _store   = dict_set(_store, pkey, json_encode(existing))
+                        let _r       = notify_subscribers(pkey, json_encode(existing))
+                        let resp     = {}
+                        let resp     = dict_set(resp, "ok",      1)
+                        let resp     = dict_set(resp, "trit",    T_TRUE)
+                        let resp     = dict_set(resp, "key",     pkey)
+                        let resp     = dict_set(resp, "version", new_ver)
+                        let resp     = dict_set(resp, "source",  psrc)
+                        json_encode(resp)
+                    } {
+                        // Different source -- conflict
+                        let cid  = record_conflict(pkey, ex_json, pval, psrc, new_ver)
+                        let resp = {}
+                        let resp = dict_set(resp, "ok",              0)
+                        let resp = dict_set(resp, "trit",            T_MAYBE)
+                        let resp = dict_set(resp, "conflict",        1)
+                        let resp = dict_set(resp, "conflict_id",     cid)
+                        let resp = dict_set(resp, "current_version", cur_ver)
+                        let resp = dict_set(resp, "current_source",  cur_src)
+                        let resp = dict_set(resp, "msg",             "conflict detected -- use /tsync/resolve or /tsync/cas")
+                        json_encode(resp)
+                    } {
+                        let cid  = record_conflict(pkey, ex_json, pval, psrc, new_ver)
+                        let resp = {}
+                        let resp = dict_set(resp, "ok",              0)
+                        let resp = dict_set(resp, "trit",            T_MAYBE)
+                        let resp = dict_set(resp, "conflict",        1)
+                        let resp = dict_set(resp, "conflict_id",     cid)
+                        let resp = dict_set(resp, "current_version", cur_ver)
+                        let resp = dict_set(resp, "msg",             "conflict detected -- use /tsync/resolve or /tsync/cas")
+                        json_encode(resp)
+                    }
+                } {
+                    // new_ver > cur_ver -- normal update
+                    let existing = dict_set(existing, "value",     pval)
+                    let existing = dict_set(existing, "version",   new_ver)
+                    let existing = dict_set(existing, "source",    psrc)
+                    let existing = dict_set(existing, "timestamp", now())
+                    let _store   = dict_set(_store, pkey, json_encode(existing))
+                    let _r       = notify_subscribers(pkey, json_encode(existing))
+                    let resp     = {}
+                    let resp     = dict_set(resp, "ok",      1)
+                    let resp     = dict_set(resp, "trit",    T_TRUE)
+                    let resp     = dict_set(resp, "key",     pkey)
+                    let resp     = dict_set(resp, "version", new_ver)
+                    let resp     = dict_set(resp, "source",  psrc)
+                    json_encode(resp)
+                } {
+                    // equal version -- window conflict check
+                    let age  = now() - dict_get(existing, "timestamp")
+                    if3 (cur_src == psrc) {
+                        // Same source same version -- allow overwrite
+                        let existing = dict_set(existing, "value",     pval)
+                        let existing = dict_set(existing, "timestamp", now())
+                        let _store   = dict_set(_store, pkey, json_encode(existing))
+                        let _r       = notify_subscribers(pkey, json_encode(existing))
+                        let resp     = {}
+                        let resp     = dict_set(resp, "ok",      1)
+                        let resp     = dict_set(resp, "trit",    T_TRUE)
+                        let resp     = dict_set(resp, "key",     pkey)
+                        let resp     = dict_set(resp, "version", new_ver)
+                        let resp     = dict_set(resp, "source",  psrc)
+                        json_encode(resp)
+                    } {
+                        if3 (age < CONFLICT_WINDOW) {
+                            // Concurrent update from different source within window
+                            let cid  = record_conflict(pkey, ex_json, pval, psrc, new_ver)
+                            let resp = {}
+                            let resp = dict_set(resp, "ok",              0)
+                            let resp = dict_set(resp, "trit",            T_MAYBE)
+                            let resp = dict_set(resp, "conflict",        1)
+                            let resp = dict_set(resp, "conflict_id",     cid)
+                            let resp = dict_set(resp, "current_version", cur_ver)
+                            let resp = dict_set(resp, "current_source",  cur_src)
+                            let resp = dict_set(resp, "msg",             "concurrent update conflict within window")
+                            json_encode(resp)
+                        } {
+                            // Outside window -- allow update
+                            let existing = dict_set(existing, "value",     pval)
+                            let existing = dict_set(existing, "version",   new_ver + 1)
+                            let existing = dict_set(existing, "source",    psrc)
+                            let existing = dict_set(existing, "timestamp", now())
+                            let _store   = dict_set(_store, pkey, json_encode(existing))
+                            let _r       = notify_subscribers(pkey, json_encode(existing))
+                            let resp     = {}
+                            let resp     = dict_set(resp, "ok",      1)
+                            let resp     = dict_set(resp, "trit",    T_TRUE)
+                            let resp     = dict_set(resp, "key",     pkey)
+                            let resp     = dict_set(resp, "version", new_ver + 1)
+                            let resp     = dict_set(resp, "source",  psrc)
+                            json_encode(resp)
+                        } {
+                            let _r = 0
+                            json_encode({})
+                        }
+                    } {
+                        let _r = 0
+                        json_encode({})
+                    }
+                }
+            } {
+                // New key
+                if3 (_key_count >= MAX_KEYS) {
+                    let err = {}
+                    let err = dict_set(err, "ok",   0)
+                    let err = dict_set(err, "trit", T_FALSE)
+                    let err = dict_set(err, "error","max keys (2187) reached")
+                    json_encode(err)
+                } {
+                    let init_ver = pver
+                    if3 (pver == "") {
+                        let init_ver = 1
+                    } {
+                        let init_ver = pver
+                    } {
+                        let init_ver = pver
+                    }
+                    let e_json = make_entry(pkey, pval, psrc, init_ver)
+                    let _store = dict_set(_store, pkey, e_json)
+                    let _key_count = _key_count + 1
+                    let _r   = notify_subscribers(pkey, e_json)
+                    let resp = {}
+                    let resp = dict_set(resp, "ok",      1)
+                    let resp = dict_set(resp, "trit",    T_TRUE)
+                    let resp = dict_set(resp, "key",     pkey)
+                    let resp = dict_set(resp, "version", init_ver)
+                    let resp = dict_set(resp, "source",  psrc)
+                    json_encode(resp)
+                } {
+                    let err = {}
+                    let err = dict_set(err, "ok",   0)
+                    let err = dict_set(err, "trit", T_FALSE)
+                    let err = dict_set(err, "error","max keys (2187) reached")
+                    json_encode(err)
+                }
+            } {
+                let err = {}
+                let err = dict_set(err, "ok",   0)
+                let err = dict_set(err, "trit", T_FALSE)
+                let err = dict_set(err, "error","store check error")
+                json_encode(err)
+            }
+        } {
+            let err = {}
+            let err = dict_set(err, "ok",   0)
+            let err = dict_set(err, "trit", T_FALSE)
+            let err = dict_set(err, "error","key validation error")
+            return err
+        }
+    }
+}
+
+// ============================================================
+// Route: POST /tsync/subscribe
+// Body JSON: {"key_pattern":"hivemind.*","callback_url":"http://..."}
+// Stores subscriber in sentinel entry for pattern-based notification.
+// ============================================================
+fn handle_subscribe(req) {
+    let _ops    = _ops + 1
+    let body    = json_decode(dict_get(req, "body"))
+    let pattern = dict_get(body, "key_pattern")
+    let cb_url  = dict_get(body, "callback_url")
+
+    if3 (pattern == "") {
+        let err = {}
+        let err = dict_set(err, "ok",   0)
+        let err = dict_set(err, "trit", T_FALSE)
+        let err = dict_set(err, "error","key_pattern required")
+        json_encode(err)
+    } {
+        if3 (cb_url == "") {
+            let err = {}
+            let err = dict_set(err, "ok",   0)
+            let err = dict_set(err, "trit", T_FALSE)
+            let err = dict_set(err, "error","callback_url required")
+            json_encode(err)
+        } {
+            if3 (contains(cb_url, "http://")) {
+                let _sub_counter = _sub_counter + 1
+                let sub_id  = join(["sub_", str(_sub_counter)], "")
+                let sub_rec = {}
+                let sub_rec = dict_set(sub_rec, "id",           sub_id)
+                let sub_rec = dict_set(sub_rec, "pattern",      pattern)
+                let sub_rec = dict_set(sub_rec, "callback_url", cb_url)
+                let sub_rec = dict_set(sub_rec, "created",      now())
+                let sub_json = json_encode(sub_rec)
+                // Attach to all existing matching keys
+                let matched_keys  = 0
+                let all_sk        = keys(_store)
+                let sk_total      = len(all_sk)
+                let si            = 0
+                while3 (si < sk_total) {
+                    let k = dict_get(all_sk, si)
+                    if3 (contains(k, "__sub_sentinel__")) {
+                        let si = si + 1
+                    } {
+                        if3 (k == "__init__") {
+                            let si = si + 1
+                        } {
+                            let matched = glob_match(pattern, k)
+                            if3 (matched == T_TRUE) {
+                                let entry     = json_decode(dict_get(_store, k))
+                                let sub_count = dict_get(entry, "sub_count")
+                                if3 (sub_count < MAX_SUBS_PER_KEY) {
+                                    let old_subs  = json_decode(dict_get(entry, "subs_json"))
+                                    let new_subs  = append(old_subs, sub_json)
+                                    let entry     = dict_set(entry, "subs_json",  json_encode(new_subs))
+                                    let entry     = dict_set(entry, "sub_count",  sub_count + 1)
+                                    let _store    = dict_set(_store, k, json_encode(entry))
+                                    let matched_keys = matched_keys + 1
+                                } {
+                                    let matched_keys = matched_keys
+                                } {
+                                    let matched_keys = matched_keys
+                                }
+                                let si = si + 1
+                            } {
+                                let si = si + 1
+                            } {
+                                let si = si + 1
+                            }
+                        }
+                    } {
+                        let si = si + 1
+                    }
+                }
+                // Create sentinel if no keys matched yet
+                let sentinel_key = join(["__sub_sentinel__", pattern], "")
+                if3 (matched_keys == 0) {
+                    if3 (dict_has(_store, sentinel_key)) {
+                        // Sentinel exists -- append subscriber
+                        let sent_entry = json_decode(dict_get(_store, sentinel_key))
+                        let old_subs   = json_decode(dict_get(sent_entry, "subs_json"))
+                        let new_subs   = append(old_subs, sub_json)
+                        let sent_entry = dict_set(sent_entry, "subs_json", json_encode(new_subs))
+                        let _store     = dict_set(_store, sentinel_key, json_encode(sent_entry))
+                    } {
+                        // Create new sentinel
+                        if3 (_key_count < MAX_KEYS) {
+                            let init_subs  = append([], sub_json)
+                            let sent_entry = {}
+                            let sent_entry = dict_set(sent_entry, "key",       sentinel_key)
+                            let sent_entry = dict_set(sent_entry, "value",     "null")
+                            let sent_entry = dict_set(sent_entry, "version",   0)
+                            let sent_entry = dict_set(sent_entry, "source",    "__system__")
+                            let sent_entry = dict_set(sent_entry, "timestamp", now())
+                            let sent_entry = dict_set(sent_entry, "subs_json", json_encode(init_subs))
+                            let sent_entry = dict_set(sent_entry, "sub_count", 1)
+                            let _store     = dict_set(_store, sentinel_key, json_encode(sent_entry))
+                            let _key_count = _key_count + 1
+                        } {
+                            let _r = 0
+                        } {
+                            let _r = 0
+                        }
+                    } {
+                        let _r = 0
+                    }
+                } {
+                    let _r = 0
+                } {
+                    let _r = 0
+                }
+                let resp = {}
+                let resp = dict_set(resp, "ok",                   1)
+                let resp = dict_set(resp, "trit",                 T_TRUE)
+                let resp = dict_set(resp, "subscription_id",      sub_id)
+                let resp = dict_set(resp, "pattern",              pattern)
+                let resp = dict_set(resp, "callback_url",         cb_url)
+                let resp = dict_set(resp, "matched_existing_keys",matched_keys)
+                json_encode(resp)
+            } {
+                let err = {}
+                let err = dict_set(err, "ok",   0)
+                let err = dict_set(err, "trit", T_FALSE)
+                let err = dict_set(err, "error","callback_url must start with http:// (local only)")
+                json_encode(err)
+            } {
+                let err = {}
+                let err = dict_set(err, "ok",   0)
+                let err = dict_set(err, "trit", T_FALSE)
+                let err = dict_set(err, "error","callback_url must start with http://")
+                return err
+            }
+        }
+    }
+}
+
+// ============================================================
+// Route: GET /tsync/state -- full snapshot excluding sentinels
+// ============================================================
+fn handle_state(req) {
+    let _ops     = _ops + 1
+    let snapshot = {}
+    let all_sk   = keys(_store)
+    let sk_total = len(all_sk)
+    let si       = 0
+    let kcount   = 0
+    while3 (si < sk_total) {
+        let k = dict_get(all_sk, si)
+        if3 (contains(k, "__sub_sentinel__")) {
+            let si = si + 1
+        } {
+            if3 (k == "__init__") {
+                let si = si + 1
+            } {
+                let e        = json_decode(dict_get(_store, k))
+                let row      = {}
+                let row      = dict_set(row, "value",            dict_get(e, "value"))
+                let row      = dict_set(row, "version",          dict_get(e, "version"))
+                let row      = dict_set(row, "source",           dict_get(e, "source"))
+                let row      = dict_set(row, "timestamp",        dict_get(e, "timestamp"))
+                let row      = dict_set(row, "subscriber_count", dict_get(e, "sub_count"))
+                let snapshot = dict_set(snapshot, k, row)
+                let kcount   = kcount + 1
+                let si       = si + 1
+            } {
+                let si = si + 1
+            }
+        } {
+            let si = si + 1
+        }
+    }
+    let resp = {}
+    let resp = dict_set(resp, "ok",        1)
+    let resp = dict_set(resp, "trit",      T_TRUE)
+    let resp = dict_set(resp, "state",     snapshot)
+    let resp = dict_set(resp, "key_count", kcount)
+    let resp = dict_set(resp, "max_keys",  MAX_KEYS)
+    return resp
+}
+
+// ============================================================
+// Route: GET /tsync/key/<key> -- get value and metadata for one key
+// Expects req body JSON: {"key":"..."} (path param passed as body field)
+// ============================================================
+fn handle_key_get(req) {
+    let _ops  = _ops + 1
+    let body  = json_decode(dict_get(req, "body"))
+    let gkey  = dict_get(body, "key")
+    if3 (gkey == "") {
+        let err = {}
+        let err = dict_set(err, "ok",   0)
+        let err = dict_set(err, "trit", T_FALSE)
+        let err = dict_set(err, "error","key name required")
+        json_encode(err)
+    } {
+        if3 (dict_has(_store, gkey)) {
+            let entry = json_decode(dict_get(_store, gkey))
+            let resp  = {}
+            let resp  = dict_set(resp, "ok",               1)
+            let resp  = dict_set(resp, "trit",             T_TRUE)
+            let resp  = dict_set(resp, "key",              gkey)
+            let resp  = dict_set(resp, "value",            dict_get(entry, "value"))
+            let resp  = dict_set(resp, "version",          dict_get(entry, "version"))
+            let resp  = dict_set(resp, "source",           dict_get(entry, "source"))
+            let resp  = dict_set(resp, "timestamp",        dict_get(entry, "timestamp"))
+            let resp  = dict_set(resp, "subscriber_count", dict_get(entry, "sub_count"))
+            json_encode(resp)
+        } {
+            let err = {}
+            let err = dict_set(err, "ok",   0)
+            let err = dict_set(err, "trit", T_FALSE)
+            let err = dict_set(err, "error", join(["key '", gkey, "' not found"], ""))
+            json_encode(err)
+        } {
+            let err = {}
+            let err = dict_set(err, "ok",   0)
+            let err = dict_set(err, "trit", T_FALSE)
+            let err = dict_set(err, "error","store lookup error")
+            return err
+        }
+    }
+}
+
+// ============================================================
+// Route: POST /tsync/cas -- compare-and-swap
+// Body JSON: {"key":"...","expected_version":N,"new_value":...,"source":"cas"}
+// ============================================================
+fn handle_cas(req) {
+    let _ops    = _ops + 1
+    let body    = json_decode(dict_get(req, "body"))
+    let ckey    = dict_get(body, "key")
+    let exp_ver = dict_get(body, "expected_version")
+    let new_val = dict_get(body, "new_value")
+    let csrc    = dict_get(body, "source")
+    if3 (csrc == "") {
+        let csrc = "cas"
+    } {
+        let csrc = csrc
+    } {
+        let csrc = csrc
+    }
+
+    if3 (ckey == "") {
+        let err = {}
+        let err = dict_set(err, "ok",   0)
+        let err = dict_set(err, "trit", T_FALSE)
+        let err = dict_set(err, "error","key required")
+        json_encode(err)
+    } {
+        if3 (exp_ver == "") {
+            let err = {}
+            let err = dict_set(err, "ok",   0)
+            let err = dict_set(err, "trit", T_FALSE)
+            let err = dict_set(err, "error","expected_version required")
+            json_encode(err)
+        } {
+            if3 (dict_has(_store, ckey)) {
+                let entry   = json_decode(dict_get(_store, ckey))
+                let cur_ver = dict_get(entry, "version")
+                if3 (cur_ver == exp_ver) {
+                    // CAS succeeds
+                    let new_ver = cur_ver + 1
+                    let entry   = dict_set(entry, "value",     new_val)
+                    let entry   = dict_set(entry, "version",   new_ver)
+                    let entry   = dict_set(entry, "source",    csrc)
+                    let entry   = dict_set(entry, "timestamp", now())
+                    let _store  = dict_set(_store, ckey, json_encode(entry))
+                    let _r      = notify_subscribers(ckey, json_encode(entry))
+                    let resp    = {}
+                    let resp    = dict_set(resp, "ok",          1)
+                    let resp    = dict_set(resp, "trit",        T_TRUE)
+                    let resp    = dict_set(resp, "key",         ckey)
+                    let resp    = dict_set(resp, "old_version", exp_ver)
+                    let resp    = dict_set(resp, "new_version", new_ver)
+                    let resp    = dict_set(resp, "source",      csrc)
+                    json_encode(resp)
+                } {
+                    // Version mismatch
+                    let resp = {}
+                    let resp = dict_set(resp, "ok",               0)
+                    let resp = dict_set(resp, "trit",             T_MAYBE)
+                    let resp = dict_set(resp, "error",            "version mismatch")
+                    let resp = dict_set(resp, "current_version",  cur_ver)
+                    let resp = dict_set(resp, "expected_version", exp_ver)
+                    let resp = dict_set(resp, "msg",              "CAS failed -- re-read and retry")
+                    json_encode(resp)
+                } {
+                    let resp = {}
+                    let resp = dict_set(resp, "ok",   0)
+                    let resp = dict_set(resp, "trit", T_MAYBE)
+                    let resp = dict_set(resp, "error","version mismatch")
+                    json_encode(resp)
+                }
+            } {
+                let err = {}
+                let err = dict_set(err, "ok",   0)
+                let err = dict_set(err, "trit", T_FALSE)
+                let err = dict_set(err, "error", join(["key '", ckey, "' not found"], ""))
+                json_encode(err)
+            } {
+                let err = {}
+                let err = dict_set(err, "ok",   0)
+                let err = dict_set(err, "trit", T_FALSE)
+                let err = dict_set(err, "error","store lookup error")
+                return err
+            }
+        }
+    }
+}
+
+// ============================================================
+// Route: GET /tsync/conflicts -- list all conflicts
+// ============================================================
+fn handle_conflicts(req) {
+    let _ops       = _ops + 1
+    let unresolved = []
+    let resolved   = []
+    let idx        = 0
+    while3 (idx < _conflict_ct) {
+        let c_json = dict_get(_conflicts, idx)
+        let c      = json_decode(c_json)
+        if3 (dict_get(c, "resolved") == 0) {
+            let unresolved = append(unresolved, c)
+        } {
+            let resolved = append(resolved, c)
+        } {
+            let resolved = append(resolved, c)
+        }
+        let idx = idx + 1
+    }
+    let un_count  = len(unresolved)
+    let res_count = len(resolved)
+    let trit_val  = T_TRUE
+    if3 (un_count > 0) {
+        let trit_val = T_MAYBE
+    } {
+        let trit_val = T_TRUE
+    } {
+        let trit_val = T_TRUE
+    }
+    let resp = {}
+    let resp = dict_set(resp, "ok",               1)
+    let resp = dict_set(resp, "trit",             trit_val)
+    let resp = dict_set(resp, "unresolved",       unresolved)
+    let resp = dict_set(resp, "unresolved_count", un_count)
+    let resp = dict_set(resp, "resolved_count",   res_count)
+    let resp = dict_set(resp, "total_conflicts",  un_count + res_count)
+    return resp
+}
+
+// ============================================================
+// Route: POST /tsync/resolve -- manual conflict resolution
+// Body JSON: {"key":"...","value":...,"source":"admin"}
+// Bumps version, sets value authoritatively, marks conflicts resolved.
+// ============================================================
+fn handle_resolve(req) {
+    let _ops  = _ops + 1
+    let body  = json_decode(dict_get(req, "body"))
+    let rkey  = dict_get(body, "key")
+    let rval  = dict_get(body, "value")
+    let rsrc  = dict_get(body, "source")
+    if3 (rsrc == "") {
+        let rsrc = "admin"
+    } {
+        let rsrc = rsrc
+    } {
+        let rsrc = rsrc
+    }
+
+    if3 (rkey == "") {
+        let err = {}
+        let err = dict_set(err, "ok",   0)
+        let err = dict_set(err, "trit", T_FALSE)
+        let err = dict_set(err, "error","key required")
+        json_encode(err)
+    } {
+        if3 (dict_has(_store, rkey)) {
+            let entry   = json_decode(dict_get(_store, rkey))
+            let new_ver = dict_get(entry, "version") + 1
+            let entry   = dict_set(entry, "version",   new_ver)
+            let entry   = dict_set(entry, "value",     rval)
+            let entry   = dict_set(entry, "source",    rsrc)
+            let entry   = dict_set(entry, "timestamp", now())
+            let _store  = dict_set(_store, rkey, json_encode(entry))
+            // Mark all conflicts for this key as resolved
+            let new_conflicts  = []
+            let resolved_count = 0
+            let ridx           = 0
+            while3 (ridx < _conflict_ct) {
+                let c_json = dict_get(_conflicts, ridx)
+                let c      = json_decode(c_json)
+                if3 (dict_get(c, "key") == rkey) {
+                    if3 (dict_get(c, "resolved") == 0) {
+                        let res_info   = {}
+                        let res_info   = dict_set(res_info, "value",     rval)
+                        let res_info   = dict_set(res_info, "source",    rsrc)
+                        let res_info   = dict_set(res_info, "timestamp", now())
+                        let c          = dict_set(c, "resolved",        1)
+                        let c          = dict_set(c, "resolution_json", json_encode(res_info))
+                        let resolved_count = resolved_count + 1
+                    } {
+                        let c = c
+                    } {
+                        let c = c
+                    }
+                } {
+                    let c = c
+                } {
+                    let c = c
+                }
+                let new_conflicts = append(new_conflicts, json_encode(c))
+                let ridx = ridx + 1
+            }
+            let _conflicts   = new_conflicts
+            let _r           = notify_subscribers(rkey, json_encode(entry))
+            let resp         = {}
+            let resp         = dict_set(resp, "ok",                1)
+            let resp         = dict_set(resp, "trit",              T_TRUE)
+            let resp         = dict_set(resp, "key",               rkey)
+            let resp         = dict_set(resp, "version",           new_ver)
+            let resp         = dict_set(resp, "resolved_conflicts", resolved_count)
+            let resp         = dict_set(resp, "source",            rsrc)
+            json_encode(resp)
+        } {
+            let err = {}
+            let err = dict_set(err, "ok",   0)
+            let err = dict_set(err, "trit", T_FALSE)
+            let err = dict_set(err, "error", join(["key '", rkey, "' not found"], ""))
+            json_encode(err)
+        } {
+            let err = {}
+            let err = dict_set(err, "ok",   0)
+            let err = dict_set(err, "trit", T_FALSE)
+            let err = dict_set(err, "error","store lookup error")
+            return err
+        }
+    }
+}
+
+// ============================================================
+// Route: POST /tsync/notify -- on-demand subscriber notification
+// Body JSON: {"key":"..."} -- triggers notify for all subs matching key
+// Replaces background threading model with explicit POST trigger.
+// ============================================================
+fn handle_notify(req) {
+    let _ops = _ops + 1
+    let body = json_decode(dict_get(req, "body"))
+    let nkey = dict_get(body, "key")
+    if3 (nkey == "") {
+        let err = {}
+        let err = dict_set(err, "ok",   0)
+        let err = dict_set(err, "trit", T_FALSE)
+        let err = dict_set(err, "error","key required")
+        json_encode(err)
+    } {
+        if3 (dict_has(_store, nkey)) {
+            let e_json = dict_get(_store, nkey)
+            let _r     = notify_subscribers(nkey, e_json)
+            let resp   = {}
+            let resp   = dict_set(resp, "ok",   1)
+            let resp   = dict_set(resp, "trit", T_TRUE)
+            let resp   = dict_set(resp, "key",  nkey)
+            let resp   = dict_set(resp, "msg",  "subscribers notified")
+            json_encode(resp)
+        } {
+            let err = {}
+            let err = dict_set(err, "ok",   0)
+            let err = dict_set(err, "trit", T_FALSE)
+            let err = dict_set(err, "error", join(["key '", nkey, "' not found"], ""))
+            json_encode(err)
+        } {
+            let err = {}
+            let err = dict_set(err, "ok",   0)
+            let err = dict_set(err, "trit", T_FALSE)
+            let err = dict_set(err, "error","store lookup error")
+            return err
+        }
+    }
+}
+
+// ============================================================
+// Route: GET /tsync/stats -- operational statistics
+// ============================================================
+fn handle_stats(req) {
+    let uptime  = now() - _start_time
+    let re      = _ops
+    let regime  = "laminar"
+    if3 (re >= RE_TURBULENT) {
+        let regime = "turbulent"
+    } {
+        if3 (re >= RE_TRANSITIONAL) {
+            let regime = "transitional"
+        } {
+            let regime = "laminar"
+        } {
+            let regime = "laminar"
+        }
+    } {
+        let regime = "chaotic"
+    }
+    let resp = {}
+    let resp = dict_set(resp, "ok",        1)
+    let resp = dict_set(resp, "trit",      T_TRUE)
+    let resp = dict_set(resp, "service",   SERVICE)
+    let resp = dict_set(resp, "version",   VERSION)
+    let resp = dict_set(resp, "uptime",    uptime)
+    let resp = dict_set(resp, "ops",       _ops)
+    let resp = dict_set(resp, "key_count", _key_count)
+    let resp = dict_set(resp, "conflicts", _conflict_ct)
+    let resp = dict_set(resp, "regime",    regime)
+    let resp = dict_set(resp, "harmonics", "H3=3 H5=5 H7=7 H13=13 BLOCK=2187")
+    return resp
+}
+
+// ============================================================
+// Route registrations
+// ============================================================
+let _r0 = troute(server, "GET",  "/health",           handle_health)
+let _r1 = troute(server, "GET",  "/tsync/health",     handle_health)
+let _r2 = troute(server, "GET",  "/tsync/state",      handle_state)
+let _r3 = troute(server, "GET",  "/tsync/conflicts",  handle_conflicts)
+let _r4 = troute(server, "GET",  "/tsync/stats",      handle_stats)
+let _r5 = troute(server, "POST", "/tsync/publish",    handle_publish)
+let _r6 = troute(server, "POST", "/tsync/subscribe",  handle_subscribe)
+let _r7 = troute(server, "POST", "/tsync/cas",        handle_cas)
+let _r8 = troute(server, "POST", "/tsync/resolve",    handle_resolve)
+let _r9 = troute(server, "POST", "/tsync/key/get",    handle_key_get)
+let _ra = troute(server, "POST", "/tsync/notify",     handle_notify)
+
+// ============================================================
+// Startup banner (ASCII only)
+// ============================================================
+print("[TSync] Ternary State Synchronization v1.0.0")
+print("[TSync] port=9976 MAX_KEYS=2187 MAX_SUBS_PER_KEY=13")
+print("[TSync] CONFLICT_WINDOW=13s NOTIFY_TIMEOUT=3s MAX_CONFLICTS=243")
+print("[TSync] harmonics=3-5-7-13 BLOCK=2187")
+print("[TSync] Regimes: laminar<27 transitional<125 turbulent<343 chaotic>=343")
+print("[TSync] Routes: /health /tsync/health /tsync/state /tsync/conflicts")
+print("[TSync] Routes: /tsync/stats /tsync/publish /tsync/subscribe /tsync/cas")
+print("[TSync] Routes: /tsync/resolve /tsync/key/get /tsync/notify")
+print("[TSync] Listening on 127.0.0.1:9976 | ternary=true")
+
+tstart(server)

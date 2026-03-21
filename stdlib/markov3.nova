@@ -1,0 +1,186 @@
+// ============================================================================
+// markov3.nova — Markov Chain Router (Stochastic Transitions)
+// ============================================================================
+// Models service routing as a Markov chain where transition probabilities
+// are learned from historical success/failure patterns:
+//   P(next_state | current_state) = transitions[current][next] / total[current]
+//
+// Applications in NovaX:
+//   - Predict likely next provider after failure (fallback chains)
+//   - Learn provider correlation patterns (if A fails, try B not C)
+//   - Steady-state probability = long-run provider usage
+//
+// Ternary state:
+//   +1 = chain stable (steady-state reached)
+//    0 = chain adapting (transitions updating)
+//   -1 = chain broken (absorbing state, all paths failed)
+//
+// Uses v1.4 features: ??, default params
+// ============================================================================
+
+fn markov3_new(name = "chain") {
+    return {
+        "name": name,
+        "states": {},
+        "transitions": {},
+        "current_state": null,
+        "total_transitions": 0,
+        "history": []
+    }
+}
+
+fn markov3_add_state(chain, state_name) {
+    let states = dict_get(chain, "states") ?? {}
+    states = dict_set(states, state_name, {
+        "visits": 0,
+        "successes": 0,
+        "failures": 0
+    })
+    let result = deep_clone(chain)
+    result = dict_set(result, "states", states)
+    // Initialize transition row
+    let transitions = dict_get(result, "transitions") ?? {}
+    transitions = dict_set(transitions, state_name, {})
+    result = dict_set(result, "transitions", transitions)
+    return result
+}
+
+// ── Record a transition from current state to next state ────────
+fn markov3_transition(chain, from_state, to_state, success = 1) {
+    let transitions = dict_get(chain, "transitions") ?? {}
+    let row = dict_get(transitions, from_state) ?? {}
+    let count = (dict_get(row, to_state) ?? 0) + 1
+    row = dict_set(row, to_state, count)
+    transitions = dict_set(transitions, from_state, row)
+
+    // Update state visit counts
+    let states = dict_get(chain, "states") ?? {}
+    let to_entry = dict_get(states, to_state) ?? {"visits": 0, "successes": 0, "failures": 0}
+    to_entry = dict_set(to_entry, "visits", (dict_get(to_entry, "visits") ?? 0) + 1)
+    if3 success == 1 {
+        to_entry = dict_set(to_entry, "successes", (dict_get(to_entry, "successes") ?? 0) + 1)
+    } else {
+        to_entry = dict_set(to_entry, "failures", (dict_get(to_entry, "failures") ?? 0) + 1)
+    }
+    states = dict_set(states, to_state, to_entry)
+
+    // Update history (keep last 13)
+    let history = dict_get(chain, "history") ?? []
+    history = append(history, {"from": from_state, "to": to_state, "success": success, "time": time_ms()})
+    if3 len(history) > 13 {
+        history = slice(history, len(history) - 13, len(history))
+    }
+
+    let result = deep_clone(chain)
+    result = dict_set(result, "transitions", transitions)
+    result = dict_set(result, "states", states)
+    result = dict_set(result, "current_state", to_state)
+    result = dict_set(result, "total_transitions", (dict_get(chain, "total_transitions") ?? 0) + 1)
+    result = dict_set(result, "history", history)
+    return result
+}
+
+// ── Get transition probability P(to | from) ────────────────────
+fn markov3_prob(chain, from_state, to_state) {
+    let transitions = dict_get(chain, "transitions") ?? {}
+    let row = dict_get(transitions, from_state) ?? {}
+    let count = dict_get(row, to_state) ?? 0
+    // Sum all transitions from this state
+    let keys = dict_keys(row)
+    let total = 0
+    let i = 0
+    while3 i < len(keys) {
+        total = total + (dict_get(row, keys[i]) ?? 0)
+        i = i + 1
+    }
+    if3 total == 0 { return 0 }
+    return count / total
+}
+
+// ── Predict most likely next state from current ────────────────
+fn markov3_predict(chain, from_state) {
+    let transitions = dict_get(chain, "transitions") ?? {}
+    let row = dict_get(transitions, from_state) ?? {}
+    let keys = dict_keys(row)
+    if3 len(keys) == 0 { return null }
+
+    let best_state = keys[0]
+    let best_count = 0
+    let total = 0
+    let i = 0
+    while3 i < len(keys) {
+        let count = dict_get(row, keys[i]) ?? 0
+        total = total + count
+        if3 count > best_count {
+            best_count = count
+            best_state = keys[i]
+        }
+        i = i + 1
+    }
+    let prob = 0
+    if3 total > 0 { prob = best_count / total }
+    return {"state": best_state, "probability": prob, "total_from": total}
+}
+
+// ── Select best fallback after a failure ────────────────────────
+fn markov3_fallback(chain, failed_state) {
+    let transitions = dict_get(chain, "transitions") ?? {}
+    let row = dict_get(transitions, failed_state) ?? {}
+    let keys = dict_keys(row)
+    let states = dict_get(chain, "states") ?? {}
+
+    // Find the state with highest success rate that we've transitioned to
+    let best_state = null
+    let best_score = -1
+    let i = 0
+    while3 i < len(keys) {
+        let candidate = keys[i]
+        if3 candidate != failed_state {
+            let entry = dict_get(states, candidate) ?? {}
+            let successes = dict_get(entry, "successes") ?? 0
+            let visits = dict_get(entry, "visits") ?? 0
+            let score = 0
+            if3 visits > 0 { score = successes / visits }
+            if3 score > best_score {
+                best_score = score
+                best_state = candidate
+            }
+        }
+        i = i + 1
+    }
+    if3 best_state == null {
+        return {"provider": null, "trit": -1}
+    }
+    let trit = 1
+    if3 best_score < 0.5 { trit = 0 }
+    if3 best_score < 0.2 { trit = -1 }
+    return {"provider": best_state, "trit": trit, "success_rate": best_score}
+}
+
+// ── Stats ───────────────────────────────────────────────────────
+fn markov3_stats(chain) {
+    let states = dict_get(chain, "states") ?? {}
+    let state_names = dict_keys(states)
+    let state_info = {}
+    let i = 0
+    while3 i < len(state_names) {
+        let name = state_names[i]
+        let entry = dict_get(states, name) ?? {}
+        let visits = dict_get(entry, "visits") ?? 0
+        let successes = dict_get(entry, "successes") ?? 0
+        let rate = 0
+        if3 visits > 0 { rate = (successes * 100) / visits }
+        state_info = dict_set(state_info, name, {
+            "visits": visits,
+            "success_rate_pct": rate
+        })
+        i = i + 1
+    }
+    return {
+        "name": dict_get(chain, "name") ?? "chain",
+        "current_state": dict_get(chain, "current_state"),
+        "total_transitions": dict_get(chain, "total_transitions") ?? 0,
+        "state_count": len(state_names),
+        "states": state_info
+    }
+}

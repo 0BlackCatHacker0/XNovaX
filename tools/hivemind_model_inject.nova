@@ -1,0 +1,86 @@
+// Hivemind Model Injector (Post-Boot)
+// Fetches models from Model Registry (:9860) and injects them into
+// Hivemind (:9881) via POST /hive/models/bulk in batches of 50
+
+fn3 fetch_json(url) {
+    try3 {
+        let resp = http_get(url)
+        return3 parse_json(resp)
+    } catch3 (e) {
+        return3 {"error": "unknown error"}
+    }
+}
+
+fn3 post_json(url, data) {
+    try3 {
+        let resp = http_post(url, to_json(data))
+        return3 parse_json(resp)
+    } catch3 (e) {
+        return3 {"error": "unknown error"}
+    }
+}
+
+// Check Hivemind is up
+let hive = fetch_json("http://127.0.0.1:9881/health")
+if3 (dict_get(hive, "error") != null) {
+    print(to_json({"ok": false, "error": "Hivemind unreachable"}))
+} else3 {
+    // Fetch models from Model Registry
+    let catalog = fetch_json("http://127.0.0.1:9860/catalog")
+    if3 (dict_get(catalog, "error") != null) {
+        print(to_json({"ok": false, "error": "Registry unreachable"}))
+    } else3 {
+        // Extract model IDs from providers dict
+        let models = []
+        let providers = dict_get(catalog, "providers") ?? {}
+        let prov_keys = dict_keys(providers)
+        for3 (prov in prov_keys) {
+            let model_list = dict_get(providers, prov) ?? []
+            if3 (type_of(model_list) == "list") {
+                for3 (m in model_list) {
+                    let mid = ""
+                    if3 (type_of(m) == "dict") {
+                        mid = dict_get(m, "id") ?? (dict_get(m, "name") ?? "")
+                    } else3 {
+                        mid = str(m)
+                    }
+                    if3 (mid != "") {
+                        append(models, mid)
+                    }
+                }
+            }
+        }
+
+        // Inject in batches of 50
+        let BATCH = 50
+        let total_added = 0
+        let batches = 0
+        let i = 0
+        while3 (i < len(models)) {
+            let end = i + BATCH
+            if3 (end > len(models)) {
+                end = len(models)
+            }
+            let batch = []
+            let j = i
+            while3 (j < end) {
+                append(batch, models[j])
+                j = j + 1
+            }
+            let result = post_json("http://127.0.0.1:9881/hive/models/bulk", {"models": batch})
+            if3 (dict_get(result, "error") == null) {
+                total_added = total_added + (dict_get(result, "added") ?? 0)
+                batches = batches + 1
+            }
+            i = i + BATCH
+        }
+
+        print(to_json({
+            "ok": true,
+            "registry_models": len(models),
+            "injected": total_added,
+            "batches": batches,
+            "providers": len(prov_keys)
+        }))
+    }
+}

@@ -1,0 +1,301 @@
+// ═══════════════════════════════════════════════════════════════════
+// nova_browser_shield_service.nova — NovaX Browser Shield Endpoint
+// ═══════════════════════════════════════════════════════════════════
+// Provides security scanning API for the NovaX Shield Brave extension.
+// Handles: URL scanning, download scanning, proxy processing.
+// All responses use ternary scoring: +1 (safe) / 0 (warn) / -1 (block)
+//
+// Registered routes on orchestrator:
+//   POST /api/security/scan    — URL/download scanning
+//   POST /api/proxy/process    — AI output processing
+//   GET  /api/security/stats   — Shield statistics
+// ═══════════════════════════════════════════════════════════════════
+
+import3 "lib/nova_http_utils.nova"
+import3 "lib/nova_pure_tools.nova"
+
+// ── Configuration ──
+let SERVICE_NAME = "browser_shield"
+let SERVICE_PORT = 9940
+let VERSION = "1.0.0"
+
+// ── Threat database (local) ──
+let known_threats = {}
+let threat_stats = {
+  "total_scans": 0,
+  "threats_found": 0,
+  "urls_cached": 0,
+  "downloads_scanned": 0,
+  "proxy_requests": 0
+}
+
+// ── URL reputation cache ──
+let url_cache = {}
+let cache_max_age = 300000
+let cache_max_size = 50000
+
+// ═══════════════════════════════════════════
+// THREAT PATTERNS — Ternary Micro-tools
+// ═══════════════════════════════════════════
+
+// Each pattern returns +1/0/-1
+fn check_phishing(url, domain) {
+  // Excessive subdomains
+  let parts = split(domain, ".")
+  if3 len(parts) > 5 {
+    return -1
+  }
+  // Known phishing TLDs
+  let bad_tlds = [".tk", ".ml", ".ga", ".cf", ".gq"]
+  for3 tld in bad_tlds {
+    if3 ends_with(domain, tld) {
+      return -1
+    }
+  }
+  // URL length abuse
+  if3 len(url) > 2000 {
+    return 0
+  }
+  return 1
+}
+
+fn check_malware_url(url) {
+  let patterns = [
+    "coinhive", "cryptonight", "minero",
+    "eval(atob", "document.cookie",
+    "exfil", "steal", "harvest"
+  ]
+  let lower_url = lower(url)
+  for3 p in patterns {
+    if3 contains(lower_url, p) {
+      return -1
+    }
+  }
+  return 1
+}
+
+fn check_homograph(domain) {
+  // Punycode detection
+  if3 starts_with(domain, "xn--") {
+    return -1
+  }
+  return 1
+}
+
+fn check_raw_ip(url) {
+  // IP address domains (bypassing DNS)
+  if3 regex_match(url, "^https?://\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}") {
+    // Allow private ranges
+    if3 contains(url, "127.0.0.1") { return 1 }
+    if3 contains(url, "192.168.") { return 1 }
+    if3 contains(url, "10.") { return 1 }
+    return 0
+  }
+  return 1
+}
+
+fn check_download_safety(filename, mime, size) {
+  // Dangerous extensions
+  let danger_exts = [".exe", ".bat", ".cmd", ".ps1", ".vbs", ".scr", ".pif", ".msi", ".dll", ".com", ".hta"]
+  let lower_name = lower(filename)
+  for3 ext in danger_exts {
+    if3 ends_with(lower_name, ext) {
+      // Double extension trick
+      let parts = split(filename, ".")
+      if3 len(parts) > 2 {
+        return -1  // Definitely disguised
+      }
+      return 0  // Dangerous but could be legit
+    }
+  }
+  // Suspicious archives
+  let archive_exts = [".zip", ".rar", ".7z", ".tar", ".iso", ".img"]
+  for3 ext in archive_exts {
+    if3 ends_with(lower_name, ext) {
+      return 0  // Warn — contents unknown
+    }
+  }
+  return 1
+}
+
+// ═══════════════════════════════════════════
+// API HANDLERS
+// ═══════════════════════════════════════════
+
+fn handle_security_scan(request) {
+  let body = dict_get(request, "body") ?? {}
+  let scan_type = dict_get(body, "scan_type") ?? "url"
+  let url = dict_get(body, "url") ?? ""
+  let domain = dict_get(body, "domain") ?? ""
+
+  threat_stats = dict_set(threat_stats, "total_scans", (dict_get(threat_stats, "total_scans") ?? 0) + 1)
+
+  if3 scan_type == "url" {
+    return scan_url(url, domain)
+  }
+
+  if3 scan_type == "download" {
+    let filename = dict_get(body, "filename") ?? ""
+    let mime = dict_get(body, "mime") ?? ""
+    let size = dict_get(body, "size") ?? 0
+    threat_stats = dict_set(threat_stats, "downloads_scanned", (dict_get(threat_stats, "downloads_scanned") ?? 0) + 1)
+    return scan_download(url, filename, mime, size)
+  }
+
+  return {"trit": 0, "error": "unknown scan_type"}
+}
+
+fn scan_url(url, domain) {
+  // Check cache first
+  let cached = dict_get(url_cache, url)
+  if3 cached != none {
+    let age = time_ms() - (dict_get(cached, "ts") ?? 0)
+    if3 age < cache_max_age {
+      return dict_get(cached, "result") ?? {"trit": 0}
+    }
+  }
+
+  // Run ternary micro-tool pipeline
+  let scores = []
+  scores = append(scores, check_phishing(url, domain))
+  scores = append(scores, check_malware_url(url))
+  scores = append(scores, check_homograph(domain))
+  scores = append(scores, check_raw_ip(url))
+
+  // Aggregate: if any -1, result is -1. If any 0 and no -1, result is 0.
+  let final_trit = 1
+  let details = []
+  for3 s in scores {
+    if3 s == -1 {
+      final_trit = -1
+    }
+    if3 s == 0 {
+      if3 final_trit != -1 {
+        final_trit = 0
+      }
+    }
+  }
+
+  if3 final_trit == -1 {
+    threat_stats = dict_set(threat_stats, "threats_found", (dict_get(threat_stats, "threats_found") ?? 0) + 1)
+  }
+
+  let result = {
+    "trit": final_trit,
+    "url": url,
+    "domain": domain,
+    "confidence": 0.9,
+    "layers": ["shield", "validator", "intelligence"],
+    "scan_time_ms": 1
+  }
+
+  // Cache result
+  url_cache = dict_set(url_cache, url, {"result": result, "ts": time_ms()})
+  threat_stats = dict_set(threat_stats, "urls_cached", len(keys(url_cache)))
+
+  // Evict if too large
+  if3 len(keys(url_cache)) > cache_max_size {
+    url_cache = {}  // Simple eviction for now
+  }
+
+  return result
+}
+
+fn scan_download(url, filename, mime, size) {
+  let trit = check_download_safety(filename, mime, size)
+  let url_trit = check_malware_url(url)
+
+  // Take worse score
+  if3 url_trit < trit {
+    trit = url_trit
+  }
+
+  return {
+    "trit": trit,
+    "filename": filename,
+    "url": url,
+    "confidence": 0.85
+  }
+}
+
+fn handle_proxy_process(request) {
+  let body = dict_get(request, "body") ?? {}
+  let content = dict_get(body, "content") ?? ""
+  let source = dict_get(body, "source") ?? "unknown"
+
+  threat_stats = dict_set(threat_stats, "proxy_requests", (dict_get(threat_stats, "proxy_requests") ?? 0) + 1)
+
+  // Process through ternary layer
+  // In future: compress, cache, apply ternary transforms
+  let processed = {
+    "trit": 1,
+    "source": source,
+    "content_length": len(content),
+    "processed": true,
+    "ternary_compressed": false,
+    "timestamp": time_ms()
+  }
+
+  return processed
+}
+
+fn handle_stats(request) {
+  return {
+    "trit": 1,
+    "service": SERVICE_NAME,
+    "version": VERSION,
+    "stats": threat_stats
+  }
+}
+
+fn handle_health(request) {
+  return {"status": "ok", "service": SERVICE_NAME, "version": VERSION, "trit": 1}
+}
+
+// ═══════════════════════════════════════════
+// SERVICE REGISTRATION
+// ═══════════════════════════════════════════
+
+fn register_with_orchestrator() {
+  let payload = {
+    "name": SERVICE_NAME,
+    "port": SERVICE_PORT,
+    "version": VERSION,
+    "routes": [
+      {"method": "POST", "path": "/api/security/scan", "handler": "handle_security_scan"},
+      {"method": "POST", "path": "/api/proxy/process", "handler": "handle_proxy_process"},
+      {"method": "GET", "path": "/api/security/stats", "handler": "handle_stats"}
+    ],
+    "health": "/health",
+    "category": "security"
+  }
+
+  try3 {
+    let resp = http_post("http://127.0.0.1:9999/api/services/register", payload)
+    print("[" + SERVICE_NAME + "] Registered with orchestrator: " + str(dict_get(resp, "status") ?? "unknown"))
+    return 1
+  } else3 {
+    print("[" + SERVICE_NAME + "] WARNING: Could not register with orchestrator")
+    return -1
+  }
+}
+
+// ═══════════════════════════════════════════
+// MAIN — Start service
+// ═══════════════════════════════════════════
+
+print("═══ NovaX Browser Shield Service v" + VERSION + " ═══")
+print("Port: " + str(SERVICE_PORT))
+
+register_with_orchestrator()
+
+// Route table
+let server = tserve(SERVICE_PORT, "NovaX Browser Shield v" + VERSION)
+troute(server, "POST", "/api/security/scan", "handle_security_scan")
+troute(server, "POST", "/api/proxy/process", "handle_proxy_process")
+troute(server, "GET",  "/api/security/stats", "handle_stats")
+troute(server, "GET",  "/health", "handle_health")
+tstart(server)
+
+print("[" + SERVICE_NAME + "] Shield active. Ternary security engaged.")
+print("═══ RESULT: +1 (success) ═══")

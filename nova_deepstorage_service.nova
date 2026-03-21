@@ -1,0 +1,760 @@
+// nova_deepstorage_service.nova -- NovaX DeepStorage v2.0 (NovaLang Port)
+// Port 9893 | Makes your hard drive hold far more than its physical size.
+//
+// Binary operations (TZip compression, dedup hashing, file I/O) are delegated
+// to a Python helper via nova_run() -- same pattern as nova_tcompress_service.nova.
+// NovaLang manages state, routing, N-S flow analysis, and ternary classification.
+//
+// Strategies (N-S Reynolds determines which per file):
+//   Laminar     (Re < 27):   simple repetitive data  -- extreme compression (80%+)
+//   Transitional (Re 27-125): mixed patterns          -- standard TZip (~50%)
+//   Turbulent   (Re 125-343): complex data            -- moderate compression
+//   Chaotic     (Re >= 343):  random/encrypted        -- skip compression, store ref
+//
+// Endpoints:
+//   POST /deep/quantize   -- quantize a file or directory
+//   POST /deep/restore    -- restore a quantized file
+//   POST /deep/scan       -- scan directory and estimate savings
+//   POST /deep/watch      -- start watching a directory
+//   POST /deep/unwatch    -- stop watching a directory
+//   GET  /deep/status     -- full engine status
+//   GET  /deep/dedup      -- deduplication report
+//   GET  /deep/tiers      -- storage tier breakdown
+//   GET  /deep/patterns   -- pattern library status
+//   GET  /health          -- health check
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3   H5=5   H7=7   H13=13
+//   BLOCK_SIZE = 3^7 = 2187
+//   RE_LAMINAR = 3^3 = 27   RE_TRANSITION = 5^3 = 125   RE_TURBULENT = 7^3 = 343
+//
+// Ternary states:
+//   +1 (T_TRUE)  = quantized / restored / op success
+//    0 (T_MAYBE) = partial / scan only / watching
+//   -1 (T_FALSE) = error / file not found / excluded
+
+// -- Port and server --
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9893
+let server = tserve(PORT, "DeepStorage v2.0 - NovaX Infinite Drive Engine")
+
+// -- 3-5-7-13 Harmonic Constants --
+let BLOCK_SIZE = 2187       // 3^7 ternary block boundary
+
+// -- Ternary truth values --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Service identity --
+let VERSION      = "2.0"
+let SERVICE_NAME = "nova-deepstorage"
+
+// -- N-S Reynolds boundaries --
+let RE_LAMINAR     = 27     // 3^3 -- highly repetitive, extreme compression
+let RE_TRANSITION  = 125    // 5^3 -- mixed patterns, standard compression
+let RE_TURBULENT   = 343    // 7^3 -- complex data, moderate compression
+
+// -- Paths --
+let NOVAX_ROOT   = "C:\\NovaX"
+let DEDUP_DB     = "C:\\NovaX\\memory\\deepstorage_dedup.json"
+let STATE_DB     = "C:\\NovaX\\memory\\deepstorage_state.json"
+let HELPER       = "deepstorage_helper.py"
+
+// -- Dedup block size (4KB blocks for content-addressable storage) --
+let DEDUP_BLOCK  = 4096
+
+// -- Max file size: 500 MB ceiling --
+let MAX_FILE_MB  = 500
+let MAX_FILE_BYTES = 524288000
+
+// -- Excluded extensions (binary system files, no compression benefit) --
+let EXCL_EXT_EXE = ".exe"
+let EXCL_EXT_DLL = ".dll"
+let EXCL_EXT_SYS = ".sys"
+let EXCL_EXT_DRV = ".drv"
+let EXCL_EXT_MSI = ".msi"
+let EXCL_EXT_BAT = ".bat"
+let EXCL_EXT_CMD = ".cmd"
+let EXCL_EXT_DEEP = ".deep"
+
+// -- Savings ratios by flow regime (3-5-7-13 harmonics) --
+// Laminar:     H5/H7  = 5/7  ~ 0.714 savings ratio
+// Transitional: H5/H13 = 5/13 ~ 0.385 savings ratio
+// Turbulent:   H3/H13 = 3/13 ~ 0.231 savings ratio
+// Chaotic:     1/H13  = 1/13 ~ 0.077 savings ratio
+let SAVINGS_LAMINAR      = 0.714
+let SAVINGS_TRANSITIONAL = 0.385
+let SAVINGS_TURBULENT    = 0.231
+let SAVINGS_CHAOTIC      = 0.077
+
+// -- Dedup estimate constant: ~20% of data is typically duplicate --
+let DEDUP_ESTIMATE_RATIO = 0.20
+
+// -- Tier names --
+let TIER_HOT    = "hot"
+let TIER_WARM   = "warm"
+let TIER_COLD   = "cold"
+let TIER_FROZEN = "frozen"
+
+// -- Flow regime labels --
+let FLOW_LAMINAR      = "laminar"
+let FLOW_TRANSITIONAL = "transitional"
+let FLOW_TURBULENT    = "turbulent"
+let FLOW_CHAOTIC      = "chaotic"
+
+// -- Mutable state counters (no threading -- single-flow NovaLang) --
+let _files_quantized          = 0
+let _files_restored           = 0
+let _bytes_original           = 0
+let _bytes_stored             = 0
+let _bytes_saved_compression  = 0
+let _bytes_saved_dedup        = 0
+let _bytes_saved_patterns     = 0
+let _errors                   = 0
+let _ops                      = 0
+let _trits_true               = 0
+let _trits_maybe              = 0
+let _trits_false              = 0
+let _start_time               = time()
+
+// -- Watch state (list of currently watched directory paths) --
+let _watch_dirs = []
+
+// -- Tier state (list of entry dicts serialized as JSON strings) --
+let _tier_entries = []
+
+// -- Dedup state: unique block count, total block count, saved bytes --
+let _dedup_total_blocks  = 0
+let _dedup_unique_blocks = 0
+let _dedup_saved_bytes   = 0
+let _dedup_files_tracked = 0
+
+// -- Pattern library state --
+let _pattern_total    = 0
+let _pattern_hot      = 0
+let _pattern_saved    = 0
+
+// -- Recent history (last 10 op summaries) --
+let _history = []
+
+// ============================================================
+// Helper: classify trit from op result dict
+// +1 = ok:true present     0 = partial     -1 = error
+// ============================================================
+fn storage_trit(ok_val) {
+    if3 ok_val == true {
+        return T_TRUE
+    } else ok_val == T_MAYBE {
+        return T_MAYBE
+    } else {
+        return T_FALSE
+    }
+}
+
+// ============================================================
+// Helper: trit char for JSON response
+// ============================================================
+fn tchar(t) {
+    if3 t == T_TRUE {
+        return "1"
+    } else t == T_MAYBE {
+        return "0"
+    } else {
+        return "T"
+    }
+}
+
+// ============================================================
+// Helper: record op trit into global counters
+// ============================================================
+fn record_trit(t) {
+    _ops = _ops + 1
+    if3 t == T_TRUE { _trits_true = _trits_true + 1
+    } else t == T_MAYBE { _trits_maybe = _trits_maybe + 1
+    } else { _trits_false = _trits_false + 1
+    }
+}
+
+// ============================================================
+// Helper: classify N-S Reynolds flow regime
+// ============================================================
+fn classify_flow(reynolds) {
+    if3 reynolds < RE_LAMINAR {
+        return FLOW_LAMINAR
+    } else reynolds < RE_TRANSITION {
+        return FLOW_TRANSITIONAL
+    } else reynolds < RE_TURBULENT {
+        return FLOW_TURBULENT
+    } else {
+        return FLOW_CHAOTIC
+    }
+}
+
+// ============================================================
+// Helper: savings ratio for a given flow regime label
+// ============================================================
+fn savings_for_flow(flow) {
+    if3 flow == FLOW_LAMINAR {
+        return SAVINGS_LAMINAR
+    } else flow == FLOW_TRANSITIONAL {
+        return SAVINGS_TRANSITIONAL
+    } else flow == FLOW_TURBULENT {
+        return SAVINGS_TURBULENT
+    } else {
+        return SAVINGS_CHAOTIC
+    }
+}
+
+// ============================================================
+// Helper: check if extension is excluded from quantization
+// Returns T_TRUE if excluded, T_FALSE if eligible
+// ============================================================
+fn is_excluded_ext(ext) {
+    if3 ext == EXCL_EXT_EXE {
+        return T_TRUE
+    } else ext == EXCL_EXT_DLL {
+        return T_TRUE
+    } else ext == EXCL_EXT_SYS {
+        return T_TRUE
+    } else ext == EXCL_EXT_DRV {
+        return T_TRUE
+    } else ext == EXCL_EXT_MSI {
+        return T_TRUE
+    } else ext == EXCL_EXT_BAT {
+        return T_TRUE
+    } else ext == EXCL_EXT_CMD {
+        return T_TRUE
+    } else ext == EXCL_EXT_DEEP {
+        return T_TRUE
+    } else {
+        return T_FALSE
+    }
+}
+
+// ============================================================
+// Helper: push a summary entry into _history (cap at 10)
+// ============================================================
+fn push_history(entry) {
+    _history = append(_history, entry)
+    let hist_len = len(_history)
+    if3 hist_len > 10 { _history = slice(_history, hist_len - 10, hist_len)
+    } else {
+        // under cap -- keep as-is
+    }
+}
+
+// ============================================================
+// Helper: push a tier entry dict into _tier_entries list
+// ============================================================
+fn push_tier_entry(entry_json) {
+    _tier_entries = append(_tier_entries, entry_json)
+}
+
+// ============================================================
+// Helper: build dedup status dict
+// ============================================================
+fn build_dedup_status() {
+    let dedup_ratio_raw = 0.0
+    if3 _dedup_total_blocks > 0 { dedup_ratio_raw = round(
+            (1.0 - float(_dedup_unique_blocks) / float(_dedup_total_blocks)) * 100.0,
+            1
+        )
+    } else {
+        // no blocks yet
+    }
+    let saved_mb = round(float(_dedup_saved_bytes) / 1048576.0, 2)
+    return {
+        "total_blocks":   _dedup_total_blocks,
+        "unique_blocks":  _dedup_unique_blocks,
+        "dedup_ratio":    str(dedup_ratio_raw) + "%",
+        "saved_bytes":    _dedup_saved_bytes,
+        "saved_mb":       saved_mb,
+        "files_tracked":  _dedup_files_tracked
+    }
+}
+
+// ============================================================
+// Helper: build pattern library status dict
+// ============================================================
+fn build_pattern_status() {
+    let saved_mb = round(float(_pattern_saved) / 1048576.0, 2)
+    return {
+        "total_patterns": _pattern_total,
+        "hot_patterns":   _pattern_hot,
+        "total_saved":    _pattern_saved,
+        "saved_mb":       saved_mb
+    }
+}
+
+// ============================================================
+// Helper: build tier breakdown from _tier_entries list
+// Each entry is a JSON-encoded dict with keys:
+//   path, original_size, stored_size, tier, reynolds, flow,
+//   compression_ratio
+// ============================================================
+fn build_tier_breakdown() {
+    let count_hot    = 0
+    let count_warm   = 0
+    let count_cold   = 0
+    let count_frozen = 0
+    let total_orig   = 0
+    let total_stored = 0
+    let i = 0
+    let entry_count = len(_tier_entries)
+    while3 i < entry_count {
+        let raw = _tier_entries[i]
+        let e = json_decode(raw)
+        let t = dict_get(e, "tier") ?? TIER_WARM
+        let orig = dict_get(e, "original_size") ?? 0
+        let stored = dict_get(e, "stored_size") ?? 0
+        total_orig = total_orig + orig
+        total_stored = total_stored + stored
+        if3 t == TIER_HOT { count_hot = count_hot + 1
+        } else t == TIER_WARM { count_warm = count_warm + 1
+        } else t == TIER_COLD { count_cold = count_cold + 1
+        } else { count_frozen = count_frozen + 1
+        }
+        i = i + 1
+    }
+    let total_files = count_hot + count_warm + count_cold + count_frozen
+    let orig_mb  = round(float(total_orig)   / 1048576.0, 2)
+    let stor_mb  = round(float(total_stored) / 1048576.0, 2)
+    let saved_mb = round(float(total_orig - total_stored) / 1048576.0, 2)
+    let eff_ratio_raw = 0.0
+    if3 total_orig > 0 { eff_ratio_raw = round(float(total_stored) / float(total_orig) * 100.0, 1)
+    } else {
+        // no data
+    }
+    return {
+        "hot":            {"count": count_hot},
+        "warm":           {"count": count_warm},
+        "cold":           {"count": count_cold},
+        "frozen":         {"count": count_frozen},
+        "total_files":    total_files,
+        "total_original_mb": orig_mb,
+        "total_stored_mb":   stor_mb,
+        "total_saved_mb":    saved_mb,
+        "effective_ratio":   str(eff_ratio_raw) + "%"
+    }
+}
+
+// ============================================================
+// Delegate: quantize a single file via helper subprocess
+// Helper receives: {"op": "quantize", "path": "..."}
+// Helper returns:  {"ok": bool, "original_size": N, "stored_size": N,
+//                  "reynolds": F, "flow": "...", "compression_saved": N,
+//                  "dedup_blocks": N, "dedup_saved": N, "store_path": "...",
+//                  "error": "..."}
+// ============================================================
+fn delegate_quantize_file(path) {
+    let args = json_encode({"op": "quantize", "path": path})
+    let result_str = nova_run(HELPER, args)
+    let result = json_decode(result_str)
+    return result
+}
+
+// ============================================================
+// Delegate: quantize all eligible files in a directory
+// Helper receives: {"op": "quantize_dir", "path": "...", "max_files": N}
+// Helper returns:  {"ok": bool, "files_quantized": N, "files_errored": N,
+//                  "total_saved_bytes": N, "details": [...], "error": "..."}
+// ============================================================
+fn delegate_quantize_dir(path, max_files) {
+    let args = json_encode({"op": "quantize_dir", "path": path, "max_files": max_files})
+    let result_str = nova_run(HELPER, args)
+    let result = json_decode(result_str)
+    return result
+}
+
+// ============================================================
+// Delegate: restore a quantized file
+// Helper receives: {"op": "restore", "path": "...", "output": "..."}
+// Helper returns:  {"ok": bool, "path": "...", "size": N, "ms": F, "error": "..."}
+// ============================================================
+fn delegate_restore_file(path, output) {
+    let args = json_encode({"op": "restore", "path": path, "output": output})
+    let result_str = nova_run(HELPER, args)
+    let result = json_decode(result_str)
+    return result
+}
+
+// ============================================================
+// Delegate: scan directory and estimate savings
+// Helper receives: {"op": "scan", "path": "..."}
+// Helper returns:  {"ok": bool, "total_files": N, "total_size_mb": F,
+//                  "estimated_savings_mb": F, "dedup_estimate_mb": F,
+//                  "combined_savings_mb": F, "combined_savings_gb": F,
+//                  "effective_ratio": "...", "flow_breakdown": {...},
+//                  "sample_files": [...], "error": "..."}
+// ============================================================
+fn delegate_scan_dir(path) {
+    let args = json_encode({"op": "scan", "path": path})
+    let result_str = nova_run(HELPER, args)
+    let result = json_decode(result_str)
+    return result
+}
+
+// ============================================================
+// ROUTE: GET /health
+// ============================================================
+fn ds_health() {
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "runtime", "novalang")
+    resp = dict_set(resp, "files_quantized", _files_quantized)
+    resp = dict_set(resp, "quality", {
+        "strong":  _trits_true,
+        "partial": _trits_maybe,
+        "failed":  _trits_false
+    })
+    return resp
+}
+
+// ============================================================
+// ROUTE: GET /deep/status
+// ============================================================
+fn ds_status() {
+    let uptime  = round(time() - _start_time, 0)
+    let total_saved = _bytes_saved_compression + _bytes_saved_dedup + _bytes_saved_patterns
+    let saved_mb = round(float(total_saved) / 1048576.0, 2)
+    let saved_gb = round(float(total_saved) / 1073741824.0, 2)
+    let eff_ratio = "0%"
+    let multiplier = "1.0x"
+    if3 _bytes_original > 0 { ratio_pct = round(float(_bytes_stored) / float(_bytes_original) * 100.0, 1)
+        let eff_ratio = str(ratio_pct) + "%"
+        let mult_raw  = round(float(_bytes_original) / float(max(_bytes_stored, 1)), 1)
+        let multiplier = str(mult_raw) + "x"
+    } else {
+        // no data yet
+    }
+    return {
+        "ok":                      true,
+        "service":                 SERVICE_NAME,
+        "version":                 VERSION,
+        "runtime":                 "novalang",
+        "uptime_s":                int(uptime),
+        "files_quantized":         _files_quantized,
+        "files_restored":          _files_restored,
+        "bytes_original":          _bytes_original,
+        "bytes_stored":            _bytes_stored,
+        "bytes_saved_compression": _bytes_saved_compression,
+        "bytes_saved_dedup":       _bytes_saved_dedup,
+        "bytes_saved_patterns":    _bytes_saved_patterns,
+        "total_saved_bytes":       total_saved,
+        "total_saved_mb":          saved_mb,
+        "total_saved_gb":          saved_gb,
+        "effective_ratio":         eff_ratio,
+        "multiplier":              multiplier,
+        "errors":                  _errors,
+        "dedup":                   build_dedup_status(),
+        "patterns":                build_pattern_status(),
+        "tiers":                   build_tier_breakdown(),
+        "watching":                _watch_dirs,
+        "recent":                  _history,
+        "harmonics":               {"H3": H3, "H5": H5, "H7": H7, "H13": H13, "BLOCK": BLOCK_SIZE},
+        "trit":                    T_TRUE,
+        "char":                    "1"
+    }
+}
+
+// ============================================================
+// ROUTE: GET /deep/dedup
+// ============================================================
+fn ds_dedup() {
+    let status = build_dedup_status()
+    status = dict_set(status, "ok", true)
+    status = dict_set(status, "trit", T_TRUE)
+    status = dict_set(status, "char", "1")
+    return status
+}
+
+// ============================================================
+// ROUTE: GET /deep/tiers
+// ============================================================
+fn ds_tiers() {
+    let breakdown = build_tier_breakdown()
+    breakdown = dict_set(breakdown, "ok", true)
+    breakdown = dict_set(breakdown, "trit", T_TRUE)
+    breakdown = dict_set(breakdown, "char", "1")
+    return breakdown
+}
+
+// ============================================================
+// ROUTE: GET /deep/patterns
+// ============================================================
+fn ds_patterns() {
+    let status = build_pattern_status()
+    status = dict_set(status, "ok", true)
+    status = dict_set(status, "trit", T_TRUE)
+    status = dict_set(status, "char", "1")
+    return status
+}
+
+// ============================================================
+// ROUTE: POST /deep/quantize
+// Input:  {"path": "/absolute/path/to/file_or_dir",
+//          "max_files": 1000}           (max_files for directories)
+// Output: quantize result with ternary annotation
+// ============================================================
+fn ds_quantize(body) {
+    let path = dict_get(body, "path") ?? ""
+    let max_files = dict_get(body, "max_files") ?? 1000
+
+    if3 len(path) == 0 { t = T_FALSE
+        record_trit(t)
+        return {
+            "ok":    false,
+            "error": "missing 'path' field",
+            "trit":  t,
+            "char":  tchar(t)
+    } else {
+        // Delegate file vs directory detection to helper
+        let result = delegate_quantize_file(path)
+        let is_dir_result = dict_get(result, "is_dir") ?? false
+
+        if3 is_dir_result == true {
+            // path is a directory -- delegate dir quantization
+            let result = delegate_quantize_dir(path, max_files)
+        } else {
+            // path is a file (or not found -- helper sets ok:false)
+        }
+
+        let ok_val = dict_get(result, "ok") ?? false
+        let t = storage_trit(ok_val)
+        record_trit(t)
+
+        if3 ok_val == true {
+            // Update global stats from helper result
+            let orig  = dict_get(result, "original_size") ?? 0
+            let stor  = dict_get(result, "stored_size") ?? 0
+            let c_saved = dict_get(result, "compression_saved") ?? 0
+            let d_saved = dict_get(result, "dedup_saved") ?? 0
+            let d_blocks = dict_get(result, "dedup_blocks") ?? 0
+            let flow    = dict_get(result, "flow") ?? FLOW_TRANSITIONAL
+            let reynolds = dict_get(result, "reynolds") ?? 0.0
+            let store_path = dict_get(result, "store_path") ?? ""
+
+            _files_quantized         = _files_quantized + 1
+            _bytes_original          = _bytes_original + orig
+            _bytes_stored            = _bytes_stored + stor
+            _bytes_saved_compression = _bytes_saved_compression + c_saved
+            _bytes_saved_dedup       = _bytes_saved_dedup + d_saved
+            _dedup_total_blocks      = _dedup_total_blocks + d_blocks
+            _dedup_files_tracked     = _dedup_files_tracked + 1
+
+            // Build and push tier entry
+            let ratio_raw = 0.0
+            if3 orig > 0 { ratio_raw = round(float(stor) / float(orig), 4)
+            } else {
+                // empty file edge case
+            }
+            let entry = json_encode({
+                "path": path,
+                "original_size": orig,
+                "stored_size": stor,
+                "tier": TIER_HOT,
+                "reynolds": reynolds,
+                "flow": flow,
+                "compression_ratio": ratio_raw
+            })
+            push_tier_entry(entry)
+
+            // Push to history
+            let total_saved = c_saved + d_saved
+            push_history({"action": "quantize", "path": path, "flow": flow, "saved": total_saved})
+
+            // Annotate result with ternary fields
+            result = dict_set(result, "trit", t)
+            result = dict_set(result, "char", tchar(t))
+        } else { _errors = _errors + 1
+            result = dict_set(result, "trit", t)
+            result = dict_set(result, "char", tchar(t))
+        }
+        return result
+    }
+}
+
+// ============================================================
+// ROUTE: POST /deep/restore
+// Input:  {"path": "/original/path/to/file",
+//          "output": "/optional/output/path"}
+// Output: restore result with ternary annotation
+// ============================================================
+}
+fn ds_restore(body) {
+    let path   = dict_get(body, "path") ?? ""
+    let output = dict_get(body, "output") ?? ""
+
+    if3 len(path) == 0 { t = T_FALSE
+        record_trit(t)
+        return {
+            "ok":    false,
+            "error": "missing 'path' field",
+            "trit":  t,
+            "char":  tchar(t)
+    } else { result = delegate_restore_file(path, output)
+        let ok_val = dict_get(result, "ok") ?? false
+        let t = storage_trit(ok_val)
+        record_trit(t)
+
+        if3 ok_val == true { _files_restored = _files_restored + 1
+            push_history({"action": "restore", "path": path})
+        } else { _errors = _errors + 1
+        }
+
+        result = dict_set(result, "trit", t)
+        result = dict_set(result, "char", tchar(t))
+        return result
+    }
+}
+
+// ============================================================
+// ROUTE: POST /deep/scan
+// Input:  {"path": "/dir/to/scan"}
+// Output: estimated savings report with N-S flow breakdown
+//
+// N-S savings estimates use 3-5-7-13 harmonics:
+//   Laminar:     H5/H7  ~ 71.4% savings
+//   Transitional: H5/H13 ~ 38.5% savings
+//   Turbulent:   H3/H13 ~ 23.1% savings
+//   Chaotic:     1/H13  ~  7.7% savings
+// Plus ~20% dedup estimate on top
+// ============================================================
+}
+fn ds_scan(body) {
+    let path = dict_get(body, "path") ?? NOVAX_ROOT
+
+    if3 len(path) == 0 { path = NOVAX_ROOT
+    } else {
+        // use provided path
+    }
+
+    let result = delegate_scan_dir(path)
+    let ok_val = dict_get(result, "ok") ?? false
+    let t = storage_trit(ok_val)
+    record_trit(t)
+
+    if3 ok_val == false { _errors = _errors + 1
+    } else {
+        // scan does not modify state -- read-only analysis
+    }
+
+    result = dict_set(result, "trit", t)
+    result = dict_set(result, "char", tchar(t))
+    return result
+}
+
+// ============================================================
+// ROUTE: POST /deep/watch
+// Input:  {"path": "/dir/to/watch"}
+// Output: {"ok": true, "watching": [...dirs...]}
+//
+// NovaLang has no background threads. The watcher loop is not
+// implemented in NovaLang. This route registers the directory
+// in _watch_dirs state so the helper (or orchestrator) can
+// poll /deep/status to get the watch list and act on it.
+// ============================================================
+fn ds_watch(body) {
+    let path = dict_get(body, "path") ?? ""
+
+    if3 len(path) == 0 { t = T_FALSE
+        record_trit(t)
+        return {
+            "ok":    false,
+            "error": "missing 'path' field",
+            "trit":  t,
+            "char":  tchar(t)
+    } else {
+        // Check if already watching (avoid duplicates)
+        let already = contains(_watch_dirs, path)
+        if3 already == true {
+            // already in watch list -- idempotent ok
+        } else { _watch_dirs = append(_watch_dirs, path)
+        }
+        let t = T_MAYBE
+        record_trit(t)
+        return {
+            "ok":      true,
+            "watching": _watch_dirs,
+            "note":    "watcher loop runs in helper process; poll /deep/status for state",
+            "trit":    t,
+            "char":    tchar(t)
+        }
+    }
+}
+
+// ============================================================
+// ROUTE: POST /deep/unwatch
+// Input:  {"path": "/dir/to/stop/watching"}
+// Output: {"ok": true, "watching": [...remaining...]}
+// ============================================================
+}
+fn ds_unwatch(body) {
+    let path = dict_get(body, "path") ?? ""
+
+    if3 len(path) == 0 { t = T_FALSE
+        record_trit(t)
+        return {
+            "ok":    false,
+            "error": "missing 'path' field",
+            "trit":  t,
+            "char":  tchar(t)
+    } else {
+        // Rebuild watch list without the target path
+        let new_dirs = []
+        let i = 0
+        let wlen = len(_watch_dirs)
+        while3 i < wlen {
+            let wdir = _watch_dirs[i]
+            if3 wdir == path {
+                // skip -- remove from watch list
+            } else { new_dirs = append(new_dirs, wdir)
+            }
+            i = i + 1
+        }
+        _watch_dirs = new_dirs
+        let t = T_TRUE
+        record_trit(t)
+        return {
+            "ok":      true,
+            "watching": _watch_dirs,
+            "trit":    t,
+            "char":    tchar(t)
+        }
+    }
+}
+
+// ============================================================
+// Route registrations
+// ============================================================
+}
+troute(server, "GET",  "/health",         "ds_health")
+troute(server, "GET",  "/deep/status",    "ds_status")
+troute(server, "GET",  "/deep/dedup",     "ds_dedup")
+troute(server, "GET",  "/deep/tiers",     "ds_tiers")
+troute(server, "GET",  "/deep/patterns",  "ds_patterns")
+troute(server, "POST", "/deep/quantize",  "ds_quantize")
+troute(server, "POST", "/deep/restore",   "ds_restore")
+troute(server, "POST", "/deep/scan",      "ds_scan")
+troute(server, "POST", "/deep/watch",     "ds_watch")
+troute(server, "POST", "/deep/unwatch",   "ds_unwatch")
+
+// ============================================================
+// Startup banner
+// ============================================================
+print("[DeepStorage] NovaX DeepStorage v" + VERSION + " -- NovaLang runtime -- Port " + str(PORT))
+print("[DeepStorage] Harmonics: 3-5-7-13 | BLOCK=" + str(BLOCK_SIZE) + " | Re=" + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT))
+print("[DeepStorage] Strategies: TZip + Dedup + Patterns + N-S Flow Tiers")
+print("[DeepStorage] Helper: " + HELPER + " (binary ops: tzip/dedup/hash/file-io)")
+print("[DeepStorage] Dedup block size: " + str(DEDUP_BLOCK) + " bytes")
+print("[DeepStorage] Savings ratios -- Laminar:" + str(SAVINGS_LAMINAR) + " Trans:" + str(SAVINGS_TRANSITIONAL) + " Turb:" + str(SAVINGS_TURBULENT) + " Chaotic:" + str(SAVINGS_CHAOTIC))
+print("[DeepStorage] Tiers: hot -> warm -> cold -> frozen (N-S demotion on stale access)")
+print("[DeepStorage] GET  /health | /deep/status | /deep/dedup | /deep/tiers | /deep/patterns")
+print("[DeepStorage] POST /deep/quantize | /deep/restore | /deep/scan | /deep/watch | /deep/unwatch")
+print("[DeepStorage] Ternary: T_TRUE=+1 T_MAYBE=0 T_FALSE=-1 | char: 1/0/T")
+print("[DeepStorage] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

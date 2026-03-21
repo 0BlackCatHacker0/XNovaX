@@ -1,0 +1,185 @@
+"""
+NovaX Service Watchdog — Auto-restart crashed services
+Runs as a background daemon. Checks all services every 30 seconds.
+If a service is down, restarts it automatically.
+
+Usage:
+  python novax_watchdog.py              Run watchdog (foreground)
+  python novax_watchdog.py --daemon     Run as background process
+"""
+import socket
+import subprocess
+import sys
+import os
+import time
+import json
+from pathlib import Path
+
+NOVAX_ROOT = r"C:\NovaX"
+PYTHON = str(Path(r"C:\NovaX\ai_env\Scripts\pythonw.exe"))
+if not Path(PYTHON).exists():
+    PYTHON = sys.executable
+
+LOG_FILE = os.path.join(NOVAX_ROOT, "memory", "watchdog_log.json")
+CHECK_INTERVAL = 30  # seconds
+
+SERVICES = [
+    {"name": "Orchestrator",  "cmd": [PYTHON, r"C:\NovaX\core\orchestrator.py"],             "port": 9999},
+    {"name": "Brain",         "cmd": [PYTHON, r"C:\NovaX\core\brain_server.py"],             "port": 9990},
+    {"name": "Relay",         "cmd": ["node", r"C:\NovaX\nova_relay.js", "--port", "9877"],  "port": 9877},
+    {"name": "Cloud Router",  "cmd": [PYTHON, r"C:\NovaX\nova_cloud_router.py"],             "port": 9878},
+    {"name": "VPN Core",      "cmd": [PYTHON, r"C:\NovaX\nova_vpn_core.py"],                 "port": 9880},
+    {"name": "Hivemind",      "cmd": [PYTHON, r"C:\NovaX\nova_hivemind.py"],                 "port": 9881},
+    {"name": "Nexus",         "cmd": [PYTHON, r"C:\NovaX\nova_nexus.py"],                    "port": 9882},
+    {"name": "Sentinel",      "cmd": [PYTHON, r"C:\NovaX\nova_sentinel.py"],                 "port": 9884},
+    {"name": "STT",           "cmd": [PYTHON, r"C:\NovaX\nova_stt.py"],                      "port": 9875},
+    {"name": "WebSocket",     "cmd": [PYTHON, r"C:\NovaX\ws_server_standalone.py"],          "port": 9998},
+]
+
+_log_entries = []
+
+
+def is_port_open(port):
+    """Check if a port is listening — socket only, NO PowerShell (no blue windows)."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return True
+    except (ConnectionRefusedError, OSError, TimeoutError):
+        return False
+
+
+def log_event(event_type, service, message=""):
+    entry = {
+        "ts": time.time(),
+        "type": event_type,
+        "service": service,
+        "message": message,
+    }
+    _log_entries.append(entry)
+    # Keep last 200 entries
+    while len(_log_entries) > 200:
+        _log_entries.pop(0)
+    # Write to disk
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "w") as f:
+            json.dump(_log_entries[-100:], f, indent=2)
+    except Exception:
+        pass
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] [{event_type}] {service}: {message}")
+
+
+def restart_service(svc):
+    name = svc["name"]
+    cmd = svc["cmd"]
+    port = svc.get("port")
+    # DUPLICATE GUARD: socket check — NO PowerShell (no blue windows)
+    if port and is_port_open(port):
+        log_event("SKIP", name, f"Port {port} already in use")
+        return False
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            cwd=NOVAX_ROOT,
+        )
+        log_event("RESTART", name, f"PID {proc.pid}")
+        return True
+    except FileNotFoundError:
+        log_event("ERROR", name, f"Executable not found: {cmd[0]}")
+        return False
+    except Exception as e:
+        log_event("ERROR", name, str(e))
+        return False
+
+
+def check_cycle():
+    """Run one check cycle across all services."""
+    down = []
+    up = []
+    for svc in SERVICES:
+        if is_port_open(svc["port"]):
+            up.append(svc["name"])
+        else:
+            down.append(svc)
+
+    if not down:
+        return len(up), 0
+
+    restarted = 0
+    for svc in down:
+        log_event("DOWN", svc["name"], f"Port {svc['port']} not responding")
+        if restart_service(svc):
+            restarted += 1
+
+    # Wait for restarts to take effect
+    if restarted > 0:
+        time.sleep(5)
+        # Verify
+        still_down = []
+        for svc in down:
+            if not is_port_open(svc["port"]):
+                still_down.append(svc["name"])
+                log_event("FAIL", svc["name"], "Still down after restart attempt")
+        if still_down:
+            log_event("WARN", "watchdog", f"Services still down: {', '.join(still_down)}")
+
+    return len(up), restarted
+
+
+def watchdog_status():
+    """Return current watchdog state (callable from orchestrator)."""
+    services = []
+    for svc in SERVICES:
+        services.append({
+            "name": svc["name"],
+            "port": svc["port"],
+            "alive": is_port_open(svc["port"]),
+        })
+    alive = sum(1 for s in services if s["alive"])
+    return {
+        "running": True,
+        "services": services,
+        "alive": alive,
+        "total": len(SERVICES),
+        "check_interval": CHECK_INTERVAL,
+        "log_entries": len(_log_entries),
+    }
+
+
+def main():
+    print("=" * 50)
+    print("  NovaX Service Watchdog")
+    print(f"  Monitoring {len(SERVICES)} services")
+    print(f"  Check interval: {CHECK_INTERVAL}s")
+    print("=" * 50)
+    log_event("START", "watchdog", f"Monitoring {len(SERVICES)} services")
+
+    while True:
+        try:
+            up, restarted = check_cycle()
+            total = len(SERVICES)
+            if restarted > 0:
+                ts = time.strftime("%H:%M:%S")
+                print(f"[{ts}] {up}/{total} up, restarted {restarted}")
+        except Exception as e:
+            log_event("ERROR", "watchdog", str(e))
+        time.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
+    if "--daemon" in sys.argv:
+        # Re-launch self as background process
+        subprocess.Popen(
+            [sys.executable, __file__],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            cwd=NOVAX_ROOT,
+        )
+        print("[NovaX] Watchdog started in background")
+    else:
+        main()

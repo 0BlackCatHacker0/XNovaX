@@ -1,0 +1,1568 @@
+// nova_cortex_service.nova -- Nova Cortex v2.0 (NovaLang Port)
+// Port 9896 | Pure NovaLang port of nova_cortex.py
+//
+// Unified Desktop AI Bridge -- connects Claude Desktop and ChatGPT Desktop
+// into the NovaX hivemind as ternary workers.
+//
+// ALL UI automation (window finding, text injection, response capture,
+// clipboard, UIA element trees) is delegated to a helper script via nova_run():
+//   nova_run("python C:\\NovaX\\cortex_helper.py <action> <json_args>")
+//
+// The helper script does the actual win32gui/pyautogui/comtypes work and
+// returns JSON results. NovaLang orchestrates the service layer.
+//
+// Ternary states:
+//   +1 (T_TRUE)  = substantive response / operation succeeded
+//    0 (T_MAYBE) = partial response / service running but no apps found
+//   -1 (T_FALSE) = error / window not found / timeout
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3   H5=5   H7=7   H13=13
+//   BLOCK = 3^7 = 2187
+//   Auto-discovery interval = H13 = 13 seconds
+//   Response poll interval = 1 second
+//   Stable polls needed = 3
+//
+// Endpoints:
+//   GET  /health                    -- health check with ternary stats
+//   GET  /cortex/status             -- both bridges + window handles + ternary
+//   GET  /cortex/services           -- health of all connected NovaX services
+//   GET  /cortex/live/claude        -- live UIA snapshot of Claude Desktop
+//   GET  /cortex/live/gpt           -- live UIA snapshot of GPT Desktop
+//   GET  /cortex/uia/status         -- UIA bridge availability
+//   GET  /cortex/command/pending    -- bridge polls for pending commands
+//   GET  /cortex/bridge/status      -- bridge cache state
+//   GET  /cortex/app-state/claude   -- structured Claude app state
+//   GET  /cortex/app-state/gpt     -- structured GPT app state
+//   POST /cortex/claude             -- query Claude Desktop
+//   POST /cortex/gpt                -- query GPT Desktop
+//   POST /cortex/both               -- fan out to both sequentially
+//   POST /cortex/chain              -- Claude->GPT debate (N rounds)
+//   POST /cortex/fuse               -- both respond, merge via pressure gradient
+//   POST /cortex/arrange            -- tile Claude+GPT side-by-side
+//   POST /cortex/proxy              -- universal tool proxy to NovaX services
+//   POST /cortex/uia/tree           -- dump UIA element tree (diagnostic)
+//   POST /cortex/action             -- UIA action (new-chat, click, etc.)
+//   POST /cortex/live/update        -- accept snapshot from bridge process
+//   POST /cortex/hint               -- accept externally-discovered HWNDs
+//   POST /cortex/command            -- enqueue command for bridge
+//   POST /cortex/command/result     -- bridge posts execution results
+//   POST /cortex/bridge/interact    -- type + submit via bridge
+//   POST /cortex/hivemind/task      -- autonomous hivemind interaction
+//   POST /cortex/hivemind/status    -- autonomous task capabilities
+//   POST /cortex/hivemind/open_sidebar -- toggle sidebar
+
+// -- Port and version --
+let PORT = 9896
+let VERSION = "2.0"
+let SERVICE = "nova-cortex"
+let HELPER = "C:\\NovaX\\cortex_helper.py"
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK = 2187
+
+// -- Ternary state symbols --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Reynolds boundaries (N-S flow routing) --
+let RE_LAMINAR    = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT  = 343
+
+// -- NovaX service endpoints for tool proxy --
+let NOVA_SERVICES_KEYS = ["tools", "ttools", "deep", "vault", "hive", "cloud", "orch"]
+let NOVA_SERVICES_URLS = [
+    "http://127.0.0.1:9891",
+    "http://127.0.0.1:9894",
+    "http://127.0.0.1:9893",
+    "http://127.0.0.1:9892",
+    "http://127.0.0.1:9881",
+    "http://127.0.0.1:9878",
+    "http://127.0.0.1:9999"
+]
+
+// -- Bridge state: Claude --
+let _claude_hwnd = 0
+let _claude_queries = 0
+let _claude_total_time_ms = 0
+let _claude_last_trit = 0
+let _claude_title = "Claude"
+
+// -- Bridge state: GPT --
+let _gpt_hwnd = 0
+let _gpt_queries = 0
+let _gpt_total_time_ms = 0
+let _gpt_last_trit = 0
+let _gpt_title = "ChatGPT"
+
+// -- Cortex stats --
+let _total_queries = 0
+let _trits_strong = 0
+let _trits_partial = 0
+let _trits_failed = 0
+let _t0 = time()
+
+// -- Live cache: Claude --
+let _live_claude_snapshot = {"elements": [], "total": 0}
+let _live_claude_messages = []
+let _live_claude_ts = 0
+let _live_claude_from_bridge = false
+
+// -- Live cache: GPT --
+let _live_gpt_snapshot = {"elements": [], "total": 0}
+let _live_gpt_messages = []
+let _live_gpt_ts = 0
+let _live_gpt_from_bridge = false
+
+// -- Command queue (list-based, no threading) --
+let _cmd_queue = []
+let _cmd_results = {}
+let _cmd_counter = 0
+
+// -- Server object --
+let server = tserve(PORT, "Nova Cortex v2.0 - Unified Desktop AI Bridge")
+
+// ============================================================
+// Helper: trit char (+1 -> "1", 0 -> "0", -1 -> "T")
+// ============================================================
+fn trit_char(trit) {
+    if3 trit == T_TRUE {
+        return "1"
+    } else trit == T_MAYBE {
+        return "0"
+    } else {
+        return "T"
+    }
+}
+
+// ============================================================
+// Helper: compute cortex trit from a result dict
+// +1 = substantive response (>50 chars), 0 = partial, -1 = error
+// ============================================================
+fn cortex_trit(result) {
+    let has_err = dict_get(result, "error", "")
+    if len(str(has_err)) > 0 {
+        return T_FALSE
+    }
+    let ok_val = dict_get(result, "ok", false)
+    if ok_val != true {
+        return T_FALSE
+    }
+    let resp = dict_get(result, "response", "")
+    if len(str(resp)) > 50 {
+        return T_TRUE
+    }
+    if len(str(resp)) > 0 {
+        return T_MAYBE
+    }
+    return T_FALSE
+}
+
+// ============================================================
+// Helper: record trit into cortex stats
+// ============================================================
+fn record_trit(trit) {
+    let _total_queries = _total_queries + 1
+    if3 trit == T_TRUE {
+        let _trits_strong = _trits_strong + 1
+    } else trit == T_MAYBE {
+        let _trits_partial = _trits_partial + 1
+    } else {
+        let _trits_failed = _trits_failed + 1
+    }
+}
+
+// ============================================================
+// Helper: get service URL by name from parallel lists
+// ============================================================
+fn get_service_url(name) {
+    let i = 0
+    let n = len(NOVA_SERVICES_KEYS)
+    while3 i < n {
+        if dict_get(NOVA_SERVICES_KEYS, i) == name {
+            return dict_get(NOVA_SERVICES_URLS, i)
+        }
+        let i = i + 1
+    }
+    return ""
+}
+
+// ============================================================
+// Helper: call cortex_helper.py via nova_run
+// action = string action name
+// args_dict = dict of arguments (will be JSON-encoded)
+// Returns: parsed JSON dict from helper stdout
+// ============================================================
+fn call_helper(action, args_dict) {
+    let args_json = json_encode(args_dict)
+    let cmd = "python " + HELPER + " " + action + " " + args_json
+    let raw = nova_run(cmd)
+    if len(raw) == 0 {
+        return {"ok": false, "error": "Helper returned empty output"}
+    }
+    try3 {
+        let parsed = json_decode(raw)
+        return parsed
+    } else {
+        return {"ok": false, "error": "Helper JSON parse failed", "raw": raw}
+    }
+}
+
+// ============================================================
+// Helper: discover window HWND for a target ("claude" or "gpt")
+// Updates global hwnd state if found
+// ============================================================
+fn discover_hwnd(target) {
+    let title = ""
+    if3 target == "claude" {
+        let title = _claude_title
+    } else {
+        let title = _gpt_title
+    }
+    let result = call_helper("find_window", {"title": title})
+    let hwnd = dict_get(result, "hwnd", 0)
+    if hwnd > 0 {
+        if target == "claude" {
+            let _claude_hwnd = hwnd
+        }
+        if target == "gpt" {
+            let _gpt_hwnd = hwnd
+        }
+    }
+    return hwnd
+}
+
+// ============================================================
+// Helper: get current HWND for target, discover if needed
+// ============================================================
+fn get_hwnd(target) {
+    if3 target == "claude" {
+        if _claude_hwnd > 0 {
+            return _claude_hwnd
+    } else {
+        if _gpt_hwnd > 0 {
+            return _gpt_hwnd
+        }
+    }
+    return discover_hwnd(target)
+}
+
+// ============================================================
+// Helper: get bridge status dict for a target
+// ============================================================
+}
+fn bridge_status(target) {
+    let hwnd = get_hwnd(target)
+    let name = ""
+    let queries = 0
+    let total_ms = 0
+    let last_trit = 0
+    if3 target == "claude" {
+        let name = "Claude"
+        let queries = _claude_queries
+        let total_ms = _claude_total_time_ms
+        let last_trit = _claude_last_trit
+    } else {
+        let name = "GPT"
+        let queries = _gpt_queries
+        let total_ms = _gpt_total_time_ms
+        let last_trit = _gpt_last_trit
+    }
+    let avg_ms = 0
+    if queries > 0 {
+        let avg_ms = round(total_ms / queries)
+    }
+    return {
+        "name": name,
+        "available": hwnd > 0,
+        "hwnd": hwnd,
+        "queries": queries,
+        "avg_time_ms": avg_ms,
+        "ternary_state": last_trit
+    }
+}
+
+// ============================================================
+// Helper: query a single desktop bridge
+// Delegates all UI work to cortex_helper.py
+// ============================================================
+fn query_bridge(target, prompt, timeout) {
+    let t_start = time()
+    let hwnd = get_hwnd(target)
+    let model_name = "cortex:" + lower(target)
+
+    if hwnd == 0 {
+        if target == "claude" {
+            let _claude_last_trit = T_FALSE
+        }
+        if target == "gpt" {
+            let _gpt_last_trit = T_FALSE
+        }
+        return {
+            "ok": false,
+            "error": target + " window not found",
+            "model": model_name,
+            "ternary_state": T_FALSE
+        }
+    }
+
+    // Delegate the full interaction to the helper
+    let result = call_helper("query", {
+        "target": target,
+        "hwnd": hwnd,
+        "prompt": prompt,
+        "timeout": timeout
+    })
+
+    let elapsed = int((time() - t_start) * 1000)
+    let ok_val = dict_get(result, "ok", false)
+    let response = dict_get(result, "response", "")
+    let err = dict_get(result, "error", "")
+
+    if3 ok_val == true {
+        // Update bridge stats
+        if target == "claude" {
+            let _claude_queries = _claude_queries + 1
+            let _claude_total_time_ms = _claude_total_time_ms + elapsed
+            let _claude_last_trit = T_TRUE
+        }
+        if target == "gpt" {
+            let _gpt_queries = _gpt_queries + 1
+            let _gpt_total_time_ms = _gpt_total_time_ms + elapsed
+            let _gpt_last_trit = T_TRUE
+        }
+        return {
+            "ok": true,
+            "model": model_name,
+            "response": response,
+            "time_ms": elapsed,
+            "tokens": 0,
+            "source": "cortex",
+            "ternary_state": T_TRUE
+    } else {
+        if target == "claude" {
+            let _claude_last_trit = T_FALSE
+        }
+        if target == "gpt" {
+            let _gpt_last_trit = T_FALSE
+        }
+        return {
+            "ok": false,
+            "model": model_name,
+            "error": str(err),
+            "time_ms": elapsed,
+            "ternary_state": T_FALSE
+        }
+    }
+}
+
+// ============================================================
+// Helper: query both bridges sequentially (no threading)
+// ============================================================
+}
+fn query_both(prompt, timeout) {
+    let claude_result = query_bridge("claude", prompt, timeout)
+    let gpt_result = query_bridge("gpt", prompt, timeout)
+
+    let both_ok = false
+    let c_ok = dict_get(claude_result, "ok", false)
+    let g_ok = dict_get(gpt_result, "ok", false)
+    if c_ok == true {
+        if g_ok == true {
+            let both_ok = true
+        }
+    }
+
+    return {
+        "ok": both_ok,
+        "results": {
+            "claude": claude_result,
+            "gpt": gpt_result
+        },
+        "source": "cortex"
+    }
+}
+
+// ============================================================
+// Helper: chain debate -- Claude->GPT->Claude->GPT for N rounds
+// Sequential while3 loops instead of for loops
+// ============================================================
+fn do_chain(prompt, rounds, timeout) {
+    let history = []
+    let current_prompt = prompt
+    let bridges = ["claude", "gpt"]
+    let r = 0
+
+    while3 r < rounds {
+        let b = 0
+        while3 b < 2 {
+            let target = dict_get(bridges, b)
+            let context = current_prompt
+
+            // Build context from previous responses
+            if len(history) > 0 {
+                let last_entry = dict_get(history, len(history) - 1)
+                let last_model = dict_get(last_entry, "model", "")
+                let last_resp = dict_get(last_entry, "response", "")
+                let context = "Previous response from " + last_model + ":\n" + last_resp + "\n\nNow respond to: " + current_prompt
+            }
+
+            let result = query_bridge(target, context, timeout)
+            dict_set(result, "round", r + 1)
+            dict_set(result, "step", b + 1)
+            append(history, result)
+
+            let step_ok = dict_get(result, "ok", false)
+            if step_ok != true {
+                return {
+                    "ok": false,
+                    "error": "Chain broke at round " + str(r + 1) + " step " + str(b + 1) + ": " + str(dict_get(result, "error", "")),
+                    "history": history,
+                    "source": "cortex"
+                }
+            }
+
+            let b = b + 1
+        }
+        let r = r + 1
+    }
+
+    let final_resp = ""
+    if len(history) > 0 {
+        let last = dict_get(history, len(history) - 1)
+        let final_resp = dict_get(last, "response", "")
+    }
+
+    return {
+        "ok": true,
+        "rounds": rounds,
+        "history": history,
+        "final_response": final_resp,
+        "source": "cortex"
+    }
+}
+
+// ============================================================
+// Helper: fuse -- both respond, merge via pressure gradient
+// ============================================================
+fn do_fuse(prompt, timeout) {
+    let both = query_both(prompt, timeout)
+    let both_ok = dict_get(both, "ok", false)
+    if both_ok != true {
+        return both
+    }
+
+    let results = dict_get(both, "results", {})
+    let claude_r = dict_get(results, "claude", {})
+    let gpt_r = dict_get(results, "gpt", {})
+    let claude_resp = dict_get(claude_r, "response", "")
+    let gpt_resp = dict_get(gpt_r, "response", "")
+
+    let claude_len = len(str(claude_resp))
+    let gpt_len = len(str(gpt_resp))
+    let total_len = claude_len + gpt_len
+
+    if total_len == 0 {
+        return {"ok": false, "error": "Both responses empty", "source": "cortex"}
+    }
+
+    let claude_weight = round(claude_len / total_len, 2)
+    let gpt_weight = round(gpt_len / total_len, 2)
+    let claude_pct = str(int(claude_weight * 100)) + "%"
+    let gpt_pct = str(int(gpt_weight * 100)) + "%"
+
+    let fused = "[Claude (" + claude_pct + ")] " + str(claude_resp) + "\n\n[GPT (" + gpt_pct + ")] " + str(gpt_resp)
+
+    return {
+        "ok": true,
+        "response": fused,
+        "weights": {"claude": claude_weight, "gpt": gpt_weight},
+        "results": results,
+        "source": "cortex",
+        "ternary_state": T_TRUE
+    }
+}
+
+// ============================================================
+// Helper: proxy a tool call to any NovaX service
+// ============================================================
+fn do_proxy(service, endpoint, data, proxy_timeout) {
+    let base_url = get_service_url(service)
+    if len(base_url) == 0 {
+        return {
+            "ok": false,
+            "error": "Unknown service: " + service + ". Available: tools,ttools,deep,vault,hive,cloud,orch"
+        }
+    }
+
+    // Strip leading slash from endpoint and build URL
+    let ep = endpoint
+    if starts_with(ep, "/") {
+        let ep = slice(ep, 1, len(ep))
+    }
+    let url = base_url + "/" + ep
+
+    // Delegate HTTP call
+    let result = {}
+    if len(keys(data)) > 0 {
+        let result = http_post(url, data)
+    }
+    if len(keys(data)) == 0 {
+        let result = http_get(url)
+    }
+
+    let ok_val = dict_get(result, "ok", false)
+    if ok_val == true {
+        return {"ok": true, "result": result, "service": service, "endpoint": endpoint}
+    }
+
+    // Check if we got a response body even without "ok"
+    let has_error = dict_get(result, "error", "")
+    if len(str(has_error)) > 0 {
+        return {"ok": false, "error": str(has_error), "service": service, "endpoint": endpoint}
+    }
+    return {"ok": true, "result": result, "service": service, "endpoint": endpoint}
+}
+
+// ============================================================
+// Helper: list all NovaX services and their health
+// ============================================================
+fn list_services() {
+    let results = {}
+    let i = 0
+    let n = len(NOVA_SERVICES_KEYS)
+    while3 i < n {
+        let svc_name = dict_get(NOVA_SERVICES_KEYS, i)
+        let svc_url = dict_get(NOVA_SERVICES_URLS, i)
+        try3 {
+            let health = http_get(svc_url + "/health")
+            dict_set(results, svc_name, {"url": svc_url, "online": true, "health": health})
+        } else {
+            dict_set(results, svc_name, {"url": svc_url, "online": false})
+        }
+        let i = i + 1
+    }
+    return results
+}
+
+// ============================================================
+// Helper: arrange windows side-by-side via helper
+// ============================================================
+fn do_arrange() {
+    let result = call_helper("arrange", {
+        "claude_hwnd": _claude_hwnd,
+        "gpt_hwnd": _gpt_hwnd
+    })
+    return result
+}
+
+// ============================================================
+// Helper: enqueue a command for bridge polling
+// ============================================================
+fn enqueue_command(action, target, params) {
+    let _cmd_counter = _cmd_counter + 1
+    let cmd_id = "cmd-" + str(_cmd_counter)
+    let cmd = {
+        "id": cmd_id,
+        "action": action,
+        "target": target,
+        "params": params,
+        "ts": time()
+    }
+    append(_cmd_queue, cmd)
+    return cmd_id
+}
+
+// ============================================================
+// Helper: check if bridge is active (recent cache data)
+// ============================================================
+fn bridge_active() {
+    let now = time()
+    if _live_claude_from_bridge == true {
+        if (now - _live_claude_ts) < H13 {
+            return true
+        }
+    }
+    if _live_gpt_from_bridge == true {
+        if (now - _live_gpt_ts) < H13 {
+            return true
+        }
+    }
+    return false
+}
+
+// ============================================================
+// GET /health
+// ============================================================
+fn handle_health(body) {
+    let claude_hw = get_hwnd("claude")
+    let gpt_hw = get_hwnd("gpt")
+    let any_app = false
+    if claude_hw > 0 {
+        let any_app = true
+    }
+    if gpt_hw > 0 {
+        let any_app = true
+    }
+
+    let self_trit = T_FALSE
+    if3 any_app == true {
+        let self_trit = T_TRUE
+    } else {
+        let self_trit = T_MAYBE
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "self_trit": self_trit,
+        "char": trit_char(self_trit),
+        "uptime": int(time() - _t0),
+        "quality": {
+            "strong": _trits_strong,
+            "partial": _trits_partial,
+            "failed": _trits_failed
+        }
+    }
+}
+
+// ============================================================
+// GET /cortex/status
+// ============================================================
+fn handle_status(body) {
+    return {
+        "service": SERVICE,
+        "port": PORT,
+        "claude": bridge_status("claude"),
+        "gpt": bridge_status("gpt")
+    }
+}
+
+// ============================================================
+// GET /cortex/services
+// ============================================================
+fn handle_services_get(body) {
+    return list_services()
+}
+
+// ============================================================
+// GET /cortex/live/claude
+// ============================================================
+fn handle_live_claude(body) {
+    let hwnd = get_hwnd("claude")
+    if hwnd == 0 {
+        return {
+            "ok": false,
+            "error": "Claude Desktop not found",
+            "elements": [],
+            "messages": []
+        }
+    }
+
+    // Try direct UIA via helper
+    let snapshot = {"elements": [], "total": 0}
+    let messages = []
+    let from_bridge = false
+
+    try3 {
+        let snap_result = call_helper("live_snapshot", {"target": "claude", "hwnd": hwnd})
+        let snap_total = dict_get(snap_result, "total", 0)
+        if snap_total > 0 {
+            let snapshot = snap_result
+            let msg_result = call_helper("get_conversation", {"target": "claude", "hwnd": hwnd})
+            let messages = dict_get(msg_result, "messages", [])
+    } else {
+        // ignore error, fall through to cache
+    }
+
+    // Fall back to bridge cache
+    let snap_total = dict_get(snapshot, "total", 0)
+    if snap_total == 0 {
+        if _live_claude_ts > 0 {
+            let snapshot = _live_claude_snapshot
+            let messages = _live_claude_messages
+            let from_bridge = true
+        }
+    }
+
+    return {
+        "ok": true,
+        "target": "claude",
+        "hwnd": hwnd,
+        "uia": from_bridge != true,
+        "from_bridge": from_bridge,
+        "snapshot": snapshot,
+        "messages": messages,
+        "ts": time()
+    }
+}
+
+// ============================================================
+// GET /cortex/live/gpt
+// ============================================================
+}
+fn handle_live_gpt(body) {
+    let hwnd = get_hwnd("gpt")
+    if hwnd == 0 {
+        return {
+            "ok": false,
+            "error": "ChatGPT Desktop not found",
+            "elements": [],
+            "messages": []
+        }
+    }
+
+    let snapshot = {"elements": [], "total": 0}
+    let messages = []
+    let from_bridge = false
+
+    try3 {
+        let snap_result = call_helper("live_snapshot", {"target": "gpt", "hwnd": hwnd})
+        let snap_total = dict_get(snap_result, "total", 0)
+        if snap_total > 0 {
+            let snapshot = snap_result
+            let msg_result = call_helper("get_conversation", {"target": "gpt", "hwnd": hwnd})
+            let messages = dict_get(msg_result, "messages", [])
+    } else {
+        // ignore
+    }
+
+    let snap_total = dict_get(snapshot, "total", 0)
+    if snap_total == 0 {
+        if _live_gpt_ts > 0 {
+            let snapshot = _live_gpt_snapshot
+            let messages = _live_gpt_messages
+            let from_bridge = true
+        }
+    }
+
+    return {
+        "ok": true,
+        "target": "gpt",
+        "hwnd": hwnd,
+        "uia": from_bridge != true,
+        "from_bridge": from_bridge,
+        "snapshot": snapshot,
+        "messages": messages,
+        "ts": time()
+    }
+}
+
+// ============================================================
+// GET /cortex/uia/status
+// ============================================================
+}
+fn handle_uia_status(body) {
+    let helper_status = call_helper("uia_status", {})
+    let uia_avail = dict_get(helper_status, "uia_available", false)
+    return {
+        "uia_available": uia_avail,
+        "comtypes": dict_get(helper_status, "comtypes", false),
+        "bridge_active": bridge_active(),
+        "claude_hwnd": get_hwnd("claude"),
+        "gpt_hwnd": get_hwnd("gpt")
+    }
+}
+
+// ============================================================
+// GET /cortex/command/pending
+// Bridge polls this to get commands to execute
+// ============================================================
+fn handle_command_pending(body) {
+    // Drain the queue and return all pending commands
+    let cmds = []
+    while3 len(_cmd_queue) > 0 {
+        let cmd = pop(_cmd_queue)
+        append(cmds, cmd)
+    }
+    return cmds
+}
+
+// ============================================================
+// GET /cortex/bridge/status
+// ============================================================
+fn handle_bridge_status(body) {
+    return {
+        "bridge_active": bridge_active(),
+        "cache_claude_ts": _live_claude_ts,
+        "cache_gpt_ts": _live_gpt_ts,
+        "cache_claude_from_bridge": _live_claude_from_bridge,
+        "cache_gpt_from_bridge": _live_gpt_from_bridge,
+        "pending_commands": len(_cmd_queue),
+        "results_cached": len(keys(_cmd_results))
+    }
+}
+
+// ============================================================
+// GET /cortex/app-state/claude
+// ============================================================
+fn handle_app_state_claude(body) {
+    return get_app_state("claude")
+}
+
+// ============================================================
+// GET /cortex/app-state/gpt
+// ============================================================
+fn handle_app_state_gpt(body) {
+    return get_app_state("gpt")
+}
+
+// ============================================================
+// Helper: get structured app state for a target
+// ============================================================
+fn get_app_state(target) {
+    let hwnd = get_hwnd(target)
+
+    // Try direct UIA via helper
+    try3 {
+        let state = call_helper("app_state", {"target": target, "hwnd": hwnd})
+        let total_els = dict_get(state, "total_elements", 0)
+        if total_els > 0 {
+            dict_set(state, "ok", true)
+            dict_set(state, "target", target)
+            dict_set(state, "source", "uia_direct")
+            return state
+    } else {
+        // fall through to cache
+    }
+
+    // Fall back to bridge cache
+    let cache_snap = {}
+    let cache_ts = 0
+    let cache_from = false
+    if3 target == "claude" {
+        let cache_snap = _live_claude_snapshot
+        let cache_ts = _live_claude_ts
+        let cache_from = _live_claude_from_bridge
+    } else {
+        let cache_snap = _live_gpt_snapshot
+        let cache_ts = _live_gpt_ts
+        let cache_from = _live_gpt_from_bridge
+    }
+
+    if cache_from == true {
+        if cache_ts > 0 {
+            let els = dict_get(cache_snap, "elements", [])
+            let state = {
+                "model": "",
+                "current_session": "",
+                "sessions": [],
+                "tabs": [],
+                "buttons": [],
+                "total_elements": len(els),
+                "ok": true,
+                "target": target,
+                "source": "bridge_cache"
+            }
+            // Parse elements for model, sessions, buttons
+            let ei = 0
+            while3 ei < len(els) {
+                let el = dict_get(els, ei)
+                let name = dict_get(el, "name", "")
+                let ct = dict_get(el, "type", 0)
+                let bounds = dict_get(el, "bounds", [0, 0, 0, 0])
+                let depth = dict_get(el, "depth", 0)
+                let el_id = dict_get(el, "id", "")
+
+                if len(name) > 0 {
+                    let nl = lower(trim(name))
+
+                    // Model detection (button type = 50000)
+                    let cur_model = dict_get(state, "model", "")
+                    if len(cur_model) == 0 {
+                        if ct == 50000 {
+                            if contains(nl, "model selector") {
+                                if contains(nl, "current model is ") {
+                                    let parts = split(name, "current model is ")
+                                    let cur_model_name = trim(dict_get(parts, len(parts) - 1))
+                                    dict_set(state, "model", cur_model_name)
+                                }
+                            }
+                        }
+                    }
+
+                    // Tab items (50013)
+                    if ct == 50013 {
+                        let tabs = dict_get(state, "tabs", [])
+                        append(tabs, name)
+                        dict_set(state, "tabs", tabs)
+                    }
+
+                    // Sessions: buttons or hyperlinks with depth >= 11
+                    if ct == 50000 {
+                        if depth >= 11 {
+                            if len(name) > 5 {
+                                let clean = split(name, " Open conversation options")
+                                let clean_name = trim(dict_get(clean, 0))
+                                if len(clean_name) > 3 {
+                                    let sessions = dict_get(state, "sessions", [])
+                                    append(sessions, {"name": clean_name, "id": el_id})
+                                    dict_set(state, "sessions", sessions)
+                                }
+                            }
+                        }
+                    }
+                    if ct == 50005 {
+                        if depth >= 11 {
+                            if len(name) > 5 {
+                                let sessions = dict_get(state, "sessions", [])
+                                append(sessions, {"name": name, "id": el_id})
+                                dict_set(state, "sessions", sessions)
+                            }
+                        }
+                    }
+
+                    // Buttons
+                    if ct == 50000 {
+                        if len(name) > 0 {
+                            let buttons = dict_get(state, "buttons", [])
+                            append(buttons, {"name": name, "id": el_id})
+                            dict_set(state, "buttons", buttons)
+                        }
+                    }
+                }
+
+                let ei = ei + 1
+            }
+            return state
+        }
+    }
+
+    return {
+        "ok": false,
+        "error": "No UIA data available",
+        "model": "",
+        "sessions": [],
+        "buttons": []
+    }
+}
+
+// ============================================================
+// POST /cortex/claude
+// ============================================================
+}
+fn handle_claude(body) {
+    let prompt = dict_get(body, "prompt", "")
+    if len(prompt) == 0 {
+        return {"error": "prompt required"}
+    }
+    let timeout = int(dict_get(body, "timeout", 90))
+    let result = query_bridge("claude", prompt, timeout)
+    let trit = cortex_trit(result)
+    record_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// ============================================================
+// POST /cortex/gpt
+// ============================================================
+fn handle_gpt(body) {
+    let prompt = dict_get(body, "prompt", "")
+    if len(prompt) == 0 {
+        return {"error": "prompt required"}
+    }
+    let timeout = int(dict_get(body, "timeout", 90))
+    let result = query_bridge("gpt", prompt, timeout)
+    let trit = cortex_trit(result)
+    record_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// ============================================================
+// POST /cortex/both
+// ============================================================
+fn handle_both(body) {
+    let prompt = dict_get(body, "prompt", "")
+    if len(prompt) == 0 {
+        return {"error": "prompt required"}
+    }
+    let timeout = int(dict_get(body, "timeout", 90))
+    let result = query_both(prompt, timeout)
+    let trit = cortex_trit(result)
+    record_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// ============================================================
+// POST /cortex/chain
+// ============================================================
+fn handle_chain(body) {
+    let prompt = dict_get(body, "prompt", "")
+    if len(prompt) == 0 {
+        return {"error": "prompt required"}
+    }
+    let rounds = int(dict_get(body, "rounds", 1))
+    let timeout = int(dict_get(body, "timeout", 90))
+    let result = do_chain(prompt, rounds, timeout)
+    let trit = cortex_trit(result)
+    record_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// ============================================================
+// POST /cortex/fuse
+// ============================================================
+fn handle_fuse(body) {
+    let prompt = dict_get(body, "prompt", "")
+    if len(prompt) == 0 {
+        return {"error": "prompt required"}
+    }
+    let timeout = int(dict_get(body, "timeout", 90))
+    let result = do_fuse(prompt, timeout)
+    let trit = cortex_trit(result)
+    record_trit(trit)
+    dict_set(result, "trit", trit)
+    dict_set(result, "char", trit_char(trit))
+    return result
+}
+
+// ============================================================
+// POST /cortex/arrange
+// ============================================================
+fn handle_arrange(body) {
+    return do_arrange()
+}
+
+// ============================================================
+// POST /cortex/uia/tree -- diagnostic dump of UIA element tree
+// ============================================================
+fn handle_uia_tree(body) {
+    let target = dict_get(body, "target", "claude")
+    let depth = int(dict_get(body, "depth", H5))
+    let hwnd = get_hwnd(target)
+    if hwnd == 0 {
+        return {"error": target + " window not found"}
+    }
+    let result = call_helper("uia_tree", {"target": target, "hwnd": hwnd, "depth": depth})
+    return result
+}
+
+// ============================================================
+// POST /cortex/proxy
+// ============================================================
+fn handle_proxy(body) {
+    let service = dict_get(body, "service", "")
+    let endpoint = dict_get(body, "endpoint", "")
+    let data = dict_get(body, "data", {})
+    let t = int(dict_get(body, "timeout", 60))
+    if len(service) == 0 {
+        return {"error": "service and endpoint required"}
+    }
+    if len(endpoint) == 0 {
+        return {"error": "service and endpoint required"}
+    }
+    return do_proxy(service, endpoint, data, t)
+}
+
+// ============================================================
+// POST /cortex/action
+// ============================================================
+fn handle_action(body) {
+    let target = dict_get(body, "target", "claude")
+    let action = dict_get(body, "action", "")
+    let params = dict_get(body, "params", {})
+
+    // Route through bridge if active
+    if bridge_active() == true {
+        let bridge_action = action
+        if action == "new-chat" {
+            let bridge_action = "new_chat"
+        }
+        if action == "select-session" {
+            let bridge_action = "select_session"
+        }
+        let cmd_id = enqueue_command(bridge_action, target, params)
+
+        // Simple poll for result (no threading)
+        let deadline = time() + H7 * H3
+        let result = {}
+        while3 time() < deadline {
+            if dict_has(_cmd_results, cmd_id) {
+                let result = dict_get(_cmd_results, cmd_id, {})
+                dict_del(_cmd_results, cmd_id)
+                return result
+            }
+            // Small busy wait -- nova_run("python -c \"import time;time.sleep(0.3)\"")
+            let _w = nova_run("python -c \"import time;time.sleep(0.3)\"")
+        }
+        return {"ok": false, "error": "Bridge timeout"}
+    }
+
+    // Direct UIA fallback via helper
+    let hwnd = get_hwnd(target)
+    if hwnd == 0 {
+        return {"ok": false, "error": target + " window not found"}
+    }
+
+    if action == "new-chat" {
+        let result = call_helper("click_element", {"hwnd": hwnd, "name": "New"})
+        dict_set(result, "action", "new-chat")
+        return result
+    }
+    if action == "select-session" {
+        let sess_name = dict_get(params, "name", "")
+        let result = call_helper("click_element", {"hwnd": hwnd, "name": sess_name})
+        dict_set(result, "action", "select-session")
+        dict_set(result, "name", sess_name)
+        return result
+    }
+    if action == "click" {
+        let click_name = dict_get(params, "name", "")
+        let result = call_helper("click_element", {"hwnd": hwnd, "name": click_name})
+        dict_set(result, "action", "click")
+        dict_set(result, "name", click_name)
+        return result
+    }
+
+    return {"ok": false, "error": "Unknown action: " + action}
+}
+
+// ============================================================
+// POST /cortex/live/update -- accept snapshot from bridge
+// ============================================================
+fn handle_live_update(body) {
+    let target = dict_get(body, "target", "claude")
+    let snapshot = dict_get(body, "snapshot", {"elements": [], "total": 0})
+    let messages = dict_get(body, "messages", [])
+
+    if3 target == "claude" {
+        let _live_claude_snapshot = snapshot
+        let _live_claude_messages = messages
+        let _live_claude_ts = time()
+        let _live_claude_from_bridge = true
+    } else target == "gpt" {
+        let _live_gpt_snapshot = snapshot
+        let _live_gpt_messages = messages
+        let _live_gpt_ts = time()
+        let _live_gpt_from_bridge = true
+    } else {
+        return {"ok": false, "error": "Unknown target: " + target}
+    }
+
+    return {
+        "ok": true,
+        "target": target,
+        "cached": true,
+        "elements": dict_get(snapshot, "total", 0),
+        "messages": len(messages)
+    }
+}
+
+// ============================================================
+// POST /cortex/hint -- accept externally-discovered HWNDs
+// ============================================================
+fn handle_hint(body) {
+    let results = {}
+    let c_hwnd = dict_get(body, "claude_hwnd", 0)
+    let g_hwnd = dict_get(body, "gpt_hwnd", 0)
+
+    if int(c_hwnd) > 0 {
+        let _claude_hwnd = int(c_hwnd)
+        dict_set(results, "claude", {"ok": true, "hwnd": _claude_hwnd})
+    }
+    if int(g_hwnd) > 0 {
+        let _gpt_hwnd = int(g_hwnd)
+        dict_set(results, "gpt", {"ok": true, "hwnd": _gpt_hwnd})
+    }
+
+    return {"ok": true, "hints": results}
+}
+
+// ============================================================
+// POST /cortex/command -- enqueue command for bridge
+// ============================================================
+fn handle_command(body) {
+    let action = dict_get(body, "action", "")
+    let target = dict_get(body, "target", "claude")
+    if len(action) == 0 {
+        return {"ok": false, "error": "No action specified"}
+    }
+
+    // Build params from body excluding action/target
+    let params = {}
+    let body_keys = keys(body)
+    let ki = 0
+    while3 ki < len(body_keys) {
+        let k = dict_get(body_keys, ki)
+        if k != "action" {
+            if k != "target" {
+                if k != "wait" {
+                    if k != "timeout" {
+                        dict_set(params, k, dict_get(body, k, ""))
+                    }
+                }
+            }
+        }
+        let ki = ki + 1
+    }
+
+    let cmd_id = enqueue_command(action, target, params)
+
+    // Optionally wait for result
+    let wait = dict_get(body, "wait", false)
+    if wait == true {
+        let wait_timeout = int(dict_get(body, "timeout", H13))
+        let deadline = time() + wait_timeout
+        while3 time() < deadline {
+            if dict_has(_cmd_results, cmd_id) {
+                let result = dict_get(_cmd_results, cmd_id, {})
+                dict_del(_cmd_results, cmd_id)
+                return {"ok": true, "cmd_id": cmd_id, "result": result}
+            }
+            let _w = nova_run("python -c \"import time;time.sleep(0.3)\"")
+        }
+        return {"ok": true, "cmd_id": cmd_id, "result": null, "timeout": true}
+    }
+
+    return {"ok": true, "cmd_id": cmd_id, "queued": true}
+}
+
+// ============================================================
+// POST /cortex/command/result -- bridge posts execution results
+// ============================================================
+fn handle_command_result(body) {
+    let cmd_id = dict_get(body, "cmd_id", "")
+    let result = dict_get(body, "result", {})
+    if len(cmd_id) > 0 {
+        dict_set(_cmd_results, cmd_id, result)
+        return {"ok": true, "cmd_id": cmd_id, "stored": true}
+    }
+    return {"ok": false, "error": "No cmd_id"}
+}
+
+// ============================================================
+// POST /cortex/bridge/interact -- type + submit via bridge
+// ============================================================
+fn handle_bridge_interact(body) {
+    let target = dict_get(body, "target", "claude")
+    let text = dict_get(body, "text", "")
+    if len(text) == 0 {
+        let text = dict_get(body, "prompt", "")
+    }
+    if len(text) == 0 {
+        return {"ok": false, "error": "No text/prompt"}
+    }
+
+    let type_id = enqueue_command("type", target, {"text": text})
+    let submit_id = enqueue_command("submit", target, {})
+    return {
+        "ok": true,
+        "type_cmd": type_id,
+        "submit_cmd": submit_id,
+        "mode": "bridge"
+    }
+}
+
+// ============================================================
+// POST /cortex/hivemind/task -- autonomous interaction
+// ============================================================
+fn handle_hivemind_task(body) {
+    let target = dict_get(body, "target", "gpt")
+    let prompt = dict_get(body, "prompt", "")
+    if len(prompt) == 0 {
+        let prompt = dict_get(body, "text", "")
+    }
+    let task_type = dict_get(body, "task_type", "query")
+    let new_chat = dict_get(body, "new_chat", true)
+    let wait_time = int(dict_get(body, "wait_time", 30))
+
+    if len(prompt) == 0 {
+        return {"ok": false, "error": "No prompt provided"}
+    }
+
+    // Check target is available
+    let hwnd = get_hwnd(target)
+    if hwnd == 0 {
+        return {"ok": false, "error": target + " not available (no hwnd)"}
+    }
+
+    // Get baseline message count
+    let baseline_count = 0
+    if3 target == "claude" {
+        let baseline_count = len(_live_claude_messages)
+    } else {
+        let baseline_count = len(_live_gpt_messages)
+    }
+
+    let steps = []
+
+    // Step 1: Create new chat if requested
+    if new_chat == true {
+        let cmd_id = enqueue_command("new_chat", target, {})
+        // Wait for result
+        let deadline = time() + H7 * H3
+        let step_result = {}
+        while3 time() < deadline {
+            if dict_has(_cmd_results, cmd_id) {
+                let step_result = dict_get(_cmd_results, cmd_id, {})
+                dict_del(_cmd_results, cmd_id)
+            }
+            let _w = nova_run("python -c \"import time;time.sleep(0.3)\"")
+        }
+        append(steps, {"step": "new_chat", "result": step_result})
+        // Wait for chat to open
+        let _w = nova_run("python -c \"import time;time.sleep(1.5)\"")
+    }
+
+    // Step 2: Type the prompt
+    let type_id = enqueue_command("type", target, {"text": prompt})
+    let type_deadline = time() + H7 * H3
+    let type_result = {}
+    while3 time() < type_deadline {
+        if dict_has(_cmd_results, type_id) {
+            let type_result = dict_get(_cmd_results, type_id, {})
+            dict_del(_cmd_results, type_id)
+        }
+        let _w = nova_run("python -c \"import time;time.sleep(0.3)\"")
+    }
+    append(steps, {"step": "type", "result": type_result})
+    let _w = nova_run("python -c \"import time;time.sleep(0.5)\"")
+
+    // Step 3: Submit (press Enter)
+    let submit_id = enqueue_command("submit", target, {})
+    let sub_deadline = time() + H7 * H3
+    let submit_result = {}
+    while3 time() < sub_deadline {
+        if dict_has(_cmd_results, submit_id) {
+            let submit_result = dict_get(_cmd_results, submit_id, {})
+            dict_del(_cmd_results, submit_id)
+        }
+        let _w = nova_run("python -c \"import time;time.sleep(0.3)\"")
+    }
+    append(steps, {"step": "submit", "result": submit_result})
+
+    // Step 4: Wait for response (poll cache for new messages)
+    let response_deadline = time() + wait_time
+    let response_text = ""
+    let response_msg_count = 0
+    let settled_count = 0
+    let last_count = 0
+    let task_start = time()
+
+    while3 time() < response_deadline {
+        // Poll every H3=3 seconds
+        let _w = nova_run("python -c \"import time;time.sleep(3)\"")
+        let current_count = 0
+        if3 target == "claude" {
+            let current_count = len(_live_claude_messages)
+        } else {
+            let current_count = len(_live_gpt_messages)
+        }
+
+        if current_count > baseline_count {
+            if current_count == last_count {
+                let settled_count = settled_count + 1
+                if settled_count >= 2 {
+                    // Response is complete -- extract new messages
+                    let all_msgs = []
+                    if3 target == "claude" {
+                        let all_msgs = _live_claude_messages
+                    } else {
+                        let all_msgs = _live_gpt_messages
+                    }
+                    let new_msgs = slice(all_msgs, baseline_count, current_count)
+                    let resp_parts = []
+                    let mi = 0
+                    while3 mi < len(new_msgs) {
+                        let m = dict_get(new_msgs, mi)
+                        let mt = dict_get(m, "text", "")
+                        if len(mt) > 0 {
+                            append(resp_parts, mt)
+                        }
+                        let mi = mi + 1
+                    }
+                    let response_text = join(resp_parts, "\n")
+                    let response_msg_count = len(new_msgs)
+            } else {
+                let settled_count = 0
+            }
+            let last_count = current_count
+        }
+    }
+
+    // Build result
+    let task_ok = len(response_text) > 0
+    let task_result = {
+        "ok": task_ok,
+        "target": target,
+        "task_type": task_type,
+        "prompt": prompt,
+        "response": response_text,
+        "response_messages": response_msg_count,
+        "steps": steps,
+        "wait_time_used": round(time() - task_start, 1)
+    }
+
+    // Update stats
+    if3 task_ok == true {
+        if target == "claude" {
+            let _claude_queries = _claude_queries + 1
+        }
+        if target == "gpt" {
+            let _gpt_queries = _gpt_queries + 1
+        }
+        let _trits_strong = _trits_strong + 1
+        let _total_queries = _total_queries + 1
+    } else {
+        let _trits_failed = _trits_failed + 1
+        let _total_queries = _total_queries + 1
+        dict_set(task_result, "error", "No response captured within timeout")
+    }
+
+    return task_result
+}
+
+// ============================================================
+// POST /cortex/hivemind/status
+// ============================================================
+}
+fn handle_hivemind_status(body) {
+    return {
+        "ok": true,
+        "targets": {
+            "claude": {
+                "available": get_hwnd("claude") > 0,
+                "hwnd": get_hwnd("claude")
+            },
+            "gpt": {
+                "available": get_hwnd("gpt") > 0,
+                "hwnd": get_hwnd("gpt")
+            }
+        },
+        "bridge_active": bridge_active(),
+        "capabilities": ["query", "script", "image", "file"],
+        "commands": [
+            "new_chat", "type", "submit", "click",
+            "select_model", "select_session", "copy_response",
+            "read_chat", "app_state", "focus"
+        ]
+    }
+}
+
+// ============================================================
+// POST /cortex/hivemind/open_sidebar
+// ============================================================
+fn handle_hivemind_open_sidebar(body) {
+    let target = dict_get(body, "target", "gpt")
+    let cmd_id = enqueue_command("click", target, {"name": "Open sidebar"})
+
+    let deadline = time() + H7 * H3
+    let result = {}
+    while3 time() < deadline {
+        if dict_has(_cmd_results, cmd_id) {
+            let result = dict_get(_cmd_results, cmd_id, {})
+            dict_del(_cmd_results, cmd_id)
+            return {"ok": true, "result": result}
+        }
+        let _w = nova_run("python -c \"import time;time.sleep(0.3)\"")
+    }
+
+    // Fallback: try Close sidebar (toggle)
+    let cmd_id2 = enqueue_command("click", target, {"name": "Close sidebar"})
+    let deadline2 = time() + H7 * H3
+    let result2 = {}
+    while3 time() < deadline2 {
+        if dict_has(_cmd_results, cmd_id2) {
+            let result2 = dict_get(_cmd_results, cmd_id2, {})
+            dict_del(_cmd_results, cmd_id2)
+            return {"ok": true, "result": result2}
+        }
+        let _w = nova_run("python -c \"import time;time.sleep(0.3)\"")
+    }
+
+    return {"ok": true, "result": {}}
+}
+
+// ============================================================
+// POST /cortex/services (also available as GET)
+// ============================================================
+fn handle_services_post(body) {
+    return list_services()
+}
+
+// ============================================================
+// Route registration
+// ============================================================
+// GET routes
+troute(server, "GET",  "/health",                      "handle_health")
+troute(server, "GET",  "/cortex/status",                "handle_status")
+troute(server, "GET",  "/cortex/services",              "handle_services_get")
+troute(server, "GET",  "/cortex/live/claude",            "handle_live_claude")
+troute(server, "GET",  "/cortex/live/gpt",               "handle_live_gpt")
+troute(server, "GET",  "/cortex/uia/status",             "handle_uia_status")
+troute(server, "GET",  "/cortex/command/pending",        "handle_command_pending")
+troute(server, "GET",  "/cortex/bridge/status",          "handle_bridge_status")
+troute(server, "GET",  "/cortex/app-state/claude",       "handle_app_state_claude")
+troute(server, "GET",  "/cortex/app-state/gpt",          "handle_app_state_gpt")
+
+// POST routes
+troute(server, "POST", "/cortex/claude",                 "handle_claude")
+troute(server, "POST", "/cortex/gpt",                    "handle_gpt")
+troute(server, "POST", "/cortex/both",                   "handle_both")
+troute(server, "POST", "/cortex/chain",                  "handle_chain")
+troute(server, "POST", "/cortex/fuse",                   "handle_fuse")
+troute(server, "POST", "/cortex/arrange",                "handle_arrange")
+troute(server, "POST", "/cortex/uia/tree",               "handle_uia_tree")
+troute(server, "POST", "/cortex/proxy",                  "handle_proxy")
+troute(server, "POST", "/cortex/action",                 "handle_action")
+troute(server, "POST", "/cortex/live/update",            "handle_live_update")
+troute(server, "POST", "/cortex/hint",                   "handle_hint")
+troute(server, "POST", "/cortex/command",                "handle_command")
+troute(server, "POST", "/cortex/command/result",         "handle_command_result")
+troute(server, "POST", "/cortex/bridge/interact",        "handle_bridge_interact")
+troute(server, "POST", "/cortex/hivemind/task",          "handle_hivemind_task")
+troute(server, "POST", "/cortex/hivemind/status",        "handle_hivemind_status")
+troute(server, "POST", "/cortex/hivemind/open_sidebar",  "handle_hivemind_open_sidebar")
+troute(server, "POST", "/cortex/services",               "handle_services_post")
+
+// ============================================================
+// Attempt initial HWND discovery
+// ============================================================
+try3 {
+    discover_hwnd("claude")
+} else {
+    // Claude Desktop not running -- will discover on demand
+}
+
+try3 {
+    discover_hwnd("gpt")
+} else {
+    // ChatGPT Desktop not running -- will discover on demand
+}
+
+// ============================================================
+// Startup Banner
+// ============================================================
+print("[CORTEX] Nova Cortex v" + VERSION + " - Unified Desktop AI Bridge")
+print("[CORTEX] Runtime: NovaLang | Ternary: TRUE | ASCII-clean")
+print("[CORTEX] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[CORTEX] Block=" + str(BLOCK) + " | Re=" + str(RE_LAMINAR) + "/" + str(RE_TRANSITION) + "/" + str(RE_TURBULENT))
+print("[CORTEX] Port " + str(PORT) + " - Claude + GPT -> Ternary Hivemind")
+print("[CORTEX] Claude Desktop: " + str(_claude_hwnd > 0))
+print("[CORTEX] ChatGPT Desktop: " + str(_gpt_hwnd > 0))
+print("[CORTEX] Helper: " + HELPER)
+print("[CORTEX] Routes: GET /health /cortex/status /cortex/services /cortex/live/* /cortex/uia/*")
+print("[CORTEX] Routes: POST /cortex/claude /cortex/gpt /cortex/both /cortex/chain /cortex/fuse")
+print("[CORTEX] Routes: POST /cortex/arrange /cortex/proxy /cortex/action /cortex/hint")
+print("[CORTEX] Routes: POST /cortex/command /cortex/bridge/interact /cortex/hivemind/*")
+print("[CORTEX] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

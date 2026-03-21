@@ -1,0 +1,768 @@
+// nova_tlock_service.nova -- NovaX Ternary Distributed Lock Service
+// Port 9981 | NovaLang pure port of nova_tlock.py
+//
+// Lock States (ternary):
+//   +1 (TRUE)  = acquired -- lock granted to requester
+//    0 (MAYBE) = waiting  -- lock contested, caller queued
+//   -1 (FALSE) = denied   -- max locks, invalid input, expired
+//
+// 3-5-7-13 Harmonic Design:
+//   H3=3   -- expiry sweep interval (lazy, per-request)
+//   H5=5   -- default TTL multiplier
+//   H7=7   -- max waiters per lock, composition unit
+//   H13=13 -- lock ID length, carrier frame
+//   MAX_LOCKS     = H13 * H7  = 91
+//   DEFAULT_TTL   = H13 * H5  = 65 seconds
+//   MAX_TTL       = H13 * H7 * H3 = 273 seconds
+
+let PORT = 9981
+let VERSION = "1.0"
+let SERVICE = "nova-tlock"
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let MAX_LOCKS = 91          // H13 * H7
+let DEFAULT_TTL = 65        // H13 * H5 seconds
+let MAX_TTL = 273           // H13 * H7 * H3 seconds
+let EXPIRY_INTERVAL = 3     // H3 seconds between expiry sweeps (lazy)
+
+// -- Core State --
+// _locks: dict  name -> {owner, lock_id, acquired_at, ttl, expires_at}
+// _waiters: dict  name -> list of {owner, ttl, queued_at, waiter_id}
+let _locks = {}
+let _waiters = {}
+
+// -- Lifetime Counters --
+let _acquired = 0
+let _released = 0
+let _expired = 0
+let _force_released = 0
+let _denied = 0
+let _queued = 0
+let _promoted = 0
+let _deadlocks_detected = 0
+
+// -- Last expiry sweep timestamp (lazy expiry) --
+let _last_expiry = 0
+
+// -- Startup banner --
+let server = tserve(PORT, "TLock v1.0 - NovaX Ternary Distributed Lock")
+print("[TLock] NovaX Ternary Distributed Lock starting on port " + str(PORT))
+print("[TLock] max_locks=" + str(MAX_LOCKS) + " default_ttl=" + str(DEFAULT_TTL) + "s max_ttl=" + str(MAX_TTL) + "s")
+print("[TLock] H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+
+
+// -- Lazy Expiry Sweep --
+// Called at the start of every handler. Runs only if EXPIRY_INTERVAL seconds
+// have passed since the last sweep. Removes expired locks and promotes waiters.
+fn maybe_expire() {
+    let now = time()
+    let elapsed = now - _last_expiry
+    if elapsed < EXPIRY_INTERVAL {
+        return 0
+    }
+    let _last_expiry = now
+
+    // Collect expired names
+    let expired_names = []
+    let lk_names = keys(_locks)
+    let i = 0
+    while3 i < len(lk_names) {
+        let nm = lk_names[i]
+        let info = dict_get(_locks, nm)
+        let exp_at = dict_get(info, "expires_at")
+        if now >= exp_at {
+            append(expired_names, nm)
+        }
+        let i = i + 1
+    }
+
+    // Expire each collected lock
+    let j = 0
+    while3 j < len(expired_names) {
+        let nm = expired_names[j]
+        if dict_has(_locks, nm) {
+            let info = dict_get(_locks, nm)
+            let old_owner = dict_get(info, "owner")
+            dict_del(_locks, nm)
+            let _expired = _expired + 1
+            promote_waiter(nm)
+            print("[TLock] expired '" + nm + "' owner=" + str(old_owner))
+        }
+        let j = j + 1
+    }
+
+    return len(expired_names)
+}
+
+
+// -- Promote Next Waiter --
+// Pops the first waiter for a lock name and grants them the lock.
+// Returns promoted owner string or "" if no waiters.
+fn promote_waiter(name) {
+    if dict_has(_waiters, name) == FALSE {
+        return ""
+    }
+    let waitq = dict_get(_waiters, name)
+    if len(waitq) == 0 {
+        dict_del(_waiters, name)
+        return ""
+    }
+
+    // Pop front (index 0)
+    let waiter = waitq[0]
+    let rest = slice(waitq, 1, len(waitq))
+    if len(rest) == 0 {
+        dict_del(_waiters, name)
+    }
+    if len(rest) > 0 {
+        dict_set(_waiters, name, rest)
+    }
+
+    let now = time()
+    let w_owner = dict_get(waiter, "owner")
+    let w_ttl = dict_get(waiter, "ttl")
+    let w_queued = dict_get(waiter, "queued_at")
+    let new_id = uuid_hex()
+    let lock_id = slice(new_id, 0, H13)
+    let new_lock = {
+        "owner": w_owner,
+        "lock_id": lock_id,
+        "acquired_at": now,
+        "ttl": w_ttl,
+        "expires_at": now + w_ttl
+    }
+    dict_set(_locks, name, new_lock)
+    let _promoted = _promoted + 1
+    let _acquired = _acquired + 1
+
+    let waited = round(now - w_queued, 2)
+    print("[TLock] promoted '" + w_owner + "' -> lock '" + name + "' (waited " + str(waited) + "s)")
+    return w_owner
+}
+
+
+// -- Lock Info Dict --
+// Builds a serializable dict for a held lock entry.
+fn lock_info_dict(name, info) {
+    let now = time()
+    let acq = dict_get(info, "acquired_at")
+    let exp = dict_get(info, "expires_at")
+    let age = round(now - acq, 2)
+    let rem = round(max(0, exp - now), 2)
+    return {
+        "name": name,
+        "owner": dict_get(info, "owner"),
+        "lock_id": dict_get(info, "lock_id"),
+        "acquired_at": acq,
+        "ttl": dict_get(info, "ttl"),
+        "expires_at": exp,
+        "age_seconds": age,
+        "remaining_seconds": rem
+    }
+}
+
+
+// -- Waiter Info Dict --
+fn waiter_info_dict(name, w) {
+    let now = time()
+    let q_at = dict_get(w, "queued_at")
+    let wait_sec = round(now - q_at, 2)
+    return {
+        "name": name,
+        "owner": dict_get(w, "owner"),
+        "waiter_id": dict_get(w, "waiter_id"),
+        "requested_ttl": dict_get(w, "ttl"),
+        "queued_at": q_at,
+        "wait_seconds": wait_sec
+    }
+}
+
+
+// -- Deadlock Detection --
+// Builds wait-for adjacency (waiter_owner -> holder_owner per lock).
+// Runs single-path DFS for each node; detects if following edges reaches
+// the start node (cycle = deadlock). Returns list of cycle strings.
+fn detect_deadlocks() {
+    // Build flat edge list: [{from, to, lock}]
+    let edges = []
+    let wk = keys(_waiters)
+    let i = 0
+    while3 i < len(wk) {
+        let nm = wk[i]
+        if dict_has(_locks, nm) {
+            let holder_info = dict_get(_locks, nm)
+            let holder_owner = dict_get(holder_info, "owner")
+            let waitq = dict_get(_waiters, nm)
+            let j = 0
+            while3 j < len(waitq) {
+                let w = waitq[j]
+                let w_owner = dict_get(w, "owner")
+                if w_owner != holder_owner {
+                    append(edges, {"from": w_owner, "to": holder_owner, "lock": nm})
+                }
+                let j = j + 1
+            }
+        }
+        let i = i + 1
+    }
+
+    // For each unique "from" node, follow chain of edges up to H7 hops.
+    // If we return to the start node, it is a cycle.
+    let cycles = []
+    let all_froms = []
+    let ei = 0
+    while3 ei < len(edges) {
+        let e = edges[ei]
+        let ef = dict_get(e, "from")
+        // Collect unique froms
+        let found_from = FALSE
+        let fi = 0
+        while3 fi < len(all_froms) {
+            if all_froms[fi] == ef {
+                let found_from = TRUE
+            }
+            let fi = fi + 1
+        }
+        if found_from == FALSE {
+            append(all_froms, ef)
+        }
+        let ei = ei + 1
+    }
+
+    let si = 0
+    while3 si < len(all_froms) {
+        let start = all_froms[si]
+        // Follow edge chain from start
+        let path = [start]
+        let current = start
+        let hops = 0
+        let cycle_found = FALSE
+        while3 hops < H7 {
+            // Find edge from current
+            let next = ""
+            let lock_nm = ""
+            let k = 0
+            while3 k < len(edges) {
+                let e = edges[k]
+                if dict_get(e, "from") == current {
+                    if next == "" {
+                        let next = dict_get(e, "to")
+                        let lock_nm = dict_get(e, "lock")
+                    }
+                }
+                let k = k + 1
+            }
+            if next == "" {
+                // Dead end -- no cycle from start
+                let hops = H7
+            }
+            if next != "" {
+                if next == start {
+                    // Cycle detected
+                    append(path, next)
+                    let cycle_found = TRUE
+                    let hops = H7
+                }
+                if next != start {
+                    append(path, next)
+                    let current = next
+                    let hops = hops + 1
+                }
+            }
+        }
+        if cycle_found == TRUE {
+            // Build cycle string for reporting
+            let cycle_str = ""
+            let pi = 0
+            while3 pi < len(path) {
+                if pi > 0 {
+                    let cycle_str = cycle_str + " -> "
+                }
+                let cycle_str = cycle_str + path[pi]
+                let pi = pi + 1
+            }
+            append(cycles, cycle_str)
+        }
+        let si = si + 1
+    }
+
+    return cycles
+}
+
+
+// -- POST /tlock/acquire --
+fn handle_acquire(body) {
+    maybe_expire()
+
+    let name = dict_get(body, "name")
+    let owner = dict_get(body, "owner")
+    let ttl = DEFAULT_TTL
+    if dict_has(body, "ttl") {
+        let ttl = int(dict_get(body, "ttl"))
+    }
+
+    if name == "" {
+        let _denied = _denied + 1
+        return {"ok": false, "trit": -1, "error": "name required"}
+    }
+    if owner == "" {
+        let _denied = _denied + 1
+        return {"ok": false, "trit": -1, "error": "owner required"}
+    }
+
+    // Clamp TTL to [1, MAX_TTL]
+    let ttl = max(1, min(MAX_TTL, ttl))
+    let now = time()
+
+    // Re-entrant acquire: same owner renews the lock
+    if dict_has(_locks, name) {
+        let existing = dict_get(_locks, name)
+        let ex_owner = dict_get(existing, "owner")
+        if ex_owner == owner {
+            dict_set(existing, "ttl", ttl)
+            dict_set(existing, "expires_at", now + ttl)
+            dict_set(_locks, name, existing)
+            let lid = dict_get(existing, "lock_id")
+            return {
+                "ok": true,
+                "trit": 1,
+                "lock_id": lid,
+                "name": name,
+                "owner": owner,
+                "ttl": ttl,
+                "msg": "lock renewed (re-entrant acquire)"
+            }
+        }
+
+        // Lock held by someone else -- queue this owner as waiter
+        if dict_has(_waiters, name) == FALSE {
+            dict_set(_waiters, name, [])
+        }
+        let waitq = dict_get(_waiters, name)
+
+        // Already queued?
+        let already = FALSE
+        let ci = 0
+        while3 ci < len(waitq) {
+            let w = waitq[ci]
+            if dict_get(w, "owner") == owner {
+                let already = TRUE
+            }
+            let ci = ci + 1
+        }
+        if already == TRUE {
+            return {
+                "ok": true,
+                "trit": 0,
+                "name": name,
+                "owner": owner,
+                "held_by": ex_owner,
+                "msg": "already queued, waiting"
+            }
+        }
+
+        // Queue full?
+        if len(waitq) >= H7 {
+            let _denied = _denied + 1
+            return {
+                "ok": false,
+                "trit": -1,
+                "error": "wait queue full (" + str(H7) + " waiters) for lock '" + name + "'"
+            }
+        }
+
+        // Enqueue
+        let new_wid = uuid_hex()
+        let waiter_id = slice(new_wid, 0, H13)
+        let waiter = {
+            "owner": owner,
+            "ttl": ttl,
+            "queued_at": now,
+            "waiter_id": waiter_id
+        }
+        append(waitq, waiter)
+        dict_set(_waiters, name, waitq)
+        let _queued = _queued + 1
+        let pos = len(waitq)
+
+        return {
+            "ok": true,
+            "trit": 0,
+            "waiter_id": waiter_id,
+            "name": name,
+            "owner": owner,
+            "held_by": ex_owner,
+            "position": pos,
+            "msg": "lock held by another owner, queued"
+        }
+    }
+
+    // Lock is free -- check capacity
+    let lock_count = len(keys(_locks))
+    if lock_count >= MAX_LOCKS {
+        let _denied = _denied + 1
+        return {
+            "ok": false,
+            "trit": -1,
+            "error": "max locks (" + str(MAX_LOCKS) + ") reached"
+        }
+    }
+
+    // Grant the lock
+    let new_id = uuid_hex()
+    let lock_id = slice(new_id, 0, H13)
+    let new_lock = {
+        "owner": owner,
+        "lock_id": lock_id,
+        "acquired_at": now,
+        "ttl": ttl,
+        "expires_at": now + ttl
+    }
+    dict_set(_locks, name, new_lock)
+    let _acquired = _acquired + 1
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "lock_id": lock_id,
+        "name": name,
+        "owner": owner,
+        "ttl": ttl
+    }
+}
+
+
+// -- POST /tlock/release --
+fn handle_release(body) {
+    maybe_expire()
+
+    let name = dict_get(body, "name")
+    let owner = dict_get(body, "owner")
+
+    if name == "" {
+        return {"ok": false, "trit": -1, "error": "name required"}
+    }
+    if owner == "" {
+        return {"ok": false, "trit": -1, "error": "owner required"}
+    }
+
+    if dict_has(_locks, name) == FALSE {
+        return {"ok": false, "trit": -1, "error": "lock '" + name + "' not held"}
+    }
+
+    let existing = dict_get(_locks, name)
+    let ex_owner = dict_get(existing, "owner")
+    if ex_owner != owner {
+        return {
+            "ok": false,
+            "trit": -1,
+            "error": "lock '" + name + "' held by '" + ex_owner + "', not '" + owner + "'"
+        }
+    }
+
+    // Release
+    dict_del(_locks, name)
+    let _released = _released + 1
+
+    // Promote next waiter
+    let promoted_owner = promote_waiter(name)
+
+    let result = {"ok": true, "trit": 1, "name": name, "owner": owner, "msg": "lock released"}
+    if promoted_owner != "" {
+        dict_set(result, "promoted", promoted_owner)
+    }
+    return result
+}
+
+
+// -- POST /tlock/renew --
+fn handle_renew(body) {
+    maybe_expire()
+
+    let name = dict_get(body, "name")
+    let owner = dict_get(body, "owner")
+    let ttl = DEFAULT_TTL
+    if dict_has(body, "ttl") {
+        let ttl = int(dict_get(body, "ttl"))
+    }
+
+    if name == "" {
+        return {"ok": false, "trit": -1, "error": "name required"}
+    }
+    if owner == "" {
+        return {"ok": false, "trit": -1, "error": "owner required"}
+    }
+
+    let ttl = max(1, min(MAX_TTL, ttl))
+    let now = time()
+
+    if dict_has(_locks, name) == FALSE {
+        return {"ok": false, "trit": -1, "error": "lock '" + name + "' not held"}
+    }
+
+    let existing = dict_get(_locks, name)
+    let ex_owner = dict_get(existing, "owner")
+    if ex_owner != owner {
+        return {
+            "ok": false,
+            "trit": -1,
+            "error": "lock '" + name + "' held by '" + ex_owner + "', not '" + owner + "'"
+        }
+    }
+
+    dict_set(existing, "ttl", ttl)
+    dict_set(existing, "expires_at", now + ttl)
+    dict_set(_locks, name, existing)
+    let new_exp = now + ttl
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "name": name,
+        "owner": owner,
+        "ttl": ttl,
+        "expires_at": new_exp,
+        "msg": "TTL renewed"
+    }
+}
+
+
+// -- POST /tlock/force_release --
+fn handle_force_release(body) {
+    maybe_expire()
+
+    let name = dict_get(body, "name")
+
+    if name == "" {
+        return {"ok": false, "trit": -1, "error": "name required"}
+    }
+
+    if dict_has(_locks, name) == FALSE {
+        return {"ok": false, "trit": -1, "error": "lock '" + name + "' not held"}
+    }
+
+    let existing = dict_get(_locks, name)
+    let old_owner = dict_get(existing, "owner")
+    let old_lock_id = dict_get(existing, "lock_id")
+    let acq_at = dict_get(existing, "acquired_at")
+    let age = round(time() - acq_at, 2)
+
+    dict_del(_locks, name)
+    let _force_released = _force_released + 1
+
+    let promoted_owner = promote_waiter(name)
+
+    let result = {
+        "ok": true,
+        "trit": 1,
+        "name": name,
+        "force_released_from": old_owner,
+        "old_lock_id": old_lock_id,
+        "age_seconds": age,
+        "msg": "lock force-released (admin)"
+    }
+    if promoted_owner != "" {
+        dict_set(result, "promoted", promoted_owner)
+    }
+    return result
+}
+
+
+// -- GET /tlock/status --
+fn handle_status() {
+    maybe_expire()
+
+    let lk_names = keys(_locks)
+    let locks_list = []
+    let i = 0
+    while3 i < len(lk_names) {
+        let nm = lk_names[i]
+        let info = dict_get(_locks, nm)
+        let entry = lock_info_dict(nm, info)
+        append(locks_list, entry)
+        let i = i + 1
+    }
+
+    let cycles = detect_deadlocks()
+    if len(cycles) > 0 {
+        let _deadlocks_detected = _deadlocks_detected + len(cycles)
+    }
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "active_locks": len(locks_list),
+        "max_locks": MAX_LOCKS,
+        "locks": locks_list,
+        "deadlocks": cycles,
+        "lifetime": {
+            "acquired": _acquired,
+            "released": _released,
+            "expired": _expired,
+            "force_released": _force_released,
+            "denied": _denied,
+            "queued": _queued,
+            "promoted": _promoted,
+            "deadlocks_detected": _deadlocks_detected
+        }
+    }
+}
+
+
+// -- GET /tlock/waiters --
+fn handle_waiters() {
+    maybe_expire()
+
+    let wk = keys(_waiters)
+    let waiters_list = []
+    let i = 0
+    while3 i < len(wk) {
+        let nm = wk[i]
+        let waitq = dict_get(_waiters, nm)
+        let j = 0
+        while3 j < len(waitq) {
+            let w = waitq[j]
+            let entry = waiter_info_dict(nm, w)
+            append(waiters_list, entry)
+            let j = j + 1
+        }
+        let i = i + 1
+    }
+
+    return {
+        "ok": true,
+        "trit": 1,
+        "total_waiters": len(waiters_list),
+        "waiters": waiters_list
+    }
+}
+
+
+// -- GET /tlock/deadlocks --
+fn handle_deadlocks() {
+    maybe_expire()
+
+    let cycles = detect_deadlocks()
+    if len(cycles) > 0 {
+        let _deadlocks_detected = _deadlocks_detected + len(cycles)
+    }
+
+    // Build wait-for graph for reporting
+    let graph = {}
+    let wk = keys(_waiters)
+    let i = 0
+    while3 i < len(wk) {
+        let nm = wk[i]
+        if dict_has(_locks, nm) {
+            let holder_info = dict_get(_locks, nm)
+            let holder_owner = dict_get(holder_info, "owner")
+            let waitq = dict_get(_waiters, nm)
+            let j = 0
+            while3 j < len(waitq) {
+                let w = waitq[j]
+                let w_owner = dict_get(w, "owner")
+                if w_owner != holder_owner {
+                    if dict_has(graph, w_owner) == FALSE {
+                        dict_set(graph, w_owner, [])
+                    }
+                    let g_list = dict_get(graph, w_owner)
+                    append(g_list, {"waits_for": holder_owner, "lock_name": nm})
+                    dict_set(graph, w_owner, g_list)
+                }
+                let j = j + 1
+            }
+        }
+        let i = i + 1
+    }
+
+    let has_deadlock = len(cycles) > 0
+    let trit_val = 1
+    if has_deadlock {
+        let trit_val = -1
+    }
+    let msg = "no deadlocks detected"
+    if has_deadlock {
+        let msg = str(len(cycles)) + " deadlock cycle(s) detected"
+    }
+
+    return {
+        "ok": true,
+        "trit": trit_val,
+        "deadlock_detected": has_deadlock,
+        "cycles": cycles,
+        "wait_for_graph": graph,
+        "msg": msg
+    }
+}
+
+
+// -- GET /health --
+fn handle_health() {
+    let lk_count = len(keys(_locks))
+    let wk = keys(_waiters)
+    let total_waiters = 0
+    let i = 0
+    while3 i < len(wk) {
+        let nm = wk[i]
+        let wq = dict_get(_waiters, nm)
+        let total_waiters = total_waiters + len(wq)
+        let i = i + 1
+    }
+
+    let cycles = detect_deadlocks()
+    let svc_trit = 1
+    if len(cycles) > 0 {
+        let svc_trit = 0
+    }
+
+    return {
+        "ok": true,
+        "service": SERVICE,
+        "port": PORT,
+        "version": VERSION,
+        "ternary": true,
+        "trit": svc_trit,
+        "runtime": "novalang",
+        "active_locks": lk_count,
+        "max_locks": MAX_LOCKS,
+        "total_waiters": total_waiters,
+        "deadlock_cycles": len(cycles),
+        "default_ttl_seconds": DEFAULT_TTL,
+        "max_ttl_seconds": MAX_TTL,
+        "expiry_check_interval": EXPIRY_INTERVAL,
+        "max_waiters_per_lock": H7,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "lifetime": {
+            "acquired": _acquired,
+            "released": _released,
+            "expired": _expired,
+            "force_released": _force_released,
+            "denied": _denied,
+            "queued": _queued,
+            "promoted": _promoted,
+            "deadlocks_detected": _deadlocks_detected
+        }
+    }
+}
+
+
+// -- Register Routes --
+troute(server, "GET",  "/health",              "handle_health")
+troute(server, "GET",  "/tlock/status",        "handle_status")
+troute(server, "GET",  "/tlock/waiters",       "handle_waiters")
+troute(server, "GET",  "/tlock/deadlocks",     "handle_deadlocks")
+troute(server, "POST", "/tlock/acquire",       "handle_acquire")
+troute(server, "POST", "/tlock/release",       "handle_release")
+troute(server, "POST", "/tlock/renew",         "handle_renew")
+troute(server, "POST", "/tlock/force_release", "handle_force_release")
+
+print("[TLock] Routes registered: /health /tlock/status /tlock/waiters /tlock/deadlocks")
+print("[TLock] Routes registered: /tlock/acquire /tlock/release /tlock/renew /tlock/force_release")
+print("[TLock] Lazy expiry: sweeps every " + str(EXPIRY_INTERVAL) + "s on handler entry")
+print("[TLock] Ternary states: +1=acquired 0=waiting/contested -1=denied/expired")
+
+tstart(server)

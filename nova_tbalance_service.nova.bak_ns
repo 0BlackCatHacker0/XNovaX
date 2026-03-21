@@ -1,0 +1,1601 @@
+// nova_tbalance_service.nova
+// NovaX TBalance -- Ternary Load Balancer
+// Port 9984
+//
+// Distributes requests across service instances and model pools.
+// Weighted round-robin, least-connections, and Reynolds-aware routing.
+// Prevents any single target from being overwhelmed.
+//
+// Strategies:
+//   weighted   -- round-robin with per-target weights
+//   least_conn -- route to target with fewest active connections
+//   reynolds   -- route to target with lowest Reynolds number (prefer laminar)
+//
+// Endpoints:
+//   GET  /health               -- standard tlight health
+//   GET  /tbalance/health      -- alias with extended pool stats
+//   POST /tbalance/route       -- pick best target from a pool
+//   POST /tbalance/pool/create -- create a new pool with targets
+//   POST /tbalance/pool/update -- update targets in an existing pool
+//   GET  /tbalance/pool/get    -- pool status (pass pool name in body)
+//   GET  /tbalance/pools       -- list all pools
+//   POST /tbalance/report      -- feedback (latency, success) for adaptive routing
+//   GET  /tbalance/stats       -- total routed, per-pool stats, hot targets
+//
+// 3-5-7-13 Harmonic Constants:
+//   H3=3 ternary base, H5=5 TZip pack, H7=7 composition, H13=13 carrier frame
+//   MAX_POOLS        = H13 * H3 = 39
+//   MAX_TARGETS      = H13 * H7 = 91
+//   CIRCUIT_FAILURES = H3       =  3 consecutive failures -> open breaker
+//   CIRCUIT_COOLDOWN = H13      = 13 seconds before retry
+
+// ============================================================================
+// Server bootstrap
+// ============================================================================
+let PORT = 9984
+let server = tserve(PORT, "nova-tbalance")
+
+// ============================================================================
+// Constants
+// ============================================================================
+let VERSION = "1.0.0"
+let SERVICE_NAME = "nova-tbalance"
+
+// Harmonic constants
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK = 2187
+
+// Derived limits
+let MAX_POOLS = 39
+let MAX_TARGETS_PER_POOL = 91
+let CIRCUIT_FAILURES = 3
+let CIRCUIT_COOLDOWN = 13
+let MAX_BODY = 6561
+let STATS_WINDOW = 3600
+
+// Reynolds regime boundaries (3^3=27, 5^3=125, 7^3=343)
+let RE_LAM = 27
+let RE_TRN = 125
+let RE_TUR = 343
+
+// Ternary truth values
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// Valid strategy names
+let STRATEGY_WEIGHTED = "weighted"
+let STRATEGY_LEAST_CONN = "least_conn"
+let STRATEGY_REYNOLDS = "reynolds"
+
+// ============================================================================
+// Global state
+// ============================================================================
+
+// _pools is a dict: pool_name -> pool_dict encoded as json string
+// We store pools as a flat dict-of-dicts pattern using json_encode/decode
+// Each pool entry key: pool name, value: json-encoded pool object
+let _pools = {}
+
+// Global counters stored as a dict
+let _global_stats = {}
+let _global_stats = dict_set(_global_stats, "total_routed", 0)
+let _global_stats = dict_set(_global_stats, "total_reports", 0)
+let _global_stats = dict_set(_global_stats, "total_circuit_opens", 0)
+
+// ============================================================================
+// Helper: clamp integer between lo and hi
+// ============================================================================
+fn clamp_int(val, lo, hi) {
+    let v = int(val)
+    let result = v
+    if3 (v < lo) {
+        let result = lo
+    } (v > hi) {
+        let result = hi
+    } () {
+        let result = v
+    }
+    result
+}
+
+// ============================================================================
+// Helper: compute Reynolds number for a target
+// A target dict has key "ops_times" storing a json-encoded list of timestamps
+// We count how many timestamps are within the last 60 seconds
+// ============================================================================
+fn target_reynolds(target) {
+    let now = time()
+    let ops_json = dict_get(target, "ops_times")
+    let ops = json_decode(ops_json)
+    let count = 0
+    let idx = 0
+    let n = len(ops)
+    while3 (idx < n) {
+        let t = dict_get(ops, idx)
+        let age = now - t
+        if3 (age < 60) {
+            let count = count + 1
+        } () {
+            let count = count
+        } () {
+            let count = count
+        }
+        let idx = idx + 1
+    }
+    count
+}
+
+// ============================================================================
+// Helper: determine flow regime string from Reynolds number
+// ============================================================================
+fn flow_regime(re) {
+    let regime = "turbulent"
+    if3 (re < RE_LAM) {
+        let regime = "laminar"
+    } (re < RE_TRN) {
+        let regime = "transitional"
+    } () {
+        let regime = "turbulent"
+    }
+    regime
+}
+
+// ============================================================================
+// Helper: check if a target is available
+// circuit_open=0 means closed, circuit_open=1 means open
+// cooldown expires after CIRCUIT_COOLDOWN seconds -> allow probe
+// ============================================================================
+fn is_target_available(target) {
+    let circuit_open = dict_get(target, "circuit_open")
+    let available = T_FALSE
+    if3 (circuit_open == 0) {
+        let available = T_TRUE
+    } () {
+        let opened_at = dict_get(target, "circuit_opened_at")
+        let elapsed = time() - opened_at
+        if3 (elapsed >= CIRCUIT_COOLDOWN) {
+            let available = T_TRUE
+        } () {
+            let available = T_FALSE
+        } () {
+            let available = T_FALSE
+        }
+    } () {
+        let available = T_FALSE
+    }
+    available
+}
+
+// ============================================================================
+// Helper: build a fresh target dict
+// weight clamped to 1..100
+// ops_times is a json-encoded empty list
+// ============================================================================
+fn new_target(url, weight) {
+    let w = clamp_int(weight, 1, 100)
+    let t = {}
+    let t = dict_set(t, "url", url)
+    let t = dict_set(t, "weight", w)
+    let t = dict_set(t, "active_connections", 0)
+    let t = dict_set(t, "total_requests", 0)
+    let t = dict_set(t, "total_successes", 0)
+    let t = dict_set(t, "total_failures", 0)
+    let t = dict_set(t, "consecutive_failures", 0)
+    let t = dict_set(t, "avg_latency_ms", 0.0)
+    let t = dict_set(t, "latency_sum", 0.0)
+    let t = dict_set(t, "latency_count", 0)
+    let t = dict_set(t, "circuit_open", 0)
+    let t = dict_set(t, "circuit_opened_at", 0.0)
+    let t = dict_set(t, "ops_times", json_encode([]))
+    let t = dict_set(t, "created_at", time())
+    t
+}
+
+// ============================================================================
+// Helper: build a fresh pool dict
+// targets_json is a json-encoded list of target dicts
+// ============================================================================
+fn new_pool(name, targets_json, strategy) {
+    let p = {}
+    let p = dict_set(p, "name", name)
+    let p = dict_set(p, "strategy", strategy)
+    let p = dict_set(p, "targets", targets_json)
+    let p = dict_set(p, "rr_counter", 0)
+    let p = dict_set(p, "total_routed", 0)
+    let p = dict_set(p, "created_at", time())
+    let p = dict_set(p, "updated_at", time())
+    p
+}
+
+// ============================================================================
+// Helper: open circuit breaker on a target dict, return modified target
+// Also increments global circuit opens counter
+// ============================================================================
+fn open_circuit(target) {
+    let t = dict_set(target, "circuit_open", 1)
+    let t = dict_set(t, "circuit_opened_at", time())
+    let opens = dict_get(_global_stats, "total_circuit_opens")
+    let _global_stats = dict_set(_global_stats, "total_circuit_opens", opens + 1)
+    t
+}
+
+// ============================================================================
+// Helper: close circuit breaker on a target dict, return modified target
+// ============================================================================
+fn close_circuit(target) {
+    let t = dict_set(target, "circuit_open", 0)
+    let t = dict_set(t, "consecutive_failures", 0)
+    t
+}
+
+// ============================================================================
+// Strategy: weighted round-robin
+// Returns selected target dict or an error marker dict
+// Uses pool rr_counter mod total_weight to pick target
+// ============================================================================
+fn select_weighted(pool) {
+    let targets_json = dict_get(pool, "targets")
+    let targets = json_decode(targets_json)
+    let n = len(targets)
+
+    // Collect available targets and compute total weight
+    let available = []
+    let total_weight = 0
+    let idx = 0
+    while3 (idx < n) {
+        let tgt = dict_get(targets, idx)
+        let avail = is_target_available(tgt)
+        if3 (avail == T_TRUE) {
+            let available = append(available, tgt)
+            let w = dict_get(tgt, "weight")
+            let total_weight = total_weight + w
+        } () {
+            let total_weight = total_weight
+        } () {
+            let total_weight = total_weight
+        }
+        let idx = idx + 1
+    }
+
+    let na = len(available)
+    // No available targets
+    if3 (na == 0) {
+        let none_marker = {}
+        let none_marker = dict_set(none_marker, "_none", 1)
+        none_marker
+    } () {
+        // All weights zero: return first
+        if3 (total_weight == 0) {
+            dict_get(available, 0)
+        } () {
+            let rr = dict_get(pool, "rr_counter")
+            let counter = rr - (total_weight * int(rr / total_weight))
+            let selected = dict_get(available, 0)
+            let cumulative = 0
+            let aidx = 0
+            let found = 0
+            while3 (aidx < na) {
+                if3 (found == 0) {
+                    let tgt2 = dict_get(available, aidx)
+                    let w2 = dict_get(tgt2, "weight")
+                    let cumulative = cumulative + w2
+                    if3 (counter < cumulative) {
+                        let selected = tgt2
+                        let found = 1
+                    } () {
+                        let found = found
+                    } () {
+                        let found = found
+                    }
+                } () {
+                    let found = found
+                } () {
+                    let found = found
+                }
+                let aidx = aidx + 1
+            }
+            selected
+        } () {
+            dict_get(available, 0)
+        }
+    } () {
+        let none_marker = {}
+        let none_marker = dict_set(none_marker, "_none", 1)
+        none_marker
+    }
+}
+
+// ============================================================================
+// Strategy: least connections
+// Returns target with fewest active_connections; tie-break by avg_latency_ms
+// ============================================================================
+fn select_least_conn(pool) {
+    let targets_json = dict_get(pool, "targets")
+    let targets = json_decode(targets_json)
+    let n = len(targets)
+    let best = {}
+    let best = dict_set(best, "_none", 1)
+    let best_conns = 999999
+    let best_latency = 999999.0
+    let idx = 0
+    while3 (idx < n) {
+        let tgt = dict_get(targets, idx)
+        let avail = is_target_available(tgt)
+        if3 (avail == T_TRUE) {
+            let conns = dict_get(tgt, "active_connections")
+            let lat = dict_get(tgt, "avg_latency_ms")
+            if3 (conns < best_conns) {
+                let best = tgt
+                let best_conns = conns
+                let best_latency = lat
+            } (conns == best_conns) {
+                if3 (lat < best_latency) {
+                    let best = tgt
+                    let best_latency = lat
+                } () {
+                    let best = best
+                } () {
+                    let best = best
+                }
+            } () {
+                let best = best
+            }
+        } () {
+            let best = best
+        } () {
+            let best = best
+        }
+        let idx = idx + 1
+    }
+    best
+}
+
+// ============================================================================
+// Strategy: Reynolds-aware routing
+// Prefer target with lowest Reynolds number (laminar flow)
+// Tie-break: fewest active connections, then lowest latency
+// ============================================================================
+fn select_reynolds(pool) {
+    let targets_json = dict_get(pool, "targets")
+    let targets = json_decode(targets_json)
+    let n = len(targets)
+    let best = {}
+    let best = dict_set(best, "_none", 1)
+    let best_re = 999999
+    let best_conns = 999999
+    let best_latency = 999999.0
+    let idx = 0
+    while3 (idx < n) {
+        let tgt = dict_get(targets, idx)
+        let avail = is_target_available(tgt)
+        if3 (avail == T_TRUE) {
+            let re = target_reynolds(tgt)
+            let conns = dict_get(tgt, "active_connections")
+            let lat = dict_get(tgt, "avg_latency_ms")
+            if3 (re < best_re) {
+                let best = tgt
+                let best_re = re
+                let best_conns = conns
+                let best_latency = lat
+            } (re == best_re) {
+                if3 (conns < best_conns) {
+                    let best = tgt
+                    let best_conns = conns
+                    let best_latency = lat
+                } (conns == best_conns) {
+                    if3 (lat < best_latency) {
+                        let best = tgt
+                        let best_latency = lat
+                    } () {
+                        let best = best
+                    } () {
+                        let best = best
+                    }
+                } () {
+                    let best = best
+                }
+            } () {
+                let best = best
+            }
+        } () {
+            let best = best
+        } () {
+            let best = best
+        }
+        let idx = idx + 1
+    }
+    best
+}
+
+// ============================================================================
+// Helper: apply strategy to pool, return best target dict
+// ============================================================================
+fn apply_strategy(pool) {
+    let strategy = dict_get(pool, "strategy")
+    let result = {}
+    let result = dict_set(result, "_none", 1)
+    if3 (strategy == STRATEGY_WEIGHTED) {
+        let result = select_weighted(pool)
+    } (strategy == STRATEGY_LEAST_CONN) {
+        let result = select_least_conn(pool)
+    } (strategy == STRATEGY_REYNOLDS) {
+        let result = select_reynolds(pool)
+    } () {
+        // Default to weighted for unknown strategy
+        let result = select_weighted(pool)
+    }
+    result
+}
+
+// ============================================================================
+// Helper: is_valid_strategy
+// ============================================================================
+fn is_valid_strategy(s) {
+    let valid = 0
+    if3 (s == STRATEGY_WEIGHTED) {
+        let valid = 1
+    } (s == STRATEGY_LEAST_CONN) {
+        let valid = 1
+    } (s == STRATEGY_REYNOLDS) {
+        let valid = 1
+    } () {
+        let valid = 0
+    }
+    valid
+}
+
+// ============================================================================
+// Helper: count available targets in a targets list (json-decoded)
+// ============================================================================
+fn count_available(targets) {
+    let n = len(targets)
+    let count = 0
+    let idx = 0
+    while3 (idx < n) {
+        let tgt = dict_get(targets, idx)
+        let avail = is_target_available(tgt)
+        if3 (avail == T_TRUE) {
+            let count = count + 1
+        } () {
+            let count = count
+        } () {
+            let count = count
+        }
+        let idx = idx + 1
+    }
+    count
+}
+
+// ============================================================================
+// Helper: find target index in list by url
+// Returns -1 if not found
+// ============================================================================
+fn find_target_idx(targets, url) {
+    let n = len(targets)
+    let found_idx = -1
+    let idx = 0
+    while3 (idx < n) {
+        let tgt = dict_get(targets, idx)
+        let turl = dict_get(tgt, "url")
+        if3 (turl == url) {
+            let found_idx = idx
+        } () {
+            let found_idx = found_idx
+        } () {
+            let found_idx = found_idx
+        }
+        let idx = idx + 1
+    }
+    found_idx
+}
+
+// ============================================================================
+// Helper: update a single target inside a targets list at a given index
+// Returns updated json-encoded targets list
+// ============================================================================
+fn update_target_at(targets_json, idx, new_target) {
+    let targets = json_decode(targets_json)
+    let n = len(targets)
+    let new_list = []
+    let i = 0
+    while3 (i < n) {
+        if3 (i == idx) {
+            let new_list = append(new_list, new_target)
+        } () {
+            let existing = dict_get(targets, i)
+            let new_list = append(new_list, existing)
+        } () {
+            let existing = dict_get(targets, i)
+            let new_list = append(new_list, existing)
+        }
+        let i = i + 1
+    }
+    json_encode(new_list)
+}
+
+// ============================================================================
+// Helper: append ops_time to a target's ops_times list (bounded by STATS_WINDOW)
+// We keep only the most recent STATS_WINDOW entries (1 hour = 3600 entries max)
+// Returns updated target dict
+// ============================================================================
+fn target_append_op(target, ts) {
+    let ops_json = dict_get(target, "ops_times")
+    let ops = json_decode(ops_json)
+    let ops = append(ops, ts)
+    let n = len(ops)
+    // Trim if over STATS_WINDOW
+    if3 (n > STATS_WINDOW) {
+        let ops = slice(ops, n - STATS_WINDOW, n)
+    } () {
+        let ops = ops
+    } () {
+        let ops = ops
+    }
+    dict_set(target, "ops_times", json_encode(ops))
+}
+
+// ============================================================================
+// Route handler: GET /health  (simple health)
+// ============================================================================
+fn handle_health_simple(req) {
+    let resp = {}
+    let resp = dict_set(resp, "ok", 1)
+    let resp = dict_set(resp, "trit", T_TRUE)
+    let resp = dict_set(resp, "service", SERVICE_NAME)
+    let resp = dict_set(resp, "port", PORT)
+    let resp = dict_set(resp, "version", VERSION)
+    return resp
+}
+
+// ============================================================================
+// Route handler: GET /tbalance/health
+// ============================================================================
+fn handle_tbalance_health(req) {
+    let pool_names = keys(_pools)
+    let pool_count = len(pool_names)
+
+    // Count all targets across all pools
+    let total_targets = 0
+    let pidx = 0
+    while3 (pidx < pool_count) {
+        let pname = dict_get(pool_names, pidx)
+        let pool = dict_get(_pools, pname)
+        let targets_json = dict_get(pool, "targets")
+        let targets = json_decode(targets_json)
+        let total_targets = total_targets + len(targets)
+        let pidx = pidx + 1
+    }
+
+    let total_routed = dict_get(_global_stats, "total_routed")
+    let total_opens = dict_get(_global_stats, "total_circuit_opens")
+
+    let resp = {}
+    let resp = dict_set(resp, "ok", 1)
+    let resp = dict_set(resp, "trit", T_TRUE)
+    let resp = dict_set(resp, "service", SERVICE_NAME)
+    let resp = dict_set(resp, "port", PORT)
+    let resp = dict_set(resp, "version", VERSION)
+    let resp = dict_set(resp, "ternary", 1)
+    let resp = dict_set(resp, "pools", pool_count)
+    let resp = dict_set(resp, "targets", total_targets)
+    let resp = dict_set(resp, "total_routed", total_routed)
+    let resp = dict_set(resp, "circuit_opens", total_opens)
+    let resp = dict_set(resp, "max_pools", MAX_POOLS)
+    let resp = dict_set(resp, "max_targets_per_pool", MAX_TARGETS_PER_POOL)
+    let resp = dict_set(resp, "harmonics_h3", H3)
+    let resp = dict_set(resp, "harmonics_h5", H5)
+    let resp = dict_set(resp, "harmonics_h7", H7)
+    let resp = dict_set(resp, "harmonics_h13", H13)
+    return resp
+}
+
+// ============================================================================
+// Route handler: POST /tbalance/route
+// Body: {"pool": "name", "request": {...}}
+// ============================================================================
+fn handle_route(req) {
+    let body = dict_get(req, "body")
+    let pool_name = dict_get(body, "pool")
+    let pn = str(pool_name)
+
+    // Validate pool name
+    if3 (len(pn) == 0) {
+        let resp = {}
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pool name required")
+        resp
+    } () {
+        if3 (dict_has(_pools, pn) == 0) {
+            let resp = {}
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", "pool not found")
+            let resp = dict_set(resp, "pool", pn)
+            resp
+        } () {
+            let pool = dict_get(_pools, pn)
+            let strategy = dict_get(pool, "strategy")
+
+            // Increment rr_counter before selection for weighted strategy
+            let rr = dict_get(pool, "rr_counter")
+            let pool = dict_set(pool, "rr_counter", rr + 1)
+
+            let target = apply_strategy(pool)
+            let is_none = dict_get(target, "_none")
+
+            if3 (is_none == 1) {
+                let tcount_json = dict_get(pool, "targets")
+                let tcount_list = json_decode(tcount_json)
+                let tcount = len(tcount_list)
+                let resp = {}
+                let resp = dict_set(resp, "ok", 0)
+                let resp = dict_set(resp, "trit", T_FALSE)
+                let resp = dict_set(resp, "error", "no available targets (all circuits open)")
+                let resp = dict_set(resp, "pool", pn)
+                let resp = dict_set(resp, "strategy", strategy)
+                let resp = dict_set(resp, "target_count", tcount)
+                resp
+            } () {
+                // Update target state: increment active_connections, total_requests, ops_times
+                let conns = dict_get(target, "active_connections")
+                let treqs = dict_get(target, "total_requests")
+                let target = dict_set(target, "active_connections", conns + 1)
+                let target = dict_set(target, "total_requests", treqs + 1)
+                let target = target_append_op(target, time())
+
+                // Update pool targets list with modified target
+                let targets_json = dict_get(pool, "targets")
+                let targets = json_decode(targets_json)
+                let turl = dict_get(target, "url")
+                let tidx = find_target_idx(targets, turl)
+                let new_targets_json = update_target_at(targets_json, tidx, target)
+                let pool = dict_set(pool, "targets", new_targets_json)
+
+                // Increment pool and global routed counters
+                let prouted = dict_get(pool, "total_routed")
+                let pool = dict_set(pool, "total_routed", prouted + 1)
+                let grouted = dict_get(_global_stats, "total_routed")
+                let _global_stats = dict_set(_global_stats, "total_routed", grouted + 1)
+
+                // Persist updated pool
+                let _pools = dict_set(_pools, pn, pool)
+
+                // Compute Reynolds and regime for response
+                let re = target_reynolds(target)
+                let regime = flow_regime(re)
+
+                // Determine if this is a probe call (circuit was open)
+                let circuit_open = dict_get(target, "circuit_open")
+                let trit_val = T_TRUE
+                if3 (circuit_open == 1) {
+                    let trit_val = T_MAYBE
+                } () {
+                    let trit_val = T_TRUE
+                } () {
+                    let trit_val = T_TRUE
+                }
+
+                let tweight = dict_get(target, "weight")
+                let tconns = dict_get(target, "active_connections")
+                let pool_tr = dict_get(pool, "total_routed")
+
+                let resp = {}
+                let resp = dict_set(resp, "ok", 1)
+                let resp = dict_set(resp, "trit", trit_val)
+                let resp = dict_set(resp, "pool", pn)
+                let resp = dict_set(resp, "strategy", strategy)
+                let resp = dict_set(resp, "target_url", turl)
+                let resp = dict_set(resp, "target_weight", tweight)
+                let resp = dict_set(resp, "active_connections", tconns)
+                let resp = dict_set(resp, "reynolds", re)
+                let resp = dict_set(resp, "flow_regime", regime)
+                let resp = dict_set(resp, "is_probe", circuit_open)
+                let resp = dict_set(resp, "pool_total_routed", pool_tr)
+                resp
+            } () {
+                let resp = {}
+                let resp = dict_set(resp, "ok", 0)
+                let resp = dict_set(resp, "trit", T_FALSE)
+                let resp = dict_set(resp, "error", "strategy selection failed")
+                resp
+            }
+        } () {
+            let resp = {}
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", "internal error checking pool")
+            resp
+        }
+    } () {
+        let resp = {}
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pool name required")
+        return resp
+    }
+}
+
+// ============================================================================
+// Route handler: POST /tbalance/pool/create
+// Body: {"name": "...", "targets": [...], "strategy": "..."}
+// ============================================================================
+fn handle_pool_create(req) {
+    let body = dict_get(req, "body")
+    let name = str(dict_get(body, "name"))
+    let strategy = lower(str(dict_get(body, "strategy")))
+    let raw_targets = dict_get(body, "targets")
+
+    // Validate name
+    if3 (len(name) == 0) {
+        let resp = {}
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pool name required")
+        resp
+    } () {
+        // Validate strategy
+        if3 (is_valid_strategy(strategy) == 0) {
+            let resp = {}
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", "invalid strategy")
+            let resp = dict_set(resp, "valid_strategies", "weighted,least_conn,reynolds")
+            resp
+        } () {
+            // Validate targets list present
+            let rt_len = len(raw_targets)
+            if3 (rt_len == 0) {
+                let resp = {}
+                let resp = dict_set(resp, "ok", 0)
+                let resp = dict_set(resp, "trit", T_FALSE)
+                let resp = dict_set(resp, "error", "targets list required (non-empty)")
+                resp
+            } () {
+                // Validate max targets
+                if3 (rt_len > MAX_TARGETS_PER_POOL) {
+                    let resp = {}
+                    let resp = dict_set(resp, "ok", 0)
+                    let resp = dict_set(resp, "trit", T_FALSE)
+                    let resp = dict_set(resp, "error", "too many targets")
+                    let resp = dict_set(resp, "max", MAX_TARGETS_PER_POOL)
+                    resp
+                } () {
+                    // Check pool limit for new pools
+                    let already_exists = dict_has(_pools, name)
+                    let pool_count = len(keys(_pools))
+                    if3 (already_exists == 0) {
+                        if3 (pool_count >= MAX_POOLS) {
+                            let resp = {}
+                            let resp = dict_set(resp, "ok", 0)
+                            let resp = dict_set(resp, "trit", T_FALSE)
+                            let resp = dict_set(resp, "error", "max pools reached")
+                            let resp = dict_set(resp, "max", MAX_POOLS)
+                            resp
+                        } () {
+                            // Build targets list
+                            let targets = []
+                            let idx = 0
+                            while3 (idx < rt_len) {
+                                let rt = dict_get(raw_targets, idx)
+                                let url = str(dict_get(rt, "url"))
+                                let weight = int(dict_get(rt, "weight"))
+                                if3 (len(url) > 0) {
+                                    let nt = new_target(url, weight)
+                                    let targets = append(targets, nt)
+                                } () {
+                                    let targets = targets
+                                } () {
+                                    let targets = targets
+                                }
+                                let idx = idx + 1
+                            }
+                            let final_count = len(targets)
+                            if3 (final_count == 0) {
+                                let resp = {}
+                                let resp = dict_set(resp, "ok", 0)
+                                let resp = dict_set(resp, "trit", T_FALSE)
+                                let resp = dict_set(resp, "error", "no valid targets provided")
+                                resp
+                            } () {
+                                let pool = new_pool(name, json_encode(targets), strategy)
+                                let _pools = dict_set(_pools, name, pool)
+                                let resp = {}
+                                let resp = dict_set(resp, "ok", 1)
+                                let resp = dict_set(resp, "trit", T_TRUE)
+                                let resp = dict_set(resp, "action", "created")
+                                let resp = dict_set(resp, "pool", name)
+                                let resp = dict_set(resp, "strategy", strategy)
+                                let resp = dict_set(resp, "target_count", final_count)
+                                resp
+                            } () {
+                                let resp = {}
+                                let resp = dict_set(resp, "ok", 0)
+                                let resp = dict_set(resp, "trit", T_FALSE)
+                                let resp = dict_set(resp, "error", "no valid targets provided")
+                                resp
+                            }
+                        } () {
+                            let resp = {}
+                            let resp = dict_set(resp, "ok", 0)
+                            let resp = dict_set(resp, "trit", T_FALSE)
+                            let resp = dict_set(resp, "error", "max pools reached")
+                            resp
+                        }
+                    } () {
+                        // Pool already exists: update it
+                        let targets = []
+                        let idx = 0
+                        while3 (idx < rt_len) {
+                            let rt = dict_get(raw_targets, idx)
+                            let url = str(dict_get(rt, "url"))
+                            let weight = int(dict_get(rt, "weight"))
+                            if3 (len(url) > 0) {
+                                let nt = new_target(url, weight)
+                                let targets = append(targets, nt)
+                            } () {
+                                let targets = targets
+                            } () {
+                                let targets = targets
+                            }
+                            let idx = idx + 1
+                        }
+                        let final_count = len(targets)
+                        if3 (final_count == 0) {
+                            let resp = {}
+                            let resp = dict_set(resp, "ok", 0)
+                            let resp = dict_set(resp, "trit", T_FALSE)
+                            let resp = dict_set(resp, "error", "no valid targets provided")
+                            resp
+                        } () {
+                            let pool = new_pool(name, json_encode(targets), strategy)
+                            let _pools = dict_set(_pools, name, pool)
+                            let resp = {}
+                            let resp = dict_set(resp, "ok", 1)
+                            let resp = dict_set(resp, "trit", T_TRUE)
+                            let resp = dict_set(resp, "action", "updated")
+                            let resp = dict_set(resp, "pool", name)
+                            let resp = dict_set(resp, "strategy", strategy)
+                            let resp = dict_set(resp, "target_count", final_count)
+                            resp
+                        } () {
+                            let resp = {}
+                            let resp = dict_set(resp, "ok", 0)
+                            let resp = dict_set(resp, "trit", T_FALSE)
+                            let resp = dict_set(resp, "error", "no valid targets provided")
+                            resp
+                        }
+                    } () {
+                        let resp = {}
+                        let resp = dict_set(resp, "ok", 0)
+                        let resp = dict_set(resp, "trit", T_FALSE)
+                        let resp = dict_set(resp, "error", "pool existence check failed")
+                        resp
+                    }
+                } () {
+                    let resp = {}
+                    let resp = dict_set(resp, "ok", 0)
+                    let resp = dict_set(resp, "trit", T_FALSE)
+                    let resp = dict_set(resp, "error", "too many targets")
+                    resp
+                }
+            } () {
+                let resp = {}
+                let resp = dict_set(resp, "ok", 0)
+                let resp = dict_set(resp, "trit", T_FALSE)
+                let resp = dict_set(resp, "error", "targets list required (non-empty)")
+                resp
+            }
+        } () {
+            let resp = {}
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", "invalid strategy")
+            resp
+        }
+    } () {
+        let resp = {}
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pool name required")
+        return resp
+    }
+}
+
+// ============================================================================
+// Route handler: POST /tbalance/pool/update
+// Body: {"name": "...", "targets": [...], "strategy": "..."} (targets/strategy optional)
+// ============================================================================
+fn handle_pool_update(req) {
+    let body = dict_get(req, "body")
+    let name = str(dict_get(body, "name"))
+
+    if3 (len(name) == 0) {
+        let resp = {}
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pool name required")
+        resp
+    } () {
+        if3 (dict_has(_pools, name) == 0) {
+            let resp = {}
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", "pool not found")
+            resp
+        } () {
+            let pool = dict_get(_pools, name)
+
+            // Update strategy if provided in body
+            let has_strategy = dict_has(body, "strategy")
+            if3 (has_strategy == 1) {
+                let new_strat = lower(str(dict_get(body, "strategy")))
+                if3 (is_valid_strategy(new_strat) == 0) {
+                    let resp = {}
+                    let resp = dict_set(resp, "ok", 0)
+                    let resp = dict_set(resp, "trit", T_FALSE)
+                    let resp = dict_set(resp, "error", "invalid strategy")
+                    let resp = dict_set(resp, "valid_strategies", "weighted,least_conn,reynolds")
+                    resp
+                } () {
+                    let pool = dict_set(pool, "strategy", new_strat)
+                    // Continue to target update below (re-enter handler via inline logic)
+                    let has_targets = dict_has(body, "targets")
+                    if3 (has_targets == 1) {
+                        let raw_targets = dict_get(body, "targets")
+                        let rt_len = len(raw_targets)
+                        if3 (rt_len > MAX_TARGETS_PER_POOL) {
+                            let resp = {}
+                            let resp = dict_set(resp, "ok", 0)
+                            let resp = dict_set(resp, "trit", T_FALSE)
+                            let resp = dict_set(resp, "error", "too many targets")
+                            let resp = dict_set(resp, "max", MAX_TARGETS_PER_POOL)
+                            resp
+                        } () {
+                            let targets = []
+                            let idx = 0
+                            while3 (idx < rt_len) {
+                                let rt = dict_get(raw_targets, idx)
+                                let url = str(dict_get(rt, "url"))
+                                let weight = int(dict_get(rt, "weight"))
+                                if3 (len(url) > 0) {
+                                    let nt = new_target(url, weight)
+                                    let targets = append(targets, nt)
+                                } () {
+                                    let targets = targets
+                                } () {
+                                    let targets = targets
+                                }
+                                let idx = idx + 1
+                            }
+                            let final_count = len(targets)
+                            if3 (final_count == 0) {
+                                let resp = {}
+                                let resp = dict_set(resp, "ok", 0)
+                                let resp = dict_set(resp, "trit", T_FALSE)
+                                let resp = dict_set(resp, "error", "no valid targets in update")
+                                resp
+                            } () {
+                                let pool = dict_set(pool, "targets", json_encode(targets))
+                                let pool = dict_set(pool, "rr_counter", 0)
+                                let pool = dict_set(pool, "updated_at", time())
+                                let _pools = dict_set(_pools, name, pool)
+                                let strat_now = dict_get(pool, "strategy")
+                                let resp = {}
+                                let resp = dict_set(resp, "ok", 1)
+                                let resp = dict_set(resp, "trit", T_TRUE)
+                                let resp = dict_set(resp, "pool", name)
+                                let resp = dict_set(resp, "strategy", strat_now)
+                                let resp = dict_set(resp, "target_count", final_count)
+                                resp
+                            } () {
+                                let resp = {}
+                                let resp = dict_set(resp, "ok", 0)
+                                let resp = dict_set(resp, "trit", T_FALSE)
+                                let resp = dict_set(resp, "error", "no valid targets in update")
+                                resp
+                            }
+                        } () {
+                            let resp = {}
+                            let resp = dict_set(resp, "ok", 0)
+                            let resp = dict_set(resp, "trit", T_FALSE)
+                            let resp = dict_set(resp, "error", "too many targets")
+                            resp
+                        }
+                    } () {
+                        // No targets update, just strategy update
+                        let pool = dict_set(pool, "updated_at", time())
+                        let _pools = dict_set(_pools, name, pool)
+                        let strat_now = dict_get(pool, "strategy")
+                        let tgts_json = dict_get(pool, "targets")
+                        let tgts_list = json_decode(tgts_json)
+                        let tcount = len(tgts_list)
+                        let resp = {}
+                        let resp = dict_set(resp, "ok", 1)
+                        let resp = dict_set(resp, "trit", T_TRUE)
+                        let resp = dict_set(resp, "pool", name)
+                        let resp = dict_set(resp, "strategy", strat_now)
+                        let resp = dict_set(resp, "target_count", tcount)
+                        resp
+                    } () {
+                        let resp = {}
+                        let resp = dict_set(resp, "ok", 0)
+                        let resp = dict_set(resp, "trit", T_FALSE)
+                        let resp = dict_set(resp, "error", "target update check failed")
+                        resp
+                    }
+                } () {
+                    let resp = {}
+                    let resp = dict_set(resp, "ok", 0)
+                    let resp = dict_set(resp, "trit", T_FALSE)
+                    let resp = dict_set(resp, "error", "invalid strategy")
+                    resp
+                }
+            } () {
+                // No strategy update: only update targets if provided
+                let has_targets = dict_has(body, "targets")
+                if3 (has_targets == 1) {
+                    let raw_targets = dict_get(body, "targets")
+                    let rt_len = len(raw_targets)
+                    if3 (rt_len > MAX_TARGETS_PER_POOL) {
+                        let resp = {}
+                        let resp = dict_set(resp, "ok", 0)
+                        let resp = dict_set(resp, "trit", T_FALSE)
+                        let resp = dict_set(resp, "error", "too many targets")
+                        let resp = dict_set(resp, "max", MAX_TARGETS_PER_POOL)
+                        resp
+                    } () {
+                        let targets = []
+                        let idx = 0
+                        while3 (idx < rt_len) {
+                            let rt = dict_get(raw_targets, idx)
+                            let url = str(dict_get(rt, "url"))
+                            let weight = int(dict_get(rt, "weight"))
+                            if3 (len(url) > 0) {
+                                let nt = new_target(url, weight)
+                                let targets = append(targets, nt)
+                            } () {
+                                let targets = targets
+                            } () {
+                                let targets = targets
+                            }
+                            let idx = idx + 1
+                        }
+                        let final_count = len(targets)
+                        if3 (final_count == 0) {
+                            let resp = {}
+                            let resp = dict_set(resp, "ok", 0)
+                            let resp = dict_set(resp, "trit", T_FALSE)
+                            let resp = dict_set(resp, "error", "no valid targets in update")
+                            resp
+                        } () {
+                            let pool = dict_set(pool, "targets", json_encode(targets))
+                            let pool = dict_set(pool, "rr_counter", 0)
+                            let pool = dict_set(pool, "updated_at", time())
+                            let _pools = dict_set(_pools, name, pool)
+                            let strat_now = dict_get(pool, "strategy")
+                            let resp = {}
+                            let resp = dict_set(resp, "ok", 1)
+                            let resp = dict_set(resp, "trit", T_TRUE)
+                            let resp = dict_set(resp, "pool", name)
+                            let resp = dict_set(resp, "strategy", strat_now)
+                            let resp = dict_set(resp, "target_count", final_count)
+                            resp
+                        } () {
+                            let resp = {}
+                            let resp = dict_set(resp, "ok", 0)
+                            let resp = dict_set(resp, "trit", T_FALSE)
+                            let resp = dict_set(resp, "error", "no valid targets in update")
+                            resp
+                        }
+                    } () {
+                        let resp = {}
+                        let resp = dict_set(resp, "ok", 0)
+                        let resp = dict_set(resp, "trit", T_FALSE)
+                        let resp = dict_set(resp, "error", "too many targets")
+                        resp
+                    }
+                } () {
+                    // Nothing to update: just touch updated_at
+                    let pool = dict_set(pool, "updated_at", time())
+                    let _pools = dict_set(_pools, name, pool)
+                    let strat_now = dict_get(pool, "strategy")
+                    let tgts_json = dict_get(pool, "targets")
+                    let tgts_list = json_decode(tgts_json)
+                    let tcount = len(tgts_list)
+                    let resp = {}
+                    let resp = dict_set(resp, "ok", 1)
+                    let resp = dict_set(resp, "trit", T_TRUE)
+                    let resp = dict_set(resp, "pool", name)
+                    let resp = dict_set(resp, "strategy", strat_now)
+                    let resp = dict_set(resp, "target_count", tcount)
+                    resp
+                } () {
+                    let resp = {}
+                    let resp = dict_set(resp, "ok", 0)
+                    let resp = dict_set(resp, "trit", T_FALSE)
+                    let resp = dict_set(resp, "error", "target update check failed")
+                    resp
+                }
+            } () {
+                let resp = {}
+                let resp = dict_set(resp, "ok", 0)
+                let resp = dict_set(resp, "trit", T_FALSE)
+                let resp = dict_set(resp, "error", "strategy check failed")
+                resp
+            }
+        } () {
+            let resp = {}
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", "pool not found")
+            resp
+        }
+    } () {
+        let resp = {}
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pool name required")
+        return resp
+    }
+}
+
+// ============================================================================
+// Route handler: GET /tbalance/pool/get
+// Body or query: {"pool": "name"}
+// (Dynamic path /tbalance/pool/<name> not supported in NovaLang tserve;
+//  use query param pool=name or POST body {"pool":"name"})
+// ============================================================================
+fn handle_pool_get(req) {
+    let body = dict_get(req, "body")
+    let pool_name = str(dict_get(body, "pool"))
+
+    if3 (len(pool_name) == 0) {
+        let resp = {}
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pool name required")
+        resp
+    } () {
+        if3 (dict_has(_pools, pool_name) == 0) {
+            let resp = {}
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", "pool not found")
+            resp
+        } () {
+            let pool = dict_get(_pools, pool_name)
+            let targets_json = dict_get(pool, "targets")
+            let targets = json_decode(targets_json)
+            let n = len(targets)
+
+            // Build targets_info list
+            let targets_info = []
+            let idx = 0
+            while3 (idx < n) {
+                let tgt = dict_get(targets, idx)
+                let re = target_reynolds(tgt)
+                let regime = flow_regime(re)
+                let avail = is_target_available(tgt)
+                let tinfo = {}
+                let tinfo = dict_set(tinfo, "url", dict_get(tgt, "url"))
+                let tinfo = dict_set(tinfo, "weight", dict_get(tgt, "weight"))
+                let tinfo = dict_set(tinfo, "active_connections", dict_get(tgt, "active_connections"))
+                let tinfo = dict_set(tinfo, "total_requests", dict_get(tgt, "total_requests"))
+                let tinfo = dict_set(tinfo, "total_successes", dict_get(tgt, "total_successes"))
+                let tinfo = dict_set(tinfo, "total_failures", dict_get(tgt, "total_failures"))
+                let tinfo = dict_set(tinfo, "avg_latency_ms", round(dict_get(tgt, "avg_latency_ms"), 2))
+                let tinfo = dict_set(tinfo, "consecutive_failures", dict_get(tgt, "consecutive_failures"))
+                let tinfo = dict_set(tinfo, "circuit_open", dict_get(tgt, "circuit_open"))
+                let tinfo = dict_set(tinfo, "reynolds", re)
+                let tinfo = dict_set(tinfo, "flow_regime", regime)
+                let tinfo = dict_set(tinfo, "available", avail)
+                let targets_info = append(targets_info, tinfo)
+                let idx = idx + 1
+            }
+
+            let resp = {}
+            let resp = dict_set(resp, "ok", 1)
+            let resp = dict_set(resp, "trit", T_TRUE)
+            let resp = dict_set(resp, "pool", pool_name)
+            let resp = dict_set(resp, "strategy", dict_get(pool, "strategy"))
+            let resp = dict_set(resp, "total_routed", dict_get(pool, "total_routed"))
+            let resp = dict_set(resp, "target_count", n)
+            let resp = dict_set(resp, "targets", targets_info)
+            let resp = dict_set(resp, "created_at", dict_get(pool, "created_at"))
+            let resp = dict_set(resp, "updated_at", dict_get(pool, "updated_at"))
+            resp
+        } () {
+            let resp = {}
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", "pool existence check failed")
+            resp
+        }
+    } () {
+        let resp = {}
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pool name required")
+        return resp
+    }
+}
+
+// ============================================================================
+// Route handler: GET /tbalance/pools
+// ============================================================================
+fn handle_pools(req) {
+    let pool_names = keys(_pools)
+    let pool_count = len(pool_names)
+    let pools_info = []
+    let pidx = 0
+    while3 (pidx < pool_count) {
+        let pname = dict_get(pool_names, pidx)
+        let pool = dict_get(_pools, pname)
+        let targets_json = dict_get(pool, "targets")
+        let targets = json_decode(targets_json)
+        let total = len(targets)
+        let available = count_available(targets)
+        let open_count = total - available
+        let pinfo = {}
+        let pinfo = dict_set(pinfo, "name", pname)
+        let pinfo = dict_set(pinfo, "strategy", dict_get(pool, "strategy"))
+        let pinfo = dict_set(pinfo, "target_count", total)
+        let pinfo = dict_set(pinfo, "available_targets", available)
+        let pinfo = dict_set(pinfo, "circuit_open_targets", open_count)
+        let pinfo = dict_set(pinfo, "total_routed", dict_get(pool, "total_routed"))
+        let pools_info = append(pools_info, pinfo)
+        let pidx = pidx + 1
+    }
+    let resp = {}
+    let resp = dict_set(resp, "ok", 1)
+    let resp = dict_set(resp, "trit", T_TRUE)
+    let resp = dict_set(resp, "pool_count", pool_count)
+    let resp = dict_set(resp, "max_pools", MAX_POOLS)
+    let resp = dict_set(resp, "pools", pools_info)
+    return resp
+}
+
+// ============================================================================
+// Route handler: POST /tbalance/report
+// Body: {"pool": "...", "target": "...", "latency_ms": N, "success": 1|0}
+// ============================================================================
+fn handle_report(req) {
+    let body = dict_get(req, "body")
+    let pool_name = str(dict_get(body, "pool"))
+    let target_url = str(dict_get(body, "target"))
+    let latency_ms = float(dict_get(body, "latency_ms"))
+    let success = int(dict_get(body, "success"))
+
+    if3 (len(pool_name) == 0) {
+        let resp = {}
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pool name required")
+        resp
+    } () {
+        if3 (len(target_url) == 0) {
+            let resp = {}
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", "target URL required")
+            resp
+        } () {
+            if3 (dict_has(_pools, pool_name) == 0) {
+                let resp = {}
+                let resp = dict_set(resp, "ok", 0)
+                let resp = dict_set(resp, "trit", T_FALSE)
+                let resp = dict_set(resp, "error", "pool not found")
+                resp
+            } () {
+                let pool = dict_get(_pools, pool_name)
+                let targets_json = dict_get(pool, "targets")
+                let targets = json_decode(targets_json)
+                let tidx = find_target_idx(targets, target_url)
+
+                if3 (tidx < 0) {
+                    let resp = {}
+                    let resp = dict_set(resp, "ok", 0)
+                    let resp = dict_set(resp, "trit", T_FALSE)
+                    let resp = dict_set(resp, "error", "target not found in pool")
+                    resp
+                } () {
+                    let target = dict_get(targets, tidx)
+
+                    // Decrement active connections
+                    let conns = dict_get(target, "active_connections")
+                    if3 (conns > 0) {
+                        let target = dict_set(target, "active_connections", conns - 1)
+                    } () {
+                        let target = target
+                    } () {
+                        let target = target
+                    }
+
+                    // Update latency tracking
+                    if3 (latency_ms > 0.0) {
+                        let lsum = dict_get(target, "latency_sum")
+                        let lcount = dict_get(target, "latency_count")
+                        let lsum = lsum + latency_ms
+                        let lcount = lcount + 1
+                        let avg = lsum / lcount
+                        let target = dict_set(target, "latency_sum", lsum)
+                        let target = dict_set(target, "latency_count", lcount)
+                        let target = dict_set(target, "avg_latency_ms", avg)
+                    } () {
+                        let target = target
+                    } () {
+                        let target = target
+                    }
+
+                    // Increment global reports
+                    let reps = dict_get(_global_stats, "total_reports")
+                    let _global_stats = dict_set(_global_stats, "total_reports", reps + 1)
+
+                    // Handle success vs failure
+                    if3 (success == 1) {
+                        let target = dict_set(target, "total_successes", dict_get(target, "total_successes") + 1)
+                        // Close circuit if it was open (probe succeeded)
+                        let was_open = dict_get(target, "circuit_open")
+                        if3 (was_open == 1) {
+                            let target = close_circuit(target)
+                        } () {
+                            let target = dict_set(target, "consecutive_failures", 0)
+                        } () {
+                            let target = target
+                        }
+                        // Persist
+                        let new_targets_json = update_target_at(targets_json, tidx, target)
+                        let pool = dict_set(pool, "targets", new_targets_json)
+                        let _pools = dict_set(_pools, pool_name, pool)
+                        let avg_lat = round(dict_get(target, "avg_latency_ms"), 2)
+                        let resp = {}
+                        let resp = dict_set(resp, "ok", 1)
+                        let resp = dict_set(resp, "trit", T_TRUE)
+                        let resp = dict_set(resp, "pool", pool_name)
+                        let resp = dict_set(resp, "target", target_url)
+                        let resp = dict_set(resp, "circuit_state", "CLOSED")
+                        let resp = dict_set(resp, "avg_latency_ms", avg_lat)
+                        resp
+                    } () {
+                        let target = dict_set(target, "total_failures", dict_get(target, "total_failures") + 1)
+                        let consec = dict_get(target, "consecutive_failures") + 1
+                        let target = dict_set(target, "consecutive_failures", consec)
+                        let circuit_state = "CLOSED"
+                        let trit_val = T_MAYBE
+                        if3 (consec >= CIRCUIT_FAILURES) {
+                            let target = open_circuit(target)
+                            let circuit_state = "OPEN"
+                            let trit_val = T_FALSE
+                        } () {
+                            let circuit_state = "CLOSED"
+                            let trit_val = T_MAYBE
+                        } () {
+                            let circuit_state = "CLOSED"
+                            let trit_val = T_MAYBE
+                        }
+                        // Persist
+                        let new_targets_json = update_target_at(targets_json, tidx, target)
+                        let pool = dict_set(pool, "targets", new_targets_json)
+                        let _pools = dict_set(_pools, pool_name, pool)
+                        let resp = {}
+                        let resp = dict_set(resp, "ok", 1)
+                        let resp = dict_set(resp, "trit", trit_val)
+                        let resp = dict_set(resp, "pool", pool_name)
+                        let resp = dict_set(resp, "target", target_url)
+                        let resp = dict_set(resp, "circuit_state", circuit_state)
+                        let resp = dict_set(resp, "consecutive_failures", consec)
+                        let resp = dict_set(resp, "threshold", CIRCUIT_FAILURES)
+                        let resp = dict_set(resp, "cooldown_s", CIRCUIT_COOLDOWN)
+                        resp
+                    } () {
+                        let resp = {}
+                        let resp = dict_set(resp, "ok", 0)
+                        let resp = dict_set(resp, "trit", T_FALSE)
+                        let resp = dict_set(resp, "error", "success flag must be 1 or 0")
+                        resp
+                    }
+                } () {
+                    let resp = {}
+                    let resp = dict_set(resp, "ok", 0)
+                    let resp = dict_set(resp, "trit", T_FALSE)
+                    let resp = dict_set(resp, "error", "target index check failed")
+                    resp
+                }
+            } () {
+                let resp = {}
+                let resp = dict_set(resp, "ok", 0)
+                let resp = dict_set(resp, "trit", T_FALSE)
+                let resp = dict_set(resp, "error", "pool not found")
+                resp
+            }
+        } () {
+            let resp = {}
+            let resp = dict_set(resp, "ok", 0)
+            let resp = dict_set(resp, "trit", T_FALSE)
+            let resp = dict_set(resp, "error", "target URL required")
+            resp
+        }
+    } () {
+        let resp = {}
+        let resp = dict_set(resp, "ok", 0)
+        let resp = dict_set(resp, "trit", T_FALSE)
+        let resp = dict_set(resp, "error", "pool name required")
+        return resp
+    }
+}
+
+// ============================================================================
+// Route handler: GET /tbalance/stats
+// ============================================================================
+fn handle_stats(req) {
+    let pool_names = keys(_pools)
+    let pool_count = len(pool_names)
+    let per_pool = {}
+    let hot_targets = []
+    let pidx = 0
+
+    while3 (pidx < pool_count) {
+        let pname = dict_get(pool_names, pidx)
+        let pool = dict_get(_pools, pname)
+        let targets_json = dict_get(pool, "targets")
+        let targets = json_decode(targets_json)
+        let n = len(targets)
+
+        let pool_active = 0
+        let pool_total = 0
+        let pool_failures = 0
+        let tidx = 0
+
+        while3 (tidx < n) {
+            let tgt = dict_get(targets, tidx)
+            let re = target_reynolds(tgt)
+            let tconns = dict_get(tgt, "active_connections")
+            let treqs = dict_get(tgt, "total_requests")
+            let tfails = dict_get(tgt, "total_failures")
+            let pool_active = pool_active + tconns
+            let pool_total = pool_total + treqs
+            let pool_failures = pool_failures + tfails
+
+            // Hot target: Reynolds >= RE_TRN(125) or active_conns >= H7(7)
+            if3 (re >= RE_TRN) {
+                let hinfo = {}
+                let hinfo = dict_set(hinfo, "pool", pname)
+                let hinfo = dict_set(hinfo, "url", dict_get(tgt, "url"))
+                let hinfo = dict_set(hinfo, "reynolds", re)
+                let hinfo = dict_set(hinfo, "flow_regime", flow_regime(re))
+                let hinfo = dict_set(hinfo, "active_connections", tconns)
+                let hinfo = dict_set(hinfo, "circuit_open", dict_get(tgt, "circuit_open"))
+                let hot_targets = append(hot_targets, hinfo)
+            } (tconns >= H7) {
+                let hinfo = {}
+                let hinfo = dict_set(hinfo, "pool", pname)
+                let hinfo = dict_set(hinfo, "url", dict_get(tgt, "url"))
+                let hinfo = dict_set(hinfo, "reynolds", re)
+                let hinfo = dict_set(hinfo, "flow_regime", flow_regime(re))
+                let hinfo = dict_set(hinfo, "active_connections", tconns)
+                let hinfo = dict_set(hinfo, "circuit_open", dict_get(tgt, "circuit_open"))
+                let hot_targets = append(hot_targets, hinfo)
+            } () {
+                let hot_targets = hot_targets
+            }
+            let tidx = tidx + 1
+        }
+
+        let pstats = {}
+        let pstats = dict_set(pstats, "strategy", dict_get(pool, "strategy"))
+        let pstats = dict_set(pstats, "targets", n)
+        let pstats = dict_set(pstats, "active_connections", pool_active)
+        let pstats = dict_set(pstats, "total_requests", pool_total)
+        let pstats = dict_set(pstats, "total_failures", pool_failures)
+        let pstats = dict_set(pstats, "total_routed", dict_get(pool, "total_routed"))
+        let per_pool = dict_set(per_pool, pname, pstats)
+        let pidx = pidx + 1
+    }
+
+    let total_routed = dict_get(_global_stats, "total_routed")
+    let total_reports = dict_get(_global_stats, "total_reports")
+    let total_opens = dict_get(_global_stats, "total_circuit_opens")
+
+    // Limit hot_targets to top H13 (13) entries
+    let ht_count = len(hot_targets)
+    let ht_limit = H13
+    if3 (ht_count > ht_limit) {
+        let hot_targets = slice(hot_targets, 0, ht_limit)
+    } () {
+        let hot_targets = hot_targets
+    } () {
+        let hot_targets = hot_targets
+    }
+
+    let resp = {}
+    let resp = dict_set(resp, "ok", 1)
+    let resp = dict_set(resp, "trit", T_TRUE)
+    let resp = dict_set(resp, "total_routed", total_routed)
+    let resp = dict_set(resp, "total_reports", total_reports)
+    let resp = dict_set(resp, "total_circuit_opens", total_opens)
+    let resp = dict_set(resp, "pool_count", pool_count)
+    let resp = dict_set(resp, "per_pool", per_pool)
+    let resp = dict_set(resp, "hot_targets", hot_targets)
+    return resp
+}
+
+// ============================================================================
+// Default pool initialization
+// ============================================================================
+fn init_default_pools() {
+    // -- ollama-models: base Ollama endpoints (least_conn) --
+    let t_ol_gen = new_target("http://127.0.0.1:11434/api/generate", 1)
+    let t_ol_chat = new_target("http://127.0.0.1:11434/api/chat", 1)
+    let t_ol_emb = new_target("http://127.0.0.1:11434/api/embeddings", 1)
+    let ollama_targets = []
+    let ollama_targets = append(ollama_targets, t_ol_gen)
+    let ollama_targets = append(ollama_targets, t_ol_chat)
+    let ollama_targets = append(ollama_targets, t_ol_emb)
+    let pool_ollama = new_pool("ollama-models", json_encode(ollama_targets), "least_conn")
+    let _pools = dict_set(_pools, "ollama-models", pool_ollama)
+
+    // -- cloud-providers: cloud-router + hivemind + novacore (weighted) --
+    let t_cloud = new_target("http://127.0.0.1:9878/cloud/query", 3)
+    let t_hive = new_target("http://127.0.0.1:9881/hive/query", 2)
+    let t_core = new_target("http://127.0.0.1:9890/health", 1)
+    let cloud_targets = []
+    let cloud_targets = append(cloud_targets, t_cloud)
+    let cloud_targets = append(cloud_targets, t_hive)
+    let cloud_targets = append(cloud_targets, t_core)
+    let pool_cloud = new_pool("cloud-providers", json_encode(cloud_targets), "weighted")
+    let _pools = dict_set(_pools, "cloud-providers", pool_cloud)
+
+    // -- storage: deepstorage + vault + tbuffer (reynolds) --
+    let t_deep = new_target("http://127.0.0.1:9883/health", 2)
+    let t_vault = new_target("http://127.0.0.1:9884/health", 1)
+    let t_tbuf = new_target("http://127.0.0.1:9886/tbuffer/query", 2)
+    let storage_targets = []
+    let storage_targets = append(storage_targets, t_deep)
+    let storage_targets = append(storage_targets, t_vault)
+    let storage_targets = append(storage_targets, t_tbuf)
+    let pool_storage = new_pool("storage", json_encode(storage_targets), "reynolds")
+    let _pools = dict_set(_pools, "storage", pool_storage)
+
+    1
+}
+
+// ============================================================================
+// Register routes
+// ============================================================================
+troute(server, "GET",  "/health",               handle_health_simple)
+troute(server, "GET",  "/tbalance/health",       handle_tbalance_health)
+troute(server, "POST", "/tbalance/route",        handle_route)
+troute(server, "POST", "/tbalance/pool/create",  handle_pool_create)
+troute(server, "POST", "/tbalance/pool/update",  handle_pool_update)
+troute(server, "GET",  "/tbalance/pool/get",     handle_pool_get)
+troute(server, "GET",  "/tbalance/pools",        handle_pools)
+troute(server, "POST", "/tbalance/report",       handle_report)
+troute(server, "GET",  "/tbalance/stats",        handle_stats)
+
+// ============================================================================
+// Initialize default pools
+// ============================================================================
+let _init = init_default_pools()
+
+// ============================================================================
+// Startup banner
+// ============================================================================
+print("[TBalance] Initializing default pools...")
+print("[TBalance]   pool 'ollama-models': 3 targets, strategy=least_conn")
+print("[TBalance]   pool 'cloud-providers': 3 targets, strategy=weighted")
+print("[TBalance]   pool 'storage': 3 targets, strategy=reynolds")
+print("[TLight] nova-tbalance v1.0.0 on 127.0.0.1:9984 | ternary=true | harmonics=3-5-7-13")
+print("[TBalance] Routes: GET /health /tbalance/health /tbalance/pool/get /tbalance/pools /tbalance/stats")
+print("[TBalance] Routes: POST /tbalance/route /tbalance/pool/create /tbalance/pool/update /tbalance/report")
+print("[TBalance] MAX_POOLS=39 MAX_TARGETS_PER_POOL=91 CIRCUIT_FAILURES=3 CIRCUIT_COOLDOWN=13s")
+print("[TBalance] T_TRUE=1 T_MAYBE=0 T_FALSE=-1 | H3=3 H5=5 H7=7 H13=13 BLOCK=2187")
+
+// ============================================================================
+// Start server
+// ============================================================================
+tstart(server)

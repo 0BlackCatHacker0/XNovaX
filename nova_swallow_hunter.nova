@@ -1,0 +1,338 @@
+// ================================================================
+// nova_swallow_hunter.nova — Static Analysis: Code Swallow Detector
+// Hunts for NovaLang patterns that silently eat/swallow code:
+//   1. try3 DIRECTLY inside if3 blocks (swallows subsequent fn defs)
+//   2. let reassignment inside if3 (not in fn) — scope-local trap
+//   3. return try3 inside conditionals
+//   4. Excessive nesting depth
+//   5. dict_get with integer index on list
+//   6. fn count verification
+// ================================================================
+// IMPORTANT: This tool avoids try3-inside-if3 in its OWN code!
+// Brace counting uses replace+len, not char iteration with try3
+// ================================================================
+
+let SCAN_DIR = "C:/NovaX"
+
+// ── Safe brace counting (no try3 needed) ──
+fn count_opens(line) { without = replace(line, "{", "")
+    return len(line) - len(without)
+}
+
+fn count_closes(line) {
+    let without = replace(line, "}", "")
+    return len(line) - len(without)
+}
+
+// ── Stack helpers (using list + slice) ──
+fn stack_top(stack) {
+    let n = len(stack)
+    if3 n == 0 { return "top" }
+    // Safe: no try3 inside if3 — we returned above
+    let last = slice(stack, n - 1, n)
+    if3 len(last) == 0 { return "top" }
+    return last[0]
+}
+
+fn stack_pop(stack) {
+    let n = len(stack)
+    if3 n == 0 { return [] }
+    return slice(stack, 0, n - 1)
+}
+
+fn is_inside_if3(stack) {
+    // Walk backwards through stack
+    // fn resets scope — stop there
+    // if3 means we're inside an if3 block
+    let n = len(stack)
+    let i = n - 1
+    while3 i >= 0 { entry = slice(stack, i, i + 1)
+        let val = ""
+        if3 len(entry) > 0 { val = entry[0] }
+        if3 val == "fn" { return false }
+        if3 val == "if3" { return true }
+        let i = i - 1
+    }
+    return false
+}
+
+fn is_try3_dangerous(stack) {
+    // try3 is dangerous when immediate parent is if3
+    let top = stack_top(stack)
+    return top == "if3"
+}
+
+// ── Determine block type from a line ──
+fn get_block_type(trimmed) {
+    if3 starts_with(trimmed, "fn ") { return "fn" }
+    if3 starts_with(trimmed, "if3 ") { return "if3" }
+    if3 starts_with(trimmed, "if3(") { return "if3" }
+    if3 contains(trimmed, "} if3 ") { return "if3" }
+    if3 starts_with(trimmed, "while3 ") { return "while3" }
+    if3 starts_with(trimmed, "for3 ") { return "for3" }
+    if3 starts_with(trimmed, "try3 ") { return "try3_block" }
+    if3 starts_with(trimmed, "match3 ") { return "match3" }
+    return "block"
+}
+
+// ── Count fn declarations in source ──
+fn count_fn_decls(source) {
+    let lines = split(source, "\n")
+    let count = 0
+    let i = 0
+    while3 i < len(lines) {
+        let tl = trim(lines[i])
+        if3 starts_with(tl, "fn ") {
+            if3 contains(tl, "(") { count = count + 1
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ── Analyze a single file ──
+fn analyze_file(filepath) {
+    let source = try3 { read_file(filepath) } fail { "" }
+    if3 len(source) == 0 {
+        return {"file": filepath, "error": "cannot_read", "findings": [], "fn_expected": 0, "lines": 0}
+    }
+
+    let lines = split(source, "\n")
+    let stack = []
+    let all_findings = []
+    let fn_expected = count_fn_decls(source)
+
+    let i = 0
+    while3 i < len(lines) {
+        let line = lines[i]
+        let line_num = i + 1
+        let trimmed = trim(line)
+        let is_comment = starts_with(trimmed, "//")
+
+        // Only analyze non-comment lines
+        if3 is_comment == false {
+
+            // ── CRITICAL: try3 when immediate parent is if3 ──
+            if3 contains(trimmed, "try3") {
+                if3 is_try3_dangerous(stack) { all_findings = append(all_findings, {
+                        "level": "CRITICAL",
+                        "line": line_num,
+                        "pattern": "try3_inside_if3",
+                        "msg": "try3 directly in if3 block -- SWALLOWS subsequent code!",
+                        "code": trimmed
+                    })
+                }
+            }
+
+            // ── WARNING: let inside if3 (not inside fn) ──
+            if3 starts_with(trimmed, "let ") {
+                if3 contains(trimmed, "=") {
+                    if3 is_inside_if3(stack) { all_findings = append(all_findings, {
+                            "level": "WARNING",
+                            "line": line_num,
+                            "pattern": "let_inside_if3",
+                            "msg": "let inside if3 (not in fn) -- scope-local var, outer unchanged",
+                            "code": trimmed
+                        })
+                    }
+                }
+            }
+
+            // ── CRITICAL: return try3 inside if3 ──
+            if3 contains(trimmed, "return try3") {
+                if3 is_inside_if3(stack) { all_findings = append(all_findings, {
+                        "level": "CRITICAL",
+                        "line": line_num,
+                        "pattern": "return_try3_in_if3",
+                        "msg": "return try3 inside if3 -- swallows all code after this!",
+                        "code": trimmed
+                    })
+                }
+            }
+
+            // ── WARNING: dict_get with integer index ──
+            if3 contains(trimmed, "dict_get(") {
+                if3 contains(trimmed, ", 0,") { all_findings = append(all_findings, {
+                        "level": "WARNING",
+                        "line": line_num,
+                        "pattern": "dict_get_on_list",
+                        "msg": "dict_get with index 0 -- null on lists! Use try3 { list[0] } fail { default }",
+                        "code": trimmed
+                    })
+                }
+            }
+
+            // ── WARNING: deep nesting ──
+            if3 len(stack) > 4 {
+                if3 contains(trimmed, "if3 ") { all_findings = append(all_findings, {
+                        "level": "WARNING",
+                        "line": line_num,
+                        "pattern": "deep_nesting",
+                        "msg": "Nesting depth " + str(len(stack)) + " -- high swallow risk",
+                        "code": trimmed
+                    })
+                }
+            }
+
+            // ── Update stack: push for opens, pop for closes ──
+            let opens = count_opens(trimmed)
+            let closes = count_closes(trimmed)
+
+            // Push block types for opens
+            if3 opens > 0 { block_type = get_block_type(trimmed)
+                let b = 0
+                while3 b < opens {
+                    stack = append(stack, block_type)
+                    let b = b + 1
+                }
+            }
+
+            // Pop for closes
+            if3 closes > 0 { c = 0
+                while3 c < closes {
+                    let stack = stack_pop(stack)
+                    let c = c + 1
+                }
+            }
+        }
+
+        i = i + 1
+    }
+
+    return {
+        "file": filepath,
+        "findings": all_findings,
+        "fn_expected": fn_expected,
+        "lines": len(lines)
+    }
+}
+
+// ── Pretty print ──
+fn print_results(result) {
+    let file = dict_get(result, "file") ?? "?"
+    let findings_list = dict_get(result, "findings") ?? []
+    let fn_expected = dict_get(result, "fn_expected") ?? 0
+    let line_count = dict_get(result, "lines") ?? 0
+    let err = dict_get(result, "error") ?? ""
+
+    let bar = "======================================================"
+    print("+" + bar)
+    print("| SWALLOW HUNTER -- " + file)
+    print("| Lines: " + str(line_count) + " | Functions: " + str(fn_expected))
+    print("+" + bar)
+
+    if3 len(err) > 0 {
+        print("| ERROR: " + err)
+        print("+" + bar)
+        return -1
+    }
+
+    let critical_count = 0
+    let warning_count = 0
+    let i = 0
+    while3 i < len(findings_list) {
+        let f = findings_list[i]
+        let level = dict_get(f, "level") ?? "?"
+        let line_num = dict_get(f, "line") ?? 0
+        let pattern = dict_get(f, "pattern") ?? "?"
+        let msg = dict_get(f, "msg") ?? ""
+        let code = dict_get(f, "code") ?? ""
+
+        if3 level == "CRITICAL" { critical_count = critical_count + 1 }
+        if3 level == "WARNING" { warning_count = warning_count + 1 }
+
+        let prefix = "  "
+        if3 level == "CRITICAL" { prefix = "!!" }
+        if3 level == "WARNING" { prefix = " >" }
+
+        print("| " + prefix + " [" + level + "] Line " + str(line_num) + ": " + pattern)
+        print("|     " + msg)
+        print("|     => " + code)
+        i = i + 1
+    }
+
+    if3 len(findings_list) == 0 {
+        print("|  [CLEAN] No swallow patterns detected")
+    }
+
+    print("+" + bar)
+    if3 critical_count > 0 {
+        print("| VERDICT: -1 (CRITICAL) -- " + str(critical_count) + " swallowing patterns!")
+        print("| ACTION: Refactor try3 OUT of if3 blocks. Use helper fns.")
+    }
+    if3 critical_count == 0 {
+        if3 warning_count > 0 {
+            print("| VERDICT: 0 (WARNING) -- " + str(warning_count) + " risky patterns")
+            print("| ACTION: Review let-inside-if3 and deep nesting")
+        }
+    }
+    if3 critical_count == 0 {
+        if3 warning_count == 0 {
+            print("| VERDICT: +1 (CLEAN) -- No swallow risks detected")
+        }
+    }
+    print("+" + bar)
+
+    if3 critical_count > 0 { return -1 }
+    if3 warning_count > 0 { return 0 }
+    return 1
+}
+
+// ── Scan directory ──
+fn scan_directory(dir) {
+    let raw = try3 { shell("dir /b \"" + dir + "\\*.nova\" 2>nul") } fail { "" }
+    if3 len(raw) == 0 {
+        print("No .nova files found in " + dir)
+        return
+    }
+    let files = split(trim(raw), "\n")
+    let total_crit = 0
+    let total_warn = 0
+    let total_clean = 0
+    let i = 0
+    while3 i < len(files) {
+        let fname = trim(files[i])
+        if3 len(fname) > 0 {
+            if3 ends_with(fname, ".nova") { filepath = dir + "/" + fname
+                let result = analyze_file(filepath)
+                let verdict = print_results(result)
+                if3 verdict == -1 { total_crit = total_crit + 1 }
+                if3 verdict == 0 { total_warn = total_warn + 1 }
+                if3 verdict == 1 { total_clean = total_clean + 1 }
+                print("")
+            }
+        }
+        i = i + 1
+    }
+    let total = total_crit + total_warn + total_clean
+    print("======================================================")
+    print(" SWALLOW HUNTER FLEET SUMMARY")
+    print(" Files scanned: " + str(total))
+    print(" Clean (+1):    " + str(total_clean))
+    print(" Warnings (0):  " + str(total_warn))
+    print(" Critical (-1): " + str(total_crit))
+    print("======================================================")
+}
+
+// ── Main ──
+let args = try3 { env_get("NOVA_ARGS", "") } fail { "" }
+if3 len(args) > 0 {
+    if3 args == "--all" {
+        scan_directory(SCAN_DIR)
+    }
+    if3 args != "--all" { result = analyze_file(args)
+        print_results(result)
+    }
+}
+
+if3 len(args) == 0 {
+    print("SWALLOW HUNTER v1.0 -- NovaLang Code Safety Analyzer")
+    print("Usage: novalang.exe nova_swallow_hunter.nova <file.nova>")
+    print("       novalang.exe nova_swallow_hunter.nova --all")
+    print("")
+    print("Demo scan: nova_cloud_api.nova")
+    print("")
+    let result = analyze_file("C:/NovaX/nova_cloud_api.nova")
+    print_results(result)
+}

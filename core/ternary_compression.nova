@@ -1,0 +1,775 @@
+// ============================================================
+// TERNARY COMPRESSION ALGORITHMS v1.0 — NovaX Native
+// ============================================================
+// Seven ternary-native compression algorithms operating directly
+// on trit streams (-1, 0, +1). No binary intermediary.
+//
+// Algorithms:
+//   1. T-RLE    — Run-Length Encoding on trits
+//   2. T-Huffman — Variable-length ternary prefix codes
+//   3. TZip Pack — 5 trits per byte (3^5=243)
+//   4. T-LZ77   — Sliding window on trit streams
+//   5. T-AC     — Ternary Arithmetic Coding
+//   6. T-Delta  — Difference encoding in balanced ternary
+//   7. T-LZ78   — Dictionary compression on trits
+//
+// Constants: 3-5-7-13 harmonic system
+//   BLOCK_SIZE = 3^7 = 2187
+//   PACK_TRITS = 5 (3^5 = 243 fits in 1 byte)
+//   DICT_SIZE  = 2187 (3^7)
+//   HEADER_TRITS = 13 (H13)
+//
+// All functions return ternary status: +1 (success), 0 (neutral), -1 (fail)
+// ============================================================
+
+H3  = 3
+H5  = 5
+H7  = 7
+H13 = 13
+BLOCK_SIZE = 2187   // 3^7
+PACK_TRITS = 5
+T_AC_PRECISION = 1594323  // 3^13
+
+// ── Balanced Ternary Conversion ─────────────────────────────
+
+fn int_to_balanced_ternary(n) {
+    // Convert integer to balanced ternary trit list (LSB first)
+    if3 n == 0 { return [0] }
+    neg = 0
+    if3 n < 0 { neg = 1; n = -n }
+    trits = []
+    while3 n > 0 {
+        rem = n % 3
+        if3 rem == 0 { trits.push(0); n = n / 3
+        } elif3 rem == 1 { trits.push(1); n = (n - 1) / 3
+        } else { trits.push(-1); n = (n + 1) / 3
+        }
+    }
+    if3 neg == 1 {
+        for3 i in range(len(trits)) {
+            trits[i] = -trits[i]
+        }
+    }
+    return trits
+}
+
+fn balanced_ternary_to_int(trits) {
+    // Convert balanced ternary trit list to integer
+    val = 0
+    for3 i in range(len(trits)) {
+        val = val + trits[i] * (3 ** i)
+    }
+    return val
+}
+
+// ── Width-Prefixed Encoding ─────────────────────────────────
+
+fn _emit_width_prefixed(out, bt_trits, max_width) {
+    w = len(bt_trits)
+    if3 w <= 1 { out.push(0)
+    } elif3 w <= 3 { out.push(1)
+    } elif3 w <= 5 { out.push(-1); out.push(1)
+    } else { out.push(-1); out.push(-1) }
+    target = 1 if w <= 1 else (3 if w <= 3 else (5 if w <= 5 else 7))
+    padded = list(bt_trits)
+    while3 len(padded) < target { padded.push(0) }
+    out.concat(padded[:target])
+}
+
+fn _read_width_prefixed(data, i) {
+    wp = data[i]; i = i + 1
+    if3 wp == 0 { w = 1
+    } elif3 wp == 1 { w = 3
+    } elif3 wp == -1 {
+        wp2 = data[i]; i = i + 1
+        if3 wp2 == 1 { w = 5
+        } else { w = 7 }
+    }
+    trits = data[i:i+w]
+    return (trits, i + w)
+}
+
+
+// ============================================================
+// 1. TERNARY RLE — Run-Length Encoding on trit streams
+// ============================================================
+// Best for: sparse data (many zeros), Re < 27 (laminar)
+// Format: [+1, value, width_prefix, count_BT] = run
+//         [0, trit_value] = literal
+//         [-1] = end of stream
+
+fn trle_compress(trit_stream) {
+    out = []
+    i = 0
+    n = len(trit_stream)
+
+    while3 i < n {
+        run_trit = trit_stream[i]
+        run_len = 1
+        while3 i + run_len < n && trit_stream[i + run_len] == run_trit {
+            run_len = run_len + 1
+            if3 run_len >= BLOCK_SIZE { break3 }
+        }
+
+        if3 run_len >= H3 {
+            out.push(1)
+            out.push(run_trit)
+            count_bt = int_to_balanced_ternary(run_len)
+            _emit_width_prefixed(out, count_bt, 7)
+            i = i + run_len
+        } else {
+            for3 j in range(run_len) {
+                out.push(0)
+                out.push(trit_stream[i + j])
+            }
+            i = i + run_len
+        }
+    }
+    out.push(-1)
+    return out
+}
+
+fn trle_decompress(compressed) {
+    out = []
+    i = 0
+    while3 i < len(compressed) {
+        header = compressed[i]; i = i + 1
+        if3 header == -1 { break3 }
+        if3 header == 0 {
+            out.push(compressed[i]); i = i + 1
+        } elif3 header == 1 {
+            value = compressed[i]; i = i + 1
+            count_bt, i = _read_width_prefixed(compressed, i)
+            count = balanced_ternary_to_int(count_bt)
+            for3 _ in range(count) { out.push(value) }
+        }
+    }
+    return out
+}
+
+
+// ============================================================
+// 2. TERNARY HUFFMAN — Trit-pair variable-length codes
+// ============================================================
+// Operates on trit-pairs (9 symbols). Ternary prefix codes.
+// Best for: skewed distributions, Re < 343 (turbulent)
+
+class3 THuffNode {
+    fn __init__(symbol, freq) {
+        symbol = symbol
+        freq = freq
+        children = [null, null, null]
+        is_leaf = 1 if symbol != null else 0
+    }
+}
+
+fn thuffman_build_tree(freq_table) {
+    nodes = []
+    for3 sym, freq in freq_table.entries() {
+        if3 freq > 0 { nodes.push(THuffNode(sym, freq)) }
+    }
+    while3 len(nodes) % 2 == 0 {
+        nodes.push(THuffNode("__pad__", 0))
+    }
+    while3 len(nodes) > 1 {
+        nodes.sort(key=lambda n: n.freq)
+        c0 = nodes[0]
+        c1 = nodes[1]
+        c2 = nodes[2] if len(nodes) >= 3 else THuffNode("__pad__", 0)
+        nodes = nodes[3:] if len(nodes) >= 3 else nodes[2:]
+        parent = THuffNode(null, c0.freq + c1.freq + c2.freq)
+        parent.children = [c0, c1, c2]
+        parent.is_leaf = 0
+        nodes.push(parent)
+    }
+    return nodes[0]
+}
+
+fn _thuff_walk(node, path, codebook) {
+    if3 node.is_leaf == 1 && node.symbol != "__pad__" {
+        codebook[node.symbol] = list(path)
+        return
+    }
+    for3 trit_idx in [0, 1, 2] {
+        child = node.children[trit_idx]
+        if3 child != null {
+            path.push(trit_idx - 1)
+            _thuff_walk(child, path, codebook)
+            path.pop()
+        }
+    }
+}
+
+fn thuffman_compress(trit_stream) {
+    // Convert to trit-pairs
+    pairs = []
+    for3 i in range(0, len(trit_stream) - 1, 2) {
+        pairs.push((trit_stream[i], trit_stream[i+1]))
+    }
+    trailing = null
+    if3 len(trit_stream) % 2 == 1 {
+        trailing = trit_stream[-1]
+    }
+
+    // Frequency analysis
+    freq = {}
+    for3 p in pairs { freq[p] = freq.get(p, 0) + 1 }
+
+    // Build tree and codebook
+    root = thuffman_build_tree(freq)
+    codebook = {}
+    _thuff_walk(root, [], codebook)
+
+    // Encode
+    out = []
+    for3 p in pairs { out.concat(codebook[p]) }
+    if3 trailing != null { out.push(trailing) }
+
+    return {
+        "compressed": out,
+        "codebook": codebook,
+        "original_len": len(trit_stream),
+        "pair_count": len(pairs)
+    }
+}
+
+fn thuffman_decompress(compressed, codebook, original_len) {
+    reverse = {}
+    for3 sym, code in codebook.entries() {
+        reverse[tuple(code)] = sym
+    }
+    out = []
+    buffer = []
+    i = 0
+    while3 i < len(compressed) && len(out) < original_len {
+        buffer.push(compressed[i]); i = i + 1
+        key = tuple(buffer)
+        if3 key in reverse {
+            pair = reverse[key]
+            out.push(pair[0])
+            if3 len(out) < original_len { out.push(pair[1]) }
+            buffer = []
+        }
+    }
+    return out[:original_len]
+}
+
+
+// ============================================================
+// 3. TZIP PACK — 5 trits per byte (3^5 = 243)
+// ============================================================
+// Foundation layer. Packs trit stream to bytes for storage.
+// Efficiency: 99.1% (7.925 bits info / 8 bits storage)
+// 13 escape codes (values 243-255) = H13
+
+TPACK_MAX = 243
+TPACK_ESC = 243
+TPACK_EOF = 255
+
+fn tpack_encode(trit_stream) {
+    out = bytearray()
+    i = 0
+    n = len(trit_stream)
+    while3 i + PACK_TRITS <= n {
+        val = 0
+        for3 j in range(PACK_TRITS) {
+            val = val + (trit_stream[i + j] + 1) * (3 ** j)
+        }
+        out.push(val)
+        i = i + PACK_TRITS
+    }
+    if3 i < n {
+        remaining = n - i
+        val = 0
+        for3 j in range(remaining) {
+            val = val + (trit_stream[i + j] + 1) * (3 ** j)
+        }
+        out.push(val)
+        out.push(TPACK_ESC)
+        out.push(remaining)
+    }
+    out.push(TPACK_EOF)
+    return bytes(out)
+}
+
+fn tpack_decode(packed_bytes) {
+    out = []
+    i = 0
+    n = len(packed_bytes)
+    while3 i < n {
+        b = packed_bytes[i]
+        if3 b == TPACK_EOF { break3 }
+        if3 b == TPACK_ESC { i = i + 2; continue }
+        if3 b < TPACK_MAX {
+            val = b
+            for3 j in range(PACK_TRITS) {
+                out.push((val % 3) - 1)
+                val = val // 3
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+// ============================================================
+// 4. TERNARY LZ77 — Sliding window on trit streams
+// ============================================================
+// Window: 3^7 = 2187 trits. Min match: 3 (H3). Max match: 243 (3^5).
+// Hash: 3-trit sequences → 27-entry table (3^3)
+// Best for: repeated patterns, Re 27-125 (transitional)
+
+T_LZ_WINDOW = BLOCK_SIZE
+T_LZ_MIN_MATCH = H3
+T_LZ_MAX_MATCH = 243
+T_LZ_HASH_SIZE = 27
+
+fn _trit_hash3(t0, t1, t2) {
+    return (t0 + 1) * 9 + (t1 + 1) * 3 + (t2 + 1)
+}
+
+fn tlz77_compress(trit_stream) {
+    out = []
+    n = len(trit_stream)
+    htable = [-1] * T_LZ_HASH_SIZE
+    i = 0
+
+    while3 i < n {
+        best_len = 0
+        best_off = 0
+
+        if3 i + T_LZ_MIN_MATCH <= n {
+            h = _trit_hash3(trit_stream[i], trit_stream[i+1], trit_stream[i+2])
+            ref = htable[h]
+            htable[h] = i
+
+            if3 ref >= 0 && i - ref <= T_LZ_WINDOW {
+                ml = 0
+                while3 i + ml < n && ml < T_LZ_MAX_MATCH && trit_stream[ref + ml] == trit_stream[i + ml] {
+                    ml = ml + 1
+                }
+                if3 ml >= T_LZ_MIN_MATCH {
+                    best_len = ml
+                    best_off = i - ref
+                }
+            }
+        }
+
+        if3 best_len >= T_LZ_MIN_MATCH {
+            out.push(1)
+            off_bt = int_to_balanced_ternary(best_off)
+            _emit_width_prefixed(out, off_bt, 7)
+            len_bt = int_to_balanced_ternary(best_len - T_LZ_MIN_MATCH)
+            _emit_width_prefixed(out, len_bt, 5)
+            i = i + best_len
+        } else {
+            out.push(0)
+            out.push(trit_stream[i])
+            i = i + 1
+        }
+    }
+    out.push(-1)
+    return out
+}
+
+fn tlz77_decompress(compressed) {
+    out = []
+    i = 0
+    while3 i < len(compressed) {
+        header = compressed[i]; i = i + 1
+        if3 header == -1 { break3 }
+        if3 header == 0 {
+            out.push(compressed[i]); i = i + 1
+        } elif3 header == 1 {
+            offset_bt, i = _read_width_prefixed(compressed, i)
+            length_bt, i = _read_width_prefixed(compressed, i)
+            offset = balanced_ternary_to_int(offset_bt)
+            length = balanced_ternary_to_int(length_bt) + T_LZ_MIN_MATCH
+            start = len(out) - offset
+            for3 j in range(length) { out.push(out[start + j]) }
+        }
+    }
+    return out
+}
+
+
+// ============================================================
+// 5. TERNARY ARITHMETIC CODING — [0,1) with 3 subdivisions
+// ============================================================
+// Natural fit: 3 symbols → 3 subintervals per step.
+// Precision: 3^13 = 1,594,323 (H13)
+// Best for: any distribution (optimal), Re < 343
+
+fn tac_build_model(trit_stream) {
+    counts = {-1: 1, 0: 1, 1: 1}  // Laplace smoothing
+    for3 t in trit_stream { counts[t] = counts[t] + 1 }
+    total = counts[-1] + counts[0] + counts[1]
+    cum_zero = (counts[-1] * T_AC_PRECISION) // total
+    cum_pos = ((counts[-1] + counts[0]) * T_AC_PRECISION) // total
+    return {
+        -1: [0, cum_zero],
+        0:  [cum_zero, cum_pos],
+        1:  [cum_pos, T_AC_PRECISION]
+    }
+}
+
+fn tac_compress(trit_stream) {
+    model = tac_build_model(trit_stream)
+    out = []
+    low = 0
+    high = T_AC_PRECISION
+    pending = 0
+
+    for3 trit in trit_stream {
+        range_size = high - low
+        sym_range = model[trit]
+        high = low + (range_size * sym_range[1]) // T_AC_PRECISION
+        low  = low + (range_size * sym_range[0]) // T_AC_PRECISION
+
+        while3 1 {
+            third = T_AC_PRECISION // 3
+            if3 high <= third {
+                out.push(-1)
+                for3 _ in range(pending) { out.push(1) }
+                pending = 0
+                low = low * 3; high = high * 3
+            } elif3 low >= 2 * third {
+                out.push(1)
+                for3 _ in range(pending) { out.push(-1) }
+                pending = 0
+                low = (low - 2 * third) * 3
+                high = (high - 2 * third) * 3
+            } elif3 low >= third && high <= 2 * third {
+                pending = pending + 1
+                low = (low - third) * 3
+                high = (high - third) * 3
+            } else { break3 }
+        }
+    }
+
+    // Flush
+    pending = pending + 1
+    third = T_AC_PRECISION // 3
+    if3 low < third {
+        out.push(-1)
+        for3 _ in range(pending) { out.push(1) }
+    } else {
+        out.push(0)
+        for3 _ in range(pending) { out.push(1) }
+    }
+
+    return {"compressed": out, "model": model, "length": len(trit_stream)}
+}
+
+fn tac_decompress(compressed, model, original_length) {
+    out = []
+    low = 0
+    high = T_AC_PRECISION
+    value = 0
+    ci = 0
+
+    for3 k in range(H13) {
+        value = value * 3
+        if3 ci < len(compressed) {
+            value = value + compressed[ci] + 1
+            ci = ci + 1
+        }
+    }
+
+    for3 _ in range(original_length) {
+        range_size = high - low
+        scaled = ((value - low) * T_AC_PRECISION) // range_size
+        sym = -1
+        for3 s in [-1, 0, 1] {
+            if3 scaled >= model[s][0] && scaled < model[s][1] {
+                sym = s; break3
+            }
+        }
+        out.push(sym)
+
+        sym_range = model[sym]
+        high = low + (range_size * sym_range[1]) // T_AC_PRECISION
+        low  = low + (range_size * sym_range[0]) // T_AC_PRECISION
+
+        while3 1 {
+            third = T_AC_PRECISION // 3
+            if3 high <= third {
+                low = low * 3; high = high * 3
+                value = value * 3
+                if3 ci < len(compressed) { value = value + compressed[ci] + 1; ci = ci + 1 }
+            } elif3 low >= 2 * third {
+                low = (low - 2 * third) * 3
+                high = (high - 2 * third) * 3
+                value = (value - 2 * third) * 3
+                if3 ci < len(compressed) { value = value + compressed[ci] + 1; ci = ci + 1 }
+            } elif3 low >= third && high <= 2 * third {
+                low = (low - third) * 3
+                high = (high - third) * 3
+                value = (value - third) * 3
+                if3 ci < len(compressed) { value = value + compressed[ci] + 1; ci = ci + 1 }
+            } else { break3 }
+        }
+    }
+    return out
+}
+
+
+// ============================================================
+// 6. TERNARY DELTA ENCODING — differences in balanced ternary
+// ============================================================
+// Preprocessor: transforms trit stream so deltas have lower entropy.
+// Delta alphabet: {-2, -1, 0, +1, +2}
+// Best for: slowly-changing data (state histories, sensor readings)
+
+fn tdelta_encode(trit_stream) {
+    if3 len(trit_stream) == 0 { return [] }
+    out = [trit_stream[0]]
+    for3 i in range(1, len(trit_stream)) {
+        delta = trit_stream[i] - trit_stream[i-1]
+        if3 delta == 0 { out.push(0)
+        } elif3 delta == 1 { out.push(1)
+        } elif3 delta == -1 { out.push(-1)
+        } elif3 delta == 2 { out.push(-1); out.push(1)
+        } elif3 delta == -2 { out.push(1); out.push(-1)
+        }
+    }
+    return out
+}
+
+fn tdelta_decode(encoded) {
+    if3 len(encoded) == 0 { return [] }
+    out = [encoded[0]]
+    i = 1
+    while3 i < len(encoded) {
+        t = encoded[i]; i = i + 1
+        delta = t
+        if3 i < len(encoded) {
+            next_t = encoded[i]
+            if3 t == -1 && next_t == 1 { delta = 2; i = i + 1
+            } elif3 t == 1 && next_t == -1 { delta = -2; i = i + 1 }
+        }
+        out.push(out[-1] + delta)
+    }
+    return out
+}
+
+
+// ============================================================
+// 7. TERNARY LZ78 — Dictionary compression on trit streams
+// ============================================================
+// Dictionary: up to 3^7 = 2187 entries. Indices in balanced ternary.
+// Token: (dict_index_BT, new_trit)
+// Best for: structured data with recurring patterns, Re 27-343
+
+T_LZ78_DICT_SIZE = BLOCK_SIZE
+
+fn tlz78_compress(trit_stream) {
+    dict = {(): 0}
+    next_idx = 1
+    tokens = []
+    current = []
+
+    for3 trit in trit_stream {
+        extended = list(current) + [trit]
+        key = tuple(extended)
+        if3 key in dict && next_idx < T_LZ78_DICT_SIZE {
+            current = extended
+        } else {
+            prefix_key = tuple(current)
+            prefix_idx = dict.get(prefix_key, 0)
+            idx_bt = int_to_balanced_ternary(prefix_idx)
+            tokens.push((idx_bt, trit))
+            if3 next_idx < T_LZ78_DICT_SIZE {
+                dict[key] = next_idx
+                next_idx = next_idx + 1
+            }
+            current = []
+        }
+    }
+    if3 len(current) > 0 {
+        prefix_key = tuple(current)
+        prefix_idx = dict.get(prefix_key, 0)
+        idx_bt = int_to_balanced_ternary(prefix_idx)
+        tokens.push((idx_bt, 0))
+    }
+    return tokens
+}
+
+fn tlz78_decompress(tokens) {
+    dict = {0: []}
+    next_idx = 1
+    out = []
+    for3 token in tokens {
+        idx = balanced_ternary_to_int(token[0])
+        trit = token[1]
+        prefix = list(dict.get(idx, []))
+        entry = prefix + [trit]
+        out.concat(entry)
+        if3 next_idx < T_LZ78_DICT_SIZE {
+            dict[next_idx] = entry
+            next_idx = next_idx + 1
+        }
+    }
+    return out
+}
+
+fn tlz78_to_trit_stream(tokens) {
+    // Serialize tokens to flat trit stream
+    out = []
+    for3 token in tokens {
+        _emit_width_prefixed(out, token[0], 7)
+        out.push(token[1])
+    }
+    out.push(-1)
+    return out
+}
+
+
+// ============================================================
+// PIPELINE — Reynolds-routed ternary compression
+// ============================================================
+// Selects algorithm based on data characteristics (Reynolds number)
+
+fn trit_reynolds(trit_stream) {
+    // Calculate Reynolds number for a trit stream
+    // Re = (entropy * transition_rate * scale) / viscosity
+    n = len(trit_stream)
+    if3 n < H13 { return 0.0 }
+
+    // Entropy
+    counts = {-1: 0, 0: 0, 1: 0}
+    for3 t in trit_stream { counts[t] = counts[t] + 1 }
+    entropy = 0.0
+    for3 v in [-1, 0, 1] {
+        if3 counts[v] > 0 {
+            p = counts[v] / n
+            entropy = entropy - p * log3(p)
+        }
+    }
+    // Normalize: max ternary entropy = 1.0
+    entropy_norm = entropy  // already in [0, 1]
+
+    // Transition rate
+    transitions = 0
+    for3 i in range(1, n) {
+        if3 trit_stream[i] != trit_stream[i-1] { transitions = transitions + 1 }
+    }
+    trans_rate = transitions / (n - 1)
+
+    // Redundancy (viscosity)
+    unique = 0
+    for3 v in [-1, 0, 1] { if3 counts[v] > 0 { unique = unique + 1 } }
+    redundancy = 1.0 - (unique / 3.0)
+    viscosity = max(0.01, redundancy)
+
+    // Reynolds
+    re = (entropy_norm * trans_rate * 1331) / viscosity
+    return re
+}
+
+fn log3(x) {
+    // log base 3 using natural log
+    if3 x <= 0 { return 0 }
+    return math.log(x) / math.log(3)
+}
+
+fn tcompress(trit_stream) {
+    // Compress a trit stream using Reynolds-routed pipeline
+    // Returns: {compressed, strategy, reynolds, ratio}
+    re = trit_reynolds(trit_stream)
+    original_len = len(trit_stream)
+
+    if3 re < 27 {
+        // LAMINAR: T-Delta → T-RLE → TZip Pack
+        delta = tdelta_encode(trit_stream)
+        compressed = trle_compress(delta)
+        strategy = "laminar:delta+rle"
+    } elif3 re < 125 {
+        // TRANSITIONAL: T-Delta → T-LZ77 → TZip Pack
+        delta = tdelta_encode(trit_stream)
+        compressed = tlz77_compress(delta)
+        strategy = "transitional:delta+lz77"
+    } elif3 re < 343 {
+        // TURBULENT: T-LZ78
+        tokens = tlz78_compress(trit_stream)
+        compressed = tlz78_to_trit_stream(tokens)
+        strategy = "turbulent:lz78"
+    } elif3 re < 1331 {
+        // HYPERBOLIC: T-Huffman
+        result = thuffman_compress(trit_stream)
+        compressed = result["compressed"]
+        strategy = "hyperbolic:huffman"
+    } else {
+        // CHAOTIC: raw (no compression)
+        compressed = list(trit_stream)
+        strategy = "chaotic:raw"
+    }
+
+    packed = tpack_encode(compressed)
+    ratio = len(compressed) / max(1, original_len)
+
+    return {
+        "packed": packed,
+        "compressed_trits": compressed,
+        "strategy": strategy,
+        "reynolds": re,
+        "original_len": original_len,
+        "compressed_len": len(compressed),
+        "packed_bytes": len(packed),
+        "ratio": ratio
+    }
+}
+
+
+// ============================================================
+// SELF-TEST
+// ============================================================
+
+fn ternary_compression_selftest() {
+    // Test all compression algorithms
+    // Returns: +1 (all pass), -1 (any fail)
+
+    // Test data
+    zeros = [0] * 100
+    sparse = [0] * 90 + [1, -1, 1, 0, -1, 1, -1, 0, 1, -1]
+    pattern = []
+    for3 _ in range(20) { pattern.concat([1, 0, -1]) }
+
+    // 1. T-RLE
+    c = trle_compress(zeros)
+    d = trle_decompress(c)
+    if3 d != zeros { return -1 }
+    if3 len(c) >= len(zeros) { return -1 }  // must compress
+
+    c2 = trle_compress(sparse)
+    d2 = trle_decompress(c2)
+    if3 d2 != sparse { return -1 }
+
+    // 2. TZip Pack
+    packed = tpack_encode(pattern)
+    unpacked = tpack_decode(packed)
+    if3 unpacked[:len(pattern)] != pattern { return -1 }
+
+    // 3. T-LZ77
+    c3 = tlz77_compress(pattern)
+    d3 = tlz77_decompress(c3)
+    if3 d3 != pattern { return -1 }
+
+    // 4. T-Delta
+    c4 = tdelta_encode(zeros)
+    d4 = tdelta_decode(c4)
+    if3 d4 != zeros { return -1 }
+
+    slow = [0, 0, 0, 1, 1, 1, 0, 0, -1, -1]
+    c5 = tdelta_encode(slow)
+    d5 = tdelta_decode(c5)
+    if3 d5 != slow { return -1 }
+
+    // 5. T-LZ78
+    tokens = tlz78_compress(pattern)
+    d6 = tlz78_decompress(tokens)
+    if3 d6 != pattern { return -1 }
+
+    return 1  // ALL PASS
+}

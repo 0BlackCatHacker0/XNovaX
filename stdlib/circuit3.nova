@@ -1,0 +1,93 @@
+// ============================================================================
+// circuit3.nova — Ternary Circuit Breaker (NovaLang v1.4 Stdlib)
+// ============================================================================
+// Three-state circuit breaker using native ternary:
+//   +1 (CLOSED)  = healthy, requests pass through
+//    0 (HALF)    = testing, limited requests pass
+//   -1 (OPEN)    = tripped, all requests blocked
+//
+// Uses v1.4 features: ??, default params, in operator
+// GOTCHA: dict_set returns new dict — must reassign!
+// ============================================================================
+
+fn circuit3_new(name, threshold = 3, reset_ms = 5000) {
+    return {
+        "name": name,
+        "state": 1,
+        "failures": 0,
+        "threshold": threshold,
+        "reset_ms": reset_ms,
+        "last_failure": 0,
+        "total_trips": 0,
+        "success_count": 0
+    }
+}
+
+fn circuit3_check(cb) {
+    let state = dict_get(cb, "state") ?? 1
+    let reset_ms = dict_get(cb, "reset_ms") ?? 5000
+    let last_fail = dict_get(cb, "last_failure") ?? 0
+    let now = time_ms()
+
+    // OPEN (-1): check if reset timeout has elapsed → move to HALF-OPEN
+    if3 state == -1 {
+        if3 (now - last_fail) > reset_ms {
+            return 0  // HALF-OPEN: allow one test request
+        }
+        return -1  // Still OPEN: block
+    }
+
+    // HALF-OPEN (0): allow through (caller must report result)
+    if3 state == 0 {
+        return 0
+    }
+
+    // CLOSED (+1): all good
+    return 1
+}
+
+fn circuit3_success(cb) {
+    let sc = dict_get(cb, "success_count") ?? 0
+    let result = deep_clone(cb)
+    result = dict_set(result, "failures", 0)
+    result = dict_set(result, "state", 1)
+    result = dict_set(result, "success_count", sc + 1)
+    return result
+}
+
+fn circuit3_failure(cb) {
+    let failures = (dict_get(cb, "failures") ?? 0) + 1
+    let threshold = dict_get(cb, "threshold") ?? 3
+    let trips = dict_get(cb, "total_trips") ?? 0
+
+    let result = deep_clone(cb)
+    result = dict_set(result, "failures", failures)
+    result = dict_set(result, "last_failure", time_ms())
+
+    if3 failures >= threshold {
+        result = dict_set(result, "state", -1)
+        result = dict_set(result, "total_trips", trips + 1)
+        result = dict_set(result, "failures", 0)
+    }
+
+    return result
+}
+
+fn circuit3_state_name(cb) {
+    let state = dict_get(cb, "state") ?? 0
+    match3 cmp3(state, 0) {
+        TRUE => { return "CLOSED" }
+        MAYBE => { return "HALF-OPEN" }
+        FALSE_ => { return "OPEN" }
+    }
+}
+
+fn circuit3_stats(cb) {
+    return {
+        "name": dict_get(cb, "name") ?? "unknown",
+        "state": circuit3_state_name(cb),
+        "failures": dict_get(cb, "failures") ?? 0,
+        "total_trips": dict_get(cb, "total_trips") ?? 0,
+        "successes": dict_get(cb, "success_count") ?? 0
+    }
+}

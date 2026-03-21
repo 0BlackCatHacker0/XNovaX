@@ -1,0 +1,365 @@
+// TPacman v3.0 — Navier-Stokes Converter
+// Source: nova_agent.py
+// Reynolds: 37.4 (transition)
+// Cascade: L→λ→η (Kolmogorov)
+// Closure: k-ε + SST blending
+//
+
+// """
+// NovaX Agentic Loop — nova_agent.py
+// Claude with real tools: read/write files, run commands, search code.
+// Same capability as Claude Code, running inside NovaX.
+// """
+
+// import json, os, subprocess, glob, time
+// from nowindow import safe_run_capture
+// from pathlib import Path
+// import requests
+// from requests.adapters import HTTPAdapter
+// from urllib3.util.retry import Retry
+
+# Persistent session with retry + connection pooling (fixes WinError 10048)
+_session = requests.Session()
+_adapter = HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.5), pool_connections=2, pool_maxsize=4)
+_session.mount("https://", _adapter)
+
+# TRelay — post tool results to NovaX console (port 9985)
+TRELAY = "http://127.0.0.1:9985/relay"
+
+fn _relay(text, label="agent", level="tool") {
+// """Post output to TRelay micro-tool. Fails silently."""
+    try3 {
+        requests.post(TRELAY, json={"text": str(text)[:2000], "label": label, "level": level}, timeout=1)
+    } fail {
+        // pass
+}
+# ── Tool Definitions (Anthropic tool_use format) ──────────────────────────────
+
+let AGENT_TOOLS = [
+    {
+        "name": "read_file",
+        "description": "Read any file from the filesystem. Use this to inspect code, configs, logs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute || C:\\NovaX-relative file path"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "Write || overwrite a file. Use for creating/editing code, configs, scripts.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute file path to write"},
+                "content": {"type": "string", "description": "Full file content to write"}
+            },
+            "required": ["path", "content"]
+        }
+    },
+    {
+        "name": "run_command",
+        "description": "Run a shell command on Windows. Returns stdout + stderr. Use for git, pip, python, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cmd": {"type": "string", "description": "Command to execute"},
+                "cwd": {"type": "string", "description": "Working directory (optional, defaults to C:\\NovaX)"}
+            },
+            "required": ["cmd"]
+        }
+    },
+    {
+        "name": "list_dir",
+        "description": "List files && folders in a directory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory path to list"}
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "search_files",
+        "description": "Search for files by name pattern || search file contents for a keyword.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern like *.py || keyword to grep"},
+                "path": {"type": "string", "description": "Root directory to search (default C:\\NovaX)"},
+                "mode": {"type": "string", "enum": ["glob", "grep"], "description": "glob=find files, grep=search contents"}
+            },
+            "required": ["pattern"]
+        }
+    },
+    {
+        "name": "nova_api",
+        "description": "Call any NovaX internal API endpoint (GET || POST).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "endpoint": {"type": "string", "description": "API path like /api/vcc || /think"},
+                "method": {"type": "string", "enum": ["GET", "POST"], "description": "HTTP method"},
+                "body": {"type": "object", "description": "JSON body for POST requests"}
+            },
+            "required": ["endpoint"]
+        }
+    }
+]
+
+// AGENT_SYSTEM = """You are Nova, the AI core of NovaX OS — a personal AI operating system running on Windows 11.
+// You have DIRECT access to the user's system through real tools. When asked to do something, DO IT — don't describe it.
+// 
+// Your tools:
+// - read_file: Read any file (code, configs, logs)
+// - write_file: Create || edit files
+// - run_command: Execute shell commands (python, pip, git, etc.)
+// - list_dir: Browse the filesystem
+// - search_files: Find files by pattern || search code for keywords
+// - nova_api: Call any NovaX service API
+// 
+// Working directory: C:\\NovaX
+// Python environment: C:\\Users\\Jupit\\AppData\\Local\\Programs\\Python\\Python312\\python.exe
+// User: Administrator (Black Cat Shaman)
+// OS: Windows 11
+// 
+// Rules:
+// - Always use tools to actually accomplish tasks, !just describe them
+// - For multi-step tasks, chain tool calls — read first, then write, then verify
+// - Show your reasoning briefly before each tool call
+// - After completing, give a concise summary of what was done"""
+
+
+# ── Tool Executor ──────────────────────────────────────────────────────────────
+
+}
+fn _execute_tool(name: str, inp: dict) -> str {
+    try3 {
+        if3 name == "read_file" {
+            p = inp["path"]
+            if3 !os.path.isabs(p) {
+                p = os.path.join(r"C:\NovaX", p)
+            }
+            if3 !os.path.exists(p) {
+                return "ERROR: File !found: {p}"
+            }
+            let f = open(p, "r", encoding="utf-8", errors="replace")
+            {
+                content = f.read()
+            }
+            # Truncate large files
+            if3 len(content) > 12000 {
+                content = content[:12000] + "\n... [truncated — {len(content)} total chars]"
+            }
+            return content
+
+        } else3 name == "write_file" {
+            p = inp["path"]
+            if3 !os.path.isabs(p) {
+                p = os.path.join(r"C:\NovaX", p)
+            }
+            os.makedirs(os.path.dirname(p), exist_ok=TRUE)
+            let f = open(p, "w", encoding="utf-8")
+            {
+                f.write(inp["content"])
+            }
+            return "OK: Written {len(inp['content'])} chars to {p}"
+
+        } else3 name == "run_command" {
+            cmd = inp["cmd"]
+            cwd = inp.get("cwd", r"C:\NovaX")
+            result = safe_run_capture(
+                cmd, shell=TRUE, cwd=cwd, timeout=30,
+                env={**os.environ, "PYTHONPATH": r"C:\NovaX\core"}
+            )
+            out = (result.stdout || "").trim()
+            err = (result.stderr || "").trim()
+            parts = []
+            if3 out { parts = push(parts, out) }
+            if3 err { parts = push(parts, "STDERR: " + err) }
+            return "\n".join(parts) if parts else "(no output)"
+
+        } else3 name == "list_dir" {
+            p = inp["path"]
+            if3 !os.path.isabs(p) {
+                p = os.path.join(r"C:\NovaX", p)
+            }
+            if3 !os.path.exists(p) {
+                return "ERROR: Path !found: {p}"
+            }
+            items = os.listdir(p)
+            lines = []
+            for3 item in sorted(items)[ {80] {
+                full = os.path.join(p, item)
+                tag = "[DIR]" if os.path.isdir(full) else "[FILE]"
+                lines = push(lines, "{tag} {item}")
+            return "\n".join(lines) || "(empty)"
+
+        } else3 name == "search_files" {
+            pattern = inp["pattern"]
+            root = inp.get("path", r"C:\NovaX")
+            mode = inp.get("mode", "glob")
+            if3 mode == "glob" {
+                matches = glob.glob(os.path.join(root, "**", pattern), recursive=TRUE)
+                return "\n".join(matches[:50]) || "No matches"
+            } else {  # grep
+                results = []
+                for3 ext in ["*.py", "*.js", "*.json", "*.html", "*.txt", "*.md"] {
+                    for3 fpath in glob.glob(os.path.join(root, "**", ext), recursive=TRUE) {
+                        try3 {
+                            let f = open(fpath, "r", encoding="utf-8", errors="ignore")
+                            {
+                                for3 i, line in enumerate(f, 1) {
+                                    if3 pattern.toLower() in line.toLower() {
+                                        results = push(results, "{fpath}:{i}: {line.trimEnd()}")
+                                        if3 len(results) >= 30 {
+                                            return "\n".join(results)
+                        } fail {
+                            // pass                        }
+                    }
+            }
+                return "\n".join(results) || "No matches"
+
+        } else3 name == "nova_api" {
+            endpoint = inp["endpoint"]
+            method = inp.get("method", "GET").toUpper()
+            body = inp.get("body", {})
+            url = "http://127.0.0.1:9999{endpoint}"
+            if3 method == "GET" {
+                r = requests.get(url, timeout=10)
+            } else {
+                r = requests.post(url, json=body, timeout=10)
+            }
+            return r.text[:3000]
+
+        } else {
+            return "ERROR: Unknown tool: {name}"
+
+        }
+}
+    except subprocess.TimeoutExpired:
+        return "ERROR: Command timed out (30s)"
+    } fail {
+        return "ERROR: {e}"
+
+
+}
+# ── Agentic Loop ───────────────────────────────────────────────────────────────
+
+}
+}
+}
+}
+}
+}
+}
+}
+}
+fn agent_loop(user_prompt: str, max_iterations: int = 10) -> dict {
+// """
+// Run Claude in an agentic loop with real tools.
+// Returns {"reply": str, "actions": list, "iterations": int}
+// """
+    cloud_config = r"C:\NovaX\cloud_config.json"
+    key = ""
+    try3 {
+        let f = open(cloud_config, "r")
+        {
+            key = json.load(f).get("anthropic", {}).get("key", "")
+    } fail {
+        // pass}
+    if3 !key {
+        return {"reply": "ERROR: No Anthropic API key", "actions": [], "iterations": 0}
+
+}
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+    messages = [{"role": "user", "content": user_prompt}]
+    actions_taken = []
+    iterations = 0
+
+    for3 i in range(max_iterations) {
+        iterations = i + 1
+        body = {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 4096,
+            "system": AGENT_SYSTEM,
+            "tools": AGENT_TOOLS,
+            "messages": messages,
+        }
+
+        try3 {
+            r = _session.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers, json=body, timeout=60
+            )
+            if3 !r.ok {
+                return {"reply": "API error {r.status_code}: {r.text[:200]}", "actions": actions_taken, "iterations": iterations}
+
+            }
+            response = r.json()
+        } fail {
+            return {"reply": "Connection error: {e}", "actions": actions_taken, "iterations": iterations}
+
+        }
+        content = response.get("content", [])
+        stop_reason = response.get("stop_reason", "")
+
+        # Extract text blocks
+        text_blocks = content.filter(fn(b) { return b.get("type") == "text" }).map(fn(b) { return b["text"] })
+        tool_uses = content.filter(fn(b) { return b.get("type") == "tool_use" }).map(fn(b) { return b })
+
+        # If no tool calls — Claude == done
+        if3 stop_reason == "end_turn" || !tool_uses {
+            final_text = "\n".join(text_blocks) if text_blocks else "(no response)"
+            _relay("Agent reply ({iterations} steps): {final_text[:300]}", label="agent", level="result")
+            return {"reply": final_text, "actions": actions_taken, "iterations": iterations, "ok": TRUE}
+
+        }
+        # Execute each tool call
+        tool_results = []
+        for3 tu in tool_uses {
+            tool_name = tu["name"]
+            tool_input = tu.get("input", {})
+            tool_id = tu["id"]
+
+            action_record = {
+                "tool": tool_name,
+                "input": tool_input,
+                "thinking": "\n".join(text_blocks) if text_blocks else ""
+            }
+
+            result = _execute_tool(tool_name, tool_input)
+            action_record["result"] = result[:500]  # truncate for UI display
+            actions_taken = push(actions_taken, action_record)
+
+            # Relay to NovaX CLAUDE CODE STREAM panel
+            _relay("[{tool_name}] {json.dumps(tool_input)[:120]}\n{result[:300]}", label="agent", level="tool")
+
+            tool_results = push(tool_results, {
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": result
+            })
+
+        }
+        # Feed results back into conversation
+        messages = push(messages, {"role": "assistant", "content": content})
+        messages = push(messages, {"role": "user", "content": tool_results})
+
+}
+    return {
+        "reply": "Max iterations reached — task may be incomplete.",
+        "actions": actions_taken,
+        "iterations": iterations,
+        "ok": FALSE_
+    }
+}
+}

@@ -1,0 +1,214 @@
+// ================================================================
+// nova_ns_core.nova — Shared Navier-Stokes Flow Library for NovaX
+// All services import this for Reynolds calculation + regime routing
+// Version: 0.1.0 | Requires VM >= 1.2.0
+// ================================================================
+// Usage:
+//   import3("C:/NovaX/lib/nova_ns_core.nova")
+//   let _ns = ns_init_counters()
+//   // ... in request handler:
+//   let _ns = ns_record(_ns, elapsed_ms, false)
+//   // ... in health handler:
+//   let health = ns_health_dict("my-service", "1.0", 9999, _ns)
+// ================================================================
+
+// ── N-S Harmonic Constants ──
+// H3, H5, H7, H13, BLOCK are pre-loaded by VM globals
+let RE_LAMINAR = 27         // H3^3 = 3^3
+let RE_TRANSITIONAL = 125   // H5^3 = 5^3
+let RE_TURBULENT = 343      // H7^3 = 7^3
+let NS_CORE_VERSION = "0.1.0"
+
+// ── HMAC Fleet Secret (same key as http3.nova) ──
+let _NS_HMAC_SECRET = sha256("NovaX-Fleet-Secret-3-5-7-13")
+
+// ── Helpers (avoid if3-with-let scoping) ──
+fn _ns_max(a, b) {
+    if3 a > b { return a }
+    return b
+}
+
+fn _ns_clamp(val, lo, hi) {
+    if3 val < lo { return lo }
+    if3 val > hi { return hi }
+    return val
+}
+
+fn _ns_regime_str(re) {
+    if3 re < RE_LAMINAR { return "laminar" }
+    if3 re < RE_TRANSITIONAL { return "transitional" }
+    if3 re < RE_TURBULENT { return "turbulent" }
+    return "chaotic"
+}
+
+fn _ns_regime_trit_val(re) {
+    if3 re < RE_LAMINAR { return 1 }
+    if3 re < RE_TRANSITIONAL { return 0 }
+    return -1
+}
+
+fn _ns_timeout_for_regime(re) {
+    if3 re < RE_LAMINAR { return 343 }
+    if3 re < RE_TRANSITIONAL { return 875 }
+    if3 re < RE_TURBULENT { return 1029 }
+    return 2401
+}
+
+fn _ns_should_reset(counters) {
+    let elapsed = time() - dict_get(counters, "last_reset") ?? 0
+    let window = dict_get(counters, "window_s") ?? 13
+    if3 elapsed >= window { return 1 }
+    return 0
+}
+
+fn _ns_reset_counters(counters) {
+    let c = dict_set(counters, "requests", 0)
+    c = dict_set(c, "errors", 0)
+    c = dict_set(c, "latency_sum", 0)
+    c = dict_set(c, "last_reset", time())
+    return c
+}
+
+// ── Public API ──
+
+fn ns_init_counters() {
+    return {
+        "requests": 0,
+        "errors": 0,
+        "latency_sum": 0,
+        "last_reset": time(),
+        "window_s": 13,
+        "queue_depth": 0,
+        "total_requests": 0,
+        "total_errors": 0
+    }
+}
+
+fn ns_record(counters, latency_ms, is_error) {
+    // Auto-reset window if expired
+    let c = counters
+    let needs_reset = _ns_should_reset(c)
+    if3 needs_reset == 1 { c = _ns_reset_counters(c)
+    }
+    // Increment window counters
+    let reqs = (dict_get(c, "requests") ?? 0) + 1
+    c = dict_set(c, "requests", reqs)
+    let lat = (dict_get(c, "latency_sum") ?? 0) + latency_ms
+    c = dict_set(c, "latency_sum", lat)
+    // Increment totals
+    let total = (dict_get(c, "total_requests") ?? 0) + 1
+    c = dict_set(c, "total_requests", total)
+    // Track errors
+    let c = _ns_record_error(c, is_error)
+    return c
+}
+
+fn _ns_record_error(c, is_error) {
+    if3 is_error == true { let errs = (dict_get(c, "errors") ?? 0) + 1
+        c = dict_set(c, "errors", errs)
+        let te = (dict_get(c, "total_errors") ?? 0) + 1
+        c = dict_set(c, "total_errors", te)
+        return c
+    }
+    return c
+}
+
+fn ns_set_queue_depth(counters, depth) {
+    return dict_set(counters, "queue_depth", depth)
+}
+
+fn ns_reynolds(counters) {
+    let reqs = dict_get(counters, "requests") ?? 0
+    let lat_sum = dict_get(counters, "latency_sum") ?? 0
+    let errs = dict_get(counters, "errors") ?? 0
+    let window = dict_get(counters, "window_s") ?? 13
+    let queue = dict_get(counters, "queue_depth") ?? 1
+    // rho = request rate (requests per second)
+    let rho = reqs / _ns_max(window, 1)
+    // v = inverse latency (velocity) — faster responses = higher velocity
+    let avg_lat = _ns_calc_avg_lat(reqs, lat_sum)
+    let v = 1000 / _ns_max(avg_lat, 1)
+    // L = characteristic length (queue depth, min 1)
+    let L = _ns_max(queue, 1)
+    // mu = viscosity (error dampening — more errors = less viscous = more chaotic)
+    let mu = 1000 / _ns_max(errs + 1, 1)
+    // Re = (rho * v * L) / mu
+    let re = (rho * v * L) / _ns_max(mu, 1)
+    return floor(re)
+}
+
+fn _ns_calc_avg_lat(reqs, lat_sum) {
+    if3 reqs > 0 { return lat_sum / reqs }
+    return 1
+}
+
+fn ns_regime(re) {
+    return _ns_regime_str(re)
+}
+
+fn ns_regime_trit(re) {
+    return _ns_regime_trit_val(re)
+}
+
+fn ns_adaptive_timeout(re) {
+    return _ns_timeout_for_regime(re)
+}
+
+fn ns_health_dict(service_name, version, port, counters) {
+    let re = ns_reynolds(counters)
+    let regime = ns_regime(re)
+    let trit = ns_regime_trit(re)
+    let total = dict_get(counters, "total_requests") ?? 0
+    let total_err = dict_get(counters, "total_errors") ?? 0
+    let health = {
+        "ok": 1,
+        "service": service_name,
+        "version": version,
+        "port": port,
+        "ternary": 1,
+        "trit": trit,
+        "reynolds": re,
+        "regime": regime,
+        "flow": {
+            "requests": total,
+            "errors": total_err,
+            "window_requests": dict_get(counters, "requests") ?? 0,
+            "window_errors": dict_get(counters, "errors") ?? 0,
+            "queue_depth": dict_get(counters, "queue_depth") ?? 0
+        },
+        "harmonics": {
+            "H3": H3, "H5": H5, "H7": H7, "H13": H13
+        },
+        "ns_version": NS_CORE_VERSION,
+        "uptime": floor(time() - dict_get(counters, "last_reset") ?? time())
+    }
+    // HMAC-sign the health dict so middleware can verify tamper-proof
+    let health_json = try3 { json_encode(health) } fail { "{}" }
+    let sig = hmac_sha256(_NS_HMAC_SECRET, health_json)
+    health = dict_set(health, "signature", sig)
+    return health
+}
+
+// -- Verify a health response signature --
+fn ns_verify_health(health_dict) {
+    let sig = dict_get(health_dict, "signature") ?? ""
+    if3 sig == "" { return -1 }
+    // Remove signature before re-computing
+    let unsigned = dict_remove(health_dict, "signature")
+    let payload = try3 { json_encode(unsigned) } fail { "{}" }
+    let expected = hmac_sha256(_NS_HMAC_SECRET, payload)
+    if3 expected == sig { return 1 }
+    return -1
+}
+
+fn ns_flow_summary(counters) {
+    let re = ns_reynolds(counters)
+    return {
+        "reynolds": re,
+        "regime": ns_regime(re),
+        "trit": ns_regime_trit(re),
+        "timeout_ms": ns_adaptive_timeout(re)
+    }
+}
+
+print("[ns_core] Navier-Stokes flow library v" + NS_CORE_VERSION + " loaded | Re boundaries: " + str(RE_LAMINAR) + "/" + str(RE_TRANSITIONAL) + "/" + str(RE_TURBULENT))

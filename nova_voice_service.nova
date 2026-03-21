@@ -1,0 +1,389 @@
+// =================================================================
+// nova_voice_service.nova -- Hey Nova Voice Wake Word + Listener v1.0.0
+// =================================================================
+// Continuous voice interaction service. Listens for "Nova" wake word,
+// captures spoken commands, routes to HiveMind, speaks responses.
+//
+// Uses PowerShell System.Speech.Recognition (no Python deps).
+//
+// POST /voice/listen   -- Start a listening session (dictation)
+// POST /voice/wake     -- Listen for "Nova" wake word
+// POST /voice/command  -- Full pipeline: listen -> HiveMind -> speak
+// GET  /voice/status   -- Listening state + engine status
+// GET  /health         -- Standard NS health
+// =================================================================
+
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+import3("C:/NovaX/lib/nova_http_utils.nova")
+
+let PORT = 9801
+let VERSION = "1.0.0"
+let SERVICE = "nova-voice"
+let _ns = ns_init_counters()
+
+// -- Ternary constants --
+let T_TRUE = 1
+let T_MAYBE = 0
+let T_FALSE = -1
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+
+// -- Service state --
+let _listen_count = 0
+let _wake_count = 0
+let _command_count = 0
+let _last_command = ""
+let _last_transcript = ""
+let _last_confidence = 0
+let _engine_ok = T_MAYBE
+
+// -- Config defaults --
+let HIVEMIND_URL = "http://127.0.0.1:9881"
+let TSPEAK_URL = "http://127.0.0.1:9895"
+let DEFAULT_TIMEOUT = 5
+let WAKE_WORD = "Nova"
+
+// =================================================================
+// POWERSHELL BUILDERS
+// =================================================================
+
+// Build PS command for dictation (free-form speech recognition)
+fn _ps_dictation(timeout_sec) {
+    let t = to_str(timeout_sec)
+    let cmd = "powershell -Command \""
+    cmd = cmd + "Add-Type -AssemblyName System.Speech; "
+    cmd = cmd + "$r = New-Object System.Speech.Recognition.SpeechRecognitionEngine; "
+    cmd = cmd + "$r.SetInputToDefaultAudioDevice(); "
+    cmd = cmd + "$g = New-Object System.Speech.Recognition.DictationGrammar; "
+    cmd = cmd + "$r.LoadGrammar($g); "
+    cmd = cmd + "$result = $r.Recognize([TimeSpan]::FromSeconds(" + t + ")); "
+    cmd = cmd + "if ($result) { "
+    cmd = cmd + "Write-Output ($result.Text + '|' + $result.Confidence.ToString()) "
+    cmd = cmd + "} else { Write-Output 'SILENCE|0' }"
+    cmd = cmd + "\""
+    return cmd
+}
+
+// Build PS command for wake word detection (restricted grammar)
+fn _ps_wake_word(timeout_sec) {
+    let t = to_str(timeout_sec)
+    let cmd = "powershell -Command \""
+    cmd = cmd + "Add-Type -AssemblyName System.Speech; "
+    cmd = cmd + "$r = New-Object System.Speech.Recognition.SpeechRecognitionEngine; "
+    cmd = cmd + "$r.SetInputToDefaultAudioDevice(); "
+    cmd = cmd + "$gb = New-Object System.Speech.Recognition.GrammarBuilder; "
+    cmd = cmd + "$choices = New-Object System.Speech.Recognition.Choices; "
+    cmd = cmd + "$choices.Add('Nova'); "
+    cmd = cmd + "$choices.Add('Hey Nova'); "
+    cmd = cmd + "$choices.Add('OK Nova'); "
+    cmd = cmd + "$gb.Append($choices); "
+    cmd = cmd + "$g = New-Object System.Speech.Recognition.Grammar($gb); "
+    cmd = cmd + "$r.LoadGrammar($g); "
+    cmd = cmd + "$result = $r.Recognize([TimeSpan]::FromSeconds(" + t + ")); "
+    cmd = cmd + "if ($result) { "
+    cmd = cmd + "Write-Output ($result.Text + '|' + $result.Confidence.ToString()) "
+    cmd = cmd + "} else { Write-Output 'NONE|0' }"
+    cmd = cmd + "\""
+    return cmd
+}
+
+// Parse "text|confidence" output from PowerShell
+fn _parse_recognition(raw) {
+    let cleaned = trim(raw)
+    if3 len(cleaned) == 0 {
+        return {"text": "", "confidence": 0}
+    }
+    let parts = split(cleaned, "|")
+    let text = ""
+    let conf = 0
+    if3 len(parts) >= 1 {
+        text = trim(parts[0])
+    }
+    if3 len(parts) >= 2 {
+        let _vf1 = try3 { to_num(trim(parts[1])) } fail { 0 }
+        conf = _vf1
+    }
+    return {"text": text, "confidence": conf}
+}
+
+// HTTP POST helper for internal service calls
+fn _http_post(url, payload_str) {
+    let curl_cmd = "powershell -Command \""
+    curl_cmd = curl_cmd + "$body = '" + replace(payload_str, "'", "''") + "'; "
+    curl_cmd = curl_cmd + "$bytes = [System.Text.Encoding]::UTF8.GetBytes($body); "
+    curl_cmd = curl_cmd + "$req = [System.Net.HttpWebRequest]::Create('" + url + "'); "
+    curl_cmd = curl_cmd + "$req.Method = 'POST'; "
+    curl_cmd = curl_cmd + "$req.ContentType = 'application/json'; "
+    curl_cmd = curl_cmd + "$req.Timeout = 30000; "
+    curl_cmd = curl_cmd + "$stream = $req.GetRequestStream(); "
+    curl_cmd = curl_cmd + "$stream.Write($bytes, 0, $bytes.Length); "
+    curl_cmd = curl_cmd + "$stream.Close(); "
+    curl_cmd = curl_cmd + "$resp = $req.GetResponse(); "
+    curl_cmd = curl_cmd + "$reader = New-Object System.IO.StreamReader($resp.GetResponseStream()); "
+    curl_cmd = curl_cmd + "Write-Output $reader.ReadToEnd(); "
+    curl_cmd = curl_cmd + "$reader.Close(); $resp.Close()"
+    curl_cmd = curl_cmd + "\""
+    let _post_result = try3 { nova_run(curl_cmd) } fail { "" }
+    return _post_result
+}
+
+// =================================================================
+// HANDLERS
+// =================================================================
+
+// -- GET /health -- Standard NS health --
+fn handle_health(req) {
+    let resp = ns_health_dict(SERVICE, VERSION, PORT, _ns)
+    resp = dict_set(resp, "listen_count", _listen_count)
+    resp = dict_set(resp, "wake_count", _wake_count)
+    resp = dict_set(resp, "command_count", _command_count)
+    return json_ok(resp)
+}
+
+// -- GET /voice/status -- Detailed status --
+fn handle_status(req) {
+    _ns = ns_record(_ns, 0, 0)
+
+    // Test if System.Speech.Recognition is available
+    let test_cmd = "powershell -Command \"Add-Type -AssemblyName System.Speech; Write-Output 'ok'\""
+    let test_result = try3 { nova_run(test_cmd) } fail { "" }
+    let speech_ok = T_FALSE
+    if3 contains(test_result, "ok") {
+        speech_ok = T_TRUE
+        _engine_ok = T_TRUE
+    }
+
+    return json_ok({
+        "trit": speech_ok,
+        "service": SERVICE,
+        "version": VERSION,
+        "port": PORT,
+        "engine": "System.Speech.Recognition.SpeechRecognitionEngine",
+        "speech_available": speech_ok,
+        "wake_word": WAKE_WORD,
+        "listen_count": _listen_count,
+        "wake_count": _wake_count,
+        "command_count": _command_count,
+        "last_command": _last_command,
+        "last_transcript": _last_transcript,
+        "hivemind": HIVEMIND_URL,
+        "tspeak": TSPEAK_URL,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    })
+}
+
+// -- POST /voice/listen -- Dictation session --
+fn handle_listen(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let timeout = dict_get(body, "timeout") ?? DEFAULT_TIMEOUT
+
+    // Run dictation recognition
+    let ps_cmd = _ps_dictation(timeout)
+    let raw = try3 { nova_run(ps_cmd) } fail { "ERROR|0" }
+    let parsed = _parse_recognition(raw)
+
+    let text = dict_get(parsed, "text") ?? ""
+    let confidence = dict_get(parsed, "confidence") ?? 0
+
+    // Determine trit
+    let trit = T_FALSE
+    if3 text == "SILENCE" {
+        trit = T_FALSE
+        text = ""
+    } else3 text == "ERROR" {
+        trit = T_FALSE
+        text = ""
+    } else3 len(text) > 0 {
+        if3 confidence > 0.5 {
+            trit = T_TRUE
+        } else3 {
+            trit = T_MAYBE
+        }
+    }
+
+    _listen_count = _listen_count + 1
+    _last_transcript = text
+
+    return json_ok({
+        "trit": trit,
+        "text": text,
+        "confidence": confidence,
+        "timeout": timeout,
+        "listen_count": _listen_count
+    })
+}
+
+// -- POST /voice/wake -- Listen for "Nova" keyword --
+fn handle_wake(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let timeout = dict_get(body, "timeout") ?? 10
+
+    // Run restricted grammar recognition
+    let ps_cmd = _ps_wake_word(timeout)
+    let raw = try3 { nova_run(ps_cmd) } fail { "NONE|0" }
+    let parsed = _parse_recognition(raw)
+
+    let text = dict_get(parsed, "text") ?? ""
+    let confidence = dict_get(parsed, "confidence") ?? 0
+
+    let detected = T_FALSE
+    if3 text == "NONE" {
+        detected = T_FALSE
+    } else3 len(text) > 0 {
+        if3 confidence > 0.4 {
+            detected = T_TRUE
+            _wake_count = _wake_count + 1
+        } else3 {
+            detected = T_MAYBE
+        }
+    }
+
+    return json_ok({
+        "trit": detected,
+        "detected": detected == T_TRUE,
+        "confidence": confidence,
+        "text": text,
+        "wake_word": WAKE_WORD,
+        "wake_count": _wake_count
+    })
+}
+
+// -- POST /voice/command -- Full pipeline: listen -> HiveMind -> TSpeak --
+fn handle_command(req) {
+    _ns = ns_record(_ns, 0, 0)
+    let body = parse_body(req)
+    let timeout = dict_get(body, "timeout") ?? DEFAULT_TIMEOUT
+    let skip_speak = dict_get(body, "skip_speak") ?? false
+
+    let log = []
+    log = append(log, {"step": "listen", "status": "starting"})
+
+    // Step 1: Listen for speech
+    let ps_cmd = _ps_dictation(timeout)
+    let raw = try3 { nova_run(ps_cmd) } fail { "ERROR|0" }
+    let parsed = _parse_recognition(raw)
+
+    let text = dict_get(parsed, "text") ?? ""
+    let confidence = dict_get(parsed, "confidence") ?? 0
+
+    if3 text == "SILENCE" {
+        log = append(log, {"step": "listen", "status": "silence"})
+        return json_ok({
+            "trit": T_FALSE,
+            "error": "no_speech_detected",
+            "log": log
+        })
+    }
+    if3 text == "ERROR" {
+        log = append(log, {"step": "listen", "status": "error"})
+        return json_ok({
+            "trit": T_FALSE,
+            "error": "recognition_failed",
+            "log": log
+        })
+    }
+    if3 len(text) == 0 {
+        log = append(log, {"step": "listen", "status": "empty"})
+        return json_ok({
+            "trit": T_FALSE,
+            "error": "empty_transcript",
+            "log": log
+        })
+    }
+
+    log = append(log, {"step": "listen", "status": "ok", "text": text, "confidence": confidence})
+
+    // Step 2: Send to HiveMind
+    let hive_payload = json_encode({"prompt": text, "source": "voice", "channel": "INSTRUCT"})
+    let hive_url = HIVEMIND_URL + "/hive/query"
+    let hive_raw = _http_post(hive_url, hive_payload)
+
+    let hive_response = ""
+    let hive_trit = T_FALSE
+    if3 len(hive_raw) > 0 {
+        let hive_data = try3 { json_decode(hive_raw) } fail { {} }
+        hive_response = dict_get(hive_data, "response") ?? dict_get(hive_data, "reply") ?? dict_get(hive_data, "text") ?? hive_raw
+        hive_trit = T_TRUE
+        log = append(log, {"step": "hivemind", "status": "ok"})
+    } else3 {
+        hive_response = "I could not reach the HiveMind."
+        hive_trit = T_FALSE
+        log = append(log, {"step": "hivemind", "status": "unreachable"})
+    }
+
+    // Step 3: Speak the response via TSpeak
+    let speak_trit = T_MAYBE
+    if3 skip_speak == false {
+        let speak_payload = json_encode({"text": to_str(hive_response)})
+        let speak_url = TSPEAK_URL + "/tspeak/say"
+        let speak_raw = _http_post(speak_url, speak_payload)
+        if3 len(speak_raw) > 0 {
+            speak_trit = T_TRUE
+            log = append(log, {"step": "tspeak", "status": "ok"})
+        } else3 {
+            speak_trit = T_FALSE
+            log = append(log, {"step": "tspeak", "status": "failed"})
+        }
+    } else3 {
+        log = append(log, {"step": "tspeak", "status": "skipped"})
+    }
+
+    // Update state
+    _command_count = _command_count + 1
+    _last_command = text
+    _last_transcript = text
+
+    // Overall trit: +1 if all worked, 0 if partial, -1 if failed
+    let overall = T_TRUE
+    if3 hive_trit == T_FALSE {
+        overall = T_FALSE
+    } else3 speak_trit == T_FALSE {
+        overall = T_MAYBE
+    }
+
+    return json_ok({
+        "trit": overall,
+        "transcript": text,
+        "confidence": confidence,
+        "response": hive_response,
+        "spoken": speak_trit == T_TRUE,
+        "command_count": _command_count,
+        "log": log
+    })
+}
+
+// =================================================================
+// ROUTES + BOOT
+// =================================================================
+
+let server = tserve(PORT, "NovaVoice v1.0")
+
+troute(server, "GET",  "/health",         "handle_health")
+troute(server, "GET",  "/voice/status",   "handle_status")
+troute(server, "POST", "/voice/listen",   "handle_listen")
+troute(server, "POST", "/voice/wake",     "handle_wake")
+troute(server, "POST", "/voice/command",  "handle_command")
+
+print("==============================================")
+print("[voice] NovaX Voice Wake Word Service v" + VERSION)
+print("[voice] Port: " + to_str(PORT))
+print("[voice] Wake Word: " + WAKE_WORD)
+print("[voice] Engine: System.Speech.Recognition (PowerShell)")
+print("[voice] HiveMind: " + HIVEMIND_URL)
+print("[voice] TSpeak: " + TSPEAK_URL)
+print("[voice] Endpoints:")
+print("[voice]   POST /voice/listen   - Dictation")
+print("[voice]   POST /voice/wake     - Wake word detection")
+print("[voice]   POST /voice/command  - Full pipeline")
+print("[voice]   GET  /voice/status   - Status")
+print("[voice]   GET  /health         - Health")
+print("==============================================")
+
+tstart(server)

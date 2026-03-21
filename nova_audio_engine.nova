@@ -1,0 +1,570 @@
+// ============================================================
+// nova_audio_engine.nova — Audio Engine Microservice
+// Port 9854 | 7 audio tools | Pure NovaLang (no Python bridge)
+// Uses sin/cos/sqrt/random builtins from novalang-vm
+// ============================================================
+
+let SERVICE_NAME = "audio-engine"
+let VERSION = "2.0.0"
+let PORT = 9854
+
+// 3-5-7-13 Harmonic Constants
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let BLOCK_SIZE = 2187
+let RE_LAMINAR = 27
+let RE_TRANSITION = 125
+let RE_TURBULENT = 343
+let PI = 3.14159265358979
+let TWO_PI = 6.28318530717959
+
+// ============================================================
+// Helpers (avoid let-inside-if3 scoping bugs)
+// ============================================================
+
+fn _wave_sample_sine(amp, freq, t) {
+    return amp * sin(TWO_PI * freq * t)
+}
+
+fn _wave_sample_square(amp, freq, t) {
+    let s = sin(TWO_PI * freq * t)
+    if3 s >= 0 { return amp }
+    return 0 - amp
+}
+
+fn _wave_sample_saw(amp, freq, t) {
+    let phase = t * freq
+    let frac = phase - floor(phase)
+    return amp * (2 * frac - 1)
+}
+
+fn _wave_sample_triangle(amp, freq, t) {
+    let phase = t * freq
+    let frac = phase - floor(phase)
+    let v = frac - 0.5
+    if3 v < 0 { v = 0 - v }
+    return amp * (4 * abs(frac - 0.5) - 1)
+}
+
+fn _lcg_next(state) {
+    let s = state * 1103515245 + 12345
+    return _abs_f(s)
+}
+
+fn _wave_sample_noise(amp, state) {
+    let ns = _lcg_next(state)
+    let val = amp * (ns / 2147483647 * 2 - 1)
+    return {"sample": val, "state": ns}
+}
+
+fn _make_wave_result(s, ns) {
+    return dict_set(dict_set({}, "sample", s), "state", ns)
+}
+
+fn _get_wave_sample(wtype, amp, freq, t, noise_state) {
+    if3 wtype == "sine" { return _make_wave_result(_wave_sample_sine(amp, freq, t), noise_state) }
+    if3 wtype == "square" { return _make_wave_result(_wave_sample_square(amp, freq, t), noise_state) }
+    if3 wtype == "saw" { return _make_wave_result(_wave_sample_saw(amp, freq, t), noise_state) }
+    if3 wtype == "triangle" { return _make_wave_result(_wave_sample_triangle(amp, freq, t), noise_state) }
+    if3 wtype == "noise" { return _wave_sample_noise(amp, noise_state) }
+    return _make_wave_result(0, noise_state)
+}
+
+fn ok_trit(ok_val) {
+    if3 ok_val == true { return 1 }
+    if3 ok_val == 1 { return 1 }
+    return -1
+}
+
+fn _cap_val(n, limit) {
+    if3 n > limit { return limit }
+    return n
+}
+
+fn _max_f(a, b) {
+    if3 a > b { return a }
+    return b
+}
+
+fn _min_f(a, b) {
+    if3 a < b { return a }
+    return b
+}
+
+fn _clamp(val, lo, hi) {
+    if3 val < lo { return lo }
+    if3 val > hi { return hi }
+    return val
+}
+
+fn _safe_div(a, b) {
+    if3 b == 0 { return 0 }
+    return a / b
+}
+
+fn _abs_f(x) {
+    if3 x < 0 { return 0 - x }
+    return x
+}
+
+fn _err_no_samples() {
+    return {"ok": false, "error": "no_samples", "trit": -1, "service": "audio-engine"}
+}
+
+fn _empty_stats() {
+    return {"ok": true, "stats": {"count": 0}}
+}
+
+fn _make_freq_bin(freq_hz, mag) {
+    return {"freq": freq_hz, "magnitude": mag}
+}
+
+fn _inc_if_pos(count, val) {
+    if3 val > 0 { return count + 1 }
+    return count
+}
+
+fn _inc_if_neg(count, val) {
+    if3 val < 0 { return count + 1 }
+    return count
+}
+
+fn _inc_if_zero(count, val) {
+    if3 val == 0 { return count + 1 }
+    return count
+}
+
+fn _pick_input(primary, fallback) {
+    if3 len(primary) > 0 { return primary }
+    return fallback
+}
+
+// Safe accessors — avoid try3 {} fail {} inside while3 {} (parser swallow)
+fn _safe_float(list, idx) {
+    let v = try3 { list[idx] } fail { 0.0 }
+    return float(v)
+}
+
+fn _safe_get(list, idx, fallback) {
+    let v = try3 { list[idx] } fail { fallback }
+    return v
+}
+
+fn _safe_get_dict(list, idx) {
+    let empty = dict_set({}, "_empty", true)
+    let v = try3 { list[idx] } fail { empty }
+    return v
+}
+
+// ============================================================
+// Tool 1: wave — generate waveform
+// POST /audio/wave
+// ============================================================
+
+fn handle_wave(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let wtype = dict_get(body, "type") ?? "sine"
+    let freq = float(dict_get(body, "freq") ?? 440)
+    let duration = float(dict_get(body, "duration") ?? 1.0)
+    let sample_rate = int(dict_get(body, "sample_rate") ?? 8000)
+    let amplitude = float(dict_get(body, "amplitude") ?? 0.8)
+    let total = int(sample_rate * duration)
+    let n = _cap_val(total, 8000)
+    let samples = []
+    let noise_state = 42
+    let i = 0
+    while3 i < n {
+        let t = float(i) / float(sample_rate)
+        let result = _get_wave_sample(wtype, amplitude, freq, t, noise_state)
+        let s = dict_get(result, "sample") ?? 0
+        noise_state = dict_get(result, "state") ?? noise_state
+        samples = append(samples, round(s, 4))
+        i = i + 1
+    }
+    // Return first 200 for display, total count for info
+    let display = []
+    let j = 0
+    let cap = _cap_val(len(samples), 200)
+    while3 j < cap {
+        let sv = _safe_get(samples, j, 0)
+        display = append(display, sv)
+        j = j + 1
+    }
+    return {"ok": true, "type": wtype, "freq": freq, "samples": display, "total_samples": n, "sample_rate": sample_rate, "duration": duration, "trit": 1, "service": SERVICE_NAME}
+}
+
+// ============================================================
+// Tool 2: freq — DFT frequency analysis
+// POST /audio/freq
+// ============================================================
+
+fn handle_freq(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let samples = dict_get(body, "samples") ?? []
+    let sample_rate = int(dict_get(body, "sample_rate") ?? 8000)
+    let n = len(samples)
+    if3 n == 0 { return _err_no_samples() }
+    let max_bins = _cap_val(n / 2, 100)
+    let spectrum = []
+    let k = 0
+    while3 k < max_bins {
+        let real_sum = 0.0
+        let imag_sum = 0.0
+        let i = 0
+        while3 i < n {
+            let s = _safe_float(samples, i)
+            let angle = TWO_PI * float(k) * float(i) / float(n)
+            real_sum = real_sum + s * cos(angle)
+            imag_sum = imag_sum + s * sin(angle)
+            i = i + 1
+        }
+        let mag = sqrt(real_sum * real_sum + imag_sum * imag_sum) / float(n)
+        let freq_hz = float(k) * float(sample_rate) / float(n)
+        let bin = _make_freq_bin(round(freq_hz, 2), round(mag, 4))
+        spectrum = append(spectrum, bin)
+        k = k + 1
+    }
+    return {"ok": true, "spectrum": spectrum, "bins": len(spectrum), "sample_rate": sample_rate, "trit": 1, "service": SERVICE_NAME}
+}
+
+// ============================================================
+// Tool 3: synth — additive synthesis
+// POST /audio/synth
+// ============================================================
+
+fn _synth_sample(harmonics, t) {
+    let sum = 0.0
+    let h = 0
+    while3 h < len(harmonics) {
+        let harm = _safe_get_dict(harmonics, h)
+        let freq = float(dict_get(harm, "freq") ?? 440)
+        let amp = float(dict_get(harm, "amp") ?? 1.0)
+        sum = sum + amp * sin(TWO_PI * freq * t)
+        h = h + 1
+    }
+    return sum
+}
+
+fn handle_synth(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let harmonics = dict_get(body, "harmonics") ?? []
+    let duration = float(dict_get(body, "duration") ?? 1.0)
+    let sample_rate = int(dict_get(body, "sample_rate") ?? 8000)
+    let total = int(sample_rate * duration)
+    let cap = _cap_val(total, 8000)
+    // Generate samples and find peak in one pass
+    let samples = []
+    let peak = 0.0
+    let i = 0
+    while3 i < cap {
+        let t = float(i) / float(sample_rate)
+        let val = _synth_sample(harmonics, t)
+        samples = append(samples, val)
+        let a = _abs_f(val)
+        peak = _max_f(peak, a)
+        i = i + 1
+    }
+    // Normalize and cap to 200 for display
+    let display = []
+    let j = 0
+    let dlen = _cap_val(cap, 200)
+    while3 j < dlen {
+        let v = _safe_float(samples, j)
+        let normed = _safe_div(v, _max_f(peak, 0.001))
+        display = append(display, round(normed, 4))
+        j = j + 1
+    }
+    return {"ok": true, "samples": display, "total_samples": cap, "harmonics_count": len(harmonics), "sample_rate": sample_rate, "trit": 1, "service": SERVICE_NAME}
+}
+
+// ============================================================
+// Tool 4: envelope — ADSR envelope generator
+// POST /audio/envelope
+// ============================================================
+
+fn _adsr_val(t, a, d, sus, dur, r) {
+    if3 t < a { return _safe_div(t, _max_f(a, 0.0001)) }
+    if3 t < a + d { return 1.0 - (1.0 - sus) * _safe_div(t - a, _max_f(d, 0.0001)) }
+    let release_start = dur - r
+    if3 t < release_start { return sus }
+    return sus * (1.0 - _safe_div(t - release_start, _max_f(r, 0.0001)))
+}
+
+fn handle_envelope(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let attack = float(dict_get(body, "attack") ?? 0.1)
+    let decay = float(dict_get(body, "decay") ?? 0.1)
+    let sustain = float(dict_get(body, "sustain") ?? 0.7)
+    let release = float(dict_get(body, "release") ?? 0.2)
+    let duration = float(dict_get(body, "duration") ?? 1.0)
+    let sample_rate = int(dict_get(body, "sample_rate") ?? 8000)
+    let total = int(sample_rate * duration)
+    let n = _cap_val(total, 8000)
+    let env = []
+    let i = 0
+    while3 i < n {
+        let t = float(i) / float(sample_rate)
+        let val = _adsr_val(t, attack, decay, sustain, duration, release)
+        let val = _clamp(val, 0, 1)
+        env = append(env, round(val, 4))
+        i = i + 1
+    }
+    let display = []
+    let j = 0
+    let dlen = _cap_val(len(env), 200)
+    while3 j < dlen {
+        let ev = _safe_get(env, j, 0)
+        display = append(display, ev)
+        j = j + 1
+    }
+    return {"ok": true, "envelope": display, "total_samples": n, "adsr": {"attack": attack, "decay": decay, "sustain": sustain, "release": release}, "trit": 1, "service": SERVICE_NAME}
+}
+
+// ============================================================
+// Tool 5: filter — lowpass/highpass/bandpass
+// POST /audio/filter
+// ============================================================
+
+fn _filter_lowpass(samples, i, window) {
+    let start = i - window
+    let start = _max_f(start, 0)
+    let sum = 0.0
+    let count = 0
+    let k = start
+    while3 k <= i {
+        let sk = _safe_float(samples, k)
+        sum = sum + sk
+        count = count + 1
+        k = k + 1
+    }
+    return _safe_div(sum, float(count))
+}
+
+fn _filter_highpass(samples, i, window) {
+    let avg = _filter_lowpass(samples, i, window)
+    let cur = _safe_float(samples, i)
+    return cur - avg
+}
+
+fn _filter_bandpass(samples, i, sr, cutoff, bw) {
+    let low_w = _max_f(1, int(sr / (2 * (cutoff + bw / 2))))
+    let high_w = _max_f(1, int(sr / (2 * _max_f(1, cutoff - bw / 2))))
+    let low_val = _filter_lowpass(samples, i, int(low_w))
+    let high_val = _filter_lowpass(samples, i, int(high_w))
+    let cur = _safe_float(samples, i)
+    return low_val - high_val + cur * 0.5
+}
+
+fn _get_filter_val(ftype, samples, i, window, sr, cutoff, bw) {
+    if3 ftype == "lowpass" { return _filter_lowpass(samples, i, window) }
+    if3 ftype == "highpass" { return _filter_highpass(samples, i, window) }
+    if3 ftype == "bandpass" { return _filter_bandpass(samples, i, sr, cutoff, bw) }
+    return _safe_float(samples, i)
+}
+
+fn handle_filter(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let ftype = dict_get(body, "type") ?? "lowpass"
+    let samples = dict_get(body, "samples") ?? []
+    let cutoff = float(dict_get(body, "cutoff") ?? 1000)
+    let sample_rate = int(dict_get(body, "sample_rate") ?? 8000)
+    let bw = float(dict_get(body, "bandwidth") ?? 200)
+    let n = len(samples)
+    if3 n == 0 { return _err_no_samples() }
+    let window = _max_f(1, int(_safe_div(float(sample_rate), 2.0 * _max_f(cutoff, 1))))
+    let filtered = []
+    let i = 0
+    while3 i < n {
+        let val = _get_filter_val(ftype, samples, i, int(window), sample_rate, cutoff, bw)
+        filtered = append(filtered, round(val, 4))
+        i = i + 1
+    }
+    let display = []
+    let j = 0
+    let dlen = _cap_val(len(filtered), 200)
+    while3 j < dlen {
+        let fv = _safe_get(filtered, j, 0)
+        display = append(display, fv)
+        j = j + 1
+    }
+    return {"ok": true, "type": ftype, "samples": display, "total_samples": n, "cutoff": cutoff, "trit": 1, "service": SERVICE_NAME}
+}
+
+// ============================================================
+// Tool 6: rhythm — ternary rhythm pattern generator
+// POST /audio/rhythm
+// ============================================================
+
+fn _rhythm_trit(ch) {
+    if3 ch == "x" { return 1 }
+    if3 ch == "X" { return 1 }
+    if3 ch == "o" { return 0 }
+    if3 ch == "O" { return 0 }
+    return -1
+}
+
+fn _rhythm_hit(ch) {
+    if3 ch == "." { return false }
+    return true
+}
+
+fn handle_rhythm(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let pattern = dict_get(body, "pattern") ?? "x.x.x.x."
+    let bpm = float(dict_get(body, "bpm") ?? 120)
+    let subdivisions = int(dict_get(body, "subdivisions") ?? 8)
+    let time_sig = dict_get(body, "time_sig") ?? [3, 4]
+    let ts1 = _safe_float(time_sig, 1)
+    let beat_dur = _safe_div(60.0, _max_f(bpm, 1))
+    let sub_dur = beat_dur / _safe_div(float(subdivisions), _max_f(ts1, 1))
+    let beats = []
+    let chars = split(pattern, "")
+    let i = 0
+    while3 i < len(chars) {
+        let ch = _safe_get(chars, i, ".")
+        let t = float(i) * sub_dur
+        let beat = dict_set(dict_set(dict_set(dict_set(dict_set({}, "index", i), "time", round(t, 4)), "hit", _rhythm_hit(ch)), "trit", _rhythm_trit(ch)), "char", ch)
+        beats = append(beats, beat)
+        i = i + 1
+    }
+    let total_dur = float(len(chars)) * sub_dur
+    return {"ok": true, "pattern": pattern, "beats": beats, "bpm": bpm, "time_sig": time_sig, "total_duration": round(total_dur, 4), "trit": 1, "service": SERVICE_NAME}
+}
+
+// ============================================================
+// Tool 7: encode — ternary audio encoding/decoding/stats
+// POST /audio/encode
+// ============================================================
+
+fn _trit_encode(samples, depth) {
+    let max_val = pow(3, depth)
+    let trits = []
+    let n = _cap_val(len(samples), 500)
+    let i = 0
+    while3 i < n {
+        let s = _safe_float(samples, i)
+        let q = round(s * (max_val - 1), 0)
+        let q = _clamp(int(q), int(0 - max_val + 1), int(max_val - 1))
+        trits = append(trits, q)
+        i = i + 1
+    }
+    let display = []
+    let j = 0
+    let dlen = _cap_val(len(trits), 200)
+    while3 j < dlen {
+        let tv = _safe_get(trits, j, 0)
+        display = append(display, tv)
+        j = j + 1
+    }
+    return {"ok": true, "op": "to_trit", "trits": display, "total": len(trits), "depth": depth, "range": [int(0 - max_val + 1), int(max_val - 1)]}
+}
+
+fn _trit_decode(trits, depth) {
+    let max_val = pow(3, depth)
+    let decoded = []
+    let n = _cap_val(len(trits), 500)
+    let i = 0
+    while3 i < n {
+        let t = _safe_float(trits, i)
+        let val = _safe_div(t, _max_f(float(max_val - 1), 1))
+        decoded = append(decoded, round(val, 4))
+        i = i + 1
+    }
+    let display = []
+    let j = 0
+    let dlen = _cap_val(len(decoded), 200)
+    while3 j < dlen {
+        let dv = _safe_get(decoded, j, 0)
+        display = append(display, dv)
+        j = j + 1
+    }
+    return {"ok": true, "op": "from_trit", "samples": display, "total": len(decoded)}
+}
+
+fn _trit_stats(samples) {
+    let n = len(samples)
+    if3 n == 0 { return _empty_stats() }
+    let peak = 0.0
+    let sum_sq = 0.0
+    let pos = 0
+    let neg = 0
+    let zero = 0
+    let i = 0
+    while3 i < n {
+        let s = _safe_float(samples, i)
+        let a = _abs_f(s)
+        peak = _max_f(peak, a)
+        let sum_sq = sum_sq + s * s
+        pos = _inc_if_pos(pos, s)
+        neg = _inc_if_neg(neg, s)
+        zero = _inc_if_zero(zero, s)
+        i = i + 1
+    }
+    let rms = sqrt(_safe_div(sum_sq, float(n)))
+    return {"ok": true, "stats": {"count": n, "peak": round(peak, 4), "rms": round(rms, 4), "positive": pos, "negative": neg, "zero": zero, "trit_balance": {"plus": pos, "zero": zero, "minus": neg}}}
+}
+
+fn handle_encode(req) {
+    let body = try3 { json_decode(req["body"]) } fail { req }
+    let op = dict_get(body, "op") ?? "to_trit"
+    let samples = dict_get(body, "samples") ?? []
+    let depth = int(dict_get(body, "depth") ?? 3)
+    let trits = dict_get(body, "trits") ?? []
+    if3 op == "to_trit" { result = _trit_encode(samples, depth)
+        result = dict_set(result, "trit", 1)
+        result = dict_set(result, "service", SERVICE_NAME)
+        return result
+    }
+    if3 op == "from_trit" { input = _pick_input(trits, samples)
+        let result = _trit_decode(input, depth)
+        result = dict_set(result, "trit", 1)
+        result = dict_set(result, "service", SERVICE_NAME)
+        return result
+    }
+    if3 op == "stats" { result = _trit_stats(samples)
+        result = dict_set(result, "trit", 1)
+        result = dict_set(result, "service", SERVICE_NAME)
+        return result
+    }
+    return {"ok": false, "error": "unknown_op", "trit": -1, "service": SERVICE_NAME}
+}
+
+// ============================================================
+// Health & Status
+// ============================================================
+
+fn handle_health(req) {
+    return {"status": "healthy", "service": SERVICE_NAME, "version": VERSION, "port": PORT, "trit": 1}
+}
+
+fn handle_status(req) {
+    let tools = ["wave", "freq", "synth", "envelope", "filter", "rhythm", "encode"]
+    return {"service": SERVICE_NAME, "version": VERSION, "port": PORT, "status": "running", "trit": 1, "tools": tools, "tool_count": 7, "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}, "block_size": BLOCK_SIZE, "reynolds": {"laminar": RE_LAMINAR, "transition": RE_TRANSITION, "turbulent": RE_TURBULENT}, "bridge": "NONE (pure NovaLang v2.0)"}
+}
+
+// ============================================================
+// Server Setup & Boot
+// ============================================================
+
+let server = tserve(PORT, SERVICE_NAME)
+
+troute(server, "GET", "/health", "handle_health")
+troute(server, "GET", "/status", "handle_status")
+troute(server, "POST", "/audio/wave", "handle_wave")
+troute(server, "POST", "/audio/freq", "handle_freq")
+troute(server, "POST", "/audio/synth", "handle_synth")
+troute(server, "POST", "/audio/envelope", "handle_envelope")
+troute(server, "POST", "/audio/filter", "handle_filter")
+troute(server, "POST", "/audio/rhythm", "handle_rhythm")
+troute(server, "POST", "/audio/encode", "handle_encode")
+
+print("=== AUDIO ENGINE v" + VERSION + " === PURE NOVALANG ===")
+print("Port: " + str(PORT))
+print("Tools: wave | freq | synth | envelope | filter | rhythm | encode")
+print("Bridge: NONE (all math native via sin/cos/sqrt/random builtins)")
+print("Harmonics: 3-5-7-13 | Block: " + str(BLOCK_SIZE))
+print("Status: ONLINE | Trit: +1")
+
+tstart(server)

@@ -1,0 +1,1099 @@
+// Nova TFlow v1.0 - N-S Flow Visualization Data Service
+// Port 9982: Real-time Navier-Stokes fluid dynamics for the NovaX service mesh
+//
+// N-S Variable Mapping (service mesh -> fluid dynamics):
+//   velocity (v)   = requests_per_second for that service
+//   pressure (P)   = error_pct / 100  (0.0 to 1.0)
+//   density  (rho) = activity density based on request_count
+//   viscosity(mu)  = avg_latency_ms / 1000  (seconds, higher = more viscous)
+//   Reynolds  Re   = (rho * v * L) / mu   where L = avg_payload_size_kb
+//   vorticity(w)   = rate of change of velocity (dv/dt between snapshots)
+//
+// Flow regimes (3-5-7-13 harmonic boundaries):
+//   Re < 27  (H3^3) = LAMINAR      (green,  healthy)
+//   Re < 125 (H5^3) = TRANSITIONAL (yellow, watch)
+//   Re < 343 (H7^3) = TURBULENT    (orange, stressed)
+//   Re >= 343        = CHAOTIC      (red,    overloaded)
+//
+// No background threading in NovaLang.
+// Background polling replaced by POST /tflow/tick (call it from a scheduler).
+//
+// Endpoints:
+//   GET  /health           -- standard tlight health
+//   GET  /tflow/field      -- current flow field (per-service N-S vectors)
+//   GET  /tflow/map        -- 2D pressure map (services as nodes)
+//   POST /tflow/inject     -- inject test flow data for a service
+//   GET  /tflow/history    -- flow field snapshots over last H13 intervals
+//   GET  /tflow/turbulence -- services in turbulent/chaotic regime
+//   GET  /tflow/laminar    -- services in laminar flow (healthy)
+//   GET  /tflow/stats      -- system-wide flow statistics
+//   POST /tflow/tick       -- trigger one TMetrics poll + N-S recompute
+
+let PORT = 9982
+let server = tserve(PORT, "TFlow v1.0 - N-S Flow Visualization Service")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+let BLOCK = 2187
+
+// -- Reynolds Boundaries --
+let RE_LAMINAR      = 27    // H3^3
+let RE_TRANSITIONAL = 125   // H5^3
+let RE_TURBULENT    = 343   // H7^3
+
+// -- Ternary Constants --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Service Configuration --
+let VERSION       = "1.0"
+let SERVICE_NAME  = "nova-tflow"
+let TMETRICS_URL  = "http://127.0.0.1:9953"
+let POLL_INTERVAL = 13
+let HISTORY_DEPTH = 13
+let FETCH_TIMEOUT = 3
+
+// -- N-S Default Constants --
+let DEFAULT_L               = 1.0
+let DEFAULT_MAX_CAPACITY    = 100.0
+let DEFAULT_MAX_CONNECTIONS = 50.0
+
+// -- Regime -> Color Map --
+// Stored as flat dict: regime name -> color string
+let regime_colors = {}
+let _rc0 = dict_set(regime_colors, "laminar",      "green")
+let _rc1 = dict_set(regime_colors, "transitional", "yellow")
+let _rc2 = dict_set(regime_colors, "turbulent",    "orange")
+let _rc3 = dict_set(regime_colors, "chaotic",      "red")
+
+// -- Regime -> Row for 2D Map --
+let regime_rows = {}
+let _rr0 = dict_set(regime_rows, "laminar",      0)
+let _rr1 = dict_set(regime_rows, "transitional", 1)
+let _rr2 = dict_set(regime_rows, "turbulent",    2)
+let _rr3 = dict_set(regime_rows, "chaotic",      3)
+
+// -- Global Flow Field State --
+// flow_field: dict of service_name -> flow_entry dict
+// Each flow_entry stores all N-S fields plus prev_velocity, prev_time
+let flow_field = {}
+
+// history: list of snapshot dicts (bounded to HISTORY_DEPTH)
+let history = []
+
+// injections: dict of service_name -> injection override dict
+let injections = {}
+
+// tmetrics_alive: 1 = reachable, 0 = down
+let tmetrics_alive = 0
+
+
+// ============================================================
+// Helper: Flow Regime Classification
+// ============================================================
+
+fn flow_regime(re) {
+    if3 re < RE_LAMINAR {
+        return "laminar"
+    }
+    if3 re < RE_TRANSITIONAL {
+        return "transitional"
+    }
+    if3 re < RE_TURBULENT {
+        return "turbulent"
+    }
+    return "chaotic"
+}
+
+fn health_trit(regime) {
+    if3 regime == "laminar" {
+        return T_TRUE
+    }
+    if3 regime == "turbulent" {
+        return T_MAYBE
+    }
+    if3 regime == "transitional" {
+        return T_MAYBE
+    }
+    return T_FALSE
+}
+
+fn trit_to_char(t) {
+    if3 t == 1 {
+        return "1"
+    }
+    if3 t == 0 {
+        return "0"
+    }
+    return "T"
+}
+
+
+// ============================================================
+// Helper: Ensure Flow Entry Exists
+// ============================================================
+
+fn ensure_flow(name, port) {
+    // Returns the flow entry for name, creating it if needed
+    if3 dict_has(flow_field, name) == false {
+        let now = time()
+        let entry = {
+            "name":          name,
+            "port":          port,
+            "velocity":      0.0,
+            "pressure":      0.0,
+            "density":       0.0,
+            "viscosity":     0.0001,
+            "reynolds":      0.0,
+            "regime":        "laminar",
+            "vorticity":     0.0,
+            "trit":          T_MAYBE,
+            "color":         "green",
+            "prev_velocity": 0.0,
+            "prev_time":     now
+        }
+        let _sf = dict_set(flow_field, name, entry)
+    }
+    return dict_get(flow_field, name)
+}
+
+
+// ============================================================
+// Helper: Update Flow Entry with New N-S Values
+// ============================================================
+
+fn update_flow(name, port, velocity, pressure, density, viscosity) {
+    // Compute Reynolds, vorticity, regime, trit, color and store back
+    let entry = ensure_flow(name, port)
+    let now = time()
+    let prev_v = dict_get(entry, "prev_velocity", 0.0)
+    let prev_t = dict_get(entry, "prev_time",     0.0)
+
+    // Vorticity = dv/dt
+    let dt = now - prev_t
+    let vorticity = 0.0
+    if3 dt > 0.0 {
+        let vorticity = round((velocity - prev_v) / dt, 4)
+    }
+
+    // Clamp values
+    let p_clamped = max(0.0, min(1.0, pressure))
+    let d_clamped = max(0.0, density)
+    let mu        = max(0.0001, viscosity)
+    let v_rounded = round(velocity, 4)
+
+    // Reynolds: Re = (rho * v * L) / mu
+    let rho = max(d_clamped, 0.01)
+    let re  = round((rho * v_rounded * DEFAULT_L) / mu, 2)
+
+    let regime = flow_regime(re)
+    let color  = dict_get(regime_colors, regime, "green")
+    let tval   = health_trit(regime)
+
+    let _dv  = dict_set(entry, "velocity",      v_rounded)
+    let _dp  = dict_set(entry, "pressure",      round(p_clamped, 4))
+    let _dd  = dict_set(entry, "density",       round(d_clamped, 4))
+    let _dmu = dict_set(entry, "viscosity",     round(mu, 6))
+    let _dr  = dict_set(entry, "reynolds",      re)
+    let _drg = dict_set(entry, "regime",        regime)
+    let _dw  = dict_set(entry, "vorticity",     vorticity)
+    let _dt  = dict_set(entry, "trit",          tval)
+    let _dc  = dict_set(entry, "color",         color)
+    let _dpv = dict_set(entry, "prev_velocity", v_rounded)
+    let _dpt = dict_set(entry, "prev_time",     now)
+    let _dn  = dict_set(entry, "name",          name)
+    let _dpo = dict_set(entry, "port",          port)
+
+    let _fs = dict_set(flow_field, name, entry)
+    return entry
+}
+
+
+// ============================================================
+// Helper: Flow Entry Snapshot (safe copy of fields)
+// ============================================================
+
+fn snap_flow(entry) {
+    return {
+        "name":      dict_get(entry, "name",      ""),
+        "port":      dict_get(entry, "port",      0),
+        "velocity":  dict_get(entry, "velocity",  0.0),
+        "pressure":  dict_get(entry, "pressure",  0.0),
+        "density":   dict_get(entry, "density",   0.0),
+        "viscosity": dict_get(entry, "viscosity", 0.0001),
+        "reynolds":  dict_get(entry, "reynolds",  0.0),
+        "regime":    dict_get(entry, "regime",    "laminar"),
+        "vorticity": dict_get(entry, "vorticity", 0.0),
+        "trit":      dict_get(entry, "trit",      T_MAYBE),
+        "char":      trit_to_char(dict_get(entry, "trit", T_MAYBE)),
+        "color":     dict_get(entry, "color",     "green")
+    }
+}
+
+
+// ============================================================
+// Helper: Compute N-S Variables from TMetrics Service Data
+// ============================================================
+
+fn compute_ns_from_svc(svc) {
+    // velocity = request_rate_rpm / 60
+    let rpm      = dict_get(svc, "request_rate_rpm", 0)
+    let velocity = rpm / 60.0
+
+    // pressure = error_pct / 100
+    let error_pct = dict_get(svc, "error_pct", 0.0)
+    let pressure  = error_pct / 100.0
+
+    // density: activity density from accumulated request count
+    let req_count = dict_get(svc, "request_count", 0)
+    let density   = 0.0
+    if3 req_count > 0 {
+        let density = 1.0 - (1.0 / max(1, req_count))
+    }
+
+    // viscosity = avg_latency_ms / 1000
+    let avg_lat_ms = dict_get(svc, "avg_latency_ms", 0.0)
+    let viscosity  = avg_lat_ms / 1000.0
+
+    return {
+        "velocity":  velocity,
+        "pressure":  pressure,
+        "density":   density,
+        "viscosity": viscosity
+    }
+}
+
+
+// ============================================================
+// Helper: Pressure Intensity to Hex Color
+// ============================================================
+
+fn pressure_to_hex(color_name, intensity) {
+    // Base RGB values per regime color
+    let base_r = 128
+    let base_g = 128
+    let base_b = 128
+
+    if3 color_name == "green" {
+        let base_r = 0
+        let base_g = 200
+        let base_b = 80
+    }
+    if3 color_name == "yellow" {
+        let base_r = 220
+        let base_g = 200
+        let base_b = 0
+    }
+    if3 color_name == "orange" {
+        let base_r = 255
+        let base_g = 140
+        let base_b = 0
+    }
+    if3 color_name == "red" {
+        let base_r = 255
+        let base_g = 40
+        let base_b = 40
+    }
+
+    // Scale by intensity: minimum 30% brightness
+    let clamped  = max(0.0, min(1.0, intensity))
+    let factor   = 0.3 + 0.7 * clamped
+    let r_int    = int(base_r * factor)
+    let g_int    = int(base_g * factor)
+    let b_int    = int(base_b * factor)
+
+    // Build hex string without format specifiers (NovaLang has no %02x)
+    // We use str() and pad manually
+    let r_hex = int_to_hex2(r_int)
+    let g_hex = int_to_hex2(g_int)
+    let b_hex = int_to_hex2(b_int)
+    return "#" + r_hex + g_hex + b_hex
+}
+
+fn int_to_hex2(n) {
+    // Convert int 0-255 to 2-char lowercase hex string
+    let hex_chars = "0123456789abcdef"
+    let hi = int(n / 16)
+    let lo = n - (hi * 16)
+    // slice returns single-char string from the character table
+    let hi_c = slice(hex_chars, hi, hi + 1)
+    let lo_c = slice(hex_chars, lo, lo + 1)
+    return hi_c + lo_c
+}
+
+
+// ============================================================
+// Helper: Build Full Field Snapshot (for history)
+// ============================================================
+
+fn build_field_snapshot() {
+    let all_names = keys(flow_field)
+    let count     = len(all_names)
+    let services  = []
+    let i = 0
+    while3 i < count {
+        let name  = dict_get(all_names, i)
+        let entry = dict_get(flow_field, name)
+        if3 entry != null {
+            let snap = snap_flow(entry)
+            let _ap  = append(services, snap)
+        }
+        let i = i + 1
+    }
+    return {
+        "timestamp":     time(),
+        "service_count": len(services),
+        "services":      services,
+        "tmetrics_alive": tmetrics_alive
+    }
+}
+
+
+// ============================================================
+// Helper: Append Snapshot to History (bounded to HISTORY_DEPTH)
+// ============================================================
+
+fn push_history(snap) {
+    let _ah = append(history, snap)
+    let hlen = len(history)
+    if3 hlen > HISTORY_DEPTH {
+        // Trim oldest: keep last HISTORY_DEPTH entries
+        let history = slice(history, hlen - HISTORY_DEPTH, hlen)
+    }
+    return T_TRUE
+}
+
+
+// ============================================================
+// Helper: Fetch TMetrics Dashboard
+// ============================================================
+
+fn fetch_tmetrics() {
+    // Returns dashboard dict or null on failure
+    let url = TMETRICS_URL + "/tmetrics/dashboard"
+    let result = null
+    try3 {
+        let result = http_get(url, FETCH_TIMEOUT)
+    } else {
+        let tmetrics_alive = 0
+        return null
+    }
+    if3 result != null {
+        let tmetrics_alive = 1
+    }
+    return result
+}
+
+
+// ============================================================
+// Helper: Compute Full Field from TMetrics
+// ============================================================
+
+fn compute_full_field() {
+    let dashboard = fetch_tmetrics()
+
+    if3 dashboard != null {
+        let svcs  = dict_get(dashboard, "services", null)
+        if3 svcs != null {
+            // svcs may be a dict keyed by name or a list; handle dict case
+            let svc_keys = keys(svcs)
+            let ks_count = len(svc_keys)
+            let i = 0
+            while3 i < ks_count {
+                let svc_name = dict_get(svc_keys, i)
+                let svc      = dict_get(svcs, svc_name)
+                let svc_port = dict_get(svc, "port", 0)
+
+                let ns = compute_ns_from_svc(svc)
+                let v  = dict_get(ns, "velocity",  0.0)
+                let p  = dict_get(ns, "pressure",  0.0)
+                let d  = dict_get(ns, "density",   0.0)
+                let mu = dict_get(ns, "viscosity", 0.0001)
+
+                // Apply injection overrides if present
+                if3 dict_has(injections, svc_name) {
+                    let inj = dict_get(injections, svc_name)
+                    if3 dict_has(inj, "velocity") {
+                        let v = dict_get(inj, "velocity", v)
+                    }
+                    if3 dict_has(inj, "pressure") {
+                        let p = dict_get(inj, "pressure", p)
+                    }
+                    if3 dict_has(inj, "density") {
+                        let d = dict_get(inj, "density", d)
+                    }
+                    if3 dict_has(inj, "viscosity") {
+                        let mu = dict_get(inj, "viscosity", mu)
+                    }
+                }
+
+                let _uf = update_flow(svc_name, svc_port, v, p, d, mu)
+                let i = i + 1
+    } else {
+        // TMetrics down: decay all existing flows toward zero
+        let all_names = keys(flow_field)
+        let count     = len(all_names)
+        let i = 0
+        while3 i < count {
+            let name  = dict_get(all_names, i)
+            let entry = dict_get(flow_field, name)
+            if3 entry != null {
+                let cur_v  = dict_get(entry, "velocity",  0.0)
+                let cur_mu = dict_get(entry, "viscosity", 0.0001)
+                let port   = dict_get(entry, "port", 0)
+                // Half-life decay: cool toward zero
+                let decayed_v = cur_v * 0.5
+                let _uf = update_flow(name, port, decayed_v, 0.0, 0.0, cur_mu)
+            }
+            let i = i + 1
+        }
+    }
+
+    // Store snapshot in history
+    let snap = build_field_snapshot()
+    let _ph  = push_history(snap)
+    return T_TRUE
+}
+
+
+// ============================================================
+// Route: GET /health
+// ============================================================
+}
+}
+
+fn health(body) {
+    let svc_count = len(keys(flow_field))
+    let hist_len  = len(history)
+    return {
+        "ok":            true,
+        "service":       SERVICE_NAME,
+        "port":          PORT,
+        "version":       VERSION,
+        "ternary":       true,
+        "trit":          T_TRUE,
+        "runtime":       "novalang",
+        "services_tracked": svc_count,
+        "history_depth": hist_len,
+        "tmetrics_alive": tmetrics_alive,
+        "harmonics":     {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+
+// ============================================================
+// Route: GET /tflow/field
+// ============================================================
+
+fn tflow_field(body) {
+    let all_names = keys(flow_field)
+    let count     = len(all_names)
+    let services  = []
+    let total_re  = 0.0
+    let i = 0
+    while3 i < count {
+        let name  = dict_get(all_names, i)
+        let entry = dict_get(flow_field, name)
+        if3 entry != null {
+            let snap = snap_flow(entry)
+            let _as  = append(services, snap)
+            let total_re = total_re + dict_get(entry, "reynolds", 0.0)
+        }
+        let i = i + 1
+    }
+
+    let n       = max(count, 1)
+    let avg_re  = round(total_re / n, 2)
+    let sys_reg = flow_regime(avg_re)
+    let alive_t = T_MAYBE
+    if3 tmetrics_alive == 1 {
+        let alive_t = T_TRUE
+    }
+
+    return {
+        "ok":             true,
+        "field":          services,
+        "service_count":  count,
+        "system_reynolds": avg_re,
+        "system_regime":  sys_reg,
+        "tmetrics_alive": tmetrics_alive,
+        "poll_interval_s": POLL_INTERVAL,
+        "trit":           alive_t,
+        "harmonics":      {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+
+// ============================================================
+// Route: GET /tflow/map
+// ============================================================
+
+fn tflow_map(body) {
+    let all_names = keys(flow_field)
+    let count     = len(all_names)
+    let nodes     = []
+
+    // Build nodes list
+    let i = 0
+    while3 i < count {
+        let name  = dict_get(all_names, i)
+        let entry = dict_get(flow_field, name)
+        if3 entry != null {
+            let snap      = snap_flow(entry)
+            let regime    = dict_get(snap, "regime",   "laminar")
+            let row       = dict_get(regime_rows, regime, 0)
+            let intensity = dict_get(snap, "pressure", 0.0)
+            let color_nm  = dict_get(snap, "color",    "green")
+            let hex_color = pressure_to_hex(color_nm, intensity)
+            let node = {
+                "name":      dict_get(snap, "name",     ""),
+                "port":      dict_get(snap, "port",     0),
+                "x":         i,
+                "y":         row,
+                "pressure":  dict_get(snap, "pressure",  0.0),
+                "velocity":  dict_get(snap, "velocity",  0.0),
+                "reynolds":  dict_get(snap, "reynolds",  0.0),
+                "regime":    regime,
+                "color":     color_nm,
+                "color_hex": hex_color,
+                "intensity": round(intensity, 3),
+                "vorticity": dict_get(snap, "vorticity", 0.0)
+            }
+            let _an = append(nodes, node)
+        }
+        let i = i + 1
+    }
+
+    // Build edges: connect adjacent services within the same regime
+    // Collect per-regime member lists
+    let lam_members  = []
+    let trn_members  = []
+    let turb_members = []
+    let cha_members  = []
+
+    let j = 0
+    let nlen = len(nodes)
+    while3 j < nlen {
+        let node    = dict_get(nodes, j)
+        let regime  = dict_get(node, "regime", "laminar")
+        let nm      = dict_get(node, "name", "")
+        if3 regime == "laminar" {
+            let _al = append(lam_members, nm)
+        }
+        if3 regime == "transitional" {
+            let _at = append(trn_members, nm)
+        }
+        if3 regime == "turbulent" {
+            let _au = append(turb_members, nm)
+        }
+        if3 regime == "chaotic" {
+            let _ac = append(cha_members, nm)
+        }
+        let j = j + 1
+    }
+
+    let edges = []
+    let edges = build_regime_edges(edges, lam_members,  "laminar",      "green")
+    let edges = build_regime_edges(edges, trn_members,  "transitional", "yellow")
+    let edges = build_regime_edges(edges, turb_members, "turbulent",    "orange")
+    let edges = build_regime_edges(edges, cha_members,  "chaotic",      "red")
+
+    return {
+        "ok":         true,
+        "nodes":      nodes,
+        "edges":      edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "regime_rows": {
+            "laminar": 0, "transitional": 1, "turbulent": 2, "chaotic": 3
+        },
+        "trit":       T_TRUE
+    }
+}
+
+fn build_regime_edges(edges, members, regime, color) {
+    // Append edge dicts connecting consecutive members of a regime group
+    let mlen = len(members)
+    let k = 0
+    while3 k < mlen - 1 {
+        let from_nm = dict_get(members, k)
+        let to_nm   = dict_get(members, k + 1)
+        let edge = {
+            "from":   from_nm,
+            "to":     to_nm,
+            "regime": regime,
+            "color":  color
+        }
+        let _ae = append(edges, edge)
+        let k = k + 1
+    }
+    return edges
+}
+
+
+// ============================================================
+// Route: POST /tflow/inject
+// ============================================================
+
+fn tflow_inject(body) {
+    let name = dict_get(body, "service", "")
+    if3 name == "" {
+        return {"ok": false, "error": "service name required", "trit": T_FALSE}
+    }
+
+    // Collect provided override fields
+    let injection = {}
+    if3 dict_has(body, "velocity") {
+        let _iv = dict_set(injection, "velocity", dict_get(body, "velocity", 0.0))
+    }
+    if3 dict_has(body, "pressure") {
+        let _ip = dict_set(injection, "pressure", dict_get(body, "pressure", 0.0))
+    }
+    if3 dict_has(body, "density") {
+        let _id = dict_set(injection, "density", dict_get(body, "density", 0.0))
+    }
+    if3 dict_has(body, "viscosity") {
+        let _imu = dict_set(injection, "viscosity", dict_get(body, "viscosity", 0.001))
+    }
+
+    let inj_keys = keys(injection)
+    if3 len(inj_keys) == 0 {
+        return {
+            "ok":    false,
+            "error": "provide at least one of: velocity, pressure, density, viscosity",
+            "trit":  T_FALSE
+        }
+    }
+
+    // Merge into injections store
+    if3 dict_has(injections, name) {
+        let existing = dict_get(injections, name)
+        let ik = keys(injection)
+        let ki = 0
+        while3 ki < len(ik) {
+            let field = dict_get(ik, ki)
+            let val   = dict_get(injection, field)
+            let _si   = dict_set(existing, field, val)
+            let ki    = ki + 1
+        }
+        let _si2 = dict_set(injections, name, existing)
+    } else {
+        let _si3 = dict_set(injections, name, injection)
+    }
+
+    // Immediately apply to flow field so next GET reflects it
+    let entry = ensure_flow(name, 0)
+    let v  = dict_get(injection, "velocity",  dict_get(entry, "velocity",  0.0))
+    let p  = dict_get(injection, "pressure",  dict_get(entry, "pressure",  0.0))
+    let d  = dict_get(injection, "density",   dict_get(entry, "density",   0.0))
+    let mu = dict_get(injection, "viscosity", dict_get(entry, "viscosity", 0.0001))
+    let port = dict_get(entry, "port", 0)
+
+    let updated_entry = update_flow(name, port, v, p, d, mu)
+    let result_snap   = snap_flow(updated_entry)
+
+    return {
+        "ok":            true,
+        "injected":      {"service": name, "fields": injection},
+        "resulting_flow": result_snap,
+        "note":          "injection persists until next TMetrics poll overwrites it",
+        "trit":          T_TRUE
+    }
+}
+
+
+// ============================================================
+// Route: GET /tflow/history
+// ============================================================
+
+fn tflow_history(body) {
+    let hlen      = len(history)
+    let total_win = HISTORY_DEPTH * POLL_INTERVAL
+    let alive_t   = T_MAYBE
+    if3 hlen > 0 {
+        let alive_t = T_TRUE
+    }
+    return {
+        "ok":             true,
+        "snapshots":      history,
+        "snapshot_count": hlen,
+        "max_snapshots":  HISTORY_DEPTH,
+        "interval_s":     POLL_INTERVAL,
+        "total_window_s": total_win,
+        "trit":           alive_t
+    }
+}
+
+
+// ============================================================
+// Route: GET /tflow/turbulence
+// ============================================================
+
+fn tflow_turbulence(body) {
+    let all_names = keys(flow_field)
+    let count     = len(all_names)
+    let turbulent = []
+    let i = 0
+    while3 i < count {
+        let name  = dict_get(all_names, i)
+        let entry = dict_get(flow_field, name)
+        if3 entry != null {
+            let regime = dict_get(entry, "regime", "laminar")
+            if3 regime == "turbulent" {
+                let snap = snap_flow(entry)
+                let _at  = append(turbulent, snap)
+            }
+            if3 regime == "chaotic" {
+                let snap = snap_flow(entry)
+                let _ac  = append(turbulent, snap)
+            }
+        }
+        let i = i + 1
+    }
+
+    // Sort turbulent list by reynolds descending (most turbulent first)
+    let turbulent = sort_by_reynolds_desc(turbulent)
+
+    let sys_trit = T_TRUE
+    if3 len(turbulent) > 0 {
+        let sys_trit = T_FALSE
+    }
+
+    return {
+        "ok":                 true,
+        "turbulent_services": turbulent,
+        "count":              len(turbulent),
+        "note":               "services with Re >= 125 (turbulent and chaotic only)",
+        "boundaries": {
+            "turbulent": ">= 125 (H5^3)",
+            "chaotic":   ">= 343 (H7^3)"
+        },
+        "trit":               sys_trit
+    }
+}
+
+
+// ============================================================
+// Route: GET /tflow/laminar
+// ============================================================
+
+fn tflow_laminar(body) {
+    let all_names = keys(flow_field)
+    let count     = len(all_names)
+    let laminar   = []
+    let i = 0
+    while3 i < count {
+        let name  = dict_get(all_names, i)
+        let entry = dict_get(flow_field, name)
+        if3 entry != null {
+            let regime = dict_get(entry, "regime", "laminar")
+            if3 regime == "laminar" {
+                let snap = snap_flow(entry)
+                let _al  = append(laminar, snap)
+            }
+        }
+        let i = i + 1
+    }
+
+    // Sort laminar list by reynolds ascending (most stable first)
+    let laminar = sort_by_reynolds_asc(laminar)
+
+    let alive_t = T_MAYBE
+    if3 len(laminar) > 0 {
+        let alive_t = T_TRUE
+    }
+
+    return {
+        "ok":               true,
+        "laminar_services": laminar,
+        "count":            len(laminar),
+        "note":             "services with Re < 27 (H3^3 = 27)",
+        "boundary":         "< 27",
+        "trit":             alive_t
+    }
+}
+
+
+// ============================================================
+// Sort Helpers (insertion sort on list of snap dicts)
+// ============================================================
+
+fn sort_by_reynolds_desc(snaps) {
+    // Insertion sort descending by "reynolds" field
+    let n = len(snaps)
+    let i = 1
+    while3 i < n {
+        let key_snap = dict_get(snaps, i)
+        let key_re   = dict_get(key_snap, "reynolds", 0.0)
+        let j = i - 1
+        while3 j >= 0 {
+            let cmp_snap = dict_get(snaps, j)
+            let cmp_re   = dict_get(cmp_snap, "reynolds", 0.0)
+            if3 cmp_re < key_re {
+                // Swap via rebuild - NovaLang has no direct list index set
+                // We use a temporary approach: build a new list
+                let snaps = list_swap(snaps, j, j + 1)
+                let j = j - 1
+            } else {
+                let j = -1
+            }
+        }
+        let i = i + 1
+    }
+    return snaps
+}
+
+fn sort_by_reynolds_asc(snaps) {
+    // Insertion sort ascending by "reynolds" field
+    let n = len(snaps)
+    let i = 1
+    while3 i < n {
+        let key_snap = dict_get(snaps, i)
+        let key_re   = dict_get(key_snap, "reynolds", 0.0)
+        let j = i - 1
+        while3 j >= 0 {
+            let cmp_snap = dict_get(snaps, j)
+            let cmp_re   = dict_get(cmp_snap, "reynolds", 0.0)
+            if3 cmp_re > key_re {
+                let snaps = list_swap(snaps, j, j + 1)
+                let j = j - 1
+            } else {
+                let j = -1
+            }
+        }
+        let i = i + 1
+    }
+    return snaps
+}
+
+fn list_swap(lst, a, b) {
+    // Rebuild list with elements at indices a and b swapped
+    let n   = len(lst)
+    let out = []
+    let i = 0
+    while3 i < n {
+        if3 i == a {
+            let _ao = append(out, dict_get(lst, b))
+        }
+        if3 i == b {
+            let _ao = append(out, dict_get(lst, a))
+        }
+        if3 i != a {
+            if3 i != b {
+                let _ao = append(out, dict_get(lst, i))
+            }
+        }
+        let i = i + 1
+    }
+    return out
+}
+
+
+// ============================================================
+// Route: GET /tflow/stats
+// ============================================================
+
+fn tflow_stats(body) {
+    let all_names = keys(flow_field)
+    let count     = len(all_names)
+
+    if3 count == 0 {
+        return {
+            "ok":   true,
+            "note": "no flow data yet - call POST /tflow/tick to poll TMetrics",
+            "trit": T_MAYBE
+        }
+    }
+
+    let velocities  = []
+    let pressures   = []
+    let densities   = []
+    let viscosities = []
+    let re_vals     = []
+    let vorticities = []
+    let cnt_lam  = 0
+    let cnt_trn  = 0
+    let cnt_turb = 0
+    let cnt_cha  = 0
+
+    let i = 0
+    while3 i < count {
+        let name  = dict_get(all_names, i)
+        let entry = dict_get(flow_field, name)
+        if3 entry != null {
+            let _av  = append(velocities,  dict_get(entry, "velocity",  0.0))
+            let _ap  = append(pressures,   dict_get(entry, "pressure",  0.0))
+            let _ad  = append(densities,   dict_get(entry, "density",   0.0))
+            let _amu = append(viscosities, dict_get(entry, "viscosity", 0.0001))
+            let _ar  = append(re_vals,     dict_get(entry, "reynolds",  0.0))
+            let vort = dict_get(entry, "vorticity", 0.0)
+            let _aw  = append(vorticities, abs(vort))
+            let regime = dict_get(entry, "regime", "laminar")
+            if3 regime == "laminar" {
+                let cnt_lam = cnt_lam + 1
+            }
+            if3 regime == "transitional" {
+                let cnt_trn = cnt_trn + 1
+            }
+            if3 regime == "turbulent" {
+                let cnt_turb = cnt_turb + 1
+            }
+            if3 regime == "chaotic" {
+                let cnt_cha = cnt_cha + 1
+            }
+        }
+        let i = i + 1
+    }
+
+    let n = max(count, 1)
+
+    let total_throughput = round(sum(velocities), 4)
+    let avg_re           = round(sum(re_vals) / n, 2)
+    let max_re           = round(max_of_list(re_vals), 2)
+    let min_re           = round(min_of_list(re_vals), 2)
+    let avg_pressure     = round(sum(pressures) / n, 4)
+    let avg_vorticity    = round(sum(vorticities) / n, 4)
+    let avg_velocity     = round(sum(velocities) / n, 4)
+    let avg_density      = round(sum(densities) / n, 4)
+    let avg_viscosity    = round(sum(viscosities) / n, 6)
+    let sys_regime       = flow_regime(avg_re)
+
+    // System health trit
+    let sys_trit = T_TRUE
+    if3 cnt_cha > 0 {
+        let sys_trit = T_FALSE
+    }
+    if3 cnt_cha == 0 {
+        if3 cnt_turb > 0 {
+            let turb_ratio = cnt_turb / n
+            if3 turb_ratio > 0.3 {
+                let sys_trit = T_MAYBE
+            }
+        }
+    }
+
+    return {
+        "ok":                    true,
+        "service_count":         count,
+        "total_throughput_rps":  total_throughput,
+        "avg_reynolds":          avg_re,
+        "max_reynolds":          max_re,
+        "min_reynolds":          min_re,
+        "system_regime":         sys_regime,
+        "regime_distribution": {
+            "laminar":      cnt_lam,
+            "transitional": cnt_trn,
+            "turbulent":    cnt_turb,
+            "chaotic":      cnt_cha
+        },
+        "avg_pressure":          avg_pressure,
+        "avg_vorticity_magnitude": avg_vorticity,
+        "avg_velocity":          avg_velocity,
+        "avg_density":           avg_density,
+        "avg_viscosity":         avg_viscosity,
+        "tmetrics_alive":        tmetrics_alive,
+        "history_depth":         len(history),
+        "max_history":           HISTORY_DEPTH,
+        "poll_interval_s":       POLL_INTERVAL,
+        "boundaries": {
+            "laminar":      RE_LAMINAR,
+            "transitional": RE_TRANSITIONAL,
+            "turbulent":    RE_TURBULENT
+        },
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13},
+        "trit":                  sys_trit,
+        "char":                  trit_to_char(sys_trit)
+    }
+}
+
+fn max_of_list(lst) {
+    let n = len(lst)
+    if3 n == 0 {
+        return 0.0
+    }
+    let best = dict_get(lst, 0)
+    let i = 1
+    while3 i < n {
+        let v = dict_get(lst, i)
+        if3 v > best {
+            let best = v
+        }
+        let i = i + 1
+    }
+    return best
+}
+
+fn min_of_list(lst) {
+    let n = len(lst)
+    if3 n == 0 {
+        return 0.0
+    }
+    let best = dict_get(lst, 0)
+    let i = 1
+    while3 i < n {
+        let v = dict_get(lst, i)
+        if3 v < best {
+            let best = v
+        }
+        let i = i + 1
+    }
+    return best
+}
+
+
+// ============================================================
+// Route: POST /tflow/tick
+// ============================================================
+// Replaces the Python background polling thread.
+// Call this endpoint from an external scheduler (e.g. TScheduler
+// or a cron-style POST every H13 seconds) to trigger one full
+// TMetrics poll and N-S recompute cycle.
+
+fn tflow_tick(body) {
+    let result = compute_full_field()
+    let hlen   = len(history)
+    return {
+        "ok":             true,
+        "trit":           T_TRUE,
+        "tmetrics_alive": tmetrics_alive,
+        "history_depth":  hlen,
+        "note":           "one N-S flow compute cycle complete"
+    }
+}
+
+
+// ============================================================
+// Route Registration
+// ============================================================
+
+troute(server, "GET",  "/health",           "health")
+troute(server, "GET",  "/tflow/field",      "tflow_field")
+troute(server, "GET",  "/tflow/map",        "tflow_map")
+troute(server, "GET",  "/tflow/history",    "tflow_history")
+troute(server, "GET",  "/tflow/turbulence", "tflow_turbulence")
+troute(server, "GET",  "/tflow/laminar",    "tflow_laminar")
+troute(server, "GET",  "/tflow/stats",      "tflow_stats")
+troute(server, "POST", "/tflow/inject",     "tflow_inject")
+troute(server, "POST", "/tflow/tick",       "tflow_tick")
+
+
+// ============================================================
+// Startup Banner
+// ============================================================
+
+print("[TFlow] NovaX N-S Flow Visualization Service v" + VERSION)
+print("[TFlow] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TFlow] TMetrics source: " + TMETRICS_URL)
+print("[TFlow] Reynolds boundaries: Re<27=laminar | Re<125=transitional | Re<343=turbulent | Re>=343=chaotic")
+print("[TFlow] Harmonics: 3-5-7-13 | Block: " + str(BLOCK))
+print("[TFlow] N-S vars: velocity(v), pressure(P), density(rho), viscosity(mu)")
+print("[TFlow] Derived: Reynolds(Re), vorticity(omega), regime, color")
+print("[TFlow] Poll mode: POST /tflow/tick (no background thread in NovaLang)")
+print("[TFlow] Routes: GET /health /tflow/field /tflow/map /tflow/history /tflow/turbulence /tflow/laminar /tflow/stats")
+print("[TFlow] Routes: POST /tflow/inject /tflow/tick")
+
+tstart(server)

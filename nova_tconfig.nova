@@ -1,0 +1,215 @@
+// Nova TConfig v1.0 - Ternary Configuration Store (N-S Flow Model)
+// Port 9941: Key-value configuration store for all NovaX services
+// Uses Navier-Stokes Reynolds classification for config flow
+//
+// N-S Mapping:
+//   config_flow = velocity_field (configuration data flow)
+//   valid_configs = laminar_particles (stable state)
+//   missing_keys = turbulent_particles (config gaps)
+//   Reynolds = missing_lookups * mutation_rate
+//   Re < 27 (H3^3) = laminar (configs stable)
+//   27 < Re < 343 (H7^3) = transitional (frequent changes)
+//   Re > 343 = turbulent (config thrashing)
+
+let PORT = 9941
+let server = tserve(PORT, "TConfig v1.0 - Ternary Configuration Store")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+let RE_LAMINAR = 27     // H3^3 - safe boundary
+let RE_TURBULENT = 343  // H7^3 - critical boundary
+let MAX_KEYS = 2187     // H3^7 - ternary block max entries
+
+// -- Config Store --
+let config = {}
+let total_gets = 0
+let total_sets = 0
+let total_misses = 0
+let last_reynolds = 0
+let last_regime = "laminar"
+
+// -- Seed default configs --
+let config = {
+    "novax.version": "5.0.0",
+    "novax.runtime": "novalang",
+    "novax.ternary": "true",
+    "novax.harmonics.h3": "3",
+    "novax.harmonics.h5": "5",
+    "novax.harmonics.h7": "7",
+    "novax.harmonics.h13": "13",
+    "novax.block_size": "2187",
+    "novax.re_laminar": "27",
+    "novax.re_turbulent": "343",
+    "orchestrator.port": "9999",
+    "hivemind.port": "9881",
+    "cloud_router.port": "9878"
+}
+
+// -- N-S Reynolds Calculation --
+fn calc_reynolds() {
+    // Re = misses * (sets / (gets + 1)) -- config instability
+    let rate = total_sets
+    if3 total_gets > 0 {
+        rate = total_sets / total_gets
+    }
+    let re = total_misses * rate
+    let regime = "laminar"
+    if3 re > RE_TURBULENT {
+        regime = "turbulent"
+    }
+    if3 re > RE_LAMINAR {
+        if3 re <= RE_TURBULENT {
+            regime = "transitional"
+        }
+    }
+    last_reynolds = re
+    last_regime = regime
+    return {"reynolds": re, "regime": regime}
+}
+
+// -- Health endpoint --
+fn health() {
+    let ns = calc_reynolds()
+    let trit = TRUE
+    if3 last_reynolds > RE_TURBULENT {
+        trit = FALSE
+    }
+    if3 last_reynolds > RE_LAMINAR {
+        if3 last_reynolds <= RE_TURBULENT {
+            trit = MAYBE
+        }
+    }
+    return {
+        "ok": true,
+        "service": "tconfig",
+        "port": PORT,
+        "version": "1.0",
+        "ternary": true,
+        "trit": trit,
+        "char": trit_char(trit),
+        "reynolds": last_reynolds,
+        "flow_regime": last_regime,
+        "total_keys": len(config),
+        "max_keys": MAX_KEYS,
+        "runtime": "novalang",
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+// -- GET /tconfig/get?key=name --
+fn tconfig_get(body) {
+    total_gets = total_gets + 1
+    // body contains query params as dict when GET
+    let key = str(dict_get(body, "key") ?? "")
+    if3 len(key) == 0 {
+        total_misses = total_misses + 1
+        return {
+            "ok": false,
+            "trit": FALSE,
+            "char": trit_char(FALSE),
+            "error": "missing key parameter"
+        }
+    }
+    let val = dict_get(config, key) ?? "__MISSING__"
+    if3 val == "__MISSING__" {
+        total_misses = total_misses + 1
+        return {
+            "ok": false,
+            "trit": FALSE,
+            "char": trit_char(FALSE),
+            "error": "key not found",
+            "key": key
+        }
+    }
+    return {
+        "ok": true,
+        "trit": TRUE,
+        "char": trit_char(TRUE),
+        "key": key,
+        "value": val,
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// -- POST /tconfig/set --
+fn tconfig_set(body) {
+    total_sets = total_sets + 1
+    let key = str(dict_get(body, "key") ?? "")
+    let value = str(dict_get(body, "value") ?? "")
+    if3 len(key) == 0 {
+        return {
+            "ok": false,
+            "trit": FALSE,
+            "char": trit_char(FALSE),
+            "error": "missing key in body"
+        }
+    }
+    // Check max capacity
+    if3 len(config) >= MAX_KEYS {
+        return {
+            "ok": false,
+            "trit": FALSE,
+            "char": trit_char(FALSE),
+            "error": "config store full",
+            "max_keys": MAX_KEYS
+        }
+    }
+    // Determine if new or update
+    let existing = dict_get(config, key) ?? "__MISSING__"
+    let action = "created"
+    if3 existing != "__MISSING__" {
+        action = "updated"
+    }
+    config = dict_set(config, key, value)
+    return {
+        "ok": true,
+        "trit": TRUE,
+        "char": trit_char(TRUE),
+        "action": action,
+        "key": key,
+        "value": value,
+        "total_keys": len(config),
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// -- GET /tconfig/all --
+fn tconfig_all(body) {
+    total_gets = total_gets + 1
+    let ns = calc_reynolds()
+    return {
+        "ok": true,
+        "trit": TRUE,
+        "char": trit_char(TRUE),
+        "total_keys": len(config),
+        "config": config,
+        "stats": {
+            "total_gets": total_gets,
+            "total_sets": total_sets,
+            "total_misses": total_misses,
+            "reynolds": dict_get(ns, "reynolds") ?? 0,
+            "regime": dict_get(ns, "regime") ?? "laminar"
+        },
+        "ternary": true,
+        "runtime": "novalang"
+    }
+}
+
+// -- Register routes --
+troute(server, "GET", "/health", "health")
+troute(server, "GET", "/tconfig/get", "tconfig_get")
+troute(server, "POST", "/tconfig/set", "tconfig_set")
+troute(server, "GET", "/tconfig/all", "tconfig_all")
+
+print("[TConfig] NovaLang TConfig v1.0 - Ternary Configuration Store")
+print("[TConfig] Port: " + str(PORT) + " | Runtime: NovaLang | Ternary: TRUE")
+print("[TConfig] Seeded " + str(len(config)) + " default config keys")
+print("[TConfig] Max keys: " + str(MAX_KEYS) + " (H3^7 ternary block)")
+print("[TConfig] Routes: /health, /tconfig/get, /tconfig/set, /tconfig/all")
+
+tstart(server)

@@ -1,0 +1,1010 @@
+// nova_tsnapshot_service.nova -- NovaX Ternary State Snapshot/Backup (port 9965)
+//
+// Git for system state. Captures service health, config, metrics at a point in
+// time. Enables rollback comparison and restore instructions.
+//
+// Every snapshot is a sealed ternary document: the system's polarization at one
+// instant. Compare two snapshots and you see exactly what changed -- which
+// services died, which healed, which drifted.
+//
+// 3-5-7-13 Harmonics:
+//   H3=3  retries per health check
+//   H5=5  parallel capture threads (converted to sequential in NovaLang)
+//   H7=7  seconds connect timeout grace
+//   H13=13 carrier frame / hash prefix
+//   MAX_SNAPSHOTS = H13 * H3 = 39 (auto-prune oldest)
+//
+// Endpoints:
+//   GET  /health
+//   GET  /tsnapshot/list
+//   GET  /tsnapshot/latest
+//   GET  /tsnapshot/get/:name   (path param via query string ?name=...)
+//   POST /tsnapshot/capture     {"name": "...", "services": ["all"]}
+//   POST /tsnapshot/compare     {"a": "snap-1", "b": "snap-2"}
+//   POST /tsnapshot/restore     {"name": "..."}
+//   POST /tsnapshot/delete      {"name": "..."}
+//
+// Storage: C:\NovaX\data\snapshots\ (one JSON file per snapshot)
+// Name format: snap-<unix-timestamp> or caller-supplied alphanumeric name
+
+// -- Shared Libraries (N-S Flow) --
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let PORT = 9965
+let server = tserve(PORT, "TSnapshot v1.0 - Ternary State Snapshot")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3    = 3
+let H5    = 5
+let H7    = 7
+let H13   = 13
+let BLOCK = 2187
+
+// -- Ternary Values --
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// -- Service Constants --
+let VERSION        = "1.0"
+let SERVICE_NAME   = "nova-tsnapshot"
+let SNAPSHOT_DIR   = "C:\\NovaX\\data\\snapshots"
+let MAX_SNAPSHOTS  = 39    // H13 * H3 = 13 * 3
+let HEALTH_TIMEOUT = 3     // H3 seconds per service
+let INDEX_FILE     = "C:\\NovaX\\data\\snapshots\\_index.json"
+
+// -- Stats State --
+let stat_t0          = time()
+let stat_captures    = 0
+let stat_compares    = 0
+let stat_deletes     = 0
+let stat_restores    = 0
+
+// -- In-memory snapshot index: list of {name, timestamp, size_bytes} --
+// Loaded from INDEX_FILE on first access via ensure_index().
+let snap_index = []
+let index_loaded = 0
+
+// ============================================================================
+// SERVICE REGISTRY
+// All known NovaX services: names and ports stored as parallel comma-
+// separated strings (no dict literal iteration needed).
+// ============================================================================
+
+let SVC_NAMES = "orchestrator,websocket,nova-hivemind,nova-nexus,nova-cloud-router,nova-stt,nova-tts,nova-sentinel,nova-exec,nova-cortex,nova-relay,nova-deepstorage,nova-vault,nova-tzip,nova-tbuffer,nova-appcontrol,nova-tsecurity,nova-tnet,nova-novacore,nova-tools,nova-ternary-tools,nova-tspeak,nova-tfetch-api,nova-tfetch-proxy,nova-tkill,nova-skiptrace,nova-tsysmon,nova-tmedia,nova-tbuild,nova-tcron,nova-tquery,nova-trecover,nova-tembed,nova-tclassify,nova-tbus,nova-tcircuit,nova-trate,nova-twatch,nova-tmesh,nova-tauth,nova-tmetrics,nova-tcache,nova-tgraph,nova-tscheduler,nova-tembed-v2,nova-max-patch,nova-closed-loop,brain-server"
+let SVC_PORTS = "9999,9998,9881,9882,9878,9875,9874,9884,9877,9896,9880,9893,9892,9885,9886,9887,9907,9906,9890,9891,9894,9895,9897,9898,9899,9903,9905,9908,9909,9910,9911,9912,9924,9921,9945,9948,9949,9950,9951,9952,9953,9956,9958,9959,9960,9889,9888,9990"
+
+// ============================================================================
+// HELPER: tchar -- ternary trit to display character
+// ============================================================================
+
+fn tchar(t) {
+    if3 t > 0 {
+        return "+"
+    }
+    if3 t < 0 {
+        return "T"
+    }
+    return "0"
+}
+
+// ============================================================================
+// HELPER: sanitize_name -- validate snapshot name (alphanumeric, dot, dash)
+// Returns T_TRUE if valid, T_FALSE if not.
+// ============================================================================
+
+fn sanitize_name(name) {
+    let s = str(name)
+    let sz = len(s)
+    if3 sz == 0 {
+        return T_FALSE
+    }
+    if3 sz > 64 {
+        return T_FALSE
+    }
+    // Walk each char; only allow a-z A-Z 0-9 . - _
+    let i = 0
+    let bad = 0
+    while3 i < sz {
+        let c = dict_get(s, i) ?? ""
+        let ok = 0
+        if3 c >= "a" {
+            if3 c <= "z" {
+                let ok = 1
+            }
+        }
+        if3 c >= "A" {
+            if3 c <= "Z" {
+                let ok = 1
+            }
+        }
+        if3 c >= "0" {
+            if3 c <= "9" {
+                let ok = 1
+            }
+        }
+        if3 c == "-" {
+            let ok = 1
+        }
+        if3 c == "_" {
+            let ok = 1
+        }
+        if3 c == "." {
+            let ok = 1
+        }
+        if3 ok == 0 {
+            let bad = 1
+        }
+        i = i + 1
+    }
+    if3 bad == 1 {
+        return T_FALSE
+    }
+    return T_TRUE
+}
+
+// ============================================================================
+// HELPER: snap_path -- build full file path for a snapshot name
+// ============================================================================
+
+fn snap_path(name) {
+    return SNAPSHOT_DIR + "\\" + name + ".json"
+}
+
+// ============================================================================
+// HELPER: load_index -- read the _index.json into snap_index list
+// Called once; subsequent calls are no-ops (index_loaded flag).
+// ============================================================================
+
+fn load_index() {
+    if3 index_loaded == 1 {
+        return T_TRUE
+    }
+    try3 {
+        let raw = nova_read(INDEX_FILE)
+        if3 len(str(raw)) > 2 {
+            let parsed = json_decode(raw)
+            snap_index = parsed
+        }
+        index_loaded = 1
+    } catch3 {
+        let snap_index = []
+        index_loaded = 1
+    }
+    return T_TRUE
+}
+
+// ============================================================================
+// HELPER: save_index -- persist snap_index list to _index.json
+// ============================================================================
+
+fn save_index() {
+    try3 {
+        nova_write(INDEX_FILE, json_encode(snap_index))
+    } catch3 {
+        // Non-fatal: in-memory index stays valid
+    }
+}
+
+// ============================================================================
+// HELPER: index_find -- find position of snapshot by name in snap_index.
+// Returns index position or -1 if not found.
+// ============================================================================
+
+fn index_find(name) {
+    let _r = load_index()
+    let total = len(snap_index)
+    let i = 0
+    while3 i < total {
+        let entry = snap_index[i]
+        let ename = dict_get(entry, "name") ?? ""
+        if3 ename == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ============================================================================
+// HELPER: index_add -- add an entry to snap_index and persist.
+// entry = {name, timestamp, size_bytes}
+// ============================================================================
+
+fn index_add(entry) {
+    let _r = load_index()
+    snap_index = append(snap_index, entry)
+    save_index()
+}
+
+// ============================================================================
+// HELPER: index_remove -- remove a snapshot entry by name from snap_index.
+// ============================================================================
+
+fn index_remove(name) {
+    let _r = load_index()
+    let total = len(snap_index)
+    let new_list = []
+    let i = 0
+    while3 i < total {
+        let e = snap_index[i]
+        let ename = dict_get(e, "name") ?? ""
+        if3 ename != name {
+            new_list = append(new_list, e)
+        }
+        i = i + 1
+    }
+    snap_index = new_list
+    save_index()
+}
+
+// ============================================================================
+// HELPER: index_sorted -- return snap_index sorted newest-first by timestamp.
+// Simple insertion sort (list is small, MAX_SNAPSHOTS=39).
+// ============================================================================
+
+fn index_sorted() {
+    let _r = load_index()
+    let total = len(snap_index)
+    // Copy into working list
+    let work = []
+    let i = 0
+    while3 i < total {
+        work = append(work, snap_index[i])
+        i = i + 1
+    }
+    // Bubble sort descending by timestamp
+    let n = len(work)
+    let outer = 0
+    while3 outer < n {
+        let inner = 0
+        while3 inner < n - outer - 1 {
+            let a = work[inner]
+            let b = work[inner + 1]
+            let ta = dict_get(a, "timestamp") ?? 0
+            let tb = dict_get(b, "timestamp") ?? 0
+            if3 ta < tb {
+                // Swap
+                work = dict_set(work, inner, b)
+                work = dict_set(work, inner + 1, a)
+            }
+            inner = inner + 1
+        }
+        outer = outer + 1
+    }
+    return work
+}
+
+// ============================================================================
+// HELPER: save_snapshot -- write snapshot dict as JSON to disk.
+// Also updates the in-memory index. Returns T_TRUE or T_FALSE.
+// ============================================================================
+
+fn save_snapshot(data) {
+    let name = dict_get(data, "name") ?? ""
+    if3 len(name) == 0 {
+        return T_FALSE
+    }
+    let path = snap_path(name)
+    let encoded = json_encode(data)
+    try3 {
+        nova_write(path, encoded)
+        // Update index
+        let sz = len(encoded)
+        let ts = dict_get(data, "timestamp") ?? 0
+        let idx_entry = {"name": name, "timestamp": ts, "size_bytes": sz}
+        let pos = index_find(name)
+        if3 pos >= 0 {
+            // Already in index -- update in place
+            snap_index = dict_set(snap_index, pos, idx_entry)
+            save_index()
+        }
+        if3 pos < 0 {
+            index_add(idx_entry)
+        }
+        return T_TRUE
+    } catch3 {
+        return T_FALSE
+    }
+}
+
+// ============================================================================
+// HELPER: load_snapshot -- read a snapshot JSON from disk.
+// Returns the decoded dict or {} on error. Also sets out_trit via return pair
+// strategy: returns {"data": ..., "trit": ...}
+// ============================================================================
+
+fn load_snapshot(name) {
+    let path = snap_path(name)
+    try3 {
+        let raw = nova_read(path)
+        if3 len(str(raw)) < 2 {
+            return {"data": {}, "trit": T_FALSE}
+        }
+        let parsed = json_decode(raw)
+        return {"data": parsed, "trit": T_TRUE}
+    } catch3 {
+        return {"data": {}, "trit": T_FALSE}
+    }
+}
+
+// ============================================================================
+// HELPER: prune_snapshots -- delete oldest snapshots when count > MAX_SNAPSHOTS.
+// Returns count of pruned entries.
+// ============================================================================
+
+fn prune_snapshots() {
+    let sorted = index_sorted()
+    let total  = len(sorted)
+    let pruned = 0
+    if3 total <= MAX_SNAPSHOTS {
+        return pruned
+    }
+    // Entries beyond MAX_SNAPSHOTS are the oldest (sorted newest-first)
+    let i = MAX_SNAPSHOTS
+    while3 i < total {
+        let e    = dict_get(sorted, i) ?? {}
+        let ename = dict_get(e, "name") ?? ""
+        if3 len(ename) > 0 {
+            let path = snap_path(ename)
+            // Delete via nova_write with empty sentinel then remove index entry
+            // nova_write is the only fs-write primitive; we overwrite with "" then
+            // remove from index so it is effectively pruned from the service view.
+            try3 {
+                nova_write(path, "")
+            } catch3 {
+                // Ignore if file already gone
+            }
+            index_remove(ename)
+            pruned = pruned + 1
+        }
+        i = i + 1
+    }
+    return pruned
+}
+
+// ============================================================================
+// HELPER: probe_service -- HTTP GET /health on a single service.
+// Returns result dict: {name, port, trit, response_ms, error}
+// Sequential (no threading): uses http_get with a short timeout.
+// ============================================================================
+
+fn probe_service(svc_name, port) {
+    let url = "http://127.0.0.1:" + str(port) + "/health"
+    let t0  = time()
+    try3 {
+        let resp = http_get(url)
+        let ms   = int((time() - t0) * 1000)
+        // Determine trit from response
+        let t = T_MAYBE
+        let resp_str = str(resp)
+        if3 contains(resp_str, "\"ok\": true") {
+            let t = T_TRUE
+        }
+        if3 contains(resp_str, "\"ok\":true") {
+            let t = T_TRUE
+        }
+        if3 contains(resp_str, "\"ok\": false") {
+            let t = T_FALSE
+        }
+        if3 contains(resp_str, "\"ok\":false") {
+            let t = T_FALSE
+        }
+        return {
+            "name":        svc_name,
+            "port":        port,
+            "trit":        t,
+            "response_ms": ms,
+            "error":       ""
+        }
+    } catch3 {
+        let ms = int((time() - t0) * 1000)
+        return {
+            "name":        svc_name,
+            "port":        port,
+            "trit":        T_FALSE,
+            "response_ms": ms,
+            "error":       "connection refused or timeout"
+        }
+    }
+}
+
+// ============================================================================
+// HELPER: capture_all -- probe all services sequentially and build snapshot.
+// filter_str: comma-separated service names, or "all".
+// Returns full snapshot dict.
+// ============================================================================
+
+fn capture_all(snap_name, filter_str) {
+    let names_list = split(SVC_NAMES, ",")
+    let ports_list = split(SVC_PORTS, ",")
+    let total_known = len(names_list)
+
+    // Build services result dict and aggregate counts
+    let services    = {}
+    let total_count = 0
+    let healthy     = 0
+    let degraded    = 0
+    let dead        = 0
+
+    let i = 0
+    while3 i < total_known {
+        let svc_name = names_list[i]
+        let port_str = ports_list[i]
+        let port     = int(port_str)
+        let svc_name = replace(svc_name, " ", "")
+
+        // Apply filter: if filter_str != "all", skip non-matching names
+        let do_probe = 1
+        if3 filter_str != "all" {
+            if3 contains(filter_str, svc_name) == false {
+                let do_probe = 0
+            }
+        }
+
+        if3 do_probe == 1 {
+            let result = probe_service(svc_name, port)
+            services = dict_set(services, svc_name, result)
+            total_count = total_count + 1
+            let rtrit = dict_get(result, "trit") ?? T_FALSE
+            if3 rtrit == T_TRUE {
+                healthy = healthy + 1
+            }
+            if3 rtrit == T_MAYBE {
+                degraded = degraded + 1
+            }
+            if3 rtrit == T_FALSE {
+                dead = dead + 1
+            }
+        }
+        i = i + 1
+    }
+
+    // Majority-vote overall trit
+    let overall = T_MAYBE
+    if3 total_count > 0 {
+        let half = total_count / 2
+        if3 healthy > half {
+            let overall = T_TRUE
+        }
+        if3 dead > half {
+            let overall = T_FALSE
+        }
+    }
+
+    // Build seal hash: sha256(name + timestamp)
+    let now      = time()
+    let seal_str = snap_name + str(now)
+    let seal_h   = sha256(seal_str)
+
+    let snapshot = {
+        "name":           snap_name,
+        "timestamp":      int(now),
+        "services":       services,
+        "total_services": total_count,
+        "healthy":        healthy,
+        "degraded":       degraded,
+        "dead":           dead,
+        "trit":           overall,
+        "trit_char":      tchar(overall),
+        "seal": {
+            "trit": T_TRUE,
+            "hash": seal_h
+        },
+        "harmonics": {
+            "H3":  H3,
+            "H5":  H5,
+            "H7":  H7,
+            "H13": H13
+        },
+        "version": VERSION
+    }
+    return snapshot
+}
+
+// ============================================================================
+// HELPER: compare_snapshots -- diff two snapshots by service trit.
+// Returns structured comparison dict.
+// ============================================================================
+
+fn compare_snapshots(snap_a, snap_b) {
+    let svc_a     = dict_get(snap_a, "services") ?? {}
+    let svc_b     = dict_get(snap_b, "services") ?? {}
+    let names_a   = keys(svc_a)
+    let names_b   = keys(svc_b)
+
+    let changes   = []
+    let added     = []
+    let removed_  = []
+    let unchanged_count = 0
+
+    // Check services in A
+    let total_a = len(names_a)
+    let i = 0
+    while3 i < total_a {
+        let sname  = names_a[i]
+        let in_b   = dict_has(svc_b, sname)
+        if3 in_b == false {
+            let sdata  = dict_get(svc_a, sname) ?? {}
+            let wtrit  = dict_get(sdata, "trit") ?? T_FALSE
+            removed_ = append(removed_, {"name": sname, "was_trit": wtrit, "was_char": tchar(wtrit)})
+        }
+        if3 in_b == true {
+            let sdata_a = dict_get(svc_a, sname) ?? {}
+            let sdata_b = dict_get(svc_b, sname) ?? {}
+            let ta      = dict_get(sdata_a, "trit") ?? T_FALSE
+            let tb      = dict_get(sdata_b, "trit") ?? T_FALSE
+            if3 ta != tb {
+                let dir = "degraded"
+                if3 tb > ta {
+                    let dir = "improved"
+                }
+                changes = append(changes, {
+                    "name":     sname,
+                    "was_trit": ta,
+                    "was_char": tchar(ta),
+                    "now_trit": tb,
+                    "now_char": tchar(tb),
+                    "direction": dir
+                })
+            }
+            if3 ta == tb {
+                unchanged_count = unchanged_count + 1
+            }
+        }
+        i = i + 1
+    }
+
+    // Check services in B not in A
+    let total_b = len(names_b)
+    let j = 0
+    while3 j < total_b {
+        let sname  = names_b[j]
+        let in_a   = dict_has(svc_a, sname)
+        if3 in_a == false {
+            let sdata  = dict_get(svc_b, sname) ?? {}
+            let ntrit  = dict_get(sdata, "trit") ?? T_FALSE
+            added = append(added, {"name": sname, "now_trit": ntrit, "now_char": tchar(ntrit)})
+        }
+        j = j + 1
+    }
+
+    // Summarize
+    let improved_count = 0
+    let degraded_count = 0
+    let total_changes  = len(changes)
+    let ci = 0
+    while3 ci < total_changes {
+        let ch  = changes[ci]
+        let dir = dict_get(ch, "direction") ?? ""
+        if3 dir == "improved" {
+            improved_count = improved_count + 1
+        }
+        if3 dir == "degraded" {
+            degraded_count = degraded_count + 1
+        }
+        ci = ci + 1
+    }
+
+    let ts_a = dict_get(snap_a, "timestamp") ?? 0
+    let ts_b = dict_get(snap_b, "timestamp") ?? 0
+    let delta = ts_b - ts_a
+    if3 delta < 0 {
+        let delta = 0 - delta
+    }
+
+    return {
+        "ok":               true,
+        "snapshot_a":       dict_get(snap_a, "name") ?? "",
+        "snapshot_b":       dict_get(snap_b, "name") ?? "",
+        "time_a":           ts_a,
+        "time_b":           ts_b,
+        "time_delta_seconds": delta,
+        "trit_a":           dict_get(snap_a, "trit") ?? T_MAYBE,
+        "trit_b":           dict_get(snap_b, "trit") ?? T_MAYBE,
+        "changes":          changes,
+        "added":            added,
+        "removed":          removed_,
+        "unchanged_count":  unchanged_count,
+        "summary": {
+            "total_changes":   total_changes,
+            "services_added":  len(added),
+            "services_removed": len(removed_),
+            "improved":        improved_count,
+            "degraded":        degraded_count
+        },
+        "trit": T_TRUE
+    }
+}
+
+// ============================================================================
+// ROUTE: GET /health
+// ============================================================================
+
+fn health(body) {
+    let _r   = load_index()
+    let sorted = index_sorted()
+    let now  = time()
+    let uptime = int(now - stat_t0)
+    let resp = ns_health_dict(SERVICE_NAME, VERSION, PORT, {})
+    resp = dict_set(resp, "snapshot_dir", SNAPSHOT_DIR)
+    resp = dict_set(resp, "snapshot_count", len(sorted))
+    resp = dict_set(resp, "max_snapshots", MAX_SNAPSHOTS)
+    resp = dict_set(resp, "known_services", len(split(SVC_NAMES, ",")))
+    resp = dict_set(resp, "uptime", uptime)
+    resp = dict_set(resp, "captures", stat_captures)
+    resp = dict_set(resp, "trit", T_TRUE)
+    resp = dict_set(resp, "char", "+")
+    return resp
+}
+
+// ============================================================================
+// ROUTE: GET /tsnapshot/list
+// ============================================================================
+
+fn handle_list(body) {
+    let sorted   = index_sorted()
+    let total    = len(sorted)
+    let enriched = []
+    let i = 0
+    while3 i < total {
+        let meta   = dict_get(sorted, i) ?? {}
+        let sname  = dict_get(meta, "name") ?? ""
+        let ts     = dict_get(meta, "timestamp") ?? 0
+        let sbytes = dict_get(meta, "size_bytes") ?? 0
+
+        // Load full snapshot to get health counts
+        let snap_result = load_snapshot(sname)
+        let snap_data   = dict_get(snap_result, "data") ?? {}
+        let snap_trit   = dict_get(snap_result, "trit") ?? T_FALSE
+
+        let entry = {
+            "name":           sname,
+            "timestamp":      ts,
+            "size_bytes":     sbytes,
+            "total_services": 0,
+            "healthy":        0,
+            "trit":           T_MAYBE,
+            "trit_char":      "0"
+        }
+        if3 snap_trit == T_TRUE {
+            entry = dict_set(entry, "total_services", dict_get(snap_data, "total_services") ?? 0)
+            entry = dict_set(entry, "healthy",        dict_get(snap_data, "healthy") ?? 0)
+            let st  = dict_get(snap_data, "trit") ?? T_MAYBE
+            entry = dict_set(entry, "trit",     st)
+            entry = dict_set(entry, "trit_char", tchar(st))
+        }
+        enriched = append(enriched, entry)
+        i = i + 1
+    }
+    return {
+        "ok":           true,
+        "snapshots":    enriched,
+        "count":        len(enriched),
+        "max_snapshots": MAX_SNAPSHOTS,
+        "trit":         T_TRUE
+    }
+}
+
+// ============================================================================
+// ROUTE: GET /tsnapshot/latest
+// ============================================================================
+
+fn handle_latest(body) {
+    let sorted = index_sorted()
+    if3 len(sorted) == 0 {
+        return {"ok": false, "error": "no snapshots found", "trit": T_FALSE}
+    }
+    let latest = dict_get(sorted, 0) ?? {}
+    let lname  = dict_get(latest, "name") ?? ""
+    let result = load_snapshot(lname)
+    let rtrit  = dict_get(result, "trit") ?? T_FALSE
+    if3 rtrit != T_TRUE {
+        return {"ok": false, "error": "failed to load latest snapshot", "trit": T_FALSE}
+    }
+    return {"ok": true, "snapshot": dict_get(result, "data") ?? {}, "trit": T_TRUE}
+}
+
+// ============================================================================
+// ROUTE: GET /tsnapshot/get  (query param: name=<snapshot-name>)
+// In NovaLang, troute does not support path params, so the caller passes
+// ?name=<value> or the orchestrator strips the suffix into a body field.
+// The route handler reads body["name"] for the snapshot name.
+// ============================================================================
+
+fn handle_get(body) {
+    let name = dict_get(body, "name") ?? ""
+    if3 len(str(name)) == 0 {
+        return {"ok": false, "error": "name param required", "trit": T_FALSE}
+    }
+    let valid = sanitize_name(name)
+    if3 valid != T_TRUE {
+        return {"ok": false, "error": "invalid snapshot name", "trit": T_FALSE}
+    }
+    let result = load_snapshot(name)
+    let rtrit  = dict_get(result, "trit") ?? T_FALSE
+    if3 rtrit != T_TRUE {
+        return {"ok": false, "error": "snapshot not found: " + str(name), "trit": T_FALSE}
+    }
+    return {"ok": true, "snapshot": dict_get(result, "data") ?? {}, "trit": T_TRUE}
+}
+
+// ============================================================================
+// ROUTE: POST /tsnapshot/capture
+// Body: {"name": "optional-name", "services": ["all"] or ["svc1","svc2",...]}
+// ============================================================================
+
+fn handle_capture(body) {
+    // Determine snapshot name
+    let given_name = dict_get(body, "name") ?? ""
+    let snap_name  = str(given_name)
+    if3 len(snap_name) == 0 {
+        let now_ts = int(time())
+        let snap_name = "snap-" + str(now_ts)
+    }
+
+    let valid = sanitize_name(snap_name)
+    if3 valid != T_TRUE {
+        return {
+            "ok":    false,
+            "error": "invalid snapshot name: " + snap_name,
+            "trit":  T_FALSE
+        }
+    }
+
+    // Check if name already exists in index
+    let existing_pos = index_find(snap_name)
+    if3 existing_pos >= 0 {
+        return {
+            "ok":    false,
+            "error": "snapshot already exists: " + snap_name,
+            "trit":  T_FALSE
+        }
+    }
+
+    // Determine service filter
+    let svc_filter = dict_get(body, "services") ?? "all"
+    let filter_str = "all"
+    let svc_type   = type_of(svc_filter)
+    if3 svc_type == "list" {
+        // Join list to comma-separated string for contains() checks
+        let filter_str = join(svc_filter, ",")
+        // If list contains "all", treat as all
+        if3 contains(filter_str, "all") {
+            let filter_str = "all"
+        }
+    }
+    if3 svc_type == "str" {
+        let filter_str = str(svc_filter)
+    }
+
+    // Capture
+    let snapshot = capture_all(snap_name, filter_str)
+
+    // Save to disk
+    let save_trit = save_snapshot(snapshot)
+    if3 save_trit != T_TRUE {
+        return {"ok": false, "error": "failed to save snapshot", "trit": T_FALSE}
+    }
+
+    // Auto-prune
+    let pruned = prune_snapshots()
+
+    // Update stats
+    stat_captures = stat_captures + 1
+
+    return {
+        "ok":             true,
+        "name":           snap_name,
+        "timestamp":      dict_get(snapshot, "timestamp") ?? 0,
+        "total_services": dict_get(snapshot, "total_services") ?? 0,
+        "healthy":        dict_get(snapshot, "healthy") ?? 0,
+        "degraded":       dict_get(snapshot, "degraded") ?? 0,
+        "dead":           dict_get(snapshot, "dead") ?? 0,
+        "trit":           dict_get(snapshot, "trit") ?? T_MAYBE,
+        "trit_char":      dict_get(snapshot, "trit_char") ?? "0",
+        "pruned":         pruned,
+        "version":        VERSION
+    }
+}
+
+// ============================================================================
+// ROUTE: POST /tsnapshot/compare
+// Body: {"a": "snap-name-1", "b": "snap-name-2"}
+// ============================================================================
+
+fn handle_compare(body) {
+    let name_a = dict_get(body, "a") ?? ""
+    let name_b = dict_get(body, "b") ?? ""
+
+    if3 len(str(name_a)) == 0 {
+        return {
+            "ok":    false,
+            "error": "both a and b snapshot names required",
+            "trit":  T_FALSE
+        }
+    }
+    if3 len(str(name_b)) == 0 {
+        return {
+            "ok":    false,
+            "error": "both a and b snapshot names required",
+            "trit":  T_FALSE
+        }
+    }
+
+    let res_a  = load_snapshot(name_a)
+    let trit_a = dict_get(res_a, "trit") ?? T_FALSE
+    if3 trit_a != T_TRUE {
+        return {"ok": false, "error": "snapshot not found: " + str(name_a), "trit": T_FALSE}
+    }
+
+    let res_b  = load_snapshot(name_b)
+    let trit_b = dict_get(res_b, "trit") ?? T_FALSE
+    if3 trit_b != T_TRUE {
+        return {"ok": false, "error": "snapshot not found: " + str(name_b), "trit": T_FALSE}
+    }
+
+    let snap_a = dict_get(res_a, "data") ?? {}
+    let snap_b = dict_get(res_b, "data") ?? {}
+
+    stat_compares = stat_compares + 1
+
+    return compare_snapshots(snap_a, snap_b)
+}
+
+// ============================================================================
+// ROUTE: POST /tsnapshot/restore
+// Body: {"name": "snap-name"}
+// Returns restore INSTRUCTIONS only. No auto-apply.
+// ============================================================================
+
+fn handle_restore(body) {
+    let name = dict_get(body, "name") ?? ""
+    if3 len(str(name)) == 0 {
+        return {"ok": false, "error": "snapshot name required", "trit": T_FALSE}
+    }
+
+    let res    = load_snapshot(name)
+    let rtrit  = dict_get(res, "trit") ?? T_FALSE
+    if3 rtrit != T_TRUE {
+        return {"ok": false, "error": "snapshot not found: " + str(name), "trit": T_FALSE}
+    }
+
+    let snap     = dict_get(res, "data") ?? {}
+    let services = dict_get(snap, "services") ?? {}
+    let svc_keys = keys(services)
+    let total_k  = len(svc_keys)
+
+    let instructions  = []
+    let restart_cmds  = []
+    let action_count  = 0
+
+    let i = 0
+    while3 i < total_k {
+        let svc_name  = svc_keys[i]
+        let svc_data  = dict_get(services, svc_name) ?? {}
+        let snap_trit = dict_get(svc_data, "trit") ?? T_FALSE
+        let port      = dict_get(svc_data, "port") ?? 0
+
+        // Probe current state
+        let current   = probe_service(svc_name, port)
+        let cur_trit  = dict_get(current, "trit") ?? T_FALSE
+
+        if3 snap_trit == T_TRUE {
+            if3 cur_trit != T_TRUE {
+                // Was healthy in snapshot, now not -- recommend restart
+                instructions = append(instructions, {
+                    "service": svc_name,
+                    "port":    port,
+                    "action":  "RESTART",
+                    "reason":  "was healthy in snapshot, now trit=" + tchar(cur_trit)
+                })
+                restart_cmds = append(restart_cmds,
+                    "POST http://127.0.0.1:9999/api/services/boot body={\"service\": \"" + svc_name + "\"}"
+                )
+                action_count = action_count + 1
+            }
+        }
+        if3 snap_trit != T_TRUE {
+            if3 cur_trit == T_TRUE {
+                instructions = append(instructions, {
+                    "service": svc_name,
+                    "port":    port,
+                    "action":  "NOTE",
+                    "reason":  "was trit=" + tchar(snap_trit) + " in snapshot but now healthy -- no action needed"
+                })
+            }
+        }
+        i = i + 1
+    }
+
+    let snap_ts   = dict_get(snap, "timestamp") ?? 0
+    stat_restores = stat_restores + 1
+
+    let out_trit = T_MAYBE
+    if3 action_count > 0 {
+        let out_trit = T_TRUE
+    }
+
+    return {
+        "ok":                 true,
+        "name":               name,
+        "snapshot_timestamp": snap_ts,
+        "instructions":       instructions,
+        "restart_commands":   restart_cmds,
+        "total_actions":      action_count,
+        "note":               "These are restore INSTRUCTIONS only. No changes have been applied.",
+        "trit":               out_trit,
+        "char":               tchar(out_trit)
+    }
+}
+
+// ============================================================================
+// ROUTE: POST /tsnapshot/delete
+// Body: {"name": "snap-name"}
+// ============================================================================
+
+fn handle_delete(body) {
+    let name = dict_get(body, "name") ?? ""
+    if3 len(str(name)) == 0 {
+        return {"ok": false, "error": "snapshot name required", "trit": T_FALSE}
+    }
+
+    let valid = sanitize_name(name)
+    if3 valid != T_TRUE {
+        return {"ok": false, "error": "invalid snapshot name: " + str(name), "trit": T_FALSE}
+    }
+
+    let pos = index_find(name)
+    if3 pos < 0 {
+        return {"ok": false, "error": "snapshot not found: " + str(name), "trit": T_FALSE}
+    }
+
+    let path = snap_path(name)
+    try3 {
+        // Overwrite with empty to effectively delete (nova_write is the only fs-write)
+        nova_write(path, "")
+        index_remove(name)
+        stat_deletes = stat_deletes + 1
+        return {"ok": true, "deleted": name, "trit": T_TRUE, "char": "+"}
+    } catch3 {
+        return {"ok": false, "error": "failed to delete snapshot: " + str(name), "trit": T_FALSE}
+    }
+}
+
+// ============================================================================
+// ROUTE registrations
+// ============================================================================
+
+troute(server, "GET",  "/health",              "health")
+troute(server, "GET",  "/tsnapshot/list",       "handle_list")
+troute(server, "GET",  "/tsnapshot/latest",     "handle_latest")
+troute(server, "GET",  "/tsnapshot/get",        "handle_get")
+troute(server, "POST", "/tsnapshot/capture",    "handle_capture")
+troute(server, "POST", "/tsnapshot/compare",    "handle_compare")
+troute(server, "POST", "/tsnapshot/restore",    "handle_restore")
+troute(server, "POST", "/tsnapshot/delete",     "handle_delete")
+
+// ============================================================================
+// Startup banner
+// ============================================================================
+
+print("[TSnapshot v" + VERSION + "] nova-tsnapshot on 127.0.0.1:" + str(PORT) + " | ternary=true | harmonics=3-5-7-13")
+print("[TSnapshot] Storage: " + SNAPSHOT_DIR)
+print("[TSnapshot] Known services: " + str(len(split(SVC_NAMES, ","))) + " | Max snapshots: " + str(MAX_SNAPSHOTS))
+print("[TSnapshot] Endpoints:")
+print("  GET  /health")
+print("  GET  /tsnapshot/list")
+print("  GET  /tsnapshot/latest")
+print("  GET  /tsnapshot/get?name=<snap-name>")
+print("  POST /tsnapshot/capture")
+print("  POST /tsnapshot/compare")
+print("  POST /tsnapshot/restore")
+print("  POST /tsnapshot/delete")
+print("[TSnapshot] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TSnapshot] BLOCK=" + str(BLOCK) + " MAX_SNAPSHOTS=" + str(MAX_SNAPSHOTS))
+print("[TSnapshot] T_TRUE=" + str(T_TRUE) + " T_MAYBE=" + str(T_MAYBE) + " T_FALSE=" + str(T_FALSE))
+print("[TSnapshot] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)

@@ -1,0 +1,192 @@
+// Nova TKill -- Ternary Process Killswitch (NovaLang TFlask)
+// Port 9901: Pure NovaLang implementation of the kill-flush-boot cycle
+// Uses nova_run for system commands, TFlask for HTTP serving
+// 3-5-7-13: 3 kill states, 5 retries, 7 batch, 13s health
+
+let PORT = 9901
+let server = tserve(PORT, "TKill NovaLang")
+
+// 3-5-7-13 Constants
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+
+// Protected ports -- NEVER kill
+let protected_ports = "9999,11434,6379,7700,9901"
+
+// Service registry as string-encoded map (port:name pairs)
+let svc_ports = "9875,9877,9878,9880,9881,9882,9884,9889,9890,9891,9892,9893,9894,9895,9896,9897,9899,9900,9990,9998"
+let svc_names = "stt,exec,cloud,vpn,hive,nexus,sentinel,patch,tshell,tools,vault,deep,ttools,tspeak,cortex,tfetch,tkill-py,tkill-node,brain,ws"
+
+// Stats
+let total_flushes = 0
+let total_kills = 0
+
+// -- Find PIDs on a port via netstat --------------------------------
+fn find_pids(port) {
+    let cmd = "netstat -ano | findstr LISTENING | findstr :" + str(port) + " "
+    let result = nova_run(cmd)
+    return result
+}
+
+// -- Kill a PID -----------------------------------------------------
+fn kill_pid(pid) {
+    let cmd = "powershell -NoProfile -Command Stop-Process -Id " + str(pid) + " -Force -ErrorAction SilentlyContinue"
+    let result = nova_run(cmd)
+    return result
+}
+
+// -- Check if port has ternary health -------------------------------
+fn check_health(port) {
+    let url = "http://127.0.0.1:" + str(port) + "/health"
+    let cmd = "powershell -NoProfile -Command (Invoke-WebRequest -Uri " + url + " -TimeoutSec 3 -UseBasicParsing).Content"
+    let result = nova_run(cmd, 10)
+    return result
+}
+
+// -- Check if port is protected -------------------------------------
+fn is_protected(port) {
+    let pstr = str(port)
+    let parts = split(protected_ports, ",")
+    for p in parts {
+        let trimmed = strip(p)
+        if trimmed == pstr {
+            return TRUE
+        }
+    }
+    return FALSE
+}
+
+// -- Flush a single port --------------------------------------------
+fn flush_port(port) {
+    let prot = is_protected(port)
+    if prot == TRUE {
+        return {"port": port, "skipped": true, "reason": "protected", "trit": 0}
+    }
+    let raw = find_pids(port)
+    let killed = 0
+    let lines = split(str(raw), "\n")
+    for line in lines {
+        let trimmed = strip(line)
+        if len(trimmed) > 5 {
+            let parts = split(trimmed, " ")
+            let last = parts[len(parts) - 1]
+            let pid_str = strip(last)
+            if len(pid_str) > 0 {
+                let result = kill_pid(pid_str)
+                let killed = killed + 1
+            }
+        }
+    }
+    return {"port": port, "killed": killed, "trit": 1}
+}
+
+// -- Health endpoint ------------------------------------------------
+fn health() {
+    return {"ok": true, "service": "nova-tkill-novalang", "port": 9901, "version": "2.0", "ternary": true, "runtime": "novalang", "harmonics": {"H3": 3, "H5": 5, "H7": 7, "H13": 13}}
+}
+
+// -- Status: check all services -------------------------------------
+fn tkill_status() {
+    let ports = split(svc_ports, ",")
+    let names = split(svc_names, ",")
+    let results = []
+    let ternary_count = 0
+    let stale_count = 0
+    let i = 0
+    for port_str in ports {
+        let port = int(strip(port_str))
+        let name = strip(names[i])
+        let raw = check_health(port)
+        let has_ternary = FALSE
+        if contains(str(raw), "ternary") {
+            let has_ternary = TRUE
+            let ternary_count = ternary_count + 1
+        }
+        let alive = TRUE
+        if contains(str(raw), "error") {
+            let alive = FALSE
+        }
+        let stale = FALSE
+        if alive == TRUE {
+            if has_ternary == FALSE {
+                let stale = TRUE
+                let stale_count = stale_count + 1
+            }
+        }
+        let trit = 1
+        if has_ternary == FALSE {
+            if alive == TRUE {
+                let trit = 0
+            }
+            if alive == FALSE {
+                let trit = -1
+            }
+        }
+        append(results, {"port": port, "name": name, "alive": alive, "ternary": has_ternary, "stale": stale, "trit": trit})
+        let i = i + 1
+    }
+    return {"ok": true, "runtime": "novalang", "services": results, "ternary_count": ternary_count, "stale_count": stale_count}
+}
+
+// -- Flush all non-protected services -------------------------------
+fn tkill_flush(body) {
+    let ports = split(svc_ports, ",")
+    let results = []
+    let killed_total = 0
+    for port_str in ports {
+        let port = int(strip(port_str))
+        let result = flush_port(port)
+        append(results, result)
+        let killed_total = killed_total + result.get("killed", 0)
+    }
+    total_flushes = total_flushes + 1
+    total_kills = total_kills + killed_total
+    return {"ok": true, "action": "flush", "runtime": "novalang", "results": results, "total_killed": killed_total}
+}
+
+// -- Flush one service ----------------------------------------------
+fn tkill_flush_one(body) {
+    let port = body.get("port", 0)
+    if port == 0 {
+        return {"error": "port required"}
+    }
+    let result = flush_port(int(port))
+    return {"ok": true, "action": "flush-one", "runtime": "novalang", "result": result}
+}
+
+// -- Flush + boot ---------------------------------------------------
+fn tkill_flush_and_boot(body) {
+    // Phase 1: Flush all
+    let flush_result = tkill_flush({})
+    // Phase 2: Wait
+    nova_run("timeout /t 3 /nobreak", 10)
+    // Phase 3: Boot via orchestrator
+    let boot_cmd = "powershell -NoProfile -Command (Invoke-WebRequest -Uri http://127.0.0.1:9999/api/services/boot -Method POST -Body '{}' -ContentType 'application/json' -TimeoutSec 60 -UseBasicParsing).Content"
+    let boot_result = nova_run(boot_cmd, 70)
+    // Phase 4: Wait for services
+    nova_run("timeout /t 10 /nobreak", 15)
+    // Phase 5: Verify
+    let verify = tkill_status()
+    return {"ok": true, "action": "flush-and-boot", "runtime": "novalang", "flush": flush_result, "boot": boot_result, "verify": verify}
+}
+
+// -- Verify ternary status ------------------------------------------
+fn tkill_verify(body) {
+    return tkill_status()
+}
+
+// -- Register routes ------------------------------------------------
+troute(server, "GET", "/health", "health")
+troute(server, "GET", "/tkill/status", "tkill_status")
+troute(server, "POST", "/tkill/flush", "tkill_flush")
+troute(server, "POST", "/tkill/flush-one", "tkill_flush_one")
+troute(server, "POST", "/tkill/flush-and-boot", "tkill_flush_and_boot")
+troute(server, "POST", "/tkill/verify", "tkill_verify")
+
+print("[TKill-Nova] NovaLang TKill v2.0 on port " + str(PORT))
+print("[TKill-Nova] Harmonics: 3-5-7-13 | Runtime: NovaLang")
+print("[TKill-Nova] Routes: /health, /tkill/status, /tkill/flush, /tkill/flush-and-boot, /tkill/verify")
+
+tstart(server)

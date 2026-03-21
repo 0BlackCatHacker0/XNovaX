@@ -1,0 +1,204 @@
+// ============================================================================
+// compress3.nova — TZip Ternary Compression for Service Responses
+// ============================================================================
+// Base-243 (3^5) encoding with run-length compression on repeated bytes.
+// Provides compress/decompress for strings and response dicts.
+//
+// 3-5-7-13 Harmonics:
+//   243 = 3^5 = TZip base | threshold = 1000 bytes
+//   Run-length marker = 0xFF (243rd trit boundary)
+// ============================================================================
+
+let _TZIP_BASE = 243
+let _TZIP_THRESHOLD = 1000
+let _TZIP_RLE_MARKER = 255
+let _TZIP_VERSION = "0.1.0"
+
+// ── Base-243 trit table (lazy: use mod/div at runtime) ──
+
+// -- Encode a single byte (0-255) into base-243 trit pair --
+fn _tzip_byte_to_trits(b) {
+    let high = floor(b / _TZIP_BASE)
+    let low = b - (high * _TZIP_BASE)
+    return [high, low]
+}
+
+// -- Decode a trit pair back to byte --
+fn _tzip_trits_to_byte(high, low) {
+    return (high * _TZIP_BASE) + low
+}
+
+// -- Run-length encode repeated bytes before trit conversion --
+// Format: [RLE_MARKER, count, byte] for runs of 3+ identical bytes
+fn _tzip_rle_encode(bytes_list) {
+    let result = []
+    let i = 0
+    let blen = len(bytes_list)
+    while3 i < blen {
+        let current = bytes_list[i]
+        let run = 1
+        // Count consecutive identical bytes (cap at 243 to fit in one trit)
+        while3 (i + run) < blen {
+            if3 bytes_list[i + run] != current { break }
+            if3 run >= _TZIP_BASE { break }
+            run = run + 1
+        }
+        if3 run >= 3 {
+            // Emit RLE: marker + count + byte
+            result = append(result, _TZIP_RLE_MARKER)
+            result = append(result, run)
+            result = append(result, current)
+        } else3 {
+            // Emit raw bytes
+            let j = 0
+            while3 j < run {
+                result = append(result, current)
+                j = j + 1
+            }
+        }
+        i = i + run
+    }
+    return result
+}
+
+// -- Decode RLE back to raw bytes --
+fn _tzip_rle_decode(encoded_list) {
+    let result = []
+    let i = 0
+    let elen = len(encoded_list)
+    while3 i < elen {
+        if3 encoded_list[i] == _TZIP_RLE_MARKER {
+            // Next two entries are count and byte
+            if3 (i + 2) < elen {
+                let count = encoded_list[i + 1]
+                let byte_val = encoded_list[i + 2]
+                let j = 0
+                while3 j < count {
+                    result = append(result, byte_val)
+                    j = j + 1
+                }
+                i = i + 3
+            } else3 {
+                // Malformed — emit marker as literal
+                result = append(result, encoded_list[i])
+                i = i + 1
+            }
+        } else3 {
+            result = append(result, encoded_list[i])
+            i = i + 1
+        }
+    }
+    return result
+}
+
+// ── Public API ──
+
+// -- Compress a string using TZip (RLE + base-243 trit encoding) --
+fn tzip_compress(data_str) {
+    let raw_bytes = try3 { str_bytes(data_str) } fail { [] }
+    if3 len(raw_bytes) == 0 {
+        return {"compressed": "", "original_len": 0, "trit": 0}
+    }
+    // Step 1: Run-length encode
+    let rle = _tzip_rle_encode(raw_bytes)
+    // Step 2: Convert each byte to base-243 trit pair
+    let trits = []
+    let i = 0
+    while3 i < len(rle) {
+        let pair = _tzip_byte_to_trits(rle[i])
+        trits = append(trits, pair[0])
+        trits = append(trits, pair[1])
+        i = i + 1
+    }
+    // Step 3: Encode trit values as compact string (each trit 0-242 as char)
+    let encoded = ""
+    let i = 0
+    while3 i < len(trits) {
+        encoded = encoded + chr(trits[i] + 33)
+        i = i + 1
+    }
+    return {
+        "compressed": encoded,
+        "original_len": len(raw_bytes),
+        "compressed_len": len(encoded),
+        "trit": 1
+    }
+}
+
+// -- Decompress a TZip-compressed string --
+fn tzip_decompress(compressed_str) {
+    if3 len(compressed_str) == 0 {
+        return {"data": "", "trit": 0}
+    }
+    // Step 1: Decode char string back to trit values
+    let trits = []
+    let i = 0
+    while3 i < len(compressed_str) {
+        let val = ord(compressed_str[i]) - 33
+        trits = append(trits, val)
+        i = i + 1
+    }
+    // Step 2: Convert trit pairs back to bytes
+    let rle_bytes = []
+    let i = 0
+    while3 i < len(trits) - 1 {
+        let byte_val = _tzip_trits_to_byte(trits[i], trits[i + 1])
+        rle_bytes = append(rle_bytes, byte_val)
+        i = i + 2
+    }
+    // Step 3: RLE decode
+    let raw_bytes = _tzip_rle_decode(rle_bytes)
+    // Step 4: Convert bytes back to string
+    let result = try3 { bytes_str(raw_bytes) } fail { "" }
+    return {"data": result, "trit": 1}
+}
+
+// -- Compress a response dict's "data" field if > threshold --
+fn compress_response(response_dict) {
+    let data = dict_get(response_dict, "data") ?? ""
+    let data_str = try3 { json_encode(data) } fail { str(data) }
+    if3 len(data_str) <= _TZIP_THRESHOLD {
+        // Below threshold — return unchanged
+        return response_dict
+    }
+    let compressed = tzip_compress(data_str)
+    let result = dict_set(response_dict, "data", dict_get(compressed, "compressed") ?? "")
+    let result = dict_set(result, "_tzip", {
+        "compressed": true,
+        "original_len": dict_get(compressed, "original_len") ?? 0,
+        "compressed_len": dict_get(compressed, "compressed_len") ?? 0,
+        "version": _TZIP_VERSION
+    })
+    return result
+}
+
+// -- Decompress a response dict's "data" field if _tzip marker present --
+fn decompress_response(compressed_dict) {
+    let tzip_meta = dict_get(compressed_dict, "_tzip")
+    if3 tzip_meta == null {
+        // Not compressed — return unchanged
+        return compressed_dict
+    }
+    let is_compressed = dict_get(tzip_meta, "compressed") ?? false
+    if3 is_compressed != true {
+        return compressed_dict
+    }
+    let compressed_data = dict_get(compressed_dict, "data") ?? ""
+    let decompressed = tzip_decompress(compressed_data)
+    let raw_str = dict_get(decompressed, "data") ?? ""
+    // Try to parse back to structured data
+    let parsed = try3 { json_decode(raw_str) } fail { raw_str }
+    let result = dict_set(compressed_dict, "data", parsed)
+    let result = dict_remove(result, "_tzip")
+    return result
+}
+
+// -- Calculate compression ratio (original / compressed) --
+fn compress_ratio(original, compressed) {
+    let orig_len = len(original)
+    let comp_len = len(compressed)
+    if3 comp_len == 0 { return 0 }
+    return floor((orig_len * 100) / comp_len)
+}
+
+print("[compress3] TZip ternary compression v" + _TZIP_VERSION + " loaded | base=" + str(_TZIP_BASE) + " threshold=" + str(_TZIP_THRESHOLD))

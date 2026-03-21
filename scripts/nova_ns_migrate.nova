@@ -1,0 +1,179 @@
+// ================================================================
+// nova_ns_migrate.nova — Fleet-Wide N-S Migration Tool
+// Adds shared library imports to all NovaX services
+// Run: novalang.exe scripts/nova_ns_migrate.nova
+// ================================================================
+import3("C:/NovaX/lib/nova_ns_core.nova")
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let NOVA_DIR = "C:/NovaX"
+let IMPORT_BLOCK = "import3(\"C:/NovaX/lib/nova_ns_core.nova\")\nimport3(\"C:/NovaX/lib/nova_stdlib.nova\")"
+let NS_INIT_LINE = "let _ns = ns_init_counters()"
+
+// Services already migrated (skip these)
+let SKIP_LIST = ["nova_tcache_service.nova", "nova_tmetrics_service.nova", "nova_tbus_service.nova", "nova_tconfig_service.nova", "nova_tlog_service.nova", "nova_tpacman_service.nova"]
+
+// Files that are NOT services (don't migrate)
+let NOT_SERVICES = ["nova_cloud_api.nova", "nova_audio_engine.nova", "nova_hivemind.nova.bak", "nova_ternary_server.nova.bak"]
+
+fn should_skip(filename) {
+    // Check skip list
+    let i = 0
+    while3 i < len(SKIP_LIST) {
+        let sk = SKIP_LIST[i]
+        if3 filename == sk { return true }
+        let i = i + 1
+    }
+    // Check not-services list
+    let i = 0
+    while3 i < len(NOT_SERVICES) {
+        let ns = NOT_SERVICES[i]
+        if3 filename == ns { return true }
+        let i = i + 1
+    }
+    return false
+}
+
+fn has_import(content) {
+    if3 contains(content, "nova_ns_core.nova") { return true }
+    return false
+}
+
+fn has_tserve(content) {
+    if3 contains(content, "tserve(") { return true }
+    return false
+}
+
+fn has_harmonic_decl(line) {
+    if3 contains(line, "let H3 = 3") { return true }
+    if3 contains(line, "let H5 = 5") { return true }
+    if3 contains(line, "let H7 = 7") { return true }
+    if3 contains(line, "let H13 = 13") { return true }
+    return false
+}
+
+// Get list of .nova service files
+let all_files = list_dir("C:/NovaX")
+let files = []
+for3 f in all_files {
+    if3 contains(f, "_service.nova") {
+        let files = append(files, f)
+    }
+}
+let migrated = 0
+let skipped = 0
+let failed = 0
+let total = len(files)
+
+print("=== NovaX N-S Fleet Migration ===")
+print("Found " + str(total) + " service files")
+print("")
+
+let fi = 0
+while3 fi < total {
+    let fname = trim(files[fi])
+    let fi = fi + 1
+
+    // Skip empty lines
+    if3 len(fname) < 3 { continue3 }
+
+    // Skip already-migrated or non-service files
+    let skip = should_skip(fname)
+    if3 skip == true {
+        print("[SKIP] " + fname + " (already migrated or excluded)")
+        let skipped = skipped + 1
+        continue3
+    }
+
+    // Read the file
+    let fpath = NOVA_DIR + "/" + fname
+    let content = try3 { read_file(fpath) } { "" }
+    if3 len(content) == 0 {
+        print("[FAIL] " + fname + " (could not read)")
+        let failed = failed + 1
+        continue3
+    }
+
+    // Skip if already has imports
+    let already = has_import(content)
+    if3 already == true {
+        print("[SKIP] " + fname + " (already has ns_core import)")
+        let skipped = skipped + 1
+        continue3
+    }
+
+    // Skip if not a tserve-based service
+    let is_service = has_tserve(content)
+    if3 is_service == false {
+        print("[SKIP] " + fname + " (no tserve — not a service)")
+        let skipped = skipped + 1
+        continue3
+    }
+
+    // Split into lines and rebuild with imports
+    let lines = split(content, "\n")
+    let new_lines = []
+    let inserted = false
+    let li = 0
+    while3 li < len(lines) {
+        let line = lines[li]
+        let li = li + 1
+
+        // Skip harmonic constant declarations (VM globals provide these)
+        let is_h = has_harmonic_decl(line)
+        if3 is_h == true { continue3 }
+
+        // Insert imports after first non-comment, non-empty line that starts with "let"
+        let result = _maybe_insert(line, inserted, new_lines)
+        let new_lines = dict_get(result, "lines") ?? new_lines
+        let inserted = dict_get(result, "inserted") ?? inserted
+    }
+
+    // Join and write back
+    let new_content = join(new_lines, "\n")
+    let ok = try3 { write_file(fpath, new_content) } { false }
+    if3 ok == false {
+        print("[FAIL] " + fname + " (write failed)")
+        let failed = failed + 1
+        continue3
+    }
+
+    print("[OK]   " + fname + " — N-S imports added")
+    let migrated = migrated + 1
+}
+
+print("")
+print("=== Migration Complete ===")
+print("Migrated: " + str(migrated))
+print("Skipped:  " + str(skipped))
+print("Failed:   " + str(failed))
+print("Total:    " + str(total))
+
+fn _maybe_insert(line, inserted, new_lines) {
+    if3 inserted == true {
+        let new_lines = append(new_lines, line)
+        return {"lines": new_lines, "inserted": true}
+    }
+    // Look for first "let PORT" or "let VERSION" as insertion point
+    let is_port = contains(line, "let PORT")
+    let is_ver = contains(line, "let VERSION")
+    if3 is_port == true {
+        // Insert imports BEFORE the PORT line
+        let new_lines = append(new_lines, "// -- Shared Libraries --")
+        let new_lines = append(new_lines, "import3(\"C:/NovaX/lib/nova_ns_core.nova\")")
+        let new_lines = append(new_lines, "import3(\"C:/NovaX/lib/nova_stdlib.nova\")")
+        let new_lines = append(new_lines, "")
+        let new_lines = append(new_lines, line)
+        return {"lines": new_lines, "inserted": true}
+    }
+    if3 is_ver == true {
+        let new_lines = append(new_lines, "// -- Shared Libraries --")
+        let new_lines = append(new_lines, "import3(\"C:/NovaX/lib/nova_ns_core.nova\")")
+        let new_lines = append(new_lines, "import3(\"C:/NovaX/lib/nova_stdlib.nova\")")
+        let new_lines = append(new_lines, "")
+        let new_lines = append(new_lines, line)
+        return {"lines": new_lines, "inserted": true}
+    }
+    let new_lines = append(new_lines, line)
+    return {"lines": new_lines, "inserted": false}
+}

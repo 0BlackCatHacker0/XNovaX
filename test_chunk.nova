@@ -1,0 +1,566 @@
+// ================================================================
+// nova_model_registry_service.nova — Model Discovery & Lock-In
+// Port 9860 — Pure NovaLang
+//
+// Discovers ALL accessible models across every provider:
+//   - OpenRouter API (340+ cloud models)
+//   - Ollama local (102+ models)
+//   - Direct providers (OpenAI, Anthropic, etc.)
+//   - Desktop bridges (Cortex:Claude, Cortex:GPT)
+//   - Ternary models (BitNet, Fleet)
+//
+// Lock-In: Extends Prime's circuit breaker to any model
+// Combined Abilities: Maps model capabilities (code, math, vision, reasoning)
+//
+// 3-5-7-13 Harmonics:
+//   H3=3  — capability tiers (free/standard/premium)
+//   H5=5  — refresh interval (5 min)
+//   H7=7  — max retries per discovery
+//   H13=13 — cache TTL (13 min)
+//
+// Endpoints:
+//   GET  /health                    — Health check
+//   GET  /models                    — Full model catalog
+//   GET  /models/free               — Free models only
+//   GET  /models/locked             — Locked-in models
+//   GET  /models/by-provider/:name  — Models by provider
+//   GET  /models/by-ability/:name   — Models by capability
+//   GET  /models/stats              — Registry statistics
+//   GET  /abilities                 — Combined ability matrix
+//   POST /models/discover           — Trigger fresh discovery
+//   POST /models/lock               — Lock in a model
+//   POST /models/unlock             — Unlock a model
+//   POST /models/lock-all-free      — Lock in all free models
+// ================================================================
+
+import3("nova_cloud_api.nova")
+
+let PORT = 9860
+let SERVICE_NAME = "nova-model-registry"
+let VERSION = "1.0.0"
+
+// 3-5-7-13
+let H3 = 3
+let H5 = 5
+let H7 = 7
+let H13 = 13
+
+// State
+let _registry = {}       // model_id -> model info dict
+let _locked = {}          // model_id -> true/false
+let _abilities = {}       // model_id -> [abilities]
+let _providers = {}       // provider_name -> [model_ids]
+let _stats = {"total": 0, "free": 0, "locked": 0, "providers": 0, "last_scan": 0, "scans": 0}
+let _last_discovery = 0
+
+let server = tserve(PORT)
+
+// ── Conditional append helper (must be defined before use) ──
+fn _check_add(list, condition, value) {
+    if3 condition == true { return append(list, value) }
+    return list
+}
+
+// ── Ability Classification ──
+// Uses helper functions to avoid let-inside-if3 scope trap
+fn _has_code(mid) {
+    if3 contains(mid, "code") { return true }
+    if3 contains(mid, "coder") { return true }
+    if3 contains(mid, "starcoder") { return true }
+    if3 contains(mid, "wizard") { return true }
+    if3 contains(mid, "magicoder") { return true }
+    if3 contains(mid, "sqlcoder") { return true }
+    if3 contains(mid, "granite-code") { return true }
+    if3 contains(mid, "codegeex") { return true }
+    return false
+}
+fn _has_reasoning(mid) {
+    if3 contains(mid, "r1") { return true }
+    if3 contains(mid, "thinking") { return true }
+    if3 contains(mid, "o1") { return true }
+    if3 contains(mid, "o3") { return true }
+    if3 contains(mid, "deepseek-r") { return true }
+    return false
+}
+fn _has_vision(mid) {
+    if3 contains(mid, "vl") { return true }
+    if3 contains(mid, "vision") { return true }
+    if3 contains(mid, "image") { return true }
+    return false
+}
+fn _has_math(mid) {
+    if3 contains(mid, "math") { return true }
+    if3 contains(mid, "nemotron") { return true }
+    return false
+}
+fn _has_chat(mid) {
+    if3 contains(mid, "chat") { return true }
+    if3 contains(mid, "instruct") { return true }
+    if3 contains(mid, "claude") { return true }
+    if3 contains(mid, "gpt") { return true }
+    if3 contains(mid, "gemini") { return true }
+    if3 contains(mid, "llama") { return true }
+    if3 contains(mid, "qwen") { return true }
+    if3 contains(mid, "mistral") { return true }
+    return false
+}
+fn _has_flagship(mid) {
+    if3 contains(mid, "large") { return true }
+    if3 contains(mid, "pro") { return true }
+    if3 contains(mid, "opus") { return true }
+    if3 contains(mid, "405b") { return true }
+    if3 contains(mid, "70b") { return true }
+    return false
+}
+fn _has_fast(mid) {
+    if3 contains(mid, "mini") { return true }
+    if3 contains(mid, "nano") { return true }
+    if3 contains(mid, "lite") { return true }
+    if3 contains(mid, "tiny") { return true }
+    if3 contains(mid, "flash") { return true }
+    if3 contains(mid, "1b") { return true }
+    if3 contains(mid, "3b") { return true }
+    return false
+}
+
+fn classify_abilities(model_id) {
+    let abs = []
+    let mid = lower(model_id)
+    // Each helper returns true/false — append outside if3
+    let abs = _check_add(abs, _has_code(mid), "code")
+    let abs = _check_add(abs, _has_reasoning(mid), "reasoning")
+    let abs = _check_add(abs, _has_vision(mid), "vision")
+    let abs = _check_add(abs, _has_math(mid), "math")
+    let abs = _check_add(abs, _has_chat(mid), "chat")
+    let abs = _check_add(abs, _has_flagship(mid), "flagship")
+    let abs = _check_add(abs, _has_fast(mid), "fast")
+    let abs = _check_add(abs, len(abs) == 0, "general")
+    return abs
+}
+
+// ── Check if model is free ──
+fn _is_free_model(cost, model_id) {
+    if3 cost == "0" { return true }
+    if3 cost == "free" { return true }
+    if3 contains(model_id, ":free") == true { return true }
+    return false
+}
+
+// ── Register a model ──
+fn register_model(model_id, provider, tier, context_len, cost) {
+    let abilities = classify_abilities(model_id)
+    let is_free = _is_free_model(cost, model_id)
+    let entry = {"id": model_id, "provider": provider, "tier": tier, "context": context_len, "cost": cost, "free": is_free, "abilities": abilities, "locked": false}
+    _registry = dict_set(_registry, model_id, entry)
+    _abilities = dict_set(_abilities, model_id, abilities)
+
+    // Track by provider
+    let prov_list = dict_get(_providers, provider) ?? []
+    prov_list = append(prov_list, model_id)
+    _providers = dict_set(_providers, provider, prov_list)
+}
+
+// ── Discover OpenRouter models ──
+fn discover_openrouter() {
+    let config = load_cloud_config()
+    let or_cfg = dict_get(config, "openrouter") ?? {}
+    let key = dict_get(or_cfg, "key") ?? ""
+    if3 len(key) == 0 { return {"ok": false, "error": "no_openrouter_key", "count": 0} }
+
+    // Use shell+curl for HTTPS (http_get has no TLS backend)
+    let curl_result = try3 { shell("C:\\Windows\\System32\\curl.exe -s -H \"Authorization: Bearer " + key + "\" https://openrouter.ai/api/v1/models") } { {"stdout": "", "stderr": "curl_failed"} }
+    let body = trim(dict_get(curl_result, "stdout") ?? "")
+    if3 len(body) == 0 { return {"ok": false, "error": "empty_body", "count": 0} }
+
+    let data = try3 { json_decode(body) } { {"error": "parse_failed"} }
+    let parse_err = dict_get(data, "error") ?? ""
+    if3 parse_err != "" { return {"ok": false, "error": parse_err, "count": 0} }
+
+    let models = dict_get(data, "data") ?? []
+    let count = 0
+    let i = 0
+    while3 i < len(models) {
+        let m = try3 { models[i] } { {} }
+        let mid = dict_get(m, "id") ?? ""
+        if3 len(mid) > 0 { ctx = dict_get(m, "context_length") ?? 0
+            let pricing = dict_get(m, "pricing") ?? {}
+            let cost = dict_get(pricing, "prompt") ?? "unknown"
+            let provider_prefix = ""
+            let parts = split(mid, "/")
+            if3 len(parts) > 1 { provider_prefix = parts[0] }
+            let tier = "cloud"
+            if3 contains(mid, ":free") { tier = "free" }
+            if3 cost == "0" { tier = "free" }
+            register_model(mid, "openrouter:" + provider_prefix, tier, ctx, str(cost))
+            let count = count + 1
+        }
+        i = i + 1
+    }
+
+    return {"ok": true, "source": "openrouter", "count": count}
+}
+
+// ── Discover Ollama local models ──
+fn discover_ollama() {
+    let resp = try3 { http_get("http://127.0.0.1:11434/api/tags") } { {"error": "ollama_offline"} }
+    let err = dict_get(resp, "error") ?? ""
+    if3 err != "" { return {"ok": false, "error": err, "count": 0} }
+
+    let body = dict_get(resp, "body") ?? ""
+    let data = try3 { json_decode(body) } { {"error": "parse_failed"} }
+    let parse_err = dict_get(data, "error") ?? ""
+    if3 parse_err != "" { return {"ok": false, "error": parse_err, "count": 0} }
+
+    let models = dict_get(data, "models") ?? []
+    let count = 0
+    let i = 0
+    while3 i < len(models) {
+        let m = try3 { models[i] } { {} }
+        let name = dict_get(m, "name") ?? ""
+        if3 len(name) > 0 {
+            register_model("ollama/" + name, "ollama", "local", 0, "free")
+            let count = count + 1
+        }
+        i = i + 1
+    }
+
+    return {"ok": true, "source": "ollama", "count": count}
+}
+
+// ── Discover direct provider models from cloud_config ──
+fn discover_config_models() {
+    let config = load_cloud_config()
+    let provider_names = keys(config)
+    let count = 0
+    let i = 0
+    while3 i < len(provider_names) {
+        let pname = try3 { provider_names[i] } { "" }
+        if3 len(pname) > 0 { pcfg = dict_get(config, pname) ?? {}
+            let models = dict_get(pcfg, "models") ?? []
+            let via = dict_get(pcfg, "via") ?? ""
+            let j = 0
+            while3 j < len(models) {
+                let mname = try3 { models[j] } { "" }
+                if3 len(mname) > 0 { tier = "cloud"
+                    if3 pname == "ollama" { tier = "local" }
+                    if3 pname == "bitnet" { tier = "local" }
+                    if3 pname == "fleet" { tier = "local" }
+                    if3 contains(mname, ":free") { tier = "free" }
+                    let source = pname
+                    if3 len(via) > 0 { source = pname + " (via " + via + ")" }
+                    register_model(pname + "/" + mname, source, tier, 0, "config")
+                    let count = count + 1
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+
+    return {"ok": true, "source": "cloud_config", "count": count}
+}
+
+// ── Run full discovery ──
+fn run_discovery() {
+    // Clear registry
+    _registry = {}
+    _providers = {}
+    _abilities = {}
+
+    let results = []
+    let total = 0
+
+    // Discover from all sources
+    let r1 = discover_openrouter()
+    results = append(results, r1)
+    let total = total + dict_get(r1, "count") ?? 0
+
+    let r2 = discover_ollama()
+    results = append(results, r2)
+    let total = total + dict_get(r2, "count") ?? 0
+
+    let r3 = discover_config_models()
+    results = append(results, r3)
+    let total = total + dict_get(r3, "count") ?? 0
+
+    // Count free
+    let free_count = 0
+    let all_ids = keys(_registry)
+    let k = 0
+    while3 k < len(all_ids) {
+        let mid = try3 { all_ids[k] } { "" }
+        let entry = dict_get(_registry, mid) ?? {}
+        if3 dict_get(entry, "free") ?? false == true { free_count = free_count + 1 }
+        k = k + 1
+    }
+
+    // Count locked
+    let locked_count = len(keys(_locked))
+
+    // Update stats
+    _stats = {
+        "total": len(keys(_registry)),
+        "free": free_count,
+        "locked": locked_count,
+        "providers": len(keys(_providers)),
+        "last_scan": time(),
+        "scans": (dict_get(_stats, "scans") ?? 0) + 1
+    }
+    _last_discovery = time()
+
+    return {
+        "ok": true,
+        "total_models": total,
+        "unique_models": len(keys(_registry)),
+        "free": free_count,
+        "locked": locked_count,
+        "providers": len(keys(_providers)),
+        "sources": results
+    }
+}
+
+// ── Lock/Unlock models ──
+fn lock_model(model_id) {
+    let entry = dict_get(_registry, model_id) ?? {}
+    if3 len(keys(entry)) == 0 { return {"ok": false, "error": "model_not_found"} }
+    _locked = dict_set(_locked, model_id, true)
+    entry = dict_set(entry, "locked", true)
+    _registry = dict_set(_registry, model_id, entry)
+    _stats = dict_set(_stats, "locked", len(keys(_locked)))
+    return {"ok": true, "locked": model_id}
+}
+
+fn unlock_model(model_id) {
+    let new_locked = {}
+    let all_locked = keys(_locked)
+    let i = 0
+    while3 i < len(all_locked) {
+        let k = try3 { all_locked[i] } { "" }
+        if3 k != model_id { new_locked = dict_set(new_locked, k, true)
+        }
+        i = i + 1
+    }
+    _locked = new_locked
+    let entry = dict_get(_registry, model_id) ?? {}
+    if3 len(keys(entry)) > 0 { entry = dict_set(entry, "locked", false)
+        _registry = dict_set(_registry, model_id, entry)
+    }
+    _stats = dict_set(_stats, "locked", len(keys(_locked)))
+    return {"ok": true, "unlocked": model_id}
+}
+
+fn lock_all_free() {
+    let all_ids = keys(_registry)
+    let count = 0
+    let i = 0
+    while3 i < len(all_ids) {
+        let mid = try3 { all_ids[i] } { "" }
+        let entry = dict_get(_registry, mid) ?? {}
+        if3 dict_get(entry, "free") ?? false == true {
+            lock_model(mid)
+            let count = count + 1
+        }
+        i = i + 1
+    }
+    return {"ok": true, "locked_count": count}
+}
+
+// ── Query helpers ──
+fn get_models_by_provider(provider_name) {
+    let result = []
+    let all_ids = keys(_registry)
+    let i = 0
+    while3 i < len(all_ids) {
+        let mid = try3 { all_ids[i] } { "" }
+        let entry = dict_get(_registry, mid) ?? {}
+        let prov = dict_get(entry, "provider") ?? ""
+        if3 contains(lower(prov), lower(provider_name)) { result = append(result, entry)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn _ability_match(abs, ability) {
+    let j = 0
+    while3 j < len(abs) {
+        let a = try3 { abs[j] } { "" }
+        if3 a == ability { return true }
+        j = j + 1
+    }
+    return false
+}
+
+fn get_models_by_ability(ability) {
+    let result = []
+    let all_ids = keys(_registry)
+    let i = 0
+    while3 i < len(all_ids) {
+        let mid = try3 { all_ids[i] } { "" }
+        let abs = dict_get(_abilities, mid) ?? []
+        let matched = _ability_match(abs, ability)
+        if3 matched == true { entry = dict_get(_registry, mid) ?? {}
+            result = append(result, entry)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn _matrix_add(matrix, ability) {
+    let count = dict_get(matrix, ability) ?? 0
+    return dict_set(matrix, ability, count + 1)
+}
+
+fn get_ability_matrix() {
+    let matrix = {}
+    let all_ids = keys(_registry)
+    let i = 0
+    while3 i < len(all_ids) {
+        let mid = try3 { all_ids[i] } { "" }
+        let abs = dict_get(_abilities, mid) ?? []
+        let j = 0
+        while3 j < len(abs) {
+            let a = try3 { abs[j] } { "" }
+            if3 len(a) > 0 { matrix = _matrix_add(matrix, a) }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return matrix
+}
+
+// ── Route Handlers ──
+fn handle_health(req) {
+    return {
+        "ok": 1, "service": SERVICE_NAME, "version": VERSION,
+        "port": PORT, "ternary": 1, "runtime": "novalang",
+        "self_trit": 1, "char": "+",
+        "total_models": dict_get(_stats, "total") ?? 0,
+        "locked_models": dict_get(_stats, "locked") ?? 0,
+        "providers": dict_get(_stats, "providers") ?? 0,
+        "harmonics": {"H3": H3, "H5": H5, "H7": H7, "H13": H13}
+    }
+}
+
+fn handle_models(req) {
+    // Return all models
+    let all_ids = keys(_registry)
+    let models = []
+    let i = 0
+    while3 i < len(all_ids) {
+        let mid = try3 { all_ids[i] } { "" }
+        let entry = dict_get(_registry, mid) ?? {}
+        models = append(models, entry)
+        i = i + 1
+    }
+    return {"ok": true, "count": len(models), "models": models}
+}
+
+fn handle_models_free(req) {
+    let all_ids = keys(_registry)
+    let models = []
+    let i = 0
+    while3 i < len(all_ids) {
+        let mid = try3 { all_ids[i] } { "" }
+        let entry = dict_get(_registry, mid) ?? {}
+        if3 dict_get(entry, "free") ?? false == true { models = append(models, entry)
+        }
+        i = i + 1
+    }
+    return {"ok": true, "count": len(models), "models": models}
+}
+
+fn handle_models_locked(req) {
+    let locked_ids = keys(_locked)
+    let models = []
+    let i = 0
+    while3 i < len(locked_ids) {
+        let mid = try3 { locked_ids[i] } { "" }
+        let entry = dict_get(_registry, mid) ?? {}
+        models = append(models, entry)
+        i = i + 1
+    }
+    return {"ok": true, "count": len(models), "models": models}
+}
+
+fn handle_models_by_provider(req) {
+    let path = dict_get(req, "path") ?? ""
+    let parts = split(path, "/")
+    let provider = try3 { parts[len(parts) - 1] } { "" }
+    let models = get_models_by_provider(provider)
+    return {"ok": true, "provider": provider, "count": len(models), "models": models}
+}
+
+fn handle_models_by_ability(req) {
+    let path = dict_get(req, "path") ?? ""
+    let parts = split(path, "/")
+    let ability = try3 { parts[len(parts) - 1] } { "" }
+    let models = get_models_by_ability(ability)
+    return {"ok": true, "ability": ability, "count": len(models), "models": models}
+}
+
+fn handle_stats(req) {
+    let matrix = get_ability_matrix()
+    return {
+        "ok": true,
+        "stats": _stats,
+        "ability_matrix": matrix,
+        "provider_counts": {},
+        "tier_breakdown": {
+            "local": 0,
+            "free": dict_get(_stats, "free") ?? 0,
+            "cloud": dict_get(_stats, "total") ?? 0 - dict_get(_stats, "free") ?? 0
+        }
+    }
+}
+
+fn handle_abilities(req) {
+    let matrix = get_ability_matrix()
+    // Also build per-ability model lists
+    let ability_names = keys(matrix)
+    let detailed = {}
+    let i = 0
+    while3 i < len(ability_names) {
+        let a = try3 { ability_names[i] } { "" }
+        if3 len(a) > 0 { models = get_models_by_ability(a)
+            let model_ids = []
+            let j = 0
+            while3 j < len(models) {
+                let m = try3 { models[j] } { {} }
+                model_ids = append(model_ids, dict_get(m, "id") ?? "")
+                j = j + 1
+            }
+            detailed = dict_set(detailed, a, {
+                "count": dict_get(matrix, a) ?? 0,
+                "models": model_ids
+            })
+        }
+        i = i + 1
+    }
+    return {"ok": true, "abilities": detailed, "summary": matrix}
+}
+
+fn handle_discover(req) {
+    let result = run_discovery()
+    return result
+}
+
+fn handle_lock(req) {
+    let body = try3 { json_decode(dict_get(req, "body") ?? "{}") } { {} }
+    let model_id = dict_get(body, "model") ?? ""
+    if3 len(model_id) == 0 { return {"ok": false, "error": "missing_model"} }
+    return lock_model(model_id)
+}
+
+fn handle_unlock(req) {
+    let body = try3 { json_decode(dict_get(req, "body") ?? "{}") } { {} }
+    let model_id = dict_get(body, "model") ?? ""
+    if3 len(model_id) == 0 { return {"ok": false, "error": "missing_model"} }
+    return unlock_model(model_id)
+}
+
+fn handle_lock_all_free(req) {
+    return lock_all_free()
+}
+print("LINE 574 OK")

@@ -1,0 +1,85 @@
+// tsysmon_procs.nova - Process list micro-tool
+// Usage: novalang.exe tools/tsysmon_procs.nova <sort_by> <top_n>
+// sort_by: "cpu" or "mem"  |  top_n: number of processes to return
+// Returns JSON: {ok, count, total_procs, sort_by, processes[]}
+// Replaces psutil-based Python script (zero Python)
+
+import3("C:/NovaX/lib/nova_stdlib.nova")
+
+let sort_by = try3 { args()[0] } { "cpu" }
+let top_n = try3 { to_int(args()[1]) } { 10 }
+
+// Use wmic for process info (PID, Name, WorkingSetSize, ThreadCount)
+let cmd = "wmic process get ProcessId,Name,WorkingSetSize,ThreadCount /format:csv 2>NUL"
+let result = shell(cmd)
+let stdout = try3 { dict_get(result, "stdout") } { "" }
+let lines = split(stdout, "\n")
+
+let procs = []
+let i = 0
+for3 line in lines {
+    let l = trim(line)
+    if3 len(l) > 5 {
+        // CSV format: Node,Name,ProcessId,ThreadCount,WorkingSetSize
+        let parts = split(l, ",")
+        if3 len(parts) >= 5 {
+            let name = try3 { trim(parts[1]) } { "?" }
+            let pid = try3 { to_int(trim(parts[2])) } { 0 }
+            let threads = try3 { to_int(trim(parts[3])) } { 0 }
+            let ws = try3 { to_int(trim(parts[4])) } { 0 }
+            let mem_mb = round(ws / 1048576, 1)
+
+            // Skip header row
+            if3 pid > 0 {
+                let entry = {}
+                entry = dict_set(entry, "pid", pid)
+                entry = dict_set(entry, "name", name)
+                entry = dict_set(entry, "cpu_percent", 0.0)
+                entry = dict_set(entry, "mem_mb", mem_mb)
+                entry = dict_set(entry, "status", "running")
+                entry = dict_set(entry, "num_threads", threads)
+                procs = append(procs, entry)
+            }
+        }
+    }
+}
+
+// Sort by memory (descending) - NovaLang doesn't have sort, so do simple selection sort for top_n
+let total_procs = len(procs)
+let sorted = []
+let used = []
+let n = 0
+while3 n < top_n {
+    if3 n >= total_procs {
+    } else3 {
+        let best_idx = -1
+        let best_val = -1
+        let j = 0
+        while3 j < total_procs {
+            if3 contains(str(used), str(j) + ",") {
+            } else3 {
+                let p = procs[j]
+                let val = dict_get(p, "mem_mb")
+                if3 val > best_val {
+                    best_val = val
+                    best_idx = j
+                }
+            }
+            j = j + 1
+        }
+        if3 best_idx >= 0 {
+            sorted = append(sorted, procs[best_idx])
+            used = append(used, str(best_idx) + ",")
+        }
+    }
+    n = n + 1
+}
+
+let out = {}
+out = dict_set(out, "ok", true)
+out = dict_set(out, "count", len(sorted))
+out = dict_set(out, "total_procs", total_procs)
+out = dict_set(out, "sort_by", sort_by)
+out = dict_set(out, "processes", sorted)
+
+print(json_encode(out))

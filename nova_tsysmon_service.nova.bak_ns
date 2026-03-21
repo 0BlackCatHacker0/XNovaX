@@ -1,0 +1,1221 @@
+// Nova TSysMon v2.0 - Ternary System Monitor (NovaLang + psutil)
+// Port 9905: CPU/RAM/Disk/Swap/Network/Process metrics with ternary scoring
+//
+// Backend: psutil 7.2.2 via nova_run("python -c \"...\"")
+// All data comes from psutil for accuracy and cross-platform correctness.
+//
+// N-S Mapping:
+//   cpu_usage  = velocity_field  (flow of compute)
+//   ram_usage  = pressure_field  (memory pressure)
+//   disk_io    = viscosity       (resistance to flow)
+//   net_bytes  = mass_flux       (data transport rate)
+//   Reynolds   = cpu_pct * 5.0  (system turbulence proxy)
+//   Re < 27  (H3^3) = laminar      (healthy, idle)
+//   Re < 125 (H5^3) = transitional (moderate load)
+//   Re < 343 (H7^3) = turbulent    (busy)
+//   Re >= 343        = chaotic     (overloaded)
+//
+// Ternary scoring per metric (harmonic thresholds):
+//   pct < 33.3% -> +1 (laminar,    healthy)
+//   pct < 66.6% ->  0 (transitional, warning)
+//   pct >= 66.6% -> -1 (turbulent,  critical)
+//
+// Routes:
+//   GET  /health              -- Health check
+//   GET  /sysmon/status       -- Service status + balanced ternary health
+//   POST /sysmon/procs        -- Process list (top N by CPU/memory)
+//   POST /sysmon/resources    -- CPU%, memory, disk, swap snapshot
+//   POST /sysmon/bench        -- Quick benchmark (hash iterations per second)
+//   POST /sysmon/trace        -- Trace a process by PID (mem, threads, files)
+//   POST /sysmon/network      -- Network stats (bytes sent/recv, connections)
+//   POST /sysmon/iowatch      -- Disk I/O stats
+//   POST /sysmon/stress       -- CPU stress test (configurable duration)
+
+let PORT = 9905
+let server = tserve(PORT, "TSysMon v2.0 - Ternary System Monitor")
+
+// -- 3-5-7-13 Harmonic Constants --
+let H3  = 3
+let H5  = 5
+let H7  = 7
+let H13 = 13
+let BLOCK_SIZE = 2187    // 3^7
+let RE_LAMINAR     = 27  // H3^3
+let RE_TRANSITION  = 125 // H5^3
+let RE_TURBULENT   = 343 // H7^3
+let TOOLS_COUNT    = 7
+let VERSION        = "2.0"
+let SERVICE_NAME   = "nova-tsysmon"
+
+// Ternary trit values
+let T_TRUE  =  1
+let T_MAYBE =  0
+let T_FALSE = -1
+
+// Temp file path for multi-line Python scripts
+let TMP_SCRIPT = "C:\\NovaX\\data\\_tsysmon_tmp.py"
+
+// -- Service stats --
+let stat_ops      = 0
+let stat_strong   = 0
+let stat_partial  = 0
+let stat_failed   = 0
+let stat_t0       = time()
+let stat_procs    = 0
+let stat_resources = 0
+let stat_bench    = 0
+let stat_trace    = 0
+let stat_network  = 0
+let stat_iowatch  = 0
+let stat_stress   = 0
+
+// ============================================================
+// Helper: score a percentage with harmonic thresholds
+// pct < 33.3% -> +1 | pct < 66.6% -> 0 | else -> -1
+// ============================================================
+fn metric_trit(pct) {
+    if3 pct < 33 {
+        T_TRUE
+    } else if3 pct < 67 {
+        T_MAYBE
+    } else {
+        T_FALSE
+    }
+}
+
+// ============================================================
+// Helper: trit to balanced ternary char
+// ============================================================
+fn bt_char(trit_val) {
+    if3 trit_val == T_TRUE {
+        "1"
+    } else if3 trit_val == T_MAYBE {
+        "0"
+    } else {
+        "T"
+    }
+}
+
+// ============================================================
+// Helper: Reynolds number from CPU percent
+// cpu_pct * 5.0, clamped to 0..2000
+// ============================================================
+fn cpu_reynolds(cpu_pct) {
+    let re = cpu_pct * 5
+    if3 re < 0 {
+        0
+    } else {
+        re
+    }
+}
+
+// ============================================================
+// Helper: classify Reynolds number into flow regime string
+// ============================================================
+fn flow_regime(re) {
+    if3 re < RE_LAMINAR {
+        "laminar"
+    } else if3 re < RE_TRANSITION {
+        "transitional"
+    } else if3 re < RE_TURBULENT {
+        "turbulent"
+    } else {
+        "chaotic"
+    }
+}
+
+// ============================================================
+// Helper: worst of two trits (most negative wins)
+// ============================================================
+fn worst_trit(a, b) {
+    if3 a == T_FALSE {
+        T_FALSE
+    } else if3 b == T_FALSE {
+        T_FALSE
+    } else if3 a == T_MAYBE {
+        T_MAYBE
+    } else if3 b == T_MAYBE {
+        T_MAYBE
+    } else {
+        T_TRUE
+    }
+}
+
+// ============================================================
+// Helper: record a tool invocation result into stats
+// ============================================================
+fn record_op(trit_val) {
+    stat_ops = stat_ops + 1
+    if3 trit_val == T_TRUE {
+        stat_strong = stat_strong + 1
+    } else if3 trit_val == T_MAYBE {
+        stat_partial = stat_partial + 1
+    } else {
+        stat_failed = stat_failed + 1
+    }
+}
+
+// ============================================================
+// Helper: parse JSON string returned by nova_run python -c
+// Returns dict/list on success, or {} on failure
+// ============================================================
+fn parse_py_json(raw) {
+    let s = trim(str(raw))
+    if len(s) < 2 {
+        return {}
+    }
+    let result = json_decode(s)
+    if result == "" {
+        return {}
+    }
+    result
+}
+
+// ============================================================
+// TOOL 1: /sysmon/procs
+// Process list via psutil -- top N by CPU or memory
+// Uses temp .py file pattern due to for-loop complexity
+// ============================================================
+fn handle_procs(req) {
+    let body = dict_get(req, "body")
+    if body == "" {
+        let body = {}
+    }
+    let top_n = 25
+    let sort_by = "cpu"
+    if3 dict_has(body, "top_n") {
+        top_n = dict_get(body, "top_n")
+    }
+    if3 dict_has(body, "sort_by") {
+        sort_by = dict_get(body, "sort_by")
+    }
+    if top_n < 1 {
+        let top_n = 1
+    }
+    if top_n > 100 {
+        let top_n = 100
+    }
+
+    // Build multi-line Python script as a string using "\n" for newlines
+    let py = "import psutil,json\n"
+    let py = py + "procs=[]\n"
+    let py = py + "for p in psutil.process_iter(['pid','name','cpu_percent','memory_info','status','num_threads']):\n"
+    let py = py + "    try:\n"
+    let py = py + "        inf=p.info\n"
+    let py = py + "        mi=inf.get('memory_info')\n"
+    let py = py + "        mem_mb=round(mi.rss/1048576,1) if mi else 0\n"
+    let py = py + "        cpu_p=inf.get('cpu_percent') or 0.0\n"
+    let py = py + "        procs.append({'pid':inf['pid'],'name':inf.get('name','?'),'cpu_percent':cpu_p,'mem_mb':mem_mb,'status':inf.get('status','?'),'num_threads':inf.get('num_threads',0)})\n"
+    let py = py + "    except Exception:\n"
+    let py = py + "        pass\n"
+    let sort_key = "cpu_percent"
+    if3 sort_by == "mem" {
+        let sort_key = "mem_mb"
+    }
+    let py = py + "procs.sort(key=lambda x:x['" + sort_key + "'],reverse=True)\n"
+    let py = py + "top=procs[:" + str(top_n) + "]\n"
+    let py = py + "print(json.dumps({'ok':True,'count':len(top),'total_procs':len(procs),'sort_by':'" + sort_by + "','processes':top}))\n"
+
+    // Write temp script and execute
+    nova_write(TMP_SCRIPT, py)
+    let raw = nova_run("python " + TMP_SCRIPT, 20)
+    let data = parse_py_json(raw)
+
+    // Score results
+    let procs_list = dict_get(data, "processes")
+    if procs_list == "" {
+        let procs_list = []
+    }
+    let proc_count = len(procs_list)
+    let overall_trit = T_TRUE
+    let high_cpu_count = 0
+    let i = 0
+    while3 i < proc_count {
+        let p = dict_get(procs_list, i)
+        let p_cpu = dict_get(p, "cpu_percent")
+        if p_cpu == "" {
+            let p_cpu = 0
+        }
+        let p_mem = dict_get(p, "mem_mb")
+        if p_mem == "" {
+            let p_mem = 0
+        }
+        // Trit per process: cpu>50% or mem>2000MB = bad
+        let pt = T_TRUE
+        if3 p_cpu > 50 {
+            let pt = T_MAYBE
+            let high_cpu_count = high_cpu_count + 1
+        }
+        if3 p_mem > 2000 {
+            let pt = T_FALSE
+        }
+        dict_set(p, "trit", pt)
+        dict_set(p, "char", bt_char(pt))
+        i = i + 1
+    }
+    // Overall: many high-CPU procs = bad
+    if3 high_cpu_count > H7 {
+        let overall_trit = T_FALSE
+    } else if3 high_cpu_count > H3 {
+        let overall_trit = T_MAYBE
+    }
+
+    let total_p = dict_get(data, "total_procs")
+    if total_p == "" {
+        let total_p = 0
+    }
+
+    // Reynolds from first process CPU or 0
+    let cpu_pct = 0
+    if3 proc_count > 0 {
+        let first_p = dict_get(procs_list, 0)
+        let cpu_pct = dict_get(first_p, "cpu_percent")
+        if cpu_pct == "" {
+            let cpu_pct = 0
+        }
+    }
+    let re = cpu_reynolds(cpu_pct)
+    let regime = flow_regime(re)
+
+    stat_procs = stat_procs + 1
+    record_op(overall_trit)
+
+    let resp = {}
+    dict_set(resp, "ok", true)
+    dict_set(resp, "processes", procs_list)
+    dict_set(resp, "count", proc_count)
+    dict_set(resp, "total_procs", total_p)
+    dict_set(resp, "sort_by", sort_by)
+    dict_set(resp, "high_cpu_count", high_cpu_count)
+    dict_set(resp, "reynolds", re)
+    dict_set(resp, "regime", regime)
+    dict_set(resp, "trit", overall_trit)
+    dict_set(resp, "char", bt_char(overall_trit))
+    dict_set(resp, "runtime", "psutil")
+    return resp
+}
+
+// ============================================================
+// TOOL 2: /sysmon/resources
+// CPU/RAM/disk/swap snapshot via psutil (single-line Python)
+// ============================================================
+fn handle_resources(req) {
+    // Single-line python using semicolons -- psutil makes this clean
+    let py_cmd = "python -c \"import psutil,json; c=psutil.cpu_percent(interval=0.5); m=psutil.virtual_memory(); d=psutil.disk_usage('C:/'); s=psutil.swap_memory(); print(json.dumps({'cpu_percent':round(c,1),'mem_total_mb':round(m.total/1048576),'mem_used_mb':round(m.used/1048576),'mem_free_mb':round(m.available/1048576),'mem_percent':round(m.percent,1),'disk_total_gb':round(d.total/1073741824,1),'disk_used_gb':round(d.used/1073741824,1),'disk_free_gb':round(d.free/1073741824,1),'disk_percent':round(d.percent,1),'swap_total_mb':round(s.total/1048576),'swap_used_mb':round(s.used/1048576),'swap_free_mb':round(s.free/1048576),'swap_percent':round(s.percent,1)}))\""
+    let raw = nova_run(py_cmd, 15)
+    let data = parse_py_json(raw)
+
+    // Extract values with safe defaults
+    let cpu_pct = dict_get(data, "cpu_percent")
+    if cpu_pct == "" {
+        let cpu_pct = 0
+    }
+    let mem_pct = dict_get(data, "mem_percent")
+    if mem_pct == "" {
+        let mem_pct = 0
+    }
+    let disk_pct = dict_get(data, "disk_percent")
+    if disk_pct == "" {
+        let disk_pct = 0
+    }
+    let swap_pct = dict_get(data, "swap_percent")
+    if swap_pct == "" {
+        let swap_pct = 0
+    }
+
+    // Trit-score each metric
+    let cpu_trit  = metric_trit(cpu_pct)
+    let mem_trit  = metric_trit(mem_pct)
+    let disk_trit = metric_trit(disk_pct)
+    let swap_trit = metric_trit(swap_pct)
+
+    // Overall: worst metric wins
+    let overall_trit = worst_trit(cpu_trit, mem_trit)
+    let overall_trit = worst_trit(overall_trit, disk_trit)
+    let overall_trit = worst_trit(overall_trit, swap_trit)
+
+    // Reynolds number from CPU
+    let re = cpu_reynolds(cpu_pct)
+    let regime = flow_regime(re)
+
+    // Balanced ternary health string: cpu|mem|disk|swap
+    let bt_str = bt_char(cpu_trit) + bt_char(mem_trit) + bt_char(disk_trit) + bt_char(swap_trit)
+
+    stat_resources = stat_resources + 1
+    record_op(overall_trit)
+
+    // Gather raw values
+    let mem_total = dict_get(data, "mem_total_mb")
+    if mem_total == "" { let mem_total = 0 }
+    let mem_used = dict_get(data, "mem_used_mb")
+    if mem_used == "" { let mem_used = 0 }
+    let mem_free = dict_get(data, "mem_free_mb")
+    if mem_free == "" { let mem_free = 0 }
+    let disk_total = dict_get(data, "disk_total_gb")
+    if disk_total == "" { let disk_total = 0 }
+    let disk_used = dict_get(data, "disk_used_gb")
+    if disk_used == "" { let disk_used = 0 }
+    let disk_free = dict_get(data, "disk_free_gb")
+    if disk_free == "" { let disk_free = 0 }
+    let swap_total = dict_get(data, "swap_total_mb")
+    if swap_total == "" { let swap_total = 0 }
+    let swap_used = dict_get(data, "swap_used_mb")
+    if swap_used == "" { let swap_used = 0 }
+    let swap_free = dict_get(data, "swap_free_mb")
+    if swap_free == "" { let swap_free = 0 }
+
+    // Build sub-dicts
+    let cpu_d = {}
+    dict_set(cpu_d, "percent", cpu_pct)
+    dict_set(cpu_d, "trit", cpu_trit)
+    dict_set(cpu_d, "char", bt_char(cpu_trit))
+
+    let mem_d = {}
+    dict_set(mem_d, "total_mb", mem_total)
+    dict_set(mem_d, "used_mb", mem_used)
+    dict_set(mem_d, "free_mb", mem_free)
+    dict_set(mem_d, "percent", mem_pct)
+    dict_set(mem_d, "trit", mem_trit)
+    dict_set(mem_d, "char", bt_char(mem_trit))
+
+    let disk_d = {}
+    dict_set(disk_d, "total_gb", disk_total)
+    dict_set(disk_d, "used_gb", disk_used)
+    dict_set(disk_d, "free_gb", disk_free)
+    dict_set(disk_d, "percent", disk_pct)
+    dict_set(disk_d, "trit", disk_trit)
+    dict_set(disk_d, "char", bt_char(disk_trit))
+
+    let swap_d = {}
+    dict_set(swap_d, "total_mb", swap_total)
+    dict_set(swap_d, "used_mb", swap_used)
+    dict_set(swap_d, "free_mb", swap_free)
+    dict_set(swap_d, "percent", swap_pct)
+    dict_set(swap_d, "trit", swap_trit)
+    dict_set(swap_d, "char", bt_char(swap_trit))
+
+    let metrics = {}
+    dict_set(metrics, "cpu", cpu_d)
+    dict_set(metrics, "memory", mem_d)
+    dict_set(metrics, "disk", disk_d)
+    dict_set(metrics, "swap", swap_d)
+
+    let resp = {}
+    dict_set(resp, "ok", true)
+    dict_set(resp, "metrics", metrics)
+    dict_set(resp, "reynolds", re)
+    dict_set(resp, "regime", regime)
+    dict_set(resp, "health_bt", bt_str)
+    dict_set(resp, "trit", overall_trit)
+    dict_set(resp, "char", bt_char(overall_trit))
+    dict_set(resp, "runtime", "psutil")
+    return resp
+}
+
+// ============================================================
+// TOOL 3: /sysmon/bench
+// Quick benchmark: hash iterations per second using psutil timer
+// Single-line Python: time a tight SHA-256 loop
+// ============================================================
+fn handle_bench(req) {
+    let body = dict_get(req, "body")
+    if body == "" {
+        let body = {}
+    }
+    let duration = 3
+    if3 dict_has(body, "duration") {
+        let duration = dict_get(body, "duration")
+    }
+    if duration < 1 { let duration = 1 }
+    if duration > H13 { let duration = H13 }
+
+    // Single-line: time SHA-256 hashing for `duration` seconds
+    // Reports hashes/sec as the benchmark score
+    let dur_s = str(duration)
+    let py_cmd = "python -c \"import hashlib,time,json; t0=time.time(); count=0; data=b'novax-bench-' * 13; deadline=t0+" + dur_s + ".0\nwhile time.time()<deadline: hashlib.sha256(data).hexdigest(); count+=1\ndt=time.time()-t0; rate=int(count/max(dt,0.001)); print(json.dumps({'ok':True,'hashes':count,'duration_s':round(dt,3),'hash_rate':rate,'data_size_bytes':len(data)}))\""
+
+    // The above uses "\n" -- but python -c on Windows can't handle real newlines.
+    // Use the temp file pattern instead for reliability.
+    let py2 = "import hashlib,time,json\n"
+    let py2 = py2 + "t0=time.time()\n"
+    let py2 = py2 + "count=0\n"
+    let py2 = py2 + "data=b'novax-bench-' * 13\n"
+    let py2 = py2 + "deadline=t0+" + dur_s + ".0\n"
+    let py2 = py2 + "while time.time()<deadline:\n"
+    let py2 = py2 + "    hashlib.sha256(data).hexdigest()\n"
+    let py2 = py2 + "    count+=1\n"
+    let py2 = py2 + "dt=time.time()-t0\n"
+    let py2 = py2 + "rate=int(count/max(dt,0.001))\n"
+    let py2 = py2 + "print(json.dumps({'ok':True,'hashes':count,'duration_s':round(dt,3),'hash_rate':rate,'data_size_bytes':len(data)}))\n"
+
+    nova_write(TMP_SCRIPT, py2)
+    let raw = nova_run("python " + TMP_SCRIPT, 30)
+    let data = parse_py_json(raw)
+
+    let hash_rate = dict_get(data, "hash_rate")
+    if hash_rate == "" { let hash_rate = 0 }
+    let hashes = dict_get(data, "hashes")
+    if hashes == "" { let hashes = 0 }
+    let actual_dur = dict_get(data, "duration_s")
+    if actual_dur == "" { let actual_dur = 0 }
+    let data_size = dict_get(data, "data_size_bytes")
+    if data_size == "" { let data_size = 0 }
+
+    // Score by Reynolds: rate > RE_TURBULENT = fast (+1), > RE_TRANSITION = ok (0), else slow (-1)
+    // Scale rate to Reynolds-comparable range: rate / 1000
+    let re_bench = hash_rate / 1000
+    if re_bench > 9999 { let re_bench = 9999 }
+    let bench_trit = T_FALSE
+    if3 re_bench > RE_TURBULENT {
+        let bench_trit = T_TRUE
+    } else if3 re_bench > RE_LAMINAR {
+        let bench_trit = T_MAYBE
+    }
+    let regime = flow_regime(re_bench)
+
+    stat_bench = stat_bench + 1
+    record_op(bench_trit)
+
+    let resp = {}
+    dict_set(resp, "ok", true)
+    dict_set(resp, "benchmark", "sha256_iterations")
+    dict_set(resp, "hashes", hashes)
+    dict_set(resp, "duration_s", actual_dur)
+    dict_set(resp, "hash_rate", hash_rate)
+    dict_set(resp, "hash_rate_unit", "hashes/sec")
+    dict_set(resp, "data_size_bytes", data_size)
+    dict_set(resp, "reynolds_scaled", re_bench)
+    dict_set(resp, "regime", regime)
+    dict_set(resp, "trit", bench_trit)
+    dict_set(resp, "char", bt_char(bench_trit))
+    dict_set(resp, "runtime", "psutil")
+    return resp
+}
+
+// ============================================================
+// TOOL 4: /sysmon/trace
+// Trace a process by PID: memory, threads, open files, cpu%
+// Uses psutil.Process(pid) via temp .py file
+// ============================================================
+fn handle_trace(req) {
+    let body = dict_get(req, "body")
+    if body == "" {
+        let body = {}
+    }
+    let pid = 0
+    if3 dict_has(body, "pid") {
+        let pid = dict_get(body, "pid")
+    }
+    if3 pid == 0 {
+        let err = {}
+        dict_set(err, "ok", false)
+        dict_set(err, "error", "pid required in request body")
+        dict_set(err, "trit", T_FALSE)
+        dict_set(err, "char", "T")
+        return err
+    }
+
+    let pid_s = str(pid)
+
+    let py = "import psutil,json\n"
+    let py = py + "pid=" + pid_s + "\n"
+    let py = py + "try:\n"
+    let py = py + "    p=psutil.Process(pid)\n"
+    let py = py + "    with p.oneshot():\n"
+    let py = py + "        mi=p.memory_info()\n"
+    let py = py + "        mem_rss=round(mi.rss/1048576,2)\n"
+    let py = py + "        mem_vms=round(mi.vms/1048576,2)\n"
+    let py = py + "        cpu_p=p.cpu_percent(interval=0.3)\n"
+    let py = py + "        num_t=p.num_threads()\n"
+    let py = py + "        status=p.status()\n"
+    let py = py + "        name=p.name()\n"
+    let py = py + "        try:\n"
+    let py = py + "            nfiles=len(p.open_files())\n"
+    let py = py + "        except Exception:\n"
+    let py = py + "            nfiles=-1\n"
+    let py = py + "        try:\n"
+    let py = py + "            nconns=len(p.net_connections())\n"
+    let py = py + "        except Exception:\n"
+    let py = py + "            nconns=-1\n"
+    let py = py + "        try:\n"
+    let py = py + "            cmdline=' '.join(p.cmdline()[:5])\n"
+    let py = py + "        except Exception:\n"
+    let py = py + "            cmdline='?'\n"
+    let py = py + "    print(json.dumps({'ok':True,'pid':pid,'name':name,'status':status,'cpu_percent':round(cpu_p,1),'mem_rss_mb':mem_rss,'mem_vms_mb':mem_vms,'num_threads':num_t,'open_files':nfiles,'net_connections':nconns,'cmdline':cmdline}))\n"
+    let py = py + "except psutil.NoSuchProcess:\n"
+    let py = py + "    print(json.dumps({'ok':False,'error':'PID " + pid_s + " not found'}))\n"
+    let py = py + "except Exception as e:\n"
+    let py = py + "    print(json.dumps({'ok':False,'error':str(e)}))\n"
+
+    nova_write(TMP_SCRIPT, py)
+    let raw = nova_run("python " + TMP_SCRIPT, 15)
+    let data = parse_py_json(raw)
+
+    let ok_val = dict_get(data, "ok")
+    if3 ok_val == false {
+        let err_msg = dict_get(data, "error")
+        if err_msg == "" { let err_msg = "trace failed" }
+        let err = {}
+        dict_set(err, "ok", false)
+        dict_set(err, "pid", pid)
+        dict_set(err, "error", err_msg)
+        dict_set(err, "trit", T_FALSE)
+        dict_set(err, "char", "T")
+        return err
+    }
+
+    // Extract values
+    let proc_name   = dict_get(data, "name")
+    if proc_name == "" { let proc_name = "?" }
+    let status      = dict_get(data, "status")
+    if status == "" { let status = "?" }
+    let cpu_pct     = dict_get(data, "cpu_percent")
+    if cpu_pct == "" { let cpu_pct = 0 }
+    let mem_rss     = dict_get(data, "mem_rss_mb")
+    if mem_rss == "" { let mem_rss = 0 }
+    let mem_vms     = dict_get(data, "mem_vms_mb")
+    if mem_vms == "" { let mem_vms = 0 }
+    let num_threads = dict_get(data, "num_threads")
+    if num_threads == "" { let num_threads = 0 }
+    let open_files  = dict_get(data, "open_files")
+    if open_files == "" { let open_files = 0 }
+    let net_conns   = dict_get(data, "net_connections")
+    if net_conns == "" { let net_conns = 0 }
+    let cmdline     = dict_get(data, "cmdline")
+    if cmdline == "" { let cmdline = "?" }
+
+    // Score: cpu > 80% = bad, mem > 2GB = bad, threads > 343 = bad
+    let proc_trit = T_TRUE
+    let cpu_trit  = metric_trit(cpu_pct)
+    let mem_trit  = T_TRUE
+    if3 mem_rss > 2048 {
+        let mem_trit = T_FALSE
+    } else if3 mem_rss > 512 {
+        let mem_trit = T_MAYBE
+    }
+    let thr_trit = T_TRUE
+    if3 num_threads > RE_TURBULENT {
+        let thr_trit = T_FALSE
+    } else if3 num_threads > RE_TRANSITION {
+        let thr_trit = T_MAYBE
+    }
+
+    let proc_trit = worst_trit(cpu_trit, mem_trit)
+    let proc_trit = worst_trit(proc_trit, thr_trit)
+
+    let re = cpu_reynolds(cpu_pct)
+    let regime = flow_regime(re)
+
+    stat_trace = stat_trace + 1
+    record_op(proc_trit)
+
+    let details = {}
+    dict_set(details, "name", proc_name)
+    dict_set(details, "status", status)
+    dict_set(details, "cpu_percent", cpu_pct)
+    dict_set(details, "mem_rss_mb", mem_rss)
+    dict_set(details, "mem_vms_mb", mem_vms)
+    dict_set(details, "num_threads", num_threads)
+    dict_set(details, "open_files", open_files)
+    dict_set(details, "net_connections", net_conns)
+    dict_set(details, "cmdline", cmdline)
+
+    let trits = {}
+    dict_set(trits, "cpu", cpu_trit)
+    dict_set(trits, "mem", mem_trit)
+    dict_set(trits, "threads", thr_trit)
+
+    let resp = {}
+    dict_set(resp, "ok", true)
+    dict_set(resp, "pid", pid)
+    dict_set(resp, "details", details)
+    dict_set(resp, "trits", trits)
+    dict_set(resp, "reynolds", re)
+    dict_set(resp, "regime", regime)
+    dict_set(resp, "trit", proc_trit)
+    dict_set(resp, "char", bt_char(proc_trit))
+    dict_set(resp, "runtime", "psutil")
+    return resp
+}
+
+// ============================================================
+// TOOL 5: /sysmon/network
+// Network stats: bytes sent/recv per NIC + connections summary
+// Single-line Python for counters, temp file for connections
+// ============================================================
+fn handle_network(req) {
+    let body = dict_get(req, "body")
+    if body == "" {
+        let body = {}
+    }
+    let include_conns = true
+    if3 dict_has(body, "include_conns") {
+        let include_conns = dict_get(body, "include_conns")
+    }
+
+    // Single-line: net I/O counters + per-NIC
+    let py_io = "python -c \"import psutil,json; c=psutil.net_io_counters(); nc=psutil.net_io_counters(pernic=True); nics={k:{'bytes_sent':v.bytes_sent,'bytes_recv':v.bytes_recv,'packets_sent':v.packets_sent,'packets_recv':v.packets_recv,'errin':v.errin,'errout':v.errout,'dropin':v.dropin,'dropout':v.dropout} for k,v in nc.items()}; print(json.dumps({'bytes_sent':c.bytes_sent,'bytes_recv':c.bytes_recv,'packets_sent':c.packets_sent,'packets_recv':c.packets_recv,'errin':c.errin,'errout':c.errout,'dropin':c.dropin,'dropout':c.dropout,'per_nic':nics}))\""
+    let raw_io = nova_run(py_io, 10)
+    let io_data = parse_py_json(raw_io)
+
+    let bytes_sent = dict_get(io_data, "bytes_sent")
+    if bytes_sent == "" { let bytes_sent = 0 }
+    let bytes_recv = dict_get(io_data, "bytes_recv")
+    if bytes_recv == "" { let bytes_recv = 0 }
+    let pkts_sent = dict_get(io_data, "packets_sent")
+    if pkts_sent == "" { let pkts_sent = 0 }
+    let pkts_recv = dict_get(io_data, "packets_recv")
+    if pkts_recv == "" { let pkts_recv = 0 }
+    let errin = dict_get(io_data, "errin")
+    if errin == "" { let errin = 0 }
+    let errout = dict_get(io_data, "errout")
+    if errout == "" { let errout = 0 }
+    let dropin = dict_get(io_data, "dropin")
+    if dropin == "" { let dropin = 0 }
+    let dropout = dict_get(io_data, "dropout")
+    if dropout == "" { let dropout = 0 }
+    let per_nic = dict_get(io_data, "per_nic")
+    if per_nic == "" { let per_nic = {} }
+
+    // MB conversions
+    let mb_sent = bytes_sent / 1048576
+    let mb_recv = bytes_recv / 1048576
+
+    // Connection summary via temp file
+    let conn_summary = {}
+    let conn_list = []
+    let total_conns = 0
+    let established = 0
+    let listening = 0
+    let external = 0
+
+    let py_c = "import psutil,json\n"
+    let py_c = py_c + "conns=psutil.net_connections(kind='all')\n"
+    let py_c = py_c + "out=[]\n"
+    let py_c = py_c + "established=0; listening=0; external=0\n"
+    let py_c = py_c + "private_pfx=('127.','10.','192.168.','172.','::1','0.0.0.0','')\n"
+    let py_c = py_c + "for c in conns:\n"
+    let py_c = py_c + "    la=c.laddr.ip if c.laddr else ''\n"
+    let py_c = py_c + "    lp=c.laddr.port if c.laddr else 0\n"
+    let py_c = py_c + "    ra=c.raddr.ip if c.raddr else ''\n"
+    let py_c = py_c + "    rp=c.raddr.port if c.raddr else 0\n"
+    let py_c = py_c + "    st=c.status or ''\n"
+    let py_c = py_c + "    pid=c.pid or 0\n"
+    let py_c = py_c + "    if st=='ESTABLISHED': established+=1\n"
+    let py_c = py_c + "    if st=='LISTEN': listening+=1\n"
+    let py_c = py_c + "    is_ext=ra and not any(ra.startswith(p) for p in private_pfx)\n"
+    let py_c = py_c + "    if is_ext: external+=1\n"
+    let py_c = py_c + "    out.append({'local':la,'lport':lp,'remote':ra,'rport':rp,'status':st,'pid':pid,'external':is_ext})\n"
+    let py_c = py_c + "print(json.dumps({'ok':True,'total':len(out),'established':established,'listening':listening,'external':external,'connections':out[:50]}))\n"
+
+    nova_write(TMP_SCRIPT, py_c)
+    let raw_c = nova_run("python " + TMP_SCRIPT, 15)
+    let conn_data = parse_py_json(raw_c)
+
+    let total_conns = dict_get(conn_data, "total")
+    if total_conns == "" { let total_conns = 0 }
+    let established = dict_get(conn_data, "established")
+    if established == "" { let established = 0 }
+    let listening = dict_get(conn_data, "listening")
+    if listening == "" { let listening = 0 }
+    let external = dict_get(conn_data, "external")
+    if external == "" { let external = 0 }
+    let conn_list = dict_get(conn_data, "connections")
+    if conn_list == "" { let conn_list = [] }
+
+    // Trit: no errors + no external = +1, few errors or externals = 0, many = -1
+    let total_errors = errin + errout + dropin + dropout
+    let net_trit = T_TRUE
+    if3 external > H7 {
+        let net_trit = T_FALSE
+    } else if3 external > 0 {
+        let net_trit = T_MAYBE
+    }
+    if3 total_errors > 100 {
+        let net_trit = worst_trit(net_trit, T_FALSE)
+    } else if3 total_errors > 10 {
+        let net_trit = worst_trit(net_trit, T_MAYBE)
+    }
+
+    stat_network = stat_network + 1
+    record_op(net_trit)
+
+    let io_summary = {}
+    dict_set(io_summary, "bytes_sent", bytes_sent)
+    dict_set(io_summary, "bytes_recv", bytes_recv)
+    dict_set(io_summary, "mb_sent", mb_sent)
+    dict_set(io_summary, "mb_recv", mb_recv)
+    dict_set(io_summary, "packets_sent", pkts_sent)
+    dict_set(io_summary, "packets_recv", pkts_recv)
+    dict_set(io_summary, "errin", errin)
+    dict_set(io_summary, "errout", errout)
+    dict_set(io_summary, "dropin", dropin)
+    dict_set(io_summary, "dropout", dropout)
+
+    let conn_summary = {}
+    dict_set(conn_summary, "total", total_conns)
+    dict_set(conn_summary, "established", established)
+    dict_set(conn_summary, "listening", listening)
+    dict_set(conn_summary, "external", external)
+
+    let resp = {}
+    dict_set(resp, "ok", true)
+    dict_set(resp, "io", io_summary)
+    dict_set(resp, "per_nic", per_nic)
+    dict_set(resp, "connections_summary", conn_summary)
+    dict_set(resp, "connections", conn_list)
+    dict_set(resp, "trit", net_trit)
+    dict_set(resp, "char", bt_char(net_trit))
+    dict_set(resp, "runtime", "psutil")
+    return resp
+}
+
+// ============================================================
+// TOOL 6: /sysmon/iowatch
+// Disk I/O stats: bytes read/write/sec via psutil.disk_io_counters
+// Samples over a window to compute delta rate
+// ============================================================
+fn handle_iowatch(req) {
+    let body = dict_get(req, "body")
+    if body == "" {
+        let body = {}
+    }
+    let window = H3
+    if3 dict_has(body, "window") {
+        let window = dict_get(body, "window")
+    }
+    if window < 1 { let window = 1 }
+    if window > H13 { let window = H13 }
+
+    let win_s = str(window)
+
+    // Sample disk I/O before and after window, compute delta bytes/sec
+    let py = "import psutil,time,json\n"
+    let py = py + "d0=psutil.disk_io_counters()\n"
+    let py = py + "t0=time.time()\n"
+    let py = py + "time.sleep(" + win_s + ")\n"
+    let py = py + "d1=psutil.disk_io_counters()\n"
+    let py = py + "dt=time.time()-t0\n"
+    let py = py + "if d0 and d1:\n"
+    let py = py + "    rb=d1.read_bytes-d0.read_bytes\n"
+    let py = py + "    wb=d1.write_bytes-d0.write_bytes\n"
+    let py = py + "    rc=d1.read_count-d0.read_count\n"
+    let py = py + "    wc=d1.write_count-d0.write_count\n"
+    let py = py + "    rt=d1.read_time-d0.read_time\n"
+    let py = py + "    wt=d1.write_time-d0.write_time\n"
+    let py = py + "    rbs=round(rb/max(dt,0.001),0)\n"
+    let py = py + "    wbs=round(wb/max(dt,0.001),0)\n"
+    let py = py + "    rmbs=round(rbs/1048576,3)\n"
+    let py = py + "    wmbs=round(wbs/1048576,3)\n"
+    let py = py + "    print(json.dumps({'ok':True,'window_s':round(dt,2),'read_bytes':rb,'write_bytes':wb,'read_count':rc,'write_count':wc,'read_time_ms':rt,'write_time_ms':wt,'read_bytes_sec':rbs,'write_bytes_sec':wbs,'read_mbs':rmbs,'write_mbs':wmbs,'total_read_bytes':d1.read_bytes,'total_write_bytes':d1.write_bytes}))\n"
+    let py = py + "else:\n"
+    let py = py + "    print(json.dumps({'ok':False,'error':'disk_io_counters unavailable'}))\n"
+
+    nova_write(TMP_SCRIPT, py)
+    let raw = nova_run("python " + TMP_SCRIPT, 30)
+    let data = parse_py_json(raw)
+
+    let ok_v = dict_get(data, "ok")
+    if3 ok_v == false {
+        let err_msg = dict_get(data, "error")
+        if err_msg == "" { let err_msg = "iowatch failed" }
+        let err = {}
+        dict_set(err, "ok", false)
+        dict_set(err, "error", err_msg)
+        dict_set(err, "trit", T_FALSE)
+        dict_set(err, "char", "T")
+        return err
+    }
+
+    let read_bps = dict_get(data, "read_bytes_sec")
+    if read_bps == "" { let read_bps = 0 }
+    let write_bps = dict_get(data, "write_bytes_sec")
+    if write_bps == "" { let write_bps = 0 }
+    let read_mbs = dict_get(data, "read_mbs")
+    if read_mbs == "" { let read_mbs = 0 }
+    let write_mbs = dict_get(data, "write_mbs")
+    if write_mbs == "" { let write_mbs = 0 }
+    let read_count = dict_get(data, "read_count")
+    if read_count == "" { let read_count = 0 }
+    let write_count = dict_get(data, "write_count")
+    if write_count == "" { let write_count = 0 }
+    let read_time = dict_get(data, "read_time_ms")
+    if read_time == "" { let read_time = 0 }
+    let write_time = dict_get(data, "write_time_ms")
+    if write_time == "" { let write_time = 0 }
+    let act_window = dict_get(data, "window_s")
+    if act_window == "" { let act_window = window }
+    let total_read = dict_get(data, "total_read_bytes")
+    if total_read == "" { let total_read = 0 }
+    let total_write = dict_get(data, "total_write_bytes")
+    if total_write == "" { let total_write = 0 }
+
+    // Reynolds from I/O: total MB/s * H7, clamped
+    let total_mbs = read_mbs + write_mbs
+    let re = total_mbs * H7
+    if re > 9999 { let re = 9999 }
+    let regime = flow_regime(re)
+
+    // Trit: idle=+1, moderate=0, thrashing=-1
+    let io_trit = T_TRUE
+    if3 re >= RE_TURBULENT {
+        let io_trit = T_FALSE
+    } else if3 re >= RE_LAMINAR {
+        let io_trit = T_MAYBE
+    }
+
+    stat_iowatch = stat_iowatch + 1
+    record_op(io_trit)
+
+    let resp = {}
+    dict_set(resp, "ok", true)
+    dict_set(resp, "window_s", act_window)
+    dict_set(resp, "read_bytes_sec", read_bps)
+    dict_set(resp, "write_bytes_sec", write_bps)
+    dict_set(resp, "read_mbs", read_mbs)
+    dict_set(resp, "write_mbs", write_mbs)
+    dict_set(resp, "read_ops", read_count)
+    dict_set(resp, "write_ops", write_count)
+    dict_set(resp, "read_time_ms", read_time)
+    dict_set(resp, "write_time_ms", write_time)
+    dict_set(resp, "total_read_bytes", total_read)
+    dict_set(resp, "total_write_bytes", total_write)
+    dict_set(resp, "reynolds", re)
+    dict_set(resp, "regime", regime)
+    dict_set(resp, "trit", io_trit)
+    dict_set(resp, "char", bt_char(io_trit))
+    dict_set(resp, "runtime", "psutil")
+    return resp
+}
+
+// ============================================================
+// TOOL 7: /sysmon/stress
+// CPU stress test: spin N worker threads for `duration` seconds
+// using Python threading + psutil CPU measurement
+// ============================================================
+fn handle_stress(req) {
+    let body = dict_get(req, "body")
+    if body == "" {
+        let body = {}
+    }
+    let duration = H3
+    let threads = H7
+    if3 dict_has(body, "duration") {
+        let duration = dict_get(body, "duration")
+    }
+    if3 dict_has(body, "threads") {
+        let threads = dict_get(body, "threads")
+    }
+    if duration < 1 { let duration = 1 }
+    if duration > 30 { let duration = 30 }
+    if threads < 1 { let threads = 1 }
+    if threads > 13 { let threads = 13 }
+
+    let dur_s = str(duration)
+    let thr_s = str(threads)
+
+    // Stress: spawn N threads each doing tight SHA-256 loops for `duration` sec
+    // Measure CPU% via psutil before+during+after
+    let py = "import psutil,threading,hashlib,time,json\n"
+    let py = py + "duration=" + dur_s + "\n"
+    let py = py + "num_threads=" + thr_s + "\n"
+    let py = py + "results=[0]*num_threads\n"
+    let py = py + "stop_flag=[False]\n"
+    let py = py + "data=b'novax-stress-' * 13\n"
+    let py = py + "def worker(idx):\n"
+    let py = py + "    count=0\n"
+    let py = py + "    deadline=time.time()+duration\n"
+    let py = py + "    while not stop_flag[0] and time.time()<deadline:\n"
+    let py = py + "        hashlib.sha256(data).hexdigest()\n"
+    let py = py + "        count+=1\n"
+    let py = py + "    results[idx]=count\n"
+    let py = py + "cpu_before=psutil.cpu_percent(interval=0.2)\n"
+    let py = py + "t_start=time.time()\n"
+    let py = py + "threads=[threading.Thread(target=worker,args=(i,)) for i in range(num_threads)]\n"
+    let py = py + "[t.start() for t in threads]\n"
+    let py = py + "time.sleep(duration*0.5)\n"
+    let py = py + "cpu_during=psutil.cpu_percent(interval=0.5)\n"
+    let py = py + "[t.join() for t in threads]\n"
+    let py = py + "dt=time.time()-t_start\n"
+    let py = py + "cpu_after=psutil.cpu_percent(interval=0.2)\n"
+    let py = py + "total=sum(results)\n"
+    let py = py + "rate=int(total/max(dt,0.001))\n"
+    let py = py + "print(json.dumps({'ok':True,'threads':num_threads,'duration_s':round(dt,2),'cpu_before':round(cpu_before,1),'cpu_during':round(cpu_during,1),'cpu_after':round(cpu_after,1),'total_hashes':total,'hash_rate':rate,'per_thread':results}))\n"
+
+    nova_write(TMP_SCRIPT, py)
+    // Timeout = duration * 3 + 10 for safety
+    let timeout_s = duration + duration + duration + 10
+    let raw = nova_run("python " + TMP_SCRIPT, timeout_s)
+    let data = parse_py_json(raw)
+
+    let ok_v = dict_get(data, "ok")
+    if3 ok_v == false {
+        let err_msg = dict_get(data, "error")
+        if err_msg == "" { let err_msg = "stress test failed" }
+        let err = {}
+        dict_set(err, "ok", false)
+        dict_set(err, "error", err_msg)
+        dict_set(err, "trit", T_FALSE)
+        dict_set(err, "char", "T")
+        return err
+    }
+
+    let cpu_before = dict_get(data, "cpu_before")
+    if cpu_before == "" { let cpu_before = 0 }
+    let cpu_during = dict_get(data, "cpu_during")
+    if cpu_during == "" { let cpu_during = 0 }
+    let cpu_after = dict_get(data, "cpu_after")
+    if cpu_after == "" { let cpu_after = 0 }
+    let total_hashes = dict_get(data, "total_hashes")
+    if total_hashes == "" { let total_hashes = 0 }
+    let hash_rate = dict_get(data, "hash_rate")
+    if hash_rate == "" { let hash_rate = 0 }
+    let per_thread = dict_get(data, "per_thread")
+    if per_thread == "" { let per_thread = [] }
+    let actual_dur = dict_get(data, "duration_s")
+    if actual_dur == "" { let actual_dur = duration }
+    let num_t = dict_get(data, "threads")
+    if num_t == "" { let num_t = threads }
+
+    // Trit: high throughput = good stress capability (+1)
+    // Rate/1000 vs Reynolds thresholds
+    let re_stress = hash_rate / 1000
+    if re_stress > 9999 { let re_stress = 9999 }
+    let stress_trit = T_FALSE
+    if3 re_stress > RE_TURBULENT {
+        let stress_trit = T_TRUE
+    } else if3 re_stress > RE_LAMINAR {
+        let stress_trit = T_MAYBE
+    }
+    let regime = flow_regime(re_stress)
+
+    // CPU saturation score: did we actually stress the CPU?
+    let cpu_delta = cpu_during - cpu_before
+    let sat_trit = T_TRUE
+    if3 cpu_delta < 10 {
+        // Barely moved CPU -- maybe already saturated or very fast
+        let sat_trit = T_MAYBE
+    }
+
+    stat_stress = stat_stress + 1
+    record_op(stress_trit)
+
+    let resp = {}
+    dict_set(resp, "ok", true)
+    dict_set(resp, "threads", num_t)
+    dict_set(resp, "duration_s", actual_dur)
+    dict_set(resp, "cpu_before_pct", cpu_before)
+    dict_set(resp, "cpu_during_pct", cpu_during)
+    dict_set(resp, "cpu_after_pct", cpu_after)
+    dict_set(resp, "cpu_delta", cpu_delta)
+    dict_set(resp, "total_hashes", total_hashes)
+    dict_set(resp, "hash_rate", hash_rate)
+    dict_set(resp, "hash_rate_unit", "hashes/sec")
+    dict_set(resp, "per_thread_hashes", per_thread)
+    dict_set(resp, "reynolds_scaled", re_stress)
+    dict_set(resp, "regime", regime)
+    dict_set(resp, "trit", stress_trit)
+    dict_set(resp, "char", bt_char(stress_trit))
+    dict_set(resp, "saturation_trit", sat_trit)
+    dict_set(resp, "saturation_char", bt_char(sat_trit))
+    dict_set(resp, "runtime", "psutil")
+    return resp
+}
+
+// ============================================================
+// GET /health
+// ============================================================
+fn handle_health(req) {
+    let uptime = time() - stat_t0
+    let self_trit = T_MAYBE
+    if3 uptime > 10 {
+        let self_trit = T_TRUE
+    }
+    let harmonics = {}
+    dict_set(harmonics, "H3", H3)
+    dict_set(harmonics, "H5", H5)
+    dict_set(harmonics, "H7", H7)
+    dict_set(harmonics, "H13", H13)
+    let quality = {}
+    dict_set(quality, "strong", stat_strong)
+    dict_set(quality, "partial", stat_partial)
+    dict_set(quality, "failed", stat_failed)
+    let resp = {}
+    dict_set(resp, "ok", true)
+    dict_set(resp, "service", SERVICE_NAME)
+    dict_set(resp, "port", PORT)
+    dict_set(resp, "version", VERSION)
+    dict_set(resp, "ternary", true)
+    dict_set(resp, "runtime", "psutil")
+    dict_set(resp, "harmonics", harmonics)
+    dict_set(resp, "tools", TOOLS_COUNT)
+    dict_set(resp, "self_trit", self_trit)
+    dict_set(resp, "char", bt_char(self_trit))
+    dict_set(resp, "uptime_s", uptime)
+    dict_set(resp, "quality", quality)
+    return resp
+}
+
+// ============================================================
+// GET /sysmon/status
+// Full service status with N-S Reynolds analysis
+// ============================================================
+fn handle_status(req) {
+    let uptime = time() - stat_t0
+
+    // Quick CPU snapshot for Reynolds number
+    let py_cpu = "python -c \"import psutil,json; c=psutil.cpu_percent(interval=0.1); print(json.dumps({'cpu':round(c,1)}))\""
+    let raw_cpu = nova_run(py_cpu, 5)
+    let cpu_data = parse_py_json(raw_cpu)
+    let cpu_pct = dict_get(cpu_data, "cpu")
+    if cpu_pct == "" { let cpu_pct = 0 }
+    let re = cpu_reynolds(cpu_pct)
+    let regime = flow_regime(re)
+
+    // System health trit from stats ratio
+    let sys_trit = T_TRUE
+    if3 stat_failed > stat_strong {
+        let sys_trit = T_FALSE
+    } else if3 stat_failed > 0 {
+        let sys_trit = T_MAYBE
+    }
+
+    // Build 13-trit health string from stat mix
+    let health_bt = ""
+    let bi = 0
+    while3 bi < H13 {
+        if3 sys_trit == T_TRUE {
+            health_bt = health_bt + "1"
+        } else if3 sys_trit == T_MAYBE {
+            health_bt = health_bt + "0"
+        } else {
+            health_bt = health_bt + "T"
+        }
+        bi = bi + 1
+    }
+
+    let by_tool = {}
+    dict_set(by_tool, "procs", stat_procs)
+    dict_set(by_tool, "resources", stat_resources)
+    dict_set(by_tool, "bench", stat_bench)
+    dict_set(by_tool, "trace", stat_trace)
+    dict_set(by_tool, "network", stat_network)
+    dict_set(by_tool, "iowatch", stat_iowatch)
+    dict_set(by_tool, "stress", stat_stress)
+
+    let trits_summary = {}
+    dict_set(trits_summary, "strong", stat_strong)
+    dict_set(trits_summary, "partial", stat_partial)
+    dict_set(trits_summary, "failed", stat_failed)
+
+    let harmonics = {}
+    dict_set(harmonics, "H3", H3)
+    dict_set(harmonics, "H5", H5)
+    dict_set(harmonics, "H7", H7)
+    dict_set(harmonics, "H13", H13)
+
+    let boundaries = {}
+    dict_set(boundaries, "laminar", RE_LAMINAR)
+    dict_set(boundaries, "transition", RE_TRANSITION)
+    dict_set(boundaries, "turbulent", RE_TURBULENT)
+
+    let resp = {}
+    dict_set(resp, "ok", true)
+    dict_set(resp, "service", SERVICE_NAME)
+    dict_set(resp, "version", VERSION)
+    dict_set(resp, "port", PORT)
+    dict_set(resp, "uptime_s", uptime)
+    dict_set(resp, "total_ops", stat_ops)
+    dict_set(resp, "by_tool", by_tool)
+    dict_set(resp, "trits", trits_summary)
+    dict_set(resp, "health_bt", health_bt)
+    dict_set(resp, "cpu_pct", cpu_pct)
+    dict_set(resp, "reynolds", re)
+    dict_set(resp, "regime", regime)
+    dict_set(resp, "system_trit", sys_trit)
+    dict_set(resp, "system_char", bt_char(sys_trit))
+    dict_set(resp, "harmonics", harmonics)
+    dict_set(resp, "reynolds_boundaries", boundaries)
+    dict_set(resp, "runtime", "psutil")
+    dict_set(resp, "block_size", BLOCK_SIZE)
+    return resp
+}
+
+// POST /sysmon/gpu — GPU stats via nvidia-smi
+fn handle_gpu(body) {
+    let EXEC = "http://127.0.0.1:9877"
+    let cmd = "nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>&1"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout", "")
+    let trit = 1
+    if contains(out, "not found") {
+        trit = 0
+        return {"ok": true, "gpu_available": false, "message": "No NVIDIA GPU or nvidia-smi not found", "trit": trit, "char": trit_char(trit)}
+    }
+    if contains(out, "error") {
+        trit = -1
+        return {"ok": false, "error": out, "trit": trit, "char": trit_char(trit)}
+    }
+    // Parse CSV output: name, mem_total, mem_used, mem_free, util%, temp
+    let lines = split(strip(out), "\n")
+    let gpus = []
+    let gidx = 0
+    while gidx < len(lines) {
+        let parts = split(lines[gidx], ",")
+        if len(parts) >= 6 {
+            let gpu = {"name": strip(parts[0]), "mem_total_mb": strip(parts[1]), "mem_used_mb": strip(parts[2]), "mem_free_mb": strip(parts[3]), "utilization_pct": strip(parts[4]), "temp_c": strip(parts[5])}
+            gpus = append(gpus, gpu)
+        }
+        gidx = gidx + 1
+    }
+    return {"ok": true, "gpu_available": true, "gpus": gpus, "count": len(gpus), "trit": trit, "char": trit_char(trit)}
+}
+
+// POST /sysmon/ncdu — disk usage analysis per subdirectory
+fn handle_ncdu(body) {
+    let path = dict_get(body, "path", ".")
+    let depth = dict_get(body, "depth", 1)
+    let EXEC = "http://127.0.0.1:9877"
+    let cmd = "du -h --max-depth=" + str(depth) + " \"" + path + "\" 2>/dev/null | sort -rh | head -30"
+    let exec_body = {"command": cmd}
+    let resp = http_post(EXEC + "/exec", exec_body, "application/json")
+    let out = dict_get(resp, "stdout", "")
+    let lines = split(strip(out), "\n")
+    let trit = 1
+    if len(lines) == 0 {
+        trit = 0
+    }
+    return {"ok": true, "path": path, "depth": depth, "entries": len(lines), "output": out, "trit": trit, "char": trit_char(trit)}
+}
+
+// ============================================================
+// Route registration
+// ============================================================
+troute(server, "GET",  "/health",           "handle_health")
+troute(server, "GET",  "/sysmon/status",    "handle_status")
+troute(server, "POST", "/sysmon/procs",     "handle_procs")
+troute(server, "POST", "/sysmon/resources", "handle_resources")
+troute(server, "POST", "/sysmon/bench",     "handle_bench")
+troute(server, "POST", "/sysmon/trace",     "handle_trace")
+troute(server, "POST", "/sysmon/network",   "handle_network")
+troute(server, "POST", "/sysmon/iowatch",   "handle_iowatch")
+troute(server, "POST", "/sysmon/stress",    "handle_stress")
+troute(server, "POST", "/sysmon/gpu",       "handle_gpu")
+troute(server, "POST", "/sysmon/ncdu",      "handle_ncdu")
+
+// ============================================================
+// Startup banner
+// ============================================================
+print("[TSysMon] NovaX Ternary System Monitor v2.0 on port " + str(PORT))
+print("[TSysMon] Backend: psutil 7.2.2 via nova_run('python -c ...') + temp .py files")
+print("[TSysMon] Runtime: NovaLang | Ternary: TRUE | Tools: " + str(TOOLS_COUNT))
+print("[TSysMon] Harmonics: H3=" + str(H3) + " H5=" + str(H5) + " H7=" + str(H7) + " H13=" + str(H13))
+print("[TSysMon] Reynolds: laminar<" + str(RE_LAMINAR) + " transitional<" + str(RE_TRANSITION) + " turbulent<" + str(RE_TURBULENT))
+print("[TSysMon] Trit thresholds: +1=<33% | 0=33-66% | -1=>=67%")
+print("[TSysMon] Routes: GET /health, GET /sysmon/status")
+print("[TSysMon]         POST /sysmon/procs, /sysmon/resources, /sysmon/bench")
+print("[TSysMon]         POST /sysmon/trace, /sysmon/network, /sysmon/iowatch, /sysmon/stress")
+print("[TSysMon] Ready -- http://127.0.0.1:" + str(PORT) + "/health")
+
+tstart(server)
