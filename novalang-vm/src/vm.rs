@@ -52,6 +52,8 @@ pub struct Runtime {
     pub source_file: Option<String>,
     /// Shutdown signal shared with HTTP server threads
     shutdown_flag: Arc<AtomicBool>,
+    /// Skip tstart during reload re-parse (prevents recursive server bind)
+    skip_tstart: bool,
 }
 
 impl Clone for Runtime {
@@ -66,6 +68,7 @@ impl Clone for Runtime {
             lambda_counter: 0,
             source_file: self.source_file.clone(),
             shutdown_flag: self.shutdown_flag.clone(),
+            skip_tstart: self.skip_tstart,
         }
     }
 }
@@ -103,6 +106,7 @@ impl Runtime {
             lambda_counter: 0,
             source_file: None,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            skip_tstart: false,
         }
     }
 
@@ -763,6 +767,10 @@ impl Runtime {
                 return Ok(Value::Trit(1));
             }
             "tstart" => {
+                // During hot-reload re-parse, skip tstart to avoid recursive bind
+                if self.skip_tstart {
+                    return Ok(Value::Trit(1));
+                }
                 let server_id = args.first().unwrap_or(&Value::Null).to_display();
                 if let Some(server) = self.servers.get(&server_id).cloned() {
                     return self.start_http_server(server);
@@ -953,156 +961,374 @@ impl Runtime {
 
     // ── HTTP Server (tiny_http) ──
 
-    fn start_http_server(&mut self, server: ServerDef) -> Result<Value, String> {
-        let addr = format!("0.0.0.0:{}", server.port);
-        println!("[NovaLang] Starting {} on port {}", server.name, server.port);
+    fn start_http_server(&mut self, mut server: ServerDef) -> Result<Value, String> {
+        let source_file = self.source_file.clone();
+        let base_dir = self.base_dir.clone();
 
-        let http_server = tiny_http::Server::http(&addr)
-            .map_err(|e| format!("Failed to bind {}: {}", addr, e))?;
+        // Outer reload loop: re-bind and re-parse on file changes
+        loop {
+            let addr = format!("0.0.0.0:{}", server.port);
+            println!("[NovaLang] Starting {} on port {}", server.name, server.port);
 
-        println!("[NovaLang] {} listening on http://127.0.0.1:{}", server.name, server.port);
+            let http_server = tiny_http::Server::http(&addr)
+                .map_err(|e| format!("Failed to bind {}: {}", addr, e))?;
 
-        // Build route lookup (shared across threads)
-        let routes: Arc<HashMap<(String, String), String>> = Arc::new(
-            server.routes.iter()
-                .map(|(m, p, h)| ((m.clone(), p.clone()), h.clone()))
-                .collect()
-        );
+            println!("[NovaLang] {} listening on http://127.0.0.1:{}", server.name, server.port);
 
-        // Thread pool size: H7=7 concurrent handlers
-        let pool_size = 7;
-        let http_server = Arc::new(http_server);
+            // Build route lookup (shared across threads)
+            let routes: Arc<HashMap<(String, String), String>> = Arc::new(
+                server.routes.iter()
+                    .map(|(m, p, h)| ((m.clone(), p.clone()), h.clone()))
+                    .collect()
+            );
 
-        // Snapshot the VM state for handler threads
-        let vm_snapshot = self.clone();
-        let vm_arc = Arc::new(std::sync::Mutex::new(vm_snapshot));
+            // Thread pool size: H7=7 concurrent handlers
+            let pool_size = 7;
+            let http_server = Arc::new(http_server);
 
-        // Spawn worker threads
-        let mut handles = Vec::new();
-        for _worker_id in 0..pool_size {
-            let server_ref = http_server.clone();
-            let routes_ref = routes.clone();
-            let vm_ref = vm_arc.clone();
+            // Shutdown signal for this server generation
+            let shutdown = Arc::new(AtomicBool::new(false));
 
-            let handle = std::thread::spawn(move || {
+            // Snapshot the VM state for handler threads
+            let vm_snapshot = self.clone();
+            let vm_arc = Arc::new(std::sync::Mutex::new(vm_snapshot));
+
+            // ── File-watcher thread: monitors .nova source for changes ──
+            let watcher_shutdown = shutdown.clone();
+            let watcher_server = http_server.clone();
+            let watcher_source = source_file.clone();
+            let watcher_handle = std::thread::spawn(move || {
+                let path = match &watcher_source {
+                    Some(p) => p.clone(),
+                    None => return, // No source file, no watching
+                };
+                // Record initial mtime
+                let initial_mtime = match std::fs::metadata(&path) {
+                    Ok(m) => m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                    Err(_) => return,
+                };
+                let mut last_mtime = initial_mtime;
+
+                // Poll every 1 second (lightweight, no external deps)
                 loop {
-                    let mut request = match server_ref.recv() {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
-
-                    let method = request.method().to_string();
-                    let path = request.url().to_string();
-                    let path_only = path.split('?').next().unwrap_or(&path).to_string();
-
-                    // CORS preflight
-                    if method == "OPTIONS" {
-                        let response = tiny_http::Response::from_string("")
-                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
-                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET,POST,PUT,DELETE,OPTIONS"[..]).unwrap())
-                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type,Authorization"[..]).unwrap());
-                        let _ = request.respond(response);
-                        continue;
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if watcher_shutdown.load(Ordering::Relaxed) {
+                        break;
                     }
+                    match std::fs::metadata(&path) {
+                        Ok(m) => {
+                            if let Ok(mtime) = m.modified() {
+                                if mtime != last_mtime {
+                                    last_mtime = mtime;
+                                    println!("[NovaLang] File change detected: {}", path);
+                                    println!("[NovaLang] Hot-reloading...");
+                                    // Signal shutdown to all worker threads
+                                    watcher_shutdown.store(true, Ordering::SeqCst);
+                                    // Unblock all workers waiting on recv_timeout
+                                    // unblock() wakes one thread per call, so call it pool_size times
+                                    for _ in 0..7 {
+                                        watcher_server.unblock();
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => {} // File temporarily unavailable during save
+                    }
+                }
+            });
 
-                    // Find matching route (exact match first, then prefix/wildcard)
-                    let handler_name = routes_ref.get(&(method.clone(), path_only.clone()))
-                        .or_else(|| routes_ref.get(&("*".into(), path_only.clone())))
-                        .cloned()
-                        .or_else(|| {
-                            // Prefix wildcard: routes ending with /* match any path with that prefix
-                            let mut best: Option<(usize, String)> = None;
-                            for ((m, p), h) in routes_ref.iter() {
-                                if p.ends_with("/*") && (m == &method || m == "*") {
-                                    let prefix = &p[..p.len() - 2];
-                                    if path_only.starts_with(prefix) && path_only.len() > prefix.len() {
-                                        let plen = prefix.len();
-                                        if best.is_none() || plen > best.as_ref().unwrap().0 {
-                                            best = Some((plen, h.clone()));
+            // Spawn worker threads
+            let mut handles = Vec::new();
+            for _worker_id in 0..pool_size {
+                let server_ref = http_server.clone();
+                let routes_ref = routes.clone();
+                let vm_ref = vm_arc.clone();
+                let worker_shutdown = shutdown.clone();
+
+                let handle = std::thread::spawn(move || {
+                    loop {
+                        // Check shutdown before blocking on recv
+                        if worker_shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        let mut request = match server_ref.recv_timeout(std::time::Duration::from_secs(1)) {
+                            Ok(Some(r)) => r,
+                            Ok(None) => continue,  // Timeout, loop back to check shutdown
+                            Err(_) => break,        // Server unblocked/dropped
+                        };
+
+                        // Double-check shutdown after waking up
+                        if worker_shutdown.load(Ordering::Relaxed) {
+                            // Respond 503 to in-flight request during shutdown
+                            let resp = tiny_http::Response::from_string(
+                                "{\"error\":\"service reloading\",\"trit\":0}"
+                            ).with_status_code(503)
+                             .with_header(tiny_http::Header::from_bytes(
+                                 &b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                            let _ = request.respond(resp);
+                            break;
+                        }
+
+                        let method = request.method().to_string();
+                        let path = request.url().to_string();
+                        let path_only = path.split('?').next().unwrap_or(&path).to_string();
+
+                        // CORS preflight
+                        if method == "OPTIONS" {
+                            let response = tiny_http::Response::from_string("")
+                                .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                                .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET,POST,PUT,DELETE,OPTIONS"[..]).unwrap())
+                                .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type,Authorization"[..]).unwrap());
+                            let _ = request.respond(response);
+                            continue;
+                        }
+
+                        // ── Internal reload endpoint: POST /_reload ──
+                        if method == "POST" && path_only == "/_reload" {
+                            let resp_body = "{\"ok\":true,\"message\":\"reloading\",\"trit\":1}";
+                            let response = tiny_http::Response::from_string(resp_body)
+                                .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
+                                .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap());
+                            let _ = request.respond(response);
+                            // Trigger shutdown for reload
+                            worker_shutdown.store(true, Ordering::SeqCst);
+                            break;
+                        }
+
+                        // ── Internal hot-swap endpoint: POST /_hotswap ──
+                        // Re-parses the source file and updates functions in-place
+                        // without dropping the server socket (zero-downtime)
+                        if method == "POST" && path_only == "/_hotswap" {
+                            // Extract source_file and base_dir under a short lock to avoid deadlock
+                            let (src_opt, bdir) = {
+                                let vm = vm_ref.lock().unwrap();
+                                (vm.source_file.clone(), vm.base_dir.clone())
+                            };
+                            let swap_result = if let Some(src_path) = src_opt {
+                                match std::fs::read_to_string(&src_path) {
+                                    Ok(code) => {
+                                        let spanned = lexer::tokenize_spanned(&code);
+                                        let tokens: Vec<lexer::Token> = spanned.iter().map(|st| st.token.clone()).collect();
+                                        let ast = crate::parser::parse(tokens);
+                                        // Build a fresh runtime to extract new function defs
+                                        let mut fresh = Runtime::new();
+                                        fresh.base_dir = bdir;
+                                        fresh.source_file = Some(src_path);
+                                        fresh.skip_tstart = true; // Don't re-bind during hotswap
+                                        // Execute top-level statements to register functions and set vars
+                                        if let Err(e) = fresh.execute(&ast) {
+                                            format!("{{\"ok\":false,\"error\":\"parse error: {}\",\"trit\":-1}}", e)
+                                        } else {
+                                            // Swap functions and top-level vars into the live VM
+                                            let mut vm = vm_ref.lock().unwrap();
+                                            vm.functions = fresh.functions;
+                                            // Merge top-level scope (preserve runtime state like _stats)
+                                            if let Some(fresh_global) = fresh.scopes.first() {
+                                                if let Some(live_global) = vm.scopes.first_mut() {
+                                                    for (k, v) in fresh_global {
+                                                        // Only update function-like and constant bindings,
+                                                        // skip runtime state vars (prefixed with _)
+                                                        if !k.starts_with('_') {
+                                                            live_global.insert(k.clone(), v.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            format!("{{\"ok\":true,\"message\":\"functions hot-swapped\",\"fn_count\":{},\"trit\":1}}",
+                                                    vm.functions.len())
+                                        }
+                                    }
+                                    Err(e) => format!("{{\"ok\":false,\"error\":\"read error: {}\",\"trit\":-1}}", e),
+                                }
+                            } else {
+                                "{\"ok\":false,\"error\":\"no source file for hotswap\",\"trit\":-1}".to_string()
+                            };
+                            let response = tiny_http::Response::from_string(&swap_result)
+                                .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
+                                .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap());
+                            let _ = request.respond(response);
+                            continue;
+                        }
+
+                        // Find matching route (exact match first, then prefix/wildcard)
+                        let handler_name = routes_ref.get(&(method.clone(), path_only.clone()))
+                            .or_else(|| routes_ref.get(&("*".into(), path_only.clone())))
+                            .cloned()
+                            .or_else(|| {
+                                // Prefix wildcard: routes ending with /* match any path with that prefix
+                                let mut best: Option<(usize, String)> = None;
+                                for ((m, p), h) in routes_ref.iter() {
+                                    if p.ends_with("/*") && (m == &method || m == "*") {
+                                        let prefix = &p[..p.len() - 2];
+                                        if path_only.starts_with(prefix) && path_only.len() > prefix.len() {
+                                            let plen = prefix.len();
+                                            if best.is_none() || plen > best.as_ref().unwrap().0 {
+                                                best = Some((plen, h.clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                                best.map(|(_, h)| h)
+                            });
+
+                        if let Some(fn_name) = handler_name {
+                            // Read request body
+                            let mut body = String::new();
+                            if let Ok(_) = request.as_reader().read_to_string(&mut body) {}
+
+                            // Build request dict
+                            let mut req_pairs: Vec<(String, Value)> = vec![
+                                ("method".into(), Value::Str(method.clone())),
+                                ("path".into(), Value::Str(path_only.clone())),
+                                ("body".into(), Value::Str(body.clone())),
+                            ];
+
+                            if let Some(q) = path.split('?').nth(1) {
+                                req_pairs.push(("query_string".into(), Value::Str(q.to_string())));
+                                let query_dict: Vec<(String, Value)> = q.split('&')
+                                    .filter_map(|pair| {
+                                        let mut parts = pair.splitn(2, '=');
+                                        let key = parts.next()?.to_string();
+                                        let val = parts.next().unwrap_or("").to_string();
+                                        Some((key, Value::Str(val)))
+                                    })
+                                    .collect();
+                                req_pairs.push(("query".into(), Value::Dict(query_dict)));
+                            }
+
+                            let header_pairs: Vec<(String, Value)> = request.headers().iter()
+                                .map(|h| (h.field.to_string().to_lowercase(), Value::Str(h.value.to_string())))
+                                .collect();
+                            req_pairs.push(("headers".into(), Value::Dict(header_pairs)));
+
+                            let req_dict = Value::Dict(req_pairs);
+
+                            // Call handler under lock (concurrent via mutex)
+                            let response_body = {
+                                let mut vm = vm_ref.lock().unwrap();
+                                let result = vm.call_fn(&fn_name, vec![req_dict]);
+                                match result {
+                                    Ok(val) => builtins::call_builtin("json_encode", &[val])
+                                        .map(|v| v.to_display())
+                                        .unwrap_or_else(|| "null".into()),
+                                    Err(e) => format!("{{\"error\":\"{}\"}}", e),
+                                }
+                            };
+
+                            let response = tiny_http::Response::from_string(&response_body)
+                                .with_header(
+                                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()
+                                )
+                                .with_header(
+                                    tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap()
+                                )
+                                .with_header(
+                                    tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET,POST,PUT,DELETE,OPTIONS"[..]).unwrap()
+                                );
+                            let _ = request.respond(response);
+                        } else {
+                            // 404 not found
+                            let not_found = format!("{{\"error\":\"not found\",\"path\":\"{}\"}}", path_only);
+                            let response = tiny_http::Response::from_string(&not_found)
+                                .with_status_code(404)
+                                .with_header(
+                                    tiny_http::Header::from_bytes(
+                                        &b"Content-Type"[..],
+                                        &b"application/json"[..],
+                                    ).unwrap()
+                                );
+                            let _ = request.respond(response);
+                        }
+                    } // end loop
+                }); // end thread::spawn
+                handles.push(handle);
+            } // end worker pool loop
+
+            // Wait for all workers to finish (they exit on shutdown signal)
+            for h in handles {
+                let _ = h.join();
+            }
+            let _ = watcher_handle.join();
+
+            // If shutdown was triggered by file change or /_reload, re-parse and loop
+            if shutdown.load(Ordering::Relaxed) {
+                // Drop the http_server (Arc) -- all refs gone after join, port is released
+                drop(http_server);
+
+                // Brief pause to let OS release the port (Windows TIME_WAIT)
+                std::thread::sleep(std::time::Duration::from_millis(300));
+
+                // Re-parse the source file
+                if let Some(ref src_path) = source_file {
+                    match std::fs::read_to_string(src_path) {
+                        Ok(code) => {
+                            println!("[NovaLang] Re-parsing {}...", src_path);
+                            let spanned = lexer::tokenize_spanned(&code);
+                            let tokens: Vec<lexer::Token> = spanned.iter().map(|st| st.token.clone()).collect();
+                            let ast = crate::parser::parse(tokens);
+                            // Re-execute in a fresh runtime to pick up new function defs
+                            let mut fresh = Runtime::new();
+                            fresh.base_dir = base_dir.clone();
+                            fresh.source_file = source_file.clone();
+                            fresh.skip_tstart = true; // Prevent recursive server bind
+                            // Execute everything except tstart (which we handle ourselves)
+                            for stmt in &ast {
+                                match fresh.exec_stmt(stmt) {
+                                    Ok(Signal::None) | Ok(Signal::Return(_)) => {}
+                                    Ok(Signal::Break) | Ok(Signal::Continue) => {}
+                                    Err(e) => {
+                                        eprintln!("[NovaLang] Reload parse error: {}", e);
+                                        // On error, wait and retry
+                                        std::thread::sleep(std::time::Duration::from_secs(2));
+                                        break;
+                                    }
+                                }
+                                // If tstart was called, it means we've re-entered this function
+                                // recursively via the fresh runtime. We need to stop and let
+                                // the outer loop handle it instead.
+                            }
+                            // Update self with fresh functions and non-runtime state
+                            self.functions = fresh.functions;
+                            if let Some(fresh_global) = fresh.scopes.first() {
+                                if let Some(live_global) = self.scopes.first_mut() {
+                                    for (k, v) in fresh_global {
+                                        if !k.starts_with('_') {
+                                            live_global.insert(k.clone(), v.clone());
                                         }
                                     }
                                 }
                             }
-                            best.map(|(_, h)| h)
-                        });
-
-                    if let Some(fn_name) = handler_name {
-                        // Read request body
-                        let mut body = String::new();
-                        if let Ok(_) = request.as_reader().read_to_string(&mut body) {}
-
-                        // Build request dict
-                        let mut req_pairs: Vec<(String, Value)> = vec![
-                            ("method".into(), Value::Str(method.clone())),
-                            ("path".into(), Value::Str(path_only.clone())),
-                            ("body".into(), Value::Str(body.clone())),
-                        ];
-
-                        if let Some(q) = path.split('?').nth(1) {
-                            req_pairs.push(("query_string".into(), Value::Str(q.to_string())));
-                            let query_dict: Vec<(String, Value)> = q.split('&')
-                                .filter_map(|pair| {
-                                    let mut parts = pair.splitn(2, '=');
-                                    let key = parts.next()?.to_string();
-                                    let val = parts.next().unwrap_or("").to_string();
-                                    Some((key, Value::Str(val)))
-                                })
-                                .collect();
-                            req_pairs.push(("query".into(), Value::Dict(query_dict)));
-                        }
-
-                        let header_pairs: Vec<(String, Value)> = request.headers().iter()
-                            .map(|h| (h.field.to_string().to_lowercase(), Value::Str(h.value.to_string())))
-                            .collect();
-                        req_pairs.push(("headers".into(), Value::Dict(header_pairs)));
-
-                        let req_dict = Value::Dict(req_pairs);
-
-                        // Clone VM, call handler in this thread (concurrent!)
-                        let response_body = {
-                            let mut vm = vm_ref.lock().unwrap();
-                            let result = vm.call_fn(&fn_name, vec![req_dict]);
-                            match result {
-                                Ok(val) => builtins::call_builtin("json_encode", &[val])
-                                    .map(|v| v.to_display())
-                                    .unwrap_or_else(|| "null".into()),
-                                Err(e) => format!("{{\"error\":\"{}\"}}", e),
+                            // Update server def if routes changed
+                            if let Some(new_server) = fresh.servers.values().next() {
+                                // Update the local server variable for next loop iteration
+                                server = new_server.clone();
+                                self.servers.insert(
+                                    format!("server_{}", server.port),
+                                    new_server.clone(),
+                                );
                             }
-                        };
-
-                        let response = tiny_http::Response::from_string(&response_body)
-                            .with_header(
-                                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()
-                            )
-                            .with_header(
-                                tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap()
-                            )
-                            .with_header(
-                                tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET,POST,PUT,DELETE,OPTIONS"[..]).unwrap()
-                            );
-                        let _ = request.respond(response);
-                    } else {
-                        // 404 not found
-                        let not_found = format!("{{\"error\":\"not found\",\"path\":\"{}\"}}", path_only);
-                        let response = tiny_http::Response::from_string(&not_found)
-                            .with_status_code(404)
-                            .with_header(
-                                tiny_http::Header::from_bytes(
-                                    &b"Content-Type"[..],
-                                    &b"application/json"[..],
-                                ).unwrap()
-                            );
-                        let _ = request.respond(response);
+                            println!("[NovaLang] Reload complete, restarting server...");
+                        }
+                        Err(e) => {
+                            eprintln!("[NovaLang] Cannot read source for reload: {}", e);
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                        }
                     }
-                } // end loop
-            }); // end thread::spawn
-            handles.push(handle);
-        } // end worker pool loop
+                } else {
+                    // No source file -- full restart requested via /_reload
+                    // but we can't re-parse. Just re-bind with existing state.
+                    println!("[NovaLang] Restarting server (no source file for re-parse)...");
+                }
 
-        // Wait forever (server runs until process killed)
-        for h in handles {
-            let _ = h.join();
-        }
+                // Reset shutdown flag and loop back to re-bind
+                continue;
+            } else {
+                // Normal exit (process termination)
+                break;
+            }
+        } // end outer reload loop
 
         Ok(Value::Trit(1))
     }

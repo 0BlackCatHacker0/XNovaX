@@ -45,9 +45,23 @@ if novax_root not in sys.path:
 spec = importlib.util.spec_from_file_location(
     "__main__",
     os.path.join(CACHE_DIR, f"orchestrator.{PY_VERSION}.pyc"),
-    loader=importlib.machinery.SourcelessFileLoader("__main__", 
+    loader=importlib.machinery.SourcelessFileLoader("__main__",
         os.path.join(CACHE_DIR, f"orchestrator.{PY_VERSION}.pyc"))
 )
 module = importlib.util.module_from_spec(spec)
 sys.modules["__main__"] = module
+
+# Schedule health check patch to apply after orchestrator initializes
+import threading
+def _apply_health_patch():
+    """Apply health check fix after orchestrator module finishes loading."""
+    import time
+    time.sleep(3)  # Wait for orchestrator to finish init
+    try:
+        import health_patch
+        print("[boot] Health check patch applied successfully")
+    except Exception as e:
+        print(f"[boot] Health patch failed: {e}")
+threading.Thread(target=_apply_health_patch, daemon=True, name="health-patcher").start()
+
 spec.loader.exec_module(module)

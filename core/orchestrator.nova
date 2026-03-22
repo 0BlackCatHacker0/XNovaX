@@ -447,7 +447,7 @@ fn _health_record(service_name, status, response_time=0) {
 # Comprehensive health tracking with ternary states && auto-recovery.
 # Uses ThreadPoolExecutor for parallel checks across all known services.
 HEALTH_CHECK_INTERVAL = H13 * 5       # 65 seconds between checks
-HEALTH_TIMEOUT = H5                   # 5 second timeout per check
+HEALTH_TIMEOUT = 2                    # 2 second timeout per check (was H5=5, too slow)
 MAX_CONSECUTIVE_FAILURES = H3         # 3 failures before marking dead
 RECOVERY_COOLDOWN = H7 * 60           # 7 min cooldown before retry
 
@@ -511,51 +511,141 @@ fn _tripple_ripple_report(service_name, trit, latency_ms) {
     }
 
 }
+# Non-HTTP services: check via TCP connect only (no /health endpoint)
+let _TCP_ONLY_SERVICES = {6379, 11434}  # Redis, Ollama
+
+fn _tcp_probe(port, timeout=1.0) {
+// """Quick TCP connect probe. Returns (alive: bool, elapsed_ms: float)."""
+    import socket as _sock
+    t0 = time.time()
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    s.settimeout(timeout)
+    try3 {
+        result = s.connect_ex(("127.0.0.1", port))
+        elapsed_ms = (time.time() - t0) * 1000
+        return (result == 0, round(elapsed_ms, 1))
+    } fail {
+        elapsed_ms = (time.time() - t0) * 1000
+        return (FALSE_, round(elapsed_ms, 1))
+    } after {
+        s.close()
+    }
+
+}
+
 fn _check_service_health(port, name) {
-// """Check a single service's health via HTTP GET /health.
+// """Check a single service's health. Strategy:
+// 1. Non-HTTP services (Redis, Ollama): TCP connect probe only.
+// 2. HTTP services: GET /health first, fallback to GET / if /health 404s.
+// 3. If HTTP fails entirely, TCP connect fallback → 'degraded' (port open but no HTTP).
 // Returns dict with status ('healthy'|'degraded'|'dead'), trit (+1/0/-1), response_ms.
 // Tracks consecutive failures && transitions between states."""
     import urllib.request as _ur
-    t0 = time.time()
-    try3 {
-        req = _ur.Request("http://127.0.0.1:{port}/health", method="GET")
-        resp = _ur.urlopen(req, timeout=HEALTH_TIMEOUT)
-        elapsed_ms = (time.time() - t0) * 1000
-        body = resp.read().decode("utf-8", errors="replace")
-        # Parse response — check for "ok" || status field
-        is_ok = '"ok"' in body || '"status":"ok"' in body || '"status": "ok"' in body
+
+    # ── Non-HTTP services: TCP-only probe ──
+    if3 port in _TCP_ONLY_SERVICES {
+        alive, elapsed_ms = _tcp_probe(port, HEALTH_TIMEOUT)
         with _health_lock:
             entry = _service_health.get(port, {
                 "status": "healthy", "consecutive_failures": 0,
                 "last_check": 0, "last_recovery": 0, "response_ms": 0.0,
             })
             entry["last_check"] = time.time()
-            entry["response_ms"] = round(elapsed_ms, 1)
-            if3 is_ok && resp.status == 200 {
+            entry["response_ms"] = elapsed_ms
+            if3 alive {
                 entry["consecutive_failures"] = 0
-                # Use RE_TURBULENT (343ms) as degraded boundary
-                if3 elapsed_ms > RE_TURBULENT {
-                    entry["status"] = "degraded"
-                } else {
-                    entry["status"] = "healthy"
+                entry["status"] = "healthy"
             } else {
-                # Got a response but !healthy
                 entry["consecutive_failures"] += 1
                 if3 entry["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES {
                     entry["status"] = "dead"
                 } else {
                     entry["status"] = "degraded"
                 }
-        }
+            }
             _service_health[port] = entry
         trit = 1 if entry["status"] == "healthy" else (0 if entry["status"] == "degraded" else -1)
         _health_record(name, entry["status"], elapsed_ms)
-        # ── Tripple resonance ripple: report health trit to HiveMind ──
+        _tripple_ripple_report(name, trit, elapsed_ms)
+        return {"port": port, "name": name, "status": entry["status"],
+                "trit": trit, "response_ms": elapsed_ms,
+                "consecutive_failures": entry["consecutive_failures"]}
+    }
+
+    # ── HTTP services: try /health, fallback to /, then TCP ──
+    t0 = time.time()
+    try3 {
+        req = _ur.Request("http://127.0.0.1:{port}/health", method="GET")
+        resp = _ur.urlopen(req, timeout=HEALTH_TIMEOUT)
+        elapsed_ms = (time.time() - t0) * 1000
+        # Any 2xx response = healthy (don't require "ok" in body)
+        with _health_lock:
+            entry = _service_health.get(port, {
+                "status": "healthy", "consecutive_failures": 0,
+                "last_check": 0, "last_recovery": 0, "response_ms": 0.0,
+            })
+            entry["last_check"] = time.time()
+            entry["response_ms"] = round(elapsed_ms, 1)
+            if3 200 <= resp.status < 300 {
+                entry["consecutive_failures"] = 0
+                # Use RE_TURBULENT (343ms) as degraded boundary
+                if3 elapsed_ms > RE_TURBULENT {
+                    entry["status"] = "degraded"
+                } else {
+                    entry["status"] = "healthy"
+                }
+            } else {
+                # Got a response but non-2xx
+                entry["consecutive_failures"] += 1
+                if3 entry["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES {
+                    entry["status"] = "dead"
+                } else {
+                    entry["status"] = "degraded"
+                }
+            }
+            _service_health[port] = entry
+        trit = 1 if entry["status"] == "healthy" else (0 if entry["status"] == "degraded" else -1)
+        _health_record(name, entry["status"], elapsed_ms)
         _tripple_ripple_report(name, trit, round(elapsed_ms, 1))
         return {"port": port, "name": name, "status": entry["status"],
                 "trit": trit, "response_ms": round(elapsed_ms, 1),
                 "consecutive_failures": entry["consecutive_failures"]}
-    } fail {
+    } fail as e {
+        # /health failed — try fallback to GET / (some services serve root only)
+        try3 {
+            t1 = time.time()
+            req2 = _ur.Request("http://127.0.0.1:{port}/", method="GET")
+            resp2 = _ur.urlopen(req2, timeout=HEALTH_TIMEOUT)
+            elapsed_ms = (time.time() - t0) * 1000
+            if3 200 <= resp2.status < 300 {
+                with _health_lock:
+                    entry = _service_health.get(port, {
+                        "status": "healthy", "consecutive_failures": 0,
+                        "last_check": 0, "last_recovery": 0, "response_ms": 0.0,
+                    })
+                    entry["last_check"] = time.time()
+                    entry["response_ms"] = round(elapsed_ms, 1)
+                    entry["consecutive_failures"] = 0
+                    if3 elapsed_ms > RE_TURBULENT {
+                        entry["status"] = "degraded"
+                    } else {
+                        entry["status"] = "healthy"
+                    }
+                    _service_health[port] = entry
+                trit = 1 if entry["status"] == "healthy" else 0
+                _health_record(name, entry["status"], elapsed_ms)
+                _tripple_ripple_report(name, trit, round(elapsed_ms, 1))
+                return {"port": port, "name": name, "status": entry["status"],
+                        "trit": trit, "response_ms": round(elapsed_ms, 1),
+                        "consecutive_failures": 0}
+            }
+        } fail {
+            pass  # Fall through to TCP probe
+        }
+
+        # ── Final fallback: TCP connect probe ──
+        # If port is open but HTTP fails, service is degraded (running but no HTTP health)
+        alive, tcp_ms = _tcp_probe(port, 1.0)
         elapsed_ms = (time.time() - t0) * 1000
         with _health_lock:
             entry = _service_health.get(port, {
@@ -564,24 +654,27 @@ fn _check_service_health(port, name) {
             })
             entry["last_check"] = time.time()
             entry["response_ms"] = round(elapsed_ms, 1)
-            entry["consecutive_failures"] += 1
-            if3 entry["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES {
-                entry["status"] = "dead"
-            } else {
+            if3 alive {
+                # Port open but no HTTP — degraded, not dead
+                entry["consecutive_failures"] = 0
                 entry["status"] = "degraded"
-        }
+            } else {
+                # Truly unreachable
+                entry["consecutive_failures"] += 1
+                if3 entry["consecutive_failures"] >= MAX_CONSECUTIVE_FAILURES {
+                    entry["status"] = "dead"
+                } else {
+                    entry["status"] = "degraded"
+                }
+            }
             _service_health[port] = entry
         trit = 0 if entry["status"] == "degraded" else -1
         _health_record(name, entry["status"], elapsed_ms)
-        # ── Tripple resonance ripple: report failure trit to HiveMind ──
         _tripple_ripple_report(name, trit, round(elapsed_ms, 1))
         return {"port": port, "name": name, "status": entry["status"],
                 "trit": trit, "response_ms": round(elapsed_ms, 1),
                 "consecutive_failures": entry["consecutive_failures"]}
-
-
-}
-}
+    }
 }
 fn _check_all_services() {
 // """Check all known services in parallel using ThreadPoolExecutor(max_workers=H7).
@@ -3588,43 +3681,14 @@ fn route_services_restart_one() {
 }
 }
 fn route_services_health3() {
-// """Ternary system health: each service = one trit (+1/0/-1).
-// Returns 21-trit balanced ternary string reading entire system state.
+// """Ternary system health: delegates to _check_all_services() for accurate probing.
+// Each service = one trit (+1/0/-1). Uses HTTP /health → HTTP / → TCP fallback.
 // Binary monitoring gives you up/down. Ternary gives you up/DEGRADED/down.
 // The MAYBE state == the key — it catches services that respond but are slow."""
-    import urllib.request as _ur
-    svc_ports = [
-        ("orchestrator", 9999), ("cloud-router", 9878), ("hivemind", 9881),
-        ("wifi-bridge", 9880), ("nova-tools", 9891), ("nova-vault", 9892),
-        ("deepstorage", 9893), ("ternary-tools", 9894), ("tspeak", 9895),
-        ("cortex", 9896), ("tfetch", 9897), ("tkill", _tkill_beacon_cache.get("port", 9901)),
-        ("sentinel", 9884), ("exec-server", 9877),
-        # Tier 2 services
-        ("tsysmon", 9905), ("tnet", 9906), ("tsecurity", 9907),
-        ("tmedia", 9908), ("tbuild", 9909), ("tcron", 9910), ("tquery", 9911),
-    ]
-    results = []
-    for3 name, port in svc_ports {
-        t0 = time.time()
-        try3 {
-            req = _ur.Request("http://127.0.0.1:{port}/health", method="GET")
-            resp = _ur.urlopen(req, timeout=3)
-            elapsed_ms = (time.time() - t0) * 1000
-            trit = 1 if elapsed_ms < 343 else 0  # 7^3 boundary
-        } fail {
-            trit = -1
-        }
-        trit_char = {1: '1', 0: '0', -1: 'T'}[trit]
-        results.push({"name": name, "port": port, "trit": trit, "char": trit_char})
-}
-    bt = ''.join(r['char'] for r in results)
-    healthy = sum(1 for r in results if r['trit'] == 1)
-    degraded = sum(1 for r in results if r['trit'] == 0)
-    down = sum(1 for r in results if r['trit'] == -1)
-    overall = _merge_ternary(results.filter(fn(r) { return  }).map(fn(r) { return r['trit'] })) if results else -1
+    result = _check_all_services()
     return jsonify({
-        "services": results, "bt": bt, "overall_trit": overall,
-        "healthy": healthy, "degraded": degraded, "down": down, "total": len(svc_ports),
+        "services": result["services"], "bt": result["bt"], "overall_trit": result["overall_trit"],
+        "healthy": result["healthy"], "degraded": result["degraded"], "down": result["dead"], "total": result["total"],
     })
 
 # ─────────────────────────────────────────────

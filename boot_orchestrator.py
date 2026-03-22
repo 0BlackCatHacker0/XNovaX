@@ -59,6 +59,15 @@ except Exception as e:
 # Phase 5: Start the Flask/SocketIO server
 import orchestrator as orch
 
+# Phase 5.5: Apply health check patch (fixes false "dead" reports)
+# Must happen after orchestrator is imported but before server starts
+try:
+    import health_patch
+    health_patch.apply_patch()
+    print("  Health patch: applied")
+except Exception as e:
+    print(f"  Health patch: FAILED - {e}")
+
 if hasattr(orch, 'socketio') and hasattr(orch, 'app'):
     print("Starting SocketIO server on 127.0.0.1:9999 (threaded)...")
     orch.socketio.run(orch.app, host='127.0.0.1', port=9999, allow_unsafe_werkzeug=True)

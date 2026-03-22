@@ -1,6 +1,6 @@
-"""NovaX Neural Voice Server — edge-tts powered
+"""NovaX Neural Voice Server -- edge-tts powered
 Serves audio files that the browser plays directly.
-Port 9801 — lightweight HTTP server.
+Port 9801 -- lightweight HTTP server.
 """
 import http.server, json, asyncio, os, time, hashlib, threading
 
@@ -126,6 +126,75 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
                 "cached": os.path.exists(fpath)
             }).encode())
 
+        elif self.path == "/voice/query":
+            # Full voice pipeline: text prompt -> AI query -> TTS audio
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+            prompt = body.get("text", "") or body.get("prompt", "")
+            if not prompt:
+                self.send_response(400)
+                self._cors()
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": -1, "error": "no text"}).encode())
+                return
+            # Step 1: Query AI via orchestrator, fallback to cloud router
+            reply = ""
+            model = "unknown"
+            try:
+                import urllib.request
+                qbody = json.dumps({"text": prompt, "mode": "speed"}).encode()
+                req = urllib.request.Request(
+                    "http://127.0.0.1:9999/think",
+                    data=qbody,
+                    headers={"Content-Type": "application/json"}
+                )
+                resp = urllib.request.urlopen(req, timeout=20)
+                d = json.loads(resp.read().decode())
+                reply = d.get("reply", "") or d.get("response", "")
+                model = d.get("model", "nova")
+            except Exception:
+                pass
+            if not reply:
+                try:
+                    qbody = json.dumps({"prompt": prompt + ". Plain text only. No markdown."}).encode()
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:9878/api/v1/query",
+                        data=qbody,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    resp = urllib.request.urlopen(req, timeout=20)
+                    d = json.loads(resp.read().decode())
+                    reply = d.get("response", "") or d.get("reply", "")
+                    model = d.get("model", d.get("provider", "cloud"))
+                except Exception as e:
+                    reply = "AI query failed: " + str(e)
+            # Step 2: Generate TTS for the reply
+            audio_url = ""
+            if reply:
+                clean = reply[:1000]
+                h = hashlib.md5((clean + VOICE + RATE).encode()).hexdigest()[:12]
+                fname = "nova_" + h + ".mp3"
+                fpath = os.path.join(AUDIO_DIR, fname)
+                if not os.path.exists(fpath):
+                    try:
+                        asyncio.run(self._generate(clean, VOICE, RATE, fpath))
+                    except Exception:
+                        pass
+                if os.path.exists(fpath):
+                    audio_url = "http://127.0.0.1:" + str(PORT) + "/audio/" + fname
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "ok": 1, "trit": 1,
+                "prompt": prompt,
+                "reply": reply,
+                "model": model,
+                "audio_url": audio_url
+            }).encode())
+
         elif self.path == "/set-voice":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length > 0 else {}
@@ -146,7 +215,8 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
         communicate = edge_tts.Communicate(text, voice, rate=rate)
         await communicate.save(output_path)
 
-print(f"NovaX Neural Voice Server v1.0 on port {PORT}")
+print(f"NovaX Neural Voice Server v1.1 on port {PORT}")
 print(f"Voice: {VOICE} | Audio dir: {AUDIO_DIR}")
+print("Endpoints: /speak, /voice/query, /set-voice, /voices, /audio/*, /health")
 server = http.server.HTTPServer(("127.0.0.1", PORT), VoiceHandler)
 server.serve_forever()
