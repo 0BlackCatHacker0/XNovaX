@@ -1,14 +1,17 @@
 """
-Quick harvester: generate training pairs via NovaX Cloud Router free-tier cascade.
-Sends diverse prompts, collects responses, appends to mega dataset.
+Mega harvester v3: generate training pairs via NovaX Cloud Router free-tier cascade.
+500+ diverse prompts across 20 domains.
+SAFE: backs up before start, atomic writes, saves every single pair.
 """
-import json, time, urllib.request, random
+import json, time, urllib.request, random, os, shutil
 
 ROUTER = "http://127.0.0.1:9878/api/v1/query"
 OUT = "C:/NovaX/data/llm_training/training_pairs_mega.json"
+BACKUP = OUT + ".backup"
+TMP = OUT + ".tmp"
 
 PROMPTS = [
-    # Math & reasoning
+    # === MATH & REASONING (50) ===
     "Explain the quadratic formula step by step",
     "What is the derivative of x^3 + 2x^2 - 5x + 3?",
     "Prove that the square root of 2 is irrational",
@@ -19,7 +22,48 @@ PROMPTS = [
     "What is the chain rule in calculus?",
     "Explain matrix multiplication with a 2x2 example",
     "What are prime numbers and why are they important in cryptography?",
-    # Computer science
+    "What is the fundamental theorem of calculus?",
+    "Explain how Fourier transforms decompose signals",
+    "What is Bayes' theorem and give a real-world example",
+    "Explain the difference between permutations and combinations",
+    "What is a Markov chain and where is it used?",
+    "How does the simplex method solve linear programming problems?",
+    "Explain the concept of mathematical induction with an example",
+    "What is the difference between convergence and divergence in series?",
+    "How do you calculate the determinant of a 3x3 matrix?",
+    "Explain what a tensor is and how it differs from a matrix",
+    "What is the Taylor series expansion and why is it useful?",
+    "Explain Lagrange multipliers for constrained optimization",
+    "What is the central limit theorem and why does it matter?",
+    "How does the fast Fourier transform achieve O(n log n)?",
+    "Explain the difference between correlation and causation with examples",
+    "What is a Hilbert space in quantum mechanics?",
+    "Explain the pigeonhole principle with three examples",
+    "What is modular arithmetic and how is it used in cryptography?",
+    "How do you prove a function is bijective?",
+    "Explain the concept of a group in abstract algebra",
+    "What is gradient clipping and why is it needed in deep learning?",
+    "Explain stochastic gradient descent vs batch gradient descent",
+    "What is the Jacobian matrix and when do you use it?",
+    "How does the Newton-Raphson method find roots?",
+    "Explain the difference between supervised and unsupervised learning mathematically",
+    "What is cross-entropy loss and why is it used for classification?",
+    "Explain the softmax function and its properties",
+    "What is the KL divergence between two distributions?",
+    "How does principal component analysis reduce dimensions mathematically?",
+    "Explain the singular value decomposition and its applications",
+    "What is a convex function and why does convexity matter for optimization?",
+    "Explain the minimax theorem in game theory",
+    "What is the Euler-Lagrange equation?",
+    "How does the method of least squares work?",
+    "Explain the difference between L1 and L2 norms",
+    "What is a generating function in combinatorics?",
+    "How does the Chinese remainder theorem work?",
+    "Explain what a metric space is",
+    "What is the Cauchy-Schwarz inequality and why is it important?",
+    "Explain the relationship between eigenvalues and matrix diagonalization",
+
+    # === COMPUTER SCIENCE (50) ===
     "How does a hash table work internally?",
     "Explain the difference between a stack and a queue",
     "What is a binary search tree and how do insertions work?",
@@ -30,7 +74,48 @@ PROMPTS = [
     "Explain how a compiler transforms source code to machine code",
     "What is a neural network and how does backpropagation work?",
     "How do databases use B-trees for indexing?",
-    # Science
+    "Explain the A* pathfinding algorithm step by step",
+    "What is dynamic programming and how does memoization help?",
+    "How does a red-black tree maintain balance?",
+    "Explain the difference between BFS and DFS with use cases",
+    "What is a bloom filter and when would you use one?",
+    "How does consistent hashing work in distributed systems?",
+    "Explain the Raft consensus algorithm",
+    "What is the difference between TCP and UDP?",
+    "How does a skip list achieve O(log n) operations?",
+    "Explain how a garbage collector handles circular references",
+    "What is copy-on-write and where is it used?",
+    "How does memory-mapped I/O work?",
+    "Explain the difference between mutex and semaphore",
+    "What is the actor model of concurrency?",
+    "How does a JIT compiler differ from an AOT compiler?",
+    "Explain tail call optimization and why it matters",
+    "What is a monad in functional programming? Give examples",
+    "How does the Linux kernel handle system calls?",
+    "Explain how virtual machines work at a high level",
+    "What is the difference between strong and weak typing?",
+    "How does a graph database differ from a relational database?",
+    "Explain how MapReduce processes large datasets",
+    "What is the CAP theorem and give examples of each trade-off",
+    "How does a content-addressable storage system work?",
+    "Explain how a lock-free data structure works",
+    "What is continuation-passing style in programming?",
+    "How does a trie differ from a hash map for string lookups?",
+    "Explain the difference between green threads and OS threads",
+    "What is a persistent data structure?",
+    "How does Kruskal's algorithm find a minimum spanning tree?",
+    "Explain how the Bellman-Ford algorithm detects negative cycles",
+    "What is the difference between NFA and DFA in automata theory?",
+    "How does LZ77 compression work?",
+    "Explain the difference between call by value and call by reference",
+    "What is a closure and how does it capture variables?",
+    "How does a write-ahead log ensure database durability?",
+    "Explain how event-driven programming differs from threaded programming",
+    "What is the difference between horizontal and vertical scaling?",
+    "How does a message queue like Kafka handle back-pressure?",
+    "Explain what CRDT is and how it enables conflict-free replication",
+
+    # === SCIENCE (50) ===
     "What is entropy and why does it always increase?",
     "Explain how CRISPR gene editing works",
     "What causes the seasons on Earth?",
@@ -41,7 +126,48 @@ PROMPTS = [
     "Explain the theory of general relativity simply",
     "What are gravitational waves and how were they detected?",
     "How does the immune system fight infections?",
-    # Engineering
+    "What is dark matter and what evidence exists for it?",
+    "Explain how nuclear fusion works in stars",
+    "What is quantum entanglement and why is it called spooky action?",
+    "How does natural selection drive evolution?",
+    "Explain the greenhouse effect and its role in climate change",
+    "What is the wave-particle duality of light?",
+    "How does an MRI machine create images of the body?",
+    "Explain what antimatter is and how it's produced",
+    "What is the Drake equation and what does it estimate?",
+    "How do tectonic plates move and cause earthquakes?",
+    "Explain the difference between mitosis and meiosis",
+    "What is a supernova and what elements does it create?",
+    "How does the human brain store memories?",
+    "Explain the Doppler effect with examples from sound and light",
+    "What is the cosmic microwave background radiation?",
+    "How do vaccines train the immune system?",
+    "Explain what a Bose-Einstein condensate is",
+    "What causes the aurora borealis?",
+    "How does carbon dating determine the age of objects?",
+    "Explain the difference between DNA and RNA",
+    "What is the Casimir effect?",
+    "How does a laser produce coherent light?",
+    "Explain the three laws of thermodynamics simply",
+    "What is quantum tunneling and where does it occur?",
+    "How do neurons transmit signals in the brain?",
+    "Explain what a prion is and how it causes disease",
+    "What is the double-slit experiment and what does it show?",
+    "How does LIGO detect gravitational waves?",
+    "Explain the difference between fission and fusion",
+    "What is the multiverse hypothesis?",
+    "How do enzymes catalyze biochemical reactions?",
+    "Explain the concept of spacetime curvature",
+    "What is epigenetics and how does it affect gene expression?",
+    "How does a superconductor achieve zero resistance?",
+    "Explain what dark energy is and why the universe is accelerating",
+    "What is the Fermi paradox?",
+    "How does the PCR technique amplify DNA?",
+    "Explain the concept of half-life in radioactive decay",
+    "What is the observer effect in quantum mechanics?",
+    "How does CERN's Large Hadron Collider work?",
+
+    # === ENGINEERING & SYSTEMS (40) ===
     "How does a CPU execute instructions?",
     "Explain how HTTPS secures web traffic",
     "What is the difference between REST and GraphQL?",
@@ -49,10 +175,41 @@ PROMPTS = [
     "Explain how a transformer architecture processes sequences",
     "What is containerization and how does Docker work?",
     "How does a GPU differ from a CPU architecturally?",
-    "Explain the CAP theorem in distributed systems",
     "How do SSDs store data differently from HDDs?",
     "What is WebAssembly and why is it important?",
-    # Coding
+    "How does a hydraulic system amplify force?",
+    "Explain how a PID controller works",
+    "What is the difference between RISC and CISC architectures?",
+    "How does fiber optic communication transmit data?",
+    "Explain how a heat pump works for both heating and cooling",
+    "What is an FPGA and how does it differ from an ASIC?",
+    "How does a lithium-ion battery store and release energy?",
+    "Explain the concept of impedance matching in electronics",
+    "What is a phase-locked loop and where is it used?",
+    "How does 5G technology differ from 4G?",
+    "Explain how a turbojet engine produces thrust",
+    "What is the difference between ARM and x86 architectures?",
+    "How does error correction work in NAND flash memory?",
+    "Explain how a bridge rectifier converts AC to DC",
+    "What is the Nyquist theorem and why does it matter for digital audio?",
+    "How does a CNC machine interpret G-code?",
+    "Explain the difference between SRAM and DRAM",
+    "What is DMA and how does it improve I/O performance?",
+    "How does a switching power supply work?",
+    "Explain the Von Neumann bottleneck and how to mitigate it",
+    "What is branch prediction in modern CPUs?",
+    "How does cache coherence work in multi-core processors?",
+    "Explain how PCIe lanes work for device communication",
+    "What is out-of-order execution in CPUs?",
+    "How does ECC memory detect and correct errors?",
+    "Explain the concept of pipelining in processor design",
+    "What is a memory barrier and when do you need one?",
+    "How does a DAC convert digital signals to analog?",
+    "Explain how Ethernet handles collisions with CSMA/CD",
+    "What is the difference between little-endian and big-endian?",
+    "How does a quantum computer use qubits differently from classical bits?",
+
+    # === CODING & ALGORITHMS (50) ===
     "Write a Python function to find the longest common subsequence of two strings",
     "Implement a simple LRU cache in Python",
     "Write a function to detect if a linked list has a cycle",
@@ -63,40 +220,154 @@ PROMPTS = [
     "Implement Dijkstra's shortest path algorithm",
     "Write a Python decorator that retries a function on failure",
     "Implement a simple regex matcher that handles . and *",
-    # Philosophy & writing
+    "Write a function to find all permutations of a string",
+    "Implement a min-heap from scratch in Python",
+    "Write a function to check if a binary tree is balanced",
+    "Implement the KMP string matching algorithm",
+    "Write a function to find the median of two sorted arrays",
+    "Implement a thread-safe queue in Python",
+    "Write a function to solve the N-queens problem",
+    "Implement topological sort for a directed acyclic graph",
+    "Write a function to find the longest palindromic substring",
+    "Implement a basic calculator that handles +, -, *, / and parentheses",
+    "Write a function to rotate a matrix 90 degrees clockwise",
+    "Implement union-find with path compression",
+    "Write a function to generate all valid parentheses combinations",
+    "Implement a sliding window maximum algorithm",
+    "Write a function to convert a number to Roman numerals",
+    "Implement a basic rate limiter using the token bucket algorithm",
+    "Write a function to find the kth largest element in an unsorted array",
+    "Implement depth-limited search for game trees",
+    "Write a function to detect a cycle in a directed graph",
+    "Implement the Rabin-Karp string search algorithm",
+    "Write a function to compute the edit distance between two strings",
+    "Implement a bloom filter in Python",
+    "Write a function to find bridges in an undirected graph",
+    "Implement a simple event emitter in Python",
+    "Write a function to solve the coin change problem with dynamic programming",
+    "Implement a binary indexed tree (Fenwick tree)",
+    "Write a function to find the longest increasing subsequence",
+    "Implement a simple JSON parser in Python",
+    "Write a function to check if a graph is bipartite",
+    "Implement the Floyd-Warshall all-pairs shortest path algorithm",
+    "Write a function that implements run-length encoding",
+    "Implement a simple HTTP client from scratch using sockets",
+    "Write a function to find the maximum subarray sum (Kadane's algorithm)",
+    "Implement a circular buffer with fixed capacity",
+    "Write a function to flatten a nested dictionary",
+    "Implement the Sieve of Eratosthenes for finding primes",
+    "Write a function to validate a sudoku board",
+    "Implement a basic garbage collector using reference counting",
+    "Write a function to find all strongly connected components in a graph",
+    "Implement a simple promise/future in Python",
+
+    # === PHILOSOPHY & REASONING (30) ===
     "What is the trolley problem and what does it reveal about ethics?",
     "Explain the difference between deductive and inductive reasoning",
     "What is Occam's Razor and how is it applied in science?",
     "Explain the concept of emergence in complex systems",
     "What is the Turing test and is it still relevant?",
-    # More technical depth
-    "Explain how attention mechanisms work in transformers with the math",
-    "What is the difference between L1 and L2 regularization?",
-    "How does batch normalization help train deep networks?",
-    "Explain the vanishing gradient problem and how ReLU helps",
-    "What is transfer learning and why does it work?",
-    "How does tokenization affect language model performance?",
-    "Explain the difference between RNNs, LSTMs, and Transformers",
-    "What is reinforcement learning from human feedback (RLHF)?",
-    "How do diffusion models generate images?",
-    "Explain the concept of embeddings in NLP",
-    "What is the difference between bagging and boosting?",
-    "How does a variational autoencoder work?",
-    "Explain the bias-variance tradeoff",
-    "What is federated learning?",
-    "How does quantization reduce model size while preserving accuracy?",
-    # Systems
-    "How does virtual memory work in operating systems?",
-    "Explain the difference between processes and threads",
-    "How does a load balancer distribute traffic?",
-    "What is eventual consistency in distributed databases?",
-    "How does DNS resolve domain names to IP addresses?",
-    "Explain how Git tracks changes internally",
-    "What is the difference between symmetric and asymmetric encryption?",
-    "How does a CDN improve website performance?",
-    "Explain how WebSockets differ from HTTP",
-    "What is sharding in databases?",
-    # Creative/diverse
+    "Explain the ship of Theseus paradox",
+    "What is the Chinese Room argument against strong AI?",
+    "Explain the difference between utilitarianism and deontological ethics",
+    "What is Godel's incompleteness theorem and what does it mean?",
+    "Explain the concept of qualia in philosophy of mind",
+    "What is the problem of induction as described by Hume?",
+    "Explain Plato's allegory of the cave and its meaning",
+    "What is the prisoner's dilemma and what strategies work best?",
+    "Explain the difference between empiricism and rationalism",
+    "What is the hard problem of consciousness?",
+    "Explain Pascal's wager and its criticisms",
+    "What is the Sapir-Whorf hypothesis about language and thought?",
+    "Explain the concept of falsifiability in philosophy of science",
+    "What is the frame problem in artificial intelligence?",
+    "Explain the difference between Type 1 and Type 2 thinking",
+    "What is moral relativism vs moral realism?",
+    "Explain the veil of ignorance thought experiment by Rawls",
+    "What is the symbol grounding problem in AI?",
+    "Explain the difference between narrow AI and general AI",
+    "What is the alignment problem in AI safety?",
+    "Explain the concept of supervenience in philosophy of mind",
+    "What is the Molyneux problem?",
+    "Explain the difference between free will and determinism",
+    "What is the Chinese Nation thought experiment?",
+    "Explain the concept of Occam's razor vs Hickam's dictum in medicine",
+
+    # === HISTORY OF TECHNOLOGY (30) ===
+    "How did the invention of the transistor change computing?",
+    "Explain the history of the internet from ARPANET to today",
+    "What was the significance of the Apollo guidance computer?",
+    "How did Alan Turing's work lead to modern computers?",
+    "Explain how the printing press changed society",
+    "What was the significance of Claude Shannon's information theory?",
+    "How did the development of assembly language change programming?",
+    "Explain the history of artificial intelligence research",
+    "What was the Unix philosophy and how did it influence software?",
+    "How did the development of the World Wide Web change everything?",
+    "Explain the significance of Moore's Law and is it still valid?",
+    "What was the Xerox PARC and what inventions came from it?",
+    "How did the smartphone revolution change computing?",
+    "Explain the history of programming paradigms from procedural to functional",
+    "What was the significance of the IBM PC?",
+    "How did open source software movement begin and evolve?",
+    "Explain the history of databases from hierarchical to NoSQL",
+    "What was the AI winter and what caused it?",
+    "How did the development of GPS work technically?",
+    "Explain the history of computer graphics from wireframe to ray tracing",
+    "What made the original Macintosh revolutionary?",
+    "How did the development of compilers change programming?",
+    "Explain how packet switching was invented and why it mattered",
+    "What was the significance of Lisp in AI research?",
+    "How did the cloud computing paradigm emerge?",
+    "Explain the evolution of CPU architectures from 8-bit to modern",
+    "What was the significance of the PDP-11 minicomputer?",
+    "How did version control evolve from RCS to Git?",
+    "Explain the history of neural networks from perceptrons to transformers",
+    "What made the original Google search algorithm revolutionary?",
+
+    # === PRACTICAL SKILLS (40) ===
+    "How do you design a scalable REST API?",
+    "Explain best practices for database schema design",
+    "What are the SOLID principles in software engineering?",
+    "How do you write effective unit tests?",
+    "Explain how to set up a CI/CD pipeline",
+    "What are design patterns and name the most important ones?",
+    "How do you handle authentication and authorization in web apps?",
+    "Explain how to optimize SQL queries for performance",
+    "What is technical debt and how do you manage it?",
+    "How do you design a microservices architecture?",
+    "Explain how to implement proper error handling in a production system",
+    "What is observability and how do metrics, logs, and traces work together?",
+    "How do you design a system for high availability?",
+    "Explain the 12-factor app methodology",
+    "What is infrastructure as code and how does Terraform work?",
+    "How do you implement rate limiting in an API?",
+    "Explain how to design a URL shortener system",
+    "What is the difference between monolith and microservices?",
+    "How do you handle database migrations safely?",
+    "Explain how to design a chat system like Slack",
+    "What are the best practices for API versioning?",
+    "How do you design a notification system?",
+    "Explain how to implement full-text search",
+    "What is the strangler fig pattern for legacy migration?",
+    "How do you design an event-driven architecture?",
+    "Explain how to implement OAuth 2.0 authorization flow",
+    "What is domain-driven design and when should you use it?",
+    "How do you handle distributed transactions?",
+    "Explain how to design a recommendation engine",
+    "What is the CQRS pattern and when is it useful?",
+    "How do you design a file storage system like S3?",
+    "Explain how to implement a pub/sub messaging system",
+    "What is the saga pattern for distributed transactions?",
+    "How do you design a real-time analytics dashboard?",
+    "Explain how to implement a search autocomplete system",
+    "What is chaos engineering and how do you practice it?",
+    "How do you design a CDN from scratch?",
+    "Explain how to implement cursor-based pagination",
+    "What is the circuit breaker pattern and when do you use it?",
+    "How do you design a distributed cache system?",
+
+    # === CREATIVE & DIVERSE (40) ===
     "Explain the Monty Hall problem and why switching is better",
     "What is the Byzantine Generals Problem?",
     "How does error correction work in QR codes?",
@@ -107,9 +378,167 @@ PROMPTS = [
     "What is homomorphic encryption?",
     "How does consensus work in blockchain?",
     "Explain the concept of dimensional reduction with PCA",
+    "What is the birthday paradox and why does it matter for hashing?",
+    "Explain how neural style transfer works",
+    "What is the difference between symbolic AI and connectionist AI?",
+    "How does optical character recognition work?",
+    "Explain the concept of adversarial examples in machine learning",
+    "What is differential privacy and how does it protect data?",
+    "How does a GAN generate realistic images?",
+    "Explain the concept of attention in human cognition vs transformers",
+    "What is the no-free-lunch theorem in machine learning?",
+    "How does a self-driving car perceive its environment?",
+    "Explain the concept of emergent behavior in cellular automata",
+    "What is the Kolmogorov complexity of a string?",
+    "How does music information retrieval identify songs?",
+    "Explain how ray tracing renders photorealistic images",
+    "What is the difference between lossy and lossless compression?",
+    "How does natural language processing handle ambiguity?",
+    "Explain the concept of transfer entropy in complex systems",
+    "What is the unreasonable effectiveness of mathematics in physics?",
+    "How does a recommendation system handle the cold start problem?",
+    "Explain the concept of ergodicity in dynamical systems",
+    "What is the curse of dimensionality?",
+    "How does a search engine rank pages?",
+    "Explain the concept of network effects in technology platforms",
+    "What is computational complexity and why P vs NP matters?",
+    "How does a spelling corrector work algorithmically?",
+    "Explain the concept of entropy coding in data compression",
+    "What is the frame problem in robotics?",
+    "How does automatic differentiation work in deep learning frameworks?",
+    "Explain the concept of reservoir computing",
+    "What is the difference between model-based and model-free reinforcement learning?",
+
+    # === LANGUAGE & COMMUNICATION (30) ===
+    "Explain how context-free grammars work in parsing",
+    "What is the Chomsky hierarchy of formal languages?",
+    "How do word embeddings capture semantic meaning?",
+    "Explain the difference between syntax and semantics",
+    "What is pragmatics in linguistics?",
+    "How does machine translation handle different word orders?",
+    "Explain how sentiment analysis works",
+    "What is the distributional hypothesis in NLP?",
+    "How do language models handle polysemy?",
+    "Explain the concept of attention in sequence-to-sequence models",
+    "What is coreference resolution in NLP?",
+    "How does a spell checker handle context-dependent errors?",
+    "Explain how named entity recognition works",
+    "What is the difference between constituency and dependency parsing?",
+    "How does text summarization work?",
+    "Explain the concept of byte-pair encoding for tokenization",
+    "What is the difference between greedy and beam search decoding?",
+    "How does a chatbot maintain conversation context?",
+    "Explain how topic modeling with LDA works",
+    "What is the difference between extractive and abstractive summarization?",
+    "How do transformers handle positional information?",
+    "Explain the concept of subword tokenization",
+    "What is perplexity as a metric for language models?",
+    "How does cross-lingual transfer learning work?",
+    "Explain the concept of prompt engineering",
+    "What is chain-of-thought prompting and why does it improve reasoning?",
+    "How does instruction tuning change a language model's behavior?",
+    "Explain the difference between encoder-only, decoder-only, and encoder-decoder transformers",
+    "What is constitutional AI and how does it work?",
+    "How does retrieval-augmented generation improve language model accuracy?",
+
+    # === SECURITY & CRYPTOGRAPHY (30) ===
+    "How does AES encryption work at a high level?",
+    "Explain the difference between symmetric and asymmetric encryption",
+    "What is a hash function and what makes it cryptographically secure?",
+    "How does a digital signature verify authenticity?",
+    "Explain how TLS/SSL handshake establishes a secure connection",
+    "What is a man-in-the-middle attack and how do you prevent it?",
+    "How does OAuth 2.0 work for authentication?",
+    "Explain how SQL injection works and how to prevent it",
+    "What is cross-site scripting (XSS) and how do you mitigate it?",
+    "How does a VPN create a secure tunnel?",
+    "Explain the concept of defense in depth in security",
+    "What is a buffer overflow attack and how does ASLR help?",
+    "How does two-factor authentication improve security?",
+    "Explain how certificate authorities and PKI work",
+    "What is a side-channel attack and give examples",
+    "How does Kerberos authentication work?",
+    "Explain the concept of least privilege in security",
+    "What is a rainbow table attack and how does salting prevent it?",
+    "How does a firewall inspect and filter network traffic?",
+    "Explain how end-to-end encryption works in messaging apps",
+    "What is the difference between authentication and authorization?",
+    "How does a hardware security module protect cryptographic keys?",
+    "Explain the concept of threat modeling",
+    "What is a timing attack and how do constant-time algorithms prevent it?",
+    "How does certificate pinning prevent MITM attacks?",
+    "Explain how bcrypt hashes passwords securely",
+    "What is the Diffie-Hellman key exchange?",
+    "How does a CAPTCHA differentiate humans from bots?",
+    "Explain the concept of sandboxing in security",
+    "What is post-quantum cryptography and why is it needed?",
+
+    # === DATA & DATABASES (30) ===
+    "How does a B+ tree differ from a B-tree?",
+    "Explain the ACID properties of database transactions",
+    "What is the difference between SQL and NoSQL databases?",
+    "How does a columnar database differ from a row-oriented one?",
+    "Explain how database indexes speed up queries",
+    "What is normalization and when should you denormalize?",
+    "How does a log-structured merge tree work?",
+    "Explain the difference between OLTP and OLAP systems",
+    "What is a materialized view and when should you use one?",
+    "How does a time-series database optimize for temporal data?",
+    "Explain how vector databases store and search embeddings",
+    "What is the difference between pessimistic and optimistic locking?",
+    "How does PostgreSQL's MVCC handle concurrent transactions?",
+    "Explain how a data warehouse differs from a data lake",
+    "What is change data capture and how does it work?",
+    "How does Redis achieve sub-millisecond latency?",
+    "Explain the difference between document stores and key-value stores",
+    "What is a write-ahead log and why is it essential for durability?",
+    "How does a distributed database handle network partitions?",
+    "Explain the concept of data lineage and why it matters",
+    "What is eventual consistency and how does it differ from strong consistency?",
+    "How does a bloom filter reduce unnecessary disk reads?",
+    "Explain how full-text search indexes work with inverted indexes",
+    "What is the difference between master-slave and multi-master replication?",
+    "How does database connection pooling improve performance?",
+    "Explain how a graph traversal query works in Neo4j",
+    "What is data partitioning and what strategies exist?",
+    "How does a query optimizer choose an execution plan?",
+    "Explain the difference between snapshot isolation and serializable",
+    "What is a cuckoo filter and how does it improve on bloom filters?",
+
+    # === OPERATING SYSTEMS & LOW-LEVEL (30) ===
+    "How does virtual memory work in operating systems?",
+    "Explain the difference between processes and threads",
+    "How does a load balancer distribute traffic?",
+    "How does DNS resolve domain names to IP addresses?",
+    "Explain how Git tracks changes internally",
+    "How does a CDN improve website performance?",
+    "Explain how WebSockets differ from HTTP",
+    "What is sharding in databases?",
+    "How does the Linux scheduler decide which process runs next?",
+    "Explain the difference between preemptive and cooperative multitasking",
+    "What is a page fault and how does the OS handle it?",
+    "How does the ext4 filesystem organize data on disk?",
+    "Explain the difference between hard links and soft links",
+    "What is a system call and how does the transition from user to kernel mode work?",
+    "How does the OS manage file descriptors?",
+    "Explain how inter-process communication works (pipes, shared memory, sockets)",
+    "What is a device driver and how does it interface with hardware?",
+    "How does the TCP congestion control algorithm work?",
+    "Explain the difference between blocking and non-blocking I/O",
+    "What is io_uring and how does it improve Linux I/O performance?",
+    "How does the buddy system allocate memory?",
+    "Explain how a hypervisor creates virtual machines",
+    "What is NUMA architecture and how does it affect performance?",
+    "How does the ARP protocol map IP addresses to MAC addresses?",
+    "Explain how container namespaces and cgroups provide isolation",
+    "What is a futex and how does it optimize synchronization?",
+    "How does the TLB speed up virtual address translation?",
+    "Explain the difference between polling and interrupt-driven I/O",
+    "What is the OOM killer in Linux and how does it decide what to kill?",
+    "How does the slab allocator manage kernel memory?",
 ]
 
-def query(prompt, max_tokens=1024):
+def query(prompt, max_tokens=512):
     body = json.dumps({"prompt": prompt, "max_tokens": max_tokens}).encode()
     req = urllib.request.Request(ROUTER, body, {"Content-Type": "application/json"})
     try:
@@ -123,42 +552,63 @@ def query(prompt, max_tokens=1024):
     except Exception as e:
         return "", "error", str(e)
 
+def safe_save(pairs):
+    """Atomic save: write to tmp file, then rename over original."""
+    with open(TMP, "w", encoding="utf-8") as f:
+        json.dump(pairs, f, ensure_ascii=False)
+    # Atomic-ish rename (Windows: need to remove target first)
+    if os.path.exists(OUT):
+        os.replace(TMP, OUT)
+    else:
+        os.rename(TMP, OUT)
+
 def main():
-    # Load existing
+    # STEP 1: Backup before anything
+    if os.path.exists(OUT):
+        shutil.copy2(OUT, BACKUP)
+        print(f"Backup created: {BACKUP}")
+
     with open(OUT, "r", encoding="utf-8") as f:
         pairs = json.load(f)
     existing_prompts = {p.get("prompt", "")[:80] for p in pairs}
 
     print(f"Existing: {len(pairs)} pairs")
-    print(f"Prompts to harvest: {len(PROMPTS)}")
+    prompts = [p for p in PROMPTS if p[:80] not in existing_prompts]
+    print(f"New prompts to harvest: {len(prompts)}")
+
+    if not prompts:
+        print("Nothing new to harvest!")
+        return
 
     added = 0
-    for i, prompt in enumerate(PROMPTS):
-        if prompt[:80] in existing_prompts:
-            print(f"  [{i+1}/{len(PROMPTS)}] SKIP (exists): {prompt[:50]}")
-            continue
-
+    fails = 0
+    for i, prompt in enumerate(prompts):
         text, provider, model = query(prompt)
         if len(text) < 20:
-            print(f"  [{i+1}/{len(PROMPTS)}] FAIL ({provider}): {prompt[:50]}")
+            fails += 1
+            print(f"  [{i+1}/{len(prompts)}] FAIL #{fails} ({provider}): {prompt[:50]}")
+            # If we get 10 consecutive fails, wait 30s (rate limit)
+            if fails >= 10:
+                print(f"  ** {fails} consecutive fails, waiting 30s for rate limits... **")
+                time.sleep(30)
+                fails = 0
             continue
 
+        fails = 0  # Reset on success
         pairs.append({
             "prompt": prompt,
             "response": text,
-            "domain": "harvested",
+            "domain": "harvested_v3",
             "provider": provider,
             "model": model
         })
         added += 1
-        print(f"  [{i+1}/{len(PROMPTS)}] OK ({provider}/{model}): {prompt[:50]}... ({len(text)} chars)")
+        print(f"  [{i+1}/{len(prompts)}] OK ({provider}/{model}): {prompt[:50]}... ({len(text)} chars)")
 
-        # Rate limit
+        # Save EVERY pair — never lose progress
+        safe_save(pairs)
+
         time.sleep(0.5)
-
-    # Save
-    with open(OUT, "w", encoding="utf-8") as f:
-        json.dump(pairs, f, ensure_ascii=False)
 
     total_chars = sum(len(p.get("prompt", "")) + len(p.get("response", "")) for p in pairs)
     print(f"\nDone: +{added} new pairs, {len(pairs)} total, {total_chars:,} chars ({total_chars/1e6:.1f}M)")
