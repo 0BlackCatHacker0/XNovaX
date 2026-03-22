@@ -2,6 +2,10 @@
 
 > A single-person-built AI OS where a custom ternary transformer commands 661 models, 109 microservices, and a custom programming language — all running on a laptop.
 
+![NovaX Boot Screen](web/images/boot-screen.png)
+
+*NovaX OS boot screen — AES-256-XTS encrypted, ternary matrix rain, one password to unlock*
+
 ---
 
 ## What is NovaX?
