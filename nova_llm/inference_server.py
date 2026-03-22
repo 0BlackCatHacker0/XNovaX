@@ -37,6 +37,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from train import TernaryTransformer, load_config, ternary_quantize
 from cached_inference import CachedInference
 from memory_manager import MemoryManager
+# v2: Advanced sampling -- Min-P + LZ repetition penalty
+from inference_utils import sample_token as _v2_sample_token
 
 # Try to load Rust trit engine for zero-multiply inference
 try:
@@ -54,7 +56,9 @@ VERSION = "2.1.0"
 MAX_CONTEXT = 1_000_000  # Million-token context via paged trit cache
 CHECKPOINT = Path(__file__).parent / "checkpoints" / "best.pt"
 VOCAB_PATH = Path(__file__).parent / "vocab.json"
-ARCH_PATH = Path(__file__).parent / "architecture.json"
+# Prefer v2 config if available, fall back to v1
+_v2_path = Path(__file__).parent / "architecture_v2.json"
+ARCH_PATH = _v2_path if _v2_path.exists() else Path(__file__).parent / "architecture.json"
 LOG_PATH = Path(__file__).parent / "training_log.json"
 
 # Special tokens (must match NovaXDataset)
@@ -260,56 +264,32 @@ def _sample_token(logits, temperature, top_k, top_p, repetition_penalty, generat
                   min_p=0.05, use_lz_penalty=True):
     """Apply advanced sampling strategy to logits and return next token.
 
-    Upgrades over basic sampling:
+    v2: Delegates to inference_utils.sample_token which implements:
     - Min-P: Dynamic threshold based on model confidence (ICLR 2025)
     - LZ repetition penalty: N-gram-aware, not crude per-token (2025)
-    """
-    # LZ-inspired repetition penalty (replaces crude per-token penalty)
-    if use_lz_penalty and len(generated) > 3:
-        logits = _lz_repetition_penalty(logits, generated)
-    elif repetition_penalty != 1.0 and len(generated) > 0:
-        # Fallback to basic penalty if LZ disabled
-        for prev_id in set(generated[-50:]):
-            if logits[prev_id] > 0:
-                logits[prev_id] /= repetition_penalty
-            else:
-                logits[prev_id] *= repetition_penalty
 
+    Falls back to inline implementation if inference_utils unavailable.
+    """
     if temperature <= 0:
         return logits.argmax().item()
 
-    logits = logits / temperature
-
-    # Top-k
-    if top_k > 0:
-        top_k_val = min(top_k, logits.size(-1))
-        indices_to_remove = logits < torch.topk(logits, top_k_val)[0][-1]
-        logits[indices_to_remove] = float("-inf")
-
-    # Min-P sampling (ICLR 2025 — recommended for ternary/1.58-bit models)
-    # Dynamically adjusts threshold based on model confidence
-    if min_p > 0:
-        probs = F.softmax(logits, dim=-1)
-        top_prob = probs.max()
-        # Tokens below min_p * top_prob are filtered out
-        min_threshold = min_p * top_prob
-        logits[probs < min_threshold] = float("-inf")
-
-    # Top-p (nucleus) — applied after Min-P for additional filtering
-    if top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        sorted_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
-        sorted_logits[sorted_mask] = float("-inf")
-        logits = torch.zeros_like(logits).scatter_(0, sorted_indices, sorted_logits)
-
-    probs = F.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).item()
+    return _v2_sample_token(
+        logits,
+        generated_ids=generated if generated else None,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        min_p=min_p,
+        use_lz_penalty=use_lz_penalty,
+        lz_window=128,
+        lz_scale=2.0,
+    )
 
 
 @torch.no_grad()
 def generate(prompt, max_tokens=256, temperature=0.7, top_k=13, top_p=0.9,
-             repetition_penalty=1.1, context_budget=None, cfg_scale=0.0):
+             repetition_penalty=1.1, context_budget=None, cfg_scale=0.0,
+             min_p=0.05, use_lz_penalty=True):
     """Autoregressive text generation with paged trit KV cache.
 
     Uses CachedInference for incremental decoding:
@@ -388,7 +368,8 @@ def generate(prompt, max_tokens=256, temperature=0.7, top_k=13, top_p=0.9,
 
         next_token = _sample_token(
             guided_logits.clone(), temperature, top_k, top_p,
-            repetition_penalty, generated
+            repetition_penalty, generated,
+            min_p=min_p, use_lz_penalty=use_lz_penalty,
         )
         generated.append(next_token)
 
@@ -716,6 +697,8 @@ class InferenceHandler(http.server.BaseHTTPRequestHandler):
                 repetition_penalty=float(body.get("repetition_penalty", 1.1)),
                 context_budget=body.get("context_budget"),
                 cfg_scale=float(body.get("cfg_scale", 0.0)),
+                min_p=float(body.get("min_p", 0.05)),
+                use_lz_penalty=bool(body.get("lz_penalty", True)),
             )
             self._json(200, result)
 

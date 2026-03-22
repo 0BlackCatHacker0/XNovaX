@@ -1,0 +1,1 @@
+C:\NovaX\novalang-vm\target\x86_64-pc-windows-gnu\release\libnovalang.rlib: C:\NovaX\novalang-vm\src\builtins.rs C:\NovaX\novalang-vm\src\isa.rs C:\NovaX\novalang-vm\src\lexer.rs C:\NovaX\novalang-vm\src\lib.rs C:\NovaX\novalang-vm\src\parser.rs C:\NovaX\novalang-vm\src\tmatmul.rs C:\NovaX\novalang-vm\src\vm.rs

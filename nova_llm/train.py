@@ -33,6 +33,11 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
 
+# v2: Grouped Query Attention (4x KV cache reduction)
+from gqa_attention import TernaryGQAttention
+
+import random
+
 # ============================================================
 # 3-5-7-13 HARMONIC CONSTANTS
 # ============================================================
@@ -46,9 +51,63 @@ RE_TRANSITIONAL = 5 ** 3 # 125
 RE_TURBULENT = 7 ** 3    # 343
 
 # ============================================================
+# FIM (Fill-in-the-Middle) SPECIAL TOKENS -- v2
+# ============================================================
+# Token IDs 6, 7, 8 are reserved (after PAD=0, BOS=1, EOS=2, UNK=3, MASK=4, SEP=5)
+FIM_PREFIX = 6   # <fim_prefix>
+FIM_MIDDLE = 7   # <fim_middle>
+FIM_SUFFIX = 8   # <fim_suffix>
+FIM_RATE = 0.3   # 30% of training examples get FIM transformation
+
+
+def apply_fim_transform(token_ids, fim_rate=FIM_RATE):
+    """Apply Fill-in-the-Middle (FIM) transformation to a token sequence.
+
+    With probability fim_rate, splits the sequence at a random point and
+    rearranges into SPM format:
+        [SUFFIX] suffix [PREFIX] prefix [MIDDLE] middle
+
+    This teaches the model to infill code/text given surrounding context.
+    FIM is "free" -- no quality degradation on standard benchmarks.
+
+    Args:
+        token_ids: list of token IDs (without BOS/EOS -- just content)
+        fim_rate: probability of applying FIM (0.3 = 30%)
+
+    Returns:
+        Transformed token IDs (or original if FIM not applied)
+    """
+    if random.random() > fim_rate:
+        return token_ids
+
+    if len(token_ids) < 6:
+        return token_ids  # Too short to split meaningfully
+
+    # Random split point (avoid edges)
+    split = random.randint(2, len(token_ids) - 2)
+
+    prefix = token_ids[:split]
+    middle_and_suffix = token_ids[split:]
+
+    # Second split for middle vs suffix (take at least 1 token each)
+    if len(middle_and_suffix) > 2:
+        split2 = random.randint(1, len(middle_and_suffix) - 1)
+        middle = middle_and_suffix[:split2]
+        suffix = middle_and_suffix[split2:]
+    else:
+        middle = middle_and_suffix[:1]
+        suffix = middle_and_suffix[1:]
+
+    # SPM format: [SUFFIX] suffix [PREFIX] prefix [MIDDLE] middle
+    return [FIM_SUFFIX] + suffix + [FIM_PREFIX] + prefix + [FIM_MIDDLE] + middle
+
+
+# ============================================================
 # CONFIGURATION (loaded from architecture.json)
 # ============================================================
-ARCH_PATH = Path(__file__).parent / "architecture.json"
+# Prefer v2 config if available, fall back to v1
+_v2_path = Path(__file__).parent / "architecture_v2.json"
+ARCH_PATH = _v2_path if _v2_path.exists() else Path(__file__).parent / "architecture.json"
 DATA_PATH = Path("C:/NovaX/data/llm_training/training_pairs_mega.json")
 VOCAB_PATH = Path(__file__).parent / "vocab.json"
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
@@ -302,11 +361,21 @@ class TernaryTransformerBlock(nn.Module):
         FFN(x) = (TernaryGELU(W1 * x)) * (W2 * x)
         out = W3 * FFN(x)
     """
-    def __init__(self, embed_dim, num_heads, head_dim, ffn_dim, dropout=0.1):
+    def __init__(self, embed_dim, num_heads, head_dim, ffn_dim, dropout=0.1,
+                 num_kv_heads=None):
         super().__init__()
-        # Attention block
+        # Attention block -- use GQA if num_kv_heads specified (v2)
         self.attn_norm = TernaryRMSNorm(embed_dim)
-        self.attn = TernaryMultiHeadAttention(embed_dim, num_heads, head_dim)
+        if num_kv_heads is not None and num_kv_heads < num_heads:
+            # v2: Grouped Query Attention (4x KV cache reduction)
+            self.attn = TernaryGQAttention(
+                embed_dim, num_heads, num_kv_heads, head_dim,
+                TernaryLinearCls=TernaryLinear,
+                RoPECls=RotaryPositionalEncoding,
+            )
+        else:
+            # v1: Standard multi-head attention
+            self.attn = TernaryMultiHeadAttention(embed_dim, num_heads, head_dim)
         self.attn_drop = nn.Dropout(dropout)
 
         # FFN block (SwiGLU-style with ternary GELU)
@@ -359,14 +428,16 @@ class TernaryTransformer(nn.Module):
         self.head_dim = model_cfg["head_dim"]
         self.ffn_dim = model_cfg["ffn_dim"]
         self.max_seq_len = model_cfg["max_seq_len"]
+        self.num_kv_heads = model_cfg.get("num_kv_heads", None)  # v2: GQA
 
         # Token embedding (full precision lookup)
         self.token_emb = TernaryEmbedding(self.vocab_size, self.embed_dim, padding_idx=0)
 
-        # Transformer blocks (H13 = 13 layers)
+        # Transformer blocks
         self.layers = nn.ModuleList([
             TernaryTransformerBlock(
-                self.embed_dim, self.num_heads, self.head_dim, self.ffn_dim
+                self.embed_dim, self.num_heads, self.head_dim, self.ffn_dim,
+                num_kv_heads=self.num_kv_heads,
             )
             for _ in range(self.num_layers)
         ])
@@ -445,8 +516,9 @@ class NovaXDataset(Dataset):
     SEP = 5
     PAD = 0
 
-    def __init__(self, data_path, vocab_path, block_size=BLOCK):
+    def __init__(self, data_path, vocab_path, block_size=BLOCK, fim_rate=0.0):
         self.block_size = block_size
+        self.fim_rate = fim_rate  # v2: FIM training objective
 
         # Load training pairs
         print(f"Loading training data from {data_path}...")
@@ -499,21 +571,34 @@ class NovaXDataset(Dataset):
         return ids
 
     def _pretokenize(self):
-        """Pre-tokenize entire dataset once (eliminates BPE overhead per step)."""
+        """Pre-tokenize entire dataset once (eliminates BPE overhead per step).
+
+        When FIM is enabled (fim_rate > 0), stores raw content IDs separately
+        so FIM transformation can be applied dynamically per __getitem__ call.
+        """
         print("  Pre-tokenizing dataset...")
         self._tokenized = []
+        self._raw_content = []  # v2: raw content for dynamic FIM
         for pair in self.pairs:
             prompt = pair.get("prompt", "") or pair.get("input", "")
             response = pair.get("response", "") or pair.get("output", "") or pair.get("completion", "")
             prompt_ids = self._encode_text(prompt)
             response_ids = self._encode_text(response)
-            full_ids = [self.BOS] + prompt_ids + [self.SEP] + response_ids + [self.EOS]
+            content_ids = prompt_ids + [self.SEP] + response_ids
+
+            if self.fim_rate > 0:
+                # Store raw content for dynamic FIM in __getitem__
+                self._raw_content.append(content_ids)
+
+            full_ids = [self.BOS] + content_ids + [self.EOS]
             if len(full_ids) > self.block_size:
                 full_ids = full_ids[:self.block_size]
             pad_len = self.block_size - len(full_ids)
             full_ids = full_ids + [self.PAD] * pad_len
             self._tokenized.append(torch.tensor(full_ids, dtype=torch.long))
-        print(f"  Pre-tokenized {len(self._tokenized)} pairs")
+
+        fim_str = f", FIM rate={self.fim_rate}" if self.fim_rate > 0 else ""
+        print(f"  Pre-tokenized {len(self._tokenized)} pairs{fim_str}")
 
     def __len__(self):
         return len(self.pairs)
@@ -521,6 +606,17 @@ class NovaXDataset(Dataset):
     def __getitem__(self, idx):
         # Use pre-tokenized data if available (fast path)
         if hasattr(self, '_tokenized') and self._tokenized:
+            # v2: Dynamic FIM on pretokenized data
+            if self.fim_rate > 0 and hasattr(self, '_raw_content') and self._raw_content:
+                content = list(self._raw_content[idx])  # copy for mutation
+                content = apply_fim_transform(content, self.fim_rate)
+                full_ids = [self.BOS] + content + [self.EOS]
+                if len(full_ids) > self.block_size:
+                    full_ids = full_ids[:self.block_size]
+                pad_len = self.block_size - len(full_ids)
+                full_ids = full_ids + [self.PAD] * pad_len
+                t = torch.tensor(full_ids, dtype=torch.long)
+                return t[:-1], t[1:]
             full_ids = self._tokenized[idx]
             return full_ids[:-1], full_ids[1:]
 
@@ -531,7 +627,12 @@ class NovaXDataset(Dataset):
         # Encode: <BOS> prompt <SEP> response <EOS>
         prompt_ids = self._encode_text(prompt)
         response_ids = self._encode_text(response)
-        full_ids = [self.BOS] + prompt_ids + [self.SEP] + response_ids + [self.EOS]
+
+        # v2: FIM transformation (30% of examples)
+        content_ids = prompt_ids + [self.SEP] + response_ids
+        if self.fim_rate > 0:
+            content_ids = apply_fim_transform(content_ids, self.fim_rate)
+        full_ids = [self.BOS] + content_ids + [self.EOS]
 
         # Truncate if needed
         if len(full_ids) > self.block_size:
@@ -573,7 +674,7 @@ def train(resume_path=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*60}")
-    print(f"  NovaX LLM v1 — Ternary Transformer Training")
+    print(f"  NovaX LLM v2 -- Ternary Transformer Training")
     print(f"{'='*60}")
     print(f"  Device:         {device}")
     if device.type == "cuda":
@@ -581,11 +682,17 @@ def train(resume_path=None):
         print(f"  VRAM:           {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print(f"  Parameters:     {model_cfg['vocab_size']} vocab, {model_cfg['embedding_dim']} dim")
     print(f"  Layers:         {model_cfg['num_layers']} (H13)")
-    print(f"  Heads:          {model_cfg['num_heads']} (H7) x {model_cfg['head_dim']} (3^5)")
-    print(f"  FFN dim:        {model_cfg['ffn_dim']} (3^8)")
+    num_kv = model_cfg.get('num_kv_heads', model_cfg['num_heads'])
+    print(f"  Heads:          {model_cfg['num_heads']} Q x {num_kv} KV x {model_cfg['head_dim']} dim")
+    if num_kv < model_cfg['num_heads']:
+        print(f"  Attention:      GQA-{model_cfg['num_heads']//num_kv} ({model_cfg['num_heads']//num_kv}x KV cache reduction)")
+    print(f"  FFN dim:        {model_cfg['ffn_dim']}")
     print(f"  Block size:     {model_cfg['block_size']} (3^7 = BLOCK)")
-    print(f"  Batch size:     {train_cfg['batch_size']} (RE_LAMINAR)")
-    print(f"  Grad accum:     {train_cfg['gradient_accumulation']} (H3)")
+    print(f"  Batch size:     {train_cfg['batch_size']}")
+    print(f"  Grad accum:     {train_cfg['gradient_accumulation']}")
+    if train_cfg.get('fim_rate', 0) > 0:
+        print(f"  FIM rate:       {train_cfg['fim_rate']*100:.0f}% (Fill-in-the-Middle)")
+    print(f"  Eff batch:      {train_cfg['batch_size'] * train_cfg['gradient_accumulation']}")
     print(f"  Warmup:         {train_cfg['warmup_steps']} (RE_TURBULENT)")
     print(f"  Total steps:    {train_cfg['total_steps']}")
     print(f"  Weight format:  ternary {{-1, 0, +1}}")
@@ -604,7 +711,9 @@ def train(resume_path=None):
     print(f"  Ternary model size: ~{param_count * 2 / 8 / 1e6:.0f} MB (2-bit packed)")
 
     # Dataset and dataloader
-    dataset = NovaXDataset(DATA_PATH, VOCAB_PATH, block_size=model_cfg["block_size"])
+    fim_rate = train_cfg.get("fim_rate", 0.0)  # v2: FIM training
+    dataset = NovaXDataset(DATA_PATH, VOCAB_PATH, block_size=model_cfg["block_size"],
+                           fim_rate=fim_rate)
     dataset._pretokenize()  # Pre-tokenize once, eliminates BPE overhead per step
     dataloader = DataLoader(
         dataset,

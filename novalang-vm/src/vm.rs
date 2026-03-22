@@ -127,7 +127,17 @@ impl Runtime {
         match stmt {
             Stmt::Let(name, expr) => {
                 let val = self.eval_expr(expr)?;
-                self.set_var(name.clone(), val);
+                // Bug 2 fix: if the variable already exists in any enclosing scope,
+                // update it there instead of creating a new local that shadows it.
+                // This ensures `let x = expr` inside for3/if3/while3/try3 blocks
+                // modifies the enclosing scope's variable, not creates an invisible local.
+                // In function scope (top of stack), set_var and update_var behave the same.
+                let exists_in_scope = self.scopes.iter().rev().any(|s| s.contains_key(name.as_str()));
+                if exists_in_scope {
+                    self.update_var(name, val);
+                } else {
+                    self.set_var(name.clone(), val);
+                }
                 Ok(Signal::None)
             }
             Stmt::Assign(name, expr) => {
@@ -212,6 +222,7 @@ impl Runtime {
                 if maybe_body.is_some() {
                     // Ternary branching: TRUE (+1/positive) → then, MAYBE (0/null) → maybe, FALSE (-1/negative) → else
                     let trit = match &val {
+                        Value::Trit(t) => *t,
                         Value::Int(n) => if *n > 0 { 1 } else if *n == 0 { 0 } else { -1 },
                         Value::Float(f) => if *f > 0.0 { 1 } else if *f == 0.0 { 0 } else { -1 },
                         Value::Bool(b) => if *b { 1 } else { -1 },
@@ -837,6 +848,25 @@ impl Runtime {
     // ── Binary Operations ──
 
     fn apply_binop(&self, op: &Op, lv: &Value, rv: &Value) -> Value {
+        // Bug 3 fix: auto-coerce Trit to Int for arithmetic contexts.
+        // When a Trit participates in math or string concatenation with numbers,
+        // treat it as its integer value (1/0/-1) rather than a trit label.
+        let lv_coerced;
+        let rv_coerced;
+        let lv = match (op, lv) {
+            (Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod, Value::Trit(t)) => {
+                lv_coerced = Value::Int(*t as i64);
+                &lv_coerced
+            }
+            _ => lv,
+        };
+        let rv = match (op, rv) {
+            (Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod, Value::Trit(t)) => {
+                rv_coerced = Value::Int(*t as i64);
+                &rv_coerced
+            }
+            _ => rv,
+        };
         match op {
             Op::Add => {
                 // String concatenation
