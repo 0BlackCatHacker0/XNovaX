@@ -14,9 +14,14 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Lanzaboote — Secure Boot for NixOS
+    lanzaboote = {
+      url = "github:nix-community/lanzaboote/v0.4.2";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, ... }:
+  outputs = { self, nixpkgs, rust-overlay, lanzaboote, ... }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
@@ -36,6 +41,7 @@
         inherit system;
         specialArgs = { inherit pkgs; };
         modules = [
+          lanzaboote.nixosModules.lanzaboote   # Secure Boot
           ./configuration.nix
           ./novax-services.nix
           ./boot-splash.nix

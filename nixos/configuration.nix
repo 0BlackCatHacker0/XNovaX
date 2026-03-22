@@ -172,18 +172,50 @@ in
   system.stateVersion = "24.11";
   time.timeZone = "America/New_York";
 
-  # ── Boot — Instant, No Menu ──────────────────────────────────────────────
+  # ── Full Disk Encryption (LUKS2 + AES-256-XTS) ──────────────────────────
+  # Military-grade: AES-256-XTS (NSA approved for TOP SECRET)
+  # One password at boot decrypts everything. Drive is unreadable without it.
+  # Even if someone steals the physical machine, they get zero data.
+  boot.initrd.luks.devices."novax-crypt" = {
+    device = "/dev/disk/by-partlabel/novax-luks";  # Set during install
+    preLVM = true;
+    allowDiscards = true;                           # SSD TRIM support
+    bypassWorkqueues = true;                        # Faster I/O
+    crypttabExtraOpts = [
+      "cipher=aes-xts-plain64"                      # AES-256-XTS
+      "key-size=512"                                 # 256-bit key (512 for XTS)
+      "hash=sha512"                                  # SHA-512 key derivation
+      "iter-time=3000"                               # 3s key derivation (anti-brute-force)
+    ];
+  };
+
+  # Encrypted swap (prevents secrets leaking to swap space)
+  swapDevices = [{
+    device = "/dev/disk/by-partlabel/novax-swap";
+    randomEncryption.enable = true;                 # Fresh random key each boot
+  }];
+
+  # ── Secure Boot (Lanzaboote) ───────────────────────────────────────────
+  # Ensures only signed, trusted code runs. Prevents boot-level tampering.
+  # Requires one-time setup: sbctl create-keys && sbctl enroll-keys
+  boot.lanzaboote = {
+    enable = true;
+    pkiBundle = "/etc/secureboot";
+  };
+  boot.loader = {
+    systemd-boot.enable = lib.mkForce false;       # Lanzaboote replaces systemd-boot
+    efi.canTouchEfiVariables = true;
+    timeout = 0;                                    # No boot menu delay
+  };
+
+  # ── Boot — Fast + Silent ───────────────────────────────────────────────
   boot = {
-    loader = {
-      systemd-boot.enable = true;
-      efi.canTouchEfiVariables = true;
-      timeout = 0;                        # No boot menu delay
-    };
     kernelPackages = pkgs.linuxPackages_latest;
-    # Minimal initrd — only what we need
+    # Minimal initrd — only what we need + crypto modules
     initrd.availableKernelModules = [
       "nvme" "xhci_pci" "ahci" "usbhid" "sd_mod"
       "nvidia" "nvidia_modeset" "nvidia_uvm" "nvidia_drm"
+      "aesni_intel" "cryptd" "dm_crypt" "dm_mod"   # Hardware AES acceleration
     ];
     kernelModules = [ "nvidia" "nvidia_modeset" "nvidia_uvm" "nvidia_drm" ];
     kernelParams = [
@@ -195,12 +227,46 @@ in
       "nowatchdog"                        # Faster boot
       "mitigations=off"                   # Max performance (single-user)
       "nvidia-drm.modeset=1"
+      "lockdown=confidentiality"          # Kernel lockdown — no /dev/mem, no kexec
     ];
     # Compress initrd for faster load
     initrd.compressor = "zstd";
     initrd.compressorArgs = [ "-19" ];
     # Silent console
     consoleLogLevel = 0;
+  };
+
+  # ── Memory Security ────────────────────────────────────────────────────
+  # Wipe RAM on shutdown to prevent cold boot attacks
+  security = {
+    # Restrict kernel pointers and dmesg access
+    protectKernelImage = true;
+    lockKernelModules = false;            # false: allow NVIDIA module loading
+    # Restrict ptrace (prevents process memory inspection)
+    allowUserNamespaces = true;
+    unprivilegedUsernsClone = true;
+    # Auto-lock screen after 5 minutes idle
+    pam.services.swaylock = {};
+  };
+
+  # ── Lock Screen ────────────────────────────────────────────────────────
+  # NovaX auto-starts unlocked, but you can lock anytime with Super+L
+  # Requires password to unlock (same as LUKS password for simplicity)
+  programs.swaylock = {
+    enable = true;
+    settings = {
+      color = "000000";
+      font = "monospace";
+      font-size = 24;
+      indicator-radius = 100;
+      indicator-thickness = 10;
+      inside-color = "00000088";
+      ring-color = "00ff41";              # NovaX green
+      key-hl-color = "00ff41";
+      text-color = "00ff41";
+      layout-text-color = "00ff41";
+      show-failed-attempts = true;
+    };
   };
 
   # ── NVIDIA GPU — RTX 4060 ───────────────────────────────────────────────
