@@ -44,10 +44,10 @@ impl Value {
             Value::Float(f) => format!("{}", f),
             Value::Str(s) => s.clone(),
             Value::Bool(b) => if *b { "true".into() } else { "false".into() },
-            Value::Trit(1) => "TRUE".into(),
-            Value::Trit(0) => "MAYBE".into(),
-            Value::Trit(-1) => "FALSE".into(),
-            Value::Trit(t) => format!("Trit({})", t),
+            // Bug 3 fix: Trit values display as their integer values (1/0/-1)
+            // so they work correctly in string interpolation and str() conversion.
+            // Use trit_label3() or trit_fmt3() for human-readable labels.
+            Value::Trit(t) => (*t as i64).to_string(),
             Value::List(items) => {
                 let inner: Vec<String> = items.iter().map(|v| v.to_repr()).collect();
                 format!("[{}]", inner.join(", "))

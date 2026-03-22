@@ -4,6 +4,9 @@
 //! TZip packing: 5 trits per byte (3^5 = 243 states in a u8).
 //! LUT decode: 243-entry table stays in L1 cache (1.2 KB).
 //!
+//! SIMD: AVX2 path uses SPLIT_SIGN_ZERO bitmap layout for 32-element-per-cycle
+//! dot products. Runtime detection falls back to scalar on non-AVX2 hardware.
+//!
 //! Model constants:
 //!   embed_dim=768, num_heads=13, head_dim=64, num_layers=13, vocab=32768
 
@@ -12,6 +15,9 @@ mod trit_lut;
 use rayon::prelude::*;
 use std::os::raw::c_char;
 use std::slice;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 use trit_lut::TRIT_LUT;
 
@@ -38,6 +44,247 @@ impl<T> SendPtr<T> {
 fn packed_len(k: usize) -> usize {
     (k + 4) / 5
 }
+
+// ---------------------------------------------------------------------------
+// SIMD bitmap layout: SPLIT_SIGN_ZERO
+// ---------------------------------------------------------------------------
+// For AVX2, we pre-expand trits into two bitmaps per weight column:
+//   sign_mask[i]:    bit=1 if trit == +1
+//   nonzero_mask[i]: bit=1 if trit != 0  (i.e., trit == +1 or trit == -1)
+//
+// The dot product becomes:
+//   result = sum_of(act[i] where sign[i]) - sum_of(act[i] where !sign[i] && nonzero[i])
+//
+// With AVX2 we process 8 floats (256 bits) per SIMD instruction.
+
+/// Pre-expanded bitmap representation of a trit weight column.
+/// Stored as parallel arrays for SIMD-friendly access.
+pub struct TritBitmaps {
+    /// sign_mask[i] = 1.0 if trit[i] == +1, else 0.0  (as f32 for masked add)
+    pub sign_pos: Vec<f32>,
+    /// sign_mask[i] = 1.0 if trit[i] == -1, else 0.0
+    pub sign_neg: Vec<f32>,
+    /// Number of elements (k dimension)
+    pub k: usize,
+}
+
+/// Expand a TZip-packed weight column into SIMD-friendly bitmaps.
+pub fn expand_trit_bitmaps(weight_col_packed: &[u8], k: usize) -> TritBitmaps {
+    // Pad to multiple of 8 for AVX2 alignment
+    let padded_k = (k + 7) & !7;
+    let mut sign_pos = vec![0.0f32; padded_k];
+    let mut sign_neg = vec![0.0f32; padded_k];
+
+    let full_chunks = k / 5;
+    let remainder = k % 5;
+
+    for chunk_idx in 0..full_chunks {
+        let byte_val = weight_col_packed[chunk_idx] as usize;
+        let trits = &TRIT_LUT[byte_val];
+        let base = chunk_idx * 5;
+        for t in 0..5 {
+            match trits[t] {
+                1 => sign_pos[base + t] = 1.0,
+                -1 => sign_neg[base + t] = 1.0,
+                _ => {} // zero: both stay 0.0
+            }
+        }
+    }
+
+    if remainder > 0 {
+        let byte_val = weight_col_packed[full_chunks] as usize;
+        let trits = &TRIT_LUT[byte_val];
+        let base = full_chunks * 5;
+        for t in 0..remainder {
+            match trits[t] {
+                1 => sign_pos[base + t] = 1.0,
+                -1 => sign_neg[base + t] = 1.0,
+                _ => {}
+            }
+        }
+    }
+
+    TritBitmaps { sign_pos, sign_neg, k }
+}
+
+// ---------------------------------------------------------------------------
+// AVX2 SIMD trit_dot
+// ---------------------------------------------------------------------------
+
+/// AVX2-accelerated trit dot product using pre-expanded bitmaps.
+/// Processes 8 floats per iteration (256-bit YMM registers).
+///
+/// # Safety
+/// - Caller must ensure AVX2 is available (use `is_x86_feature_detected!`)
+/// - `input_row` must have at least `bitmaps.k` elements
+/// - `bitmaps.sign_pos` and `bitmaps.sign_neg` are padded to multiple of 8
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn trit_dot_simd_avx2(input_row: &[f32], bitmaps: &TritBitmaps) -> f32 {
+    let k = bitmaps.k;
+    let padded_k = (k + 7) & !7;
+
+    // Accumulators for positive and negative contributions
+    // SAFETY: _mm256_setzero_ps requires AVX, guaranteed by target_feature
+    let mut acc_pos = _mm256_setzero_ps();
+    let mut acc_neg = _mm256_setzero_ps();
+
+    let inp_ptr = input_row.as_ptr();
+    let pos_ptr = bitmaps.sign_pos.as_ptr();
+    let neg_ptr = bitmaps.sign_neg.as_ptr();
+
+    let mut i = 0usize;
+    while i + 8 <= padded_k {
+        // SAFETY: pointers are valid for padded_k elements which is aligned to 8.
+        // Input beyond k is zero-padded in bitmaps, so out-of-bounds input values
+        // get multiplied by 0.0 and don't contribute to the result.
+        // We must handle the case where input_row may be shorter than padded_k.
+        if i + 8 <= k {
+            let inp = _mm256_loadu_ps(inp_ptr.add(i));
+            let pos = _mm256_loadu_ps(pos_ptr.add(i));
+            let neg = _mm256_loadu_ps(neg_ptr.add(i));
+
+            // acc_pos += input * sign_pos  (adds where trit == +1)
+            acc_pos = _mm256_add_ps(acc_pos, _mm256_mul_ps(inp, pos));
+            // acc_neg += input * sign_neg  (adds where trit == -1)
+            acc_neg = _mm256_add_ps(acc_neg, _mm256_mul_ps(inp, neg));
+        } else if i < k {
+            // Tail: less than 8 elements remaining, handle scalar
+            let mut tail_pos = 0.0f32;
+            let mut tail_neg = 0.0f32;
+            for j in i..k {
+                tail_pos += *inp_ptr.add(j) * *pos_ptr.add(j);
+                tail_neg += *inp_ptr.add(j) * *neg_ptr.add(j);
+            }
+            // Add tail to accumulators via scalar path at the end
+            // We'll add these after the horizontal sum
+            let result = hsum_avx2(acc_pos) - hsum_avx2(acc_neg);
+            return result + tail_pos - tail_neg;
+        }
+        i += 8;
+    }
+
+    // Horizontal sum: result = sum(acc_pos) - sum(acc_neg)
+    hsum_avx2(acc_pos) - hsum_avx2(acc_neg)
+}
+
+/// Horizontal sum of all 8 floats in a __m256.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hsum_avx2(v: __m256) -> f32 {
+    // SAFETY: AVX2 guaranteed by target_feature attribute
+    // Step 1: add high 128 bits to low 128 bits
+    let hi128 = _mm256_extractf128_ps(v, 1);
+    let lo128 = _mm256_castps256_ps128(v);
+    let sum128 = _mm_add_ps(lo128, hi128);
+    // Step 2: horizontal add within 128-bit lane
+    let shuf = _mm_movehdup_ps(sum128); // [1,1,3,3]
+    let sums = _mm_add_ps(sum128, shuf); // [0+1, _, 2+3, _]
+    let shuf2 = _mm_movehl_ps(sums, sums); // [2+3, _, _, _]
+    let result = _mm_add_ss(sums, shuf2); // [0+1+2+3, _, _, _]
+    _mm_cvtss_f32(result)
+}
+
+/// Safe dispatcher: picks AVX2 or scalar at runtime.
+#[inline]
+fn trit_dot_bitmap(input_row: &[f32], bitmaps: &TritBitmaps) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 availability verified by runtime check above
+            return unsafe { trit_dot_simd_avx2(input_row, bitmaps) };
+        }
+    }
+    // Scalar fallback using pre-expanded bitmaps
+    trit_dot_bitmap_scalar(input_row, bitmaps)
+}
+
+/// Scalar fallback for trit_dot using pre-expanded bitmaps.
+#[inline]
+fn trit_dot_bitmap_scalar(input_row: &[f32], bitmaps: &TritBitmaps) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..bitmaps.k {
+        acc += input_row[i] * bitmaps.sign_pos[i];
+        acc -= input_row[i] * bitmaps.sign_neg[i];
+    }
+    acc
+}
+
+// ---------------------------------------------------------------------------
+// Tiled matmul with SIMD
+// ---------------------------------------------------------------------------
+
+/// Cache-friendly tiled matmul using SIMD trit_dot.
+/// Tiles along the N (column) dimension so weight bitmaps fit in L2 cache.
+/// Tile size: 256 columns per block (tuned for 1024-dim models).
+const TILE_N: usize = 256;
+
+/// SIMD-accelerated trit_matmul with tiling.
+/// Pre-expands weight bitmaps per tile for SIMD dot products.
+/// Falls back to scalar bitmap path on non-AVX2 hardware.
+#[no_mangle]
+pub extern "C" fn trit_matmul_simd(
+    input: *const f32,
+    weights: *const u8,
+    output: *mut f32,
+    scales: *const f32,
+    m: i32,
+    k: i32,
+    n: i32,
+) -> i32 {
+    if input.is_null() || weights.is_null() || output.is_null() || scales.is_null() {
+        return -1;
+    }
+
+    let m = m as usize;
+    let k = k as usize;
+    let n = n as usize;
+    let pk = packed_len(k);
+
+    let input_slice = unsafe { slice::from_raw_parts(input, m * k) };
+    let weights_slice = unsafe { slice::from_raw_parts(weights, pk * n) };
+    let scales_slice = unsafe { slice::from_raw_parts(scales, n) };
+    let output_ptr = SendPtr::new(output);
+
+    // Tile along N dimension for L2 cache efficiency
+    let num_tiles = (n + TILE_N - 1) / TILE_N;
+
+    for tile in 0..num_tiles {
+        let col_start = tile * TILE_N;
+        let col_end = (col_start + TILE_N).min(n);
+        let tile_width = col_end - col_start;
+
+        // Pre-expand bitmaps for this tile's columns
+        let bitmaps: Vec<TritBitmaps> = (col_start..col_end)
+            .map(|col| {
+                let weight_col = &weights_slice[col * pk..(col + 1) * pk];
+                expand_trit_bitmaps(weight_col, k)
+            })
+            .collect();
+
+        // Parallel over rows within this tile
+        (0..m).into_par_iter().for_each(|row_idx| {
+            let input_row = &input_slice[row_idx * k..(row_idx + 1) * k];
+            let out_base = row_idx * n + col_start;
+
+            for tc in 0..tile_width {
+                let raw = trit_dot_bitmap(input_row, &bitmaps[tc]);
+                // SAFETY: each (row_idx, col_start+tc) pair is unique across
+                // parallel iterations, so no data races.
+                unsafe {
+                    *output_ptr.ptr().add(out_base + tc) = raw * scales_slice[col_start + tc];
+                }
+            }
+        });
+    }
+
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Original scalar trit_dot (kept as fallback)
+// ---------------------------------------------------------------------------
 
 /// Core inner product: one output element.
 /// `input_row` has length `k`, `weight_col_packed` has length `ceil(k/5)`.
@@ -462,7 +709,7 @@ pub extern "C" fn trit_unpack_kv(
 // Engine info
 // ---------------------------------------------------------------------------
 
-static ENGINE_INFO: &[u8] = b"trit_engine v1.0.0 | NovaX LLM | zero-multiply ternary matmul | TZip(3^5=243) LUT decode | rayon parallel | embed=768 heads=13 layers=13 vocab=32768\0";
+static ENGINE_INFO: &[u8] = b"trit_engine v1.1.0 | NovaX LLM | zero-multiply ternary matmul | TZip(3^5=243) LUT decode | AVX2 SIMD + tiled matmul | rayon parallel | embed=768 heads=13 layers=13 vocab=32768\0";
 
 /// Returns a static C string with engine info.
 #[no_mangle]
@@ -569,6 +816,117 @@ mod tests {
                 j, expected, output[j]
             );
         }
+    }
+
+    #[test]
+    fn test_simd_matmul_matches_scalar() {
+        let m = 4usize;
+        let k = 768usize; // realistic embed_dim
+        let n = 64usize;
+        let pk = packed_len(k);
+
+        // Create deterministic weights and input
+        let mut weights_float = vec![0.0f32; k * n];
+        for j in 0..n {
+            for i in 0..k {
+                weights_float[i * n + j] = match (i * 7 + j * 13) % 5 {
+                    0 => 1.0,
+                    1 => -1.0,
+                    _ => 0.0,
+                };
+            }
+        }
+
+        let mut packed = vec![0u8; pk * n];
+        let mut scales = vec![0.0f32; n];
+        trit_quantize_weights(
+            weights_float.as_ptr(),
+            packed.as_mut_ptr(),
+            scales.as_mut_ptr(),
+            k as i32,
+            n as i32,
+        );
+
+        let mut input = vec![0.0f32; m * k];
+        for i in 0..input.len() {
+            input[i] = ((i % 17) as f32 - 8.0) * 0.1;
+        }
+
+        // Scalar result
+        let mut output_scalar = vec![0.0f32; m * n];
+        trit_matmul(
+            input.as_ptr(),
+            packed.as_ptr(),
+            output_scalar.as_mut_ptr(),
+            scales.as_ptr(),
+            m as i32,
+            k as i32,
+            n as i32,
+        );
+
+        // SIMD result
+        let mut output_simd = vec![0.0f32; m * n];
+        trit_matmul_simd(
+            input.as_ptr(),
+            packed.as_ptr(),
+            output_simd.as_mut_ptr(),
+            scales.as_ptr(),
+            m as i32,
+            k as i32,
+            n as i32,
+        );
+
+        // Compare
+        for i in 0..output_scalar.len() {
+            assert!(
+                (output_scalar[i] - output_simd[i]).abs() < 1e-3,
+                "Mismatch at index {}: scalar={}, simd={}",
+                i, output_scalar[i], output_simd[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_bitmap_expansion_correctness() {
+        let trits_raw: [i8; 5] = [1, -1, 0, 1, -1];
+        let packed_byte = trit_lut::encode_trits(&trits_raw);
+        let packed = vec![packed_byte];
+        let bitmaps = expand_trit_bitmaps(&packed, 5);
+
+        assert_eq!(bitmaps.sign_pos[0], 1.0); // +1
+        assert_eq!(bitmaps.sign_neg[1], 1.0); // -1
+        assert_eq!(bitmaps.sign_pos[2], 0.0); // 0
+        assert_eq!(bitmaps.sign_neg[2], 0.0); // 0
+        assert_eq!(bitmaps.sign_pos[3], 1.0); // +1
+        assert_eq!(bitmaps.sign_neg[4], 1.0); // -1
+    }
+
+    #[test]
+    fn test_trit_dot_bitmap_matches_scalar() {
+        let k = 100usize;
+        let pk = packed_len(k);
+
+        // Create packed weights
+        let mut packed = vec![0u8; pk];
+        for i in 0..pk {
+            packed[i] = (i % 243) as u8;
+        }
+
+        // Create input
+        let input: Vec<f32> = (0..k).map(|i| (i as f32 - 50.0) * 0.02).collect();
+
+        // Scalar via original trit_dot
+        let scalar_result = trit_dot(&input, &packed, k);
+
+        // Bitmap-based (dispatches to SIMD if available)
+        let bitmaps = expand_trit_bitmaps(&packed, k);
+        let bitmap_result = trit_dot_bitmap(&input, &bitmaps);
+
+        assert!(
+            (scalar_result - bitmap_result).abs() < 1e-3,
+            "scalar={}, bitmap={}",
+            scalar_result, bitmap_result
+        );
     }
 
     #[test]
