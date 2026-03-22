@@ -195,9 +195,27 @@ C:\NovaX\
 
 ---
 
-## License
+## Legal
 
-All rights reserved. This is a private repository.
+Copyright (c) 2023-2026 BlackCatHacker (0BlackCatHacker0). All Rights Reserved.
+
+This software is proprietary and confidential. No part of this project may be
+reproduced, distributed, or transmitted in any form without prior written
+permission from the copyright holder. See [LICENSE](LICENSE) for full terms.
+
+NovaX contains trade secrets protected under the Defend Trade Secrets Act
+(18 U.S.C. 1836). Unauthorized use, disclosure, or exploitation of any
+proprietary technology, algorithms, or methodologies contained herein may
+result in civil and criminal liability.
+
+**Protected intellectual property includes:**
+- NovaLang programming language and runtime
+- NovaX Ternary Transformer architecture
+- TZip ternary compression algorithm
+- Navier-Stokes query routing system
+- All model weights, training data, and configurations
+
+For licensing inquiries: [github.com/0BlackCatHacker0](https://github.com/0BlackCatHacker0)
 
 ---
 
