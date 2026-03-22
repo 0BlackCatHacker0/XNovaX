@@ -6,6 +6,10 @@
 
 *NovaX OS boot screen — AES-256-XTS encrypted, ternary matrix rain, one password to unlock*
 
+![NovaX Desktop](web/images/desktop.png)
+
+*NovaX AI Console — 109 services, 661 models, ternary code rain, cyberpunk interface*
+
 ---
 
 ## What is NovaX?
