@@ -171,6 +171,14 @@ fn main() {
     let ast = parser::parse_spanned_file(spanned_tokens, &file_name);
     let mut runtime = vm::Runtime::new();
     runtime.base_dir = base_dir;
+    // Set source file path for hot-reload support
+    if !file_name.is_empty() {
+        // Canonicalize to absolute path for reliable file-watching
+        let abs_path = std::fs::canonicalize(&file_name)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| file_name.clone());
+        runtime.source_file = Some(abs_path);
+    }
     if let Err(e) = runtime.execute(&ast) {
         eprintln!("Runtime error: {}", e);
         process::exit(1);
