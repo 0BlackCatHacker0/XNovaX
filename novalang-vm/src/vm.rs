@@ -1,9 +1,12 @@
 // NovaLang VM — tree-walking evaluator for NovaLang AST
 // Executes parsed AST nodes with ternary-first semantics
+// v1.3: Hot-reload support — file-watch + graceful restart
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::parser::{Expr, Stmt, Op};
+use crate::lexer;
 use crate::builtins::{self, Value};
 
 /// Control flow signals for break/continue/return
@@ -45,6 +48,10 @@ pub struct Runtime {
     imported_files: HashSet<String>,
     /// Counter for generating unique lambda names
     lambda_counter: u64,
+    /// Source file path for hot-reload (set by main.rs)
+    pub source_file: Option<String>,
+    /// Shutdown signal shared with HTTP server threads
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 impl Clone for Runtime {
@@ -57,6 +64,8 @@ impl Clone for Runtime {
             base_dir: self.base_dir.clone(),
             imported_files: self.imported_files.clone(),
             lambda_counter: 0,
+            source_file: self.source_file.clone(),
+            shutdown_flag: self.shutdown_flag.clone(),
         }
     }
 }
@@ -92,6 +101,8 @@ impl Runtime {
             base_dir: String::new(),
             imported_files: HashSet::new(),
             lambda_counter: 0,
+            source_file: None,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 

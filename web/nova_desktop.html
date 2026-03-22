@@ -2371,38 +2371,112 @@ function _nvSetState(s){
   _updateWakeUI();
 }
 
-// ── MAIN: Start always-on voice pipeline ──
+// -- MAIN: Start always-on voice pipeline via Web Speech API --
+// Uses browser SpeechRecognition for STT (works without server).
+// Wake word "Nova" triggers command capture -> orchestrator -> TTS response.
+var _wakeRecog=null;
 function startWakeWord(){
   if(NV.state!=='idle')return;
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){rlog('SpeechRecognition not supported in this browser','err');return;}
   _nvSetState('wake_listening');
-  rlog('Voice ON -- listening via NovaX Voice Server','ok');
-  _voiceLoop();
+  rlog('Voice ON -- say "Nova" to activate','ok');
+  _wakeRecog=new SR();
+  _wakeRecog.continuous=true;
+  _wakeRecog.interimResults=false;
+  _wakeRecog.lang='en-US';
+  _wakeRecog.maxAlternatives=1;
+  _wakeRecog.onresult=function(e){
+    for(var i=e.resultIndex;i<e.results.length;i++){
+      if(!e.results[i].isFinal)continue;
+      var t=e.results[i][0].transcript.trim();
+      if(!t)continue;
+      console.log('[Nova Wake] heard: '+t);
+      var lower=t.toLowerCase();
+      // Check for wake word
+      if(lower.indexOf('nova')!==-1||lower.indexOf('no va')!==-1||lower.indexOf('novo')!==-1){
+        // Strip wake word to get command
+        var cmd=t.replace(/\b(hey\s+)?(nova|no\s*va|novo)\b[,.:!?\s]*/gi,'').trim();
+        if(cmd.length>2){
+          // Wake + command in one breath
+          rlog('Heard: '+cmd,'ok');
+          _nvSetState('thinking');
+          _wakeExecCommand(cmd);
+        }else{
+          // Just "Nova" -- greet and wait
+          rlog('Wake word detected','ok');
+          _nvSetState('speaking');
+          var greeting=NV.GREETINGS[Math.floor(Math.random()*NV.GREETINGS.length)];
+          novaSpeak(greeting);
+          // Brief pause then capture next phrase as command
+          _nvSetState('command_wait');
+          _wakeCapturePending=true;
+        }
+      }else if(_wakeCapturePending){
+        // This is the command after wake word
+        _wakeCapturePending=false;
+        if(t.length>1){
+          rlog('Command: '+t,'ok');
+          _nvSetState('thinking');
+          _wakeExecCommand(t);
+        }else{
+          _nvSetState('wake_listening');
+        }
+      }
+    }
+  };
+  _wakeRecog.onerror=function(e){
+    if(e.error==='no-speech')return; // normal, keep listening
+    if(e.error==='aborted')return;
+    console.warn('[Nova Wake] error:',e.error);
+    if(e.error==='not-allowed'){rlog('Mic access denied','err');stopWakeWord();return;}
+  };
+  _wakeRecog.onend=function(){
+    // Auto-restart if still enabled
+    if(_wakeEnabled&&NV.state!=='idle'){
+      try{_wakeRecog.start();}catch(ex){
+        // Small delay before retry
+        setTimeout(function(){
+          if(_wakeEnabled&&NV.state!=='idle'){try{_wakeRecog.start();}catch(e2){}}
+        },500);
+      }
+    }
+  };
+  try{_wakeRecog.start();}catch(e){rlog('Could not start voice: '+e.message,'err');}
 }
-var _voiceLooping=false;
-async function _voiceLoop(){
-  if(_voiceLooping)return;
-  _voiceLooping=true;
-  rlog('Speak now... (5 sec recording)','ok');
+var _wakeCapturePending=false;
+async function _wakeExecCommand(cmd){
+  addUserMsg(cmd+' (voice)');
+  showThinking();
   try{
-    var r=await fetch('http://127.0.0.1:9801/full-loop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout:5})});
-    var d=await r.json();
-    if(d.ok===1&&d.text){
-      rlog('Heard: '+d.text,'ok');
-      addUserMsg(d.text+' (voice)');
-      if(d.response){addAiMsg(d.response,'nova-voice');}
-      rlog('Response spoken via edge-tts','ok');
-    } else if(d.ok===0){
-      rlog('No speech detected','sys');
-    } else {
-      rlog('Voice error: '+(d.error||'unknown'),'err');
+    // Send to orchestrator /think endpoint
+    var r=await fetchT(API+'/think',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:cmd,mode:'speed'})},30000);
+    removeThinking();
+    if(!r.ok){
+      // Fallback to cloud router
+      r=await fetchT('http://127.0.0.1:9878/api/v1/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:cmd+'. Plain text only. No markdown. No emojis.'})},30000);
+    }
+    if(r.ok){
+      var raw=await r.text();
+      var fixed=raw.replace(/[\x00-\x1F]/g,function(c){if(c==='\n')return'\\n';if(c==='\r')return'\\r';if(c==='\t')return'\\t';return'';});
+      var d;try{d=JSON.parse(fixed);}catch(pe){d={reply:raw.substring(0,500)};}
+      var reply=(d.reply||d.response||'(no response)');
+      var model=(d.model||d.provider||'nova');
+      document.getElementById('prompt-model').textContent=model;
+      addAiMsg(reply,model);
+      if(reply&&reply.length>3){
+        _nvSetState('speaking');
+        await novaSpeak(reply);
+      }
+    }else{
+      addAiMsg('Voice query failed (HTTP '+r.status+')','error');
     }
   }catch(e){
-    rlog('Voice server offline (port 9801)','err');
+    removeThinking();
+    addAiMsg('Voice error: '+e.message,'error');
+    rlog('Voice error: '+e.message,'err');
   }
-  _voiceLooping=false;
-  if(_wakeEnabled&&NV.state!=='idle'){
-    setTimeout(_voiceLoop,500);
-  }
+  _nvSetState('wake_listening');
 }
 
 // ── Monitor loop — runs every 80ms ──
@@ -2553,42 +2627,45 @@ async function novaSpeak(text){
   if(!text)return;
   var clean=text.replace(/```[\s\S]*?```/g,'').replace(/[*#_`~\[\]]/g,'').replace(/https?:\/\/\S+/g,'').trim();
   if(!clean)return;
-  // Neural voice via edge-tts server (AvaNeural) — no character limit
-  // Mute mic to prevent echo
-  if(NV&&NV.gainNode&&NV.actx)try{NV.gainNode.gain.setValueAtTime(0,NV.actx.currentTime);}catch(e){}
+  // Temporarily stop wake word recognition to prevent echo feedback
+  if(_wakeRecog){try{_wakeRecog.abort();}catch(e){}}
   try{
     var resp=await fetch('http://127.0.0.1:9801/speak',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:clean})});
     var data=await resp.json();
     if(data.audio_url){
-      var audio=new Audio(data.audio_url);
-      audio.onended=function(){
-        setTimeout(function(){if(NV&&NV.gainNode&&NV.actx)try{NV.gainNode.gain.setValueAtTime(1,NV.actx.currentTime);}catch(e){}},300);
-      };
-      audio.onerror=function(){
-        console.error('[Nova TTS] Audio playback error');
-        if(NV&&NV.gainNode&&NV.actx)try{NV.gainNode.gain.setValueAtTime(1,NV.actx.currentTime);}catch(e){}
-      };
-      audio.play();
+      await new Promise(function(resolve){
+        var audio=new Audio(data.audio_url);
+        audio.onended=function(){setTimeout(resolve,300);};
+        audio.onerror=function(){console.error('[Nova TTS] Audio playback error');resolve();};
+        audio.play().catch(function(e){console.error('[Nova TTS] play() blocked:',e);resolve();});
+      });
+      return;
     }
   }catch(e){
     console.error('[Nova TTS] Voice server error:',e);
-    // Fallback to System.Speech if neural voice server is down
-    if(window.speechSynthesis){
+  }
+  // Fallback to browser SpeechSynthesis if edge-tts server is down
+  if(window.speechSynthesis){
+    await new Promise(function(resolve){
       speechSynthesis.cancel();
-      var u=new SpeechSynthesisUtterance(clean);
+      var u=new SpeechSynthesisUtterance(clean.substring(0,500));
       u.rate=1;u.pitch=1;u.volume=1;
-      u.onend=function(){if(NV&&NV.gainNode&&NV.actx)try{NV.gainNode.gain.setValueAtTime(1,NV.actx.currentTime);}catch(e){}};
+      if(_novaBestVoice)u.voice=_novaBestVoice;
+      u.onend=function(){resolve();};
+      u.onerror=function(){resolve();};
       speechSynthesis.speak(u);
-    }
-    if(NV&&NV.gainNode&&NV.actx)try{NV.gainNode.gain.setValueAtTime(1,NV.actx.currentTime);}catch(e){}
+      // Safety timeout in case onend never fires
+      setTimeout(resolve,30000);
+    });
   }
 }
-async function speakResponse(text){novaSpeak(text);}
-async function _nvSpeak(text){novaSpeak(text);}
+async function speakResponse(text){return novaSpeak(text);}
+async function _nvSpeak(text){return novaSpeak(text);}
 let _novaSpeakingUntil=0;
 function _safeRestartWake(){}
 
 function stopWakeWord(){
+  if(_wakeRecog){try{_wakeRecog.abort();}catch(e){}_wakeRecog=null;}
   if(NV.recognition){try{NV.recognition.stop();}catch(e){}}
   if(NV.cmdTimeout){clearTimeout(NV.cmdTimeout);NV.cmdTimeout=null;}
   if(NV.clipTimer){clearInterval(NV.clipTimer);NV.clipTimer=null;}
@@ -2596,7 +2673,7 @@ function stopWakeWord(){
   if(NV.actx){try{NV.actx.close();}catch(e){}}
   if(NV.stream){NV.stream.getTracks().forEach(t=>t.stop());}
   NV.stream=null;NV.actx=null;NV.analyser=null;NV.gainNode=null;NV.processor=null;NV.recognition=null;
-  NV.chunks=[];
+  NV.chunks=[];_wakeCapturePending=false;
   _nvSetState('idle');
   _wakeListening=false;_wakeEnabled=false;
 }

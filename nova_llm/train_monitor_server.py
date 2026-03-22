@@ -5,6 +5,10 @@ LOG = "C:/NovaX/nova_llm/training_log.json"
 PORT = 9802
 TOTAL = 20000
 
+# Tracks the last-known file mtime and max step so we can detect new runs
+_last_mtime = 0.0
+_last_max_step = 0
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
@@ -27,11 +31,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data).encode())
 
     def _read_log(self):
+        """Read log and return only the current training run's entries.
+
+        Detects a new run in two ways:
+        1. File was replaced (mtime jumped and first step is small) — return all entries.
+        2. Log contains a step reset (step N followed by step < N) — return only
+           entries from the last reset onward, which is the newest run.
+        """
+        global _last_mtime, _last_max_step
+        try:
+            mtime = os.path.getmtime(LOG)
+        except OSError:
+            _last_mtime = 0.0
+            _last_max_step = 0
+            return []
+
         try:
             with open(LOG, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
+                raw = json.load(f)
+        except Exception:
             return []
+
+        if not raw:
+            _last_mtime = mtime
+            _last_max_step = 0
+            return []
+
+        # --- Detect the start index of the current (newest) run ---
+        # Walk backwards to find the last point where step decreased,
+        # which marks where a new run's entries begin.
+        run_start = 0
+        for i in range(1, len(raw)):
+            prev_step = raw[i - 1].get("step", 0)
+            curr_step = raw[i].get("step", 0)
+            if curr_step < prev_step:
+                # Step counter reset — new run starts at index i
+                run_start = i
+
+        current_run = raw[run_start:]
+
+        # Update tracking state
+        if current_run:
+            _last_max_step = current_run[-1].get("step", 0)
+        _last_mtime = mtime
+
+        return current_run
 
     def do_GET(self):
         log = self._read_log()
