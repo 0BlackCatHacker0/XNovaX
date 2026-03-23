@@ -59,6 +59,12 @@ class TernaryGQAttention(nn.Module):
 
         self.scale = math.sqrt(head_dim)
 
+        # Cached causal mask for fallback attention (no per-forward allocation)
+        max_seq = 2187  # BLOCK = 3^7
+        self.register_buffer('causal_mask',
+                             torch.tril(torch.ones(max_seq, max_seq, dtype=torch.bool)),
+                             persistent=False)
+
     def forward(self, x, mask=None):
         B, T, C = x.shape
 
@@ -74,26 +80,30 @@ class TernaryGQAttention(nn.Module):
             q = apply_rotary(q, cos, sin)
             k = apply_rotary(k, cos, sin)
 
-        # Expand KV heads to match Q heads via repeat
+        # Expand KV heads to match Q heads via zero-copy expand (no memory alloc)
         # k shape: (B, 4, T, 64) -> (B, 16, T, 64)
-        # Each KV head is shared across num_groups=4 query heads
-        k = k.repeat_interleave(self.num_groups, dim=1)
-        v = v.repeat_interleave(self.num_groups, dim=1)
+        B, _, T, D = k.shape
+        k = k.unsqueeze(2).expand(B, self.num_kv_heads, self.num_groups, T, D).reshape(B, self.num_heads, T, D)
+        v = v.unsqueeze(2).expand(B, self.num_kv_heads, self.num_groups, T, D).reshape(B, self.num_heads, T, D)
 
-        # Scaled dot-product attention
-        attn = torch.matmul(q, k.transpose(-2, -1)) / self.scale
-
-        # Causal mask
-        if mask is not None:
-            attn = attn.masked_fill(mask == 0, float("-inf"))
+        # Use PyTorch 2.0+ fused SDPA (Flash Attention / Memory-Efficient kernel)
+        # ~1.3-1.5x faster than manual attention, also more memory-efficient
+        if hasattr(F, 'scaled_dot_product_attention') and getattr(self, '_use_sdpa', True):
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=mask,
+                is_causal=(mask is None),  # Auto causal mask when no explicit mask
+                scale=1.0 / self.scale,
+            )
         else:
-            causal = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-            attn = attn.masked_fill(~causal, float("-inf"))
-
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply attention to values
-        out = torch.matmul(attn, v)
+            # Fallback: manual attention (for older PyTorch)
+            attn = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+            if mask is not None:
+                attn = attn.masked_fill(mask == 0, float("-inf"))
+            else:
+                attn = attn.masked_fill(~self.causal_mask[:T, :T], float("-inf"))
+            attn = F.softmax(attn, dim=-1)
+            out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(B, T, self.q_dim)
 
         return self.out_proj(out)

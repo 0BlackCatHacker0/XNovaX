@@ -20,20 +20,98 @@ MEILI_URL = "http://127.0.0.1:7700"
 MEILI_INDEX = "novax_knowledge"
 LLM_URL = "http://127.0.0.1:9800/llm/generate"
 ROUTE_URL = "http://127.0.0.1:9800/llm/route"
+TRAINING_DATA_PATH = Path("C:/NovaX/data/llm_training/training_pairs_mega.json")
+MAX_INDEX_DOCS = 10000  # cap for initial indexing
+
+# Track hybrid search capability
+_hybrid_available = None  # None = not checked, True/False = result
 
 # ── Meilisearch Operations ──────────────────────────────────
-def meili_search(query, limit=5):
-    """Search Meilisearch for relevant documents."""
+def check_hybrid_support():
+    """Check if Meilisearch has vector search / hybrid enabled."""
+    global _hybrid_available
+    if _hybrid_available is not None:
+        return _hybrid_available
     try:
-        r = requests.post(f"{MEILI_URL}/indexes/{MEILI_INDEX}/search", json={
-            "q": query,
-            "limit": limit,
-            "attributesToRetrieve": ["id", "title", "content", "domain", "source"],
-        }, timeout=5)
+        r = requests.get(f"{MEILI_URL}/experimental-features", timeout=3)
+        if r.status_code == 200:
+            feats = r.json()
+            _hybrid_available = feats.get("vectorStore", False)
+            if not _hybrid_available:
+                # Try to enable it
+                r2 = requests.patch(f"{MEILI_URL}/experimental-features",
+                                    json={"vectorStore": True}, timeout=5)
+                if r2.status_code == 200:
+                    feats2 = r2.json()
+                    _hybrid_available = feats2.get("vectorStore", False)
+                    if _hybrid_available:
+                        print("  [RAG] Enabled Meilisearch vector store for hybrid search")
+            return _hybrid_available
+    except Exception:
+        pass
+    _hybrid_available = False
+    return False
+
+
+def configure_embedders():
+    """Configure Meilisearch embedders for hybrid search."""
+    try:
+        r = requests.patch(
+            f"{MEILI_URL}/indexes/{MEILI_INDEX}/settings",
+            json={
+                "embedders": {
+                    "default": {
+                        "source": "huggingFace",
+                        "model": "sentence-transformers/all-MiniLM-L6-v2",
+                        "documentTemplate": "{{doc.title}} {{doc.content}}",
+                    }
+                }
+            },
+            timeout=10,
+        )
+        if r.status_code in (200, 202):
+            print("  [RAG] Configured HuggingFace embedder for hybrid search")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def meili_search(query, limit=5, semantic_ratio=0.5):
+    """Search Meilisearch using hybrid search if available, else keyword."""
+    search_body = {
+        "q": query,
+        "limit": limit,
+        "attributesToRetrieve": ["id", "title", "content", "domain", "source"],
+    }
+
+    # Try hybrid search first
+    use_hybrid = check_hybrid_support()
+    if use_hybrid:
+        search_body["hybrid"] = {"semanticRatio": semantic_ratio, "embedder": "default"}
+
+    try:
+        r = requests.post(f"{MEILI_URL}/indexes/{MEILI_INDEX}/search",
+                          json=search_body, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            return data.get("hits", [])
-    except:
+            hits = data.get("hits", [])
+            # Tag hits with search mode
+            mode = "hybrid" if use_hybrid else "keyword"
+            for h in hits:
+                h["_searchMode"] = mode
+            return hits
+        elif r.status_code == 400 and use_hybrid:
+            # Hybrid not configured properly -- fall back to keyword
+            search_body.pop("hybrid", None)
+            r2 = requests.post(f"{MEILI_URL}/indexes/{MEILI_INDEX}/search",
+                               json=search_body, timeout=5)
+            if r2.status_code == 200:
+                hits = r2.json().get("hits", [])
+                for h in hits:
+                    h["_searchMode"] = "keyword_fallback"
+                return hits
+    except Exception:
         pass
     return []
 
@@ -75,17 +153,23 @@ def meili_stats():
 
 
 def ensure_index():
-    """Create the index if it doesn't exist."""
+    """Create the index if it doesn't exist, configure settings and embedders."""
     try:
         requests.post(f"{MEILI_URL}/indexes", json={
             "uid": MEILI_INDEX,
             "primaryKey": "id"
         }, timeout=5)
-        # Set searchable attributes
-        requests.put(f"{MEILI_URL}/indexes/{MEILI_INDEX}/settings/searchable-attributes",
-                    json=["title", "content", "domain"], timeout=5)
-    except:
+        # Set searchable + filterable attributes
+        requests.patch(f"{MEILI_URL}/indexes/{MEILI_INDEX}/settings", json={
+            "searchableAttributes": ["title", "content", "domain"],
+            "filterableAttributes": ["domain", "source"],
+            "sortableAttributes": ["domain"],
+        }, timeout=5)
+    except Exception:
         pass
+    # Enable hybrid search if possible
+    if check_hybrid_support():
+        configure_embedders()
 
 
 # ── RAG Query ───────────────────────────────────────────────
@@ -150,12 +234,14 @@ def rag_query(query, max_tokens=256, num_results=3):
 
     elapsed = time.time() - t0
 
+    search_mode = context_docs[0].get("_searchMode", "none") if context_docs else "none"
     return {
         "response": llm_result.get("text", ""),
         "retrieved": needs_retrieval,
         "num_sources": len(context_docs),
         "sources": [{"title": d.get("title", ""), "id": d.get("id", "")}
                     for d in context_docs],
+        "searchMode": search_mode,
         "model": llm_result.get("model", "NovaX-LLM"),
         "elapsed_ms": round(elapsed * 1000, 1),
         "tokens_generated": llm_result.get("tokens_generated", 0),
@@ -164,22 +250,53 @@ def rag_query(query, max_tokens=256, num_results=3):
 
 
 # ── Index Training Data ────────────────────────────────────
-def index_training_data(path=None):
-    """Index existing training data into Meilisearch for RAG."""
+def index_training_data(path=None, max_docs=None):
+    """Index existing training data into Meilisearch for RAG.
+
+    Args:
+        path: Path to training JSON. Defaults to TRAINING_DATA_PATH.
+        max_docs: Cap on documents to index. Defaults to MAX_INDEX_DOCS.
+
+    Returns:
+        dict with indexed count, total available, and any errors.
+    """
     if path is None:
-        path = Path("C:/NovaX/data/llm_training/training_pairs_mega.json")
+        path = TRAINING_DATA_PATH
+    else:
+        path = Path(path)
+    if max_docs is None:
+        max_docs = MAX_INDEX_DOCS
+
+    result = {"indexed": 0, "total_available": 0, "errors": [], "path": str(path)}
 
     if not path.exists():
-        print(f"  Training data not found at {path}")
-        return 0
+        result["errors"].append(f"Training data not found at {path}")
+        print(f"  [RAG] Training data not found at {path}")
+        return result
 
-    data = json.load(open(path, "r", encoding="utf-8"))
+    try:
+        data = json.load(open(path, "r", encoding="utf-8"))
+    except Exception as e:
+        result["errors"].append(f"Failed to parse JSON: {e}")
+        return result
+
+    result["total_available"] = len(data)
+
+    # Cap to max_docs
+    if max_docs and len(data) > max_docs:
+        data = data[:max_docs]
+        print(f"  [RAG] Capping index to {max_docs} of {result['total_available']} pairs")
+
     docs = []
     for i, pair in enumerate(data):
+        prompt = pair.get("prompt", "") or ""
+        response = pair.get("response", "") or ""
+        if not response.strip():
+            continue  # skip empty responses
         docs.append({
             "id": f"train_{i}",
-            "title": pair.get("prompt", "")[:100],
-            "content": pair.get("response", ""),
+            "title": prompt[:100],
+            "content": response,
             "domain": pair.get("domain", "general"),
             "source": pair.get("model", "unknown"),
         })
@@ -190,10 +307,14 @@ def index_training_data(path=None):
         batch = docs[i:i+500]
         if meili_index_batch(batch):
             indexed += len(batch)
-            print(f"  Indexed {indexed}/{len(docs)} documents...")
+            if indexed % 2000 == 0 or i + 500 >= len(docs):
+                print(f"  [RAG] Indexed {indexed}/{len(docs)} documents...")
+        else:
+            result["errors"].append(f"Batch at offset {i} failed")
 
-    print(f"  Total indexed: {indexed}")
-    return indexed
+    result["indexed"] = indexed
+    print(f"  [RAG] Total indexed: {indexed}")
+    return result
 
 
 # ── HTTP Server (port 9804) ─────────────────────────────────
@@ -223,12 +344,24 @@ class RAGHandler(http.server.BaseHTTPRequestHandler):
             stats = meili_stats()
             self._json(200, {
                 "service": "NovaX RAG Pipeline",
+                "version": "2.0-hybrid",
                 "meili_docs": stats.get("numberOfDocuments", 0),
                 "meili_indexing": stats.get("isIndexing", False),
+                "hybrid_search": check_hybrid_support(),
                 "ternary": 1,
             })
         elif self.path == "/rag/stats":
-            self._json(200, meili_stats())
+            stats = meili_stats()
+            hybrid = check_hybrid_support()
+            self._json(200, {
+                "numberOfDocuments": stats.get("numberOfDocuments", 0),
+                "isIndexing": stats.get("isIndexing", False),
+                "fieldDistribution": stats.get("fieldDistribution", {}),
+                "hybridSearch": hybrid,
+                "searchMode": "hybrid" if hybrid else "keyword",
+                "index": MEILI_INDEX,
+                "meiliUrl": MEILI_URL,
+            })
         else:
             self._json(404, {"error": "Not found"})
 
@@ -253,16 +386,40 @@ class RAGHandler(http.server.BaseHTTPRequestHandler):
             if not query:
                 self._json(400, {"error": "No query provided"})
                 return
-            hits = meili_search(query, limit=body.get("limit", 5))
-            self._json(200, {"hits": hits, "count": len(hits)})
+            ratio = body.get("semantic_ratio", 0.5)
+            hits = meili_search(query, limit=body.get("limit", 5),
+                                semantic_ratio=ratio)
+            search_mode = hits[0].get("_searchMode", "keyword") if hits else "unknown"
+            self._json(200, {
+                "hits": hits,
+                "count": len(hits),
+                "searchMode": search_mode,
+                "hybridAvailable": check_hybrid_support(),
+            })
 
         elif self.path == "/rag/index":
             docs = body.get("documents", [])
-            if not docs:
-                self._json(400, {"error": "No documents provided"})
-                return
-            success = meili_index_batch(docs)
-            self._json(200, {"indexed": len(docs), "success": success})
+            if docs:
+                # Index provided documents
+                success = meili_index_batch(docs)
+                self._json(200, {"indexed": len(docs), "success": success,
+                                  "mode": "documents"})
+            else:
+                # Trigger reindex from training data
+                import threading
+                max_docs = body.get("max_docs", MAX_INDEX_DOCS)
+                path = body.get("path", None)
+                def _reindex():
+                    ensure_index()
+                    index_training_data(path=path, max_docs=max_docs)
+                t = threading.Thread(target=_reindex, daemon=True)
+                t.start()
+                self._json(202, {
+                    "status": "reindex_started",
+                    "max_docs": max_docs,
+                    "source": str(path or TRAINING_DATA_PATH),
+                    "message": "Reindexing in background. Check /rag/stats for progress.",
+                })
 
         else:
             self._json(404, {"error": "Not found"})
@@ -271,25 +428,29 @@ class RAGHandler(http.server.BaseHTTPRequestHandler):
 def main():
     PORT = 9804
     print("=" * 50)
-    print("  NovaX RAG Pipeline — Port", PORT)
+    print("  NovaX RAG Pipeline v2.0 (Hybrid Search)")
+    print("  Port:", PORT)
     print("=" * 50)
 
-    # Ensure index exists
+    # Ensure index exists and configure embedders
     ensure_index()
     stats = meili_stats()
-    print(f"  Meilisearch: {stats.get('numberOfDocuments', 0)} documents indexed")
+    doc_count = stats.get("numberOfDocuments", 0)
+    hybrid = check_hybrid_support()
+    print(f"  Meilisearch: {doc_count} documents indexed")
+    print(f"  Search mode: {'hybrid (semantic+keyword)' if hybrid else 'keyword only'}")
 
     # Index training data if empty
-    if stats.get("numberOfDocuments", 0) == 0:
+    if doc_count == 0:
         print(f"  Indexing training data into Meilisearch...")
-        count = index_training_data()
-        print(f"  Done: {count} documents")
+        result = index_training_data()
+        print(f"  Done: {result['indexed']} documents (of {result['total_available']} available)")
 
     print(f"\nEndpoints:")
-    print(f"  POST /rag/query   -- RAG-augmented query")
-    print(f"  POST /rag/search  -- search only")
-    print(f"  POST /rag/index   -- index documents")
-    print(f"  GET  /rag/stats   -- index statistics")
+    print(f"  POST /rag/query   -- RAG-augmented query (retrieve + generate)")
+    print(f"  POST /rag/search  -- hybrid search (keyword + semantic)")
+    print(f"  POST /rag/index   -- index docs or trigger reindex from training data")
+    print(f"  GET  /rag/stats   -- index statistics + hybrid status")
     print(f"  GET  /health      -- service health")
     print()
 
