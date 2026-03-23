@@ -30,7 +30,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from torch.utils.data import Dataset, DataLoader
 
 # v2: Grouped Query Attention (4x KV cache reduction)
@@ -105,7 +105,8 @@ def apply_fim_transform(token_ids, fim_rate=FIM_RATE):
 # ============================================================
 # CONFIGURATION (loaded from architecture.json)
 # ============================================================
-# Prefer v2 config if available, fall back to v1
+# Config resolution: --fast flag -> v2_fast -> v2 -> v1
+_fast_path = Path(__file__).parent / "architecture_v2_fast.json"
 _v2_path = Path(__file__).parent / "architecture_v2.json"
 ARCH_PATH = _v2_path if _v2_path.exists() else Path(__file__).parent / "architecture.json"
 DATA_PATH = Path("C:/NovaX/data/llm_training/training_pairs_mega.json")
@@ -315,6 +316,12 @@ class TernaryMultiHeadAttention(nn.Module):
         self.rope = RotaryPositionalEncoding(head_dim)
         self.scale = math.sqrt(head_dim)
 
+        # Cached causal mask for fallback attention (no per-forward allocation)
+        max_seq = BLOCK  # 2187
+        self.register_buffer('causal_mask',
+                             torch.tril(torch.ones(max_seq, max_seq, dtype=torch.bool)),
+                             persistent=False)
+
     def forward(self, x, mask=None):
         B, T, C = x.shape
 
@@ -328,21 +335,23 @@ class TernaryMultiHeadAttention(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        # Scaled dot-product attention
-        attn = torch.matmul(q, k.transpose(-2, -1)) / self.scale
-
-        # Causal mask
-        if mask is not None:
-            attn = attn.masked_fill(mask == 0, float("-inf"))
+        # Use PyTorch 2.0+ fused SDPA (Flash Attention kernel) when available
+        if hasattr(F, 'scaled_dot_product_attention'):
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=mask,
+                is_causal=(mask is None),
+                scale=1.0 / self.scale,
+            )
         else:
-            # Auto causal mask
-            causal = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-            attn = attn.masked_fill(~causal, float("-inf"))
-
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply attention to values
-        out = torch.matmul(attn, v)
+            # Fallback: manual attention (cached causal mask, no allocation)
+            attn = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+            if mask is not None:
+                attn = attn.masked_fill(mask == 0, float("-inf"))
+            else:
+                attn = attn.masked_fill(~self.causal_mask[:T, :T], float("-inf"))
+            attn = F.softmax(attn, dim=-1)
+            out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(B, T, self.inner_dim)
         return self.out_proj(out)
 
@@ -597,26 +606,41 @@ class NovaXDataset(Dataset):
             full_ids = full_ids + [self.PAD] * pad_len
             self._tokenized.append(torch.tensor(full_ids, dtype=torch.long))
 
-        fim_str = f", FIM rate={self.fim_rate}" if self.fim_rate > 0 else ""
-        print(f"  Pre-tokenized {len(self._tokenized)} pairs{fim_str}")
+        # Free raw JSON data — no longer needed after tokenization (saves ~500MB RAM)
+        pair_count = len(self.pairs)
+        self.pairs = None
+
+        # If FIM active, _tokenized is unused (FIM rebuilds from _raw_content)
+        if self.fim_rate > 0 and self._raw_content:
+            self._tokenized = None
+            print(f"  Pre-tokenized {pair_count} pairs (FIM mode, raw content kept)")
+        else:
+            fim_str = f", FIM rate={self.fim_rate}" if self.fim_rate > 0 else ""
+            print(f"  Pre-tokenized {pair_count} pairs{fim_str}")
 
     def __len__(self):
-        return len(self.pairs)
+        if self._raw_content:
+            return len(self._raw_content)
+        if self._tokenized:
+            return len(self._tokenized)
+        return 0
 
     def __getitem__(self, idx):
-        # Use pre-tokenized data if available (fast path)
-        if hasattr(self, '_tokenized') and self._tokenized:
-            # v2: Dynamic FIM on pretokenized data
-            if self.fim_rate > 0 and hasattr(self, '_raw_content') and self._raw_content:
-                content = list(self._raw_content[idx])  # copy for mutation
+        # FIM mode: use raw_content with dynamic FIM transform
+        if hasattr(self, '_raw_content') and self._raw_content:
+            content = list(self._raw_content[idx])
+            if self.fim_rate > 0:
                 content = apply_fim_transform(content, self.fim_rate)
-                full_ids = [self.BOS] + content + [self.EOS]
-                if len(full_ids) > self.block_size:
-                    full_ids = full_ids[:self.block_size]
-                pad_len = self.block_size - len(full_ids)
-                full_ids = full_ids + [self.PAD] * pad_len
-                t = torch.tensor(full_ids, dtype=torch.long)
-                return t[:-1], t[1:]
+            full_ids = [self.BOS] + content + [self.EOS]
+            if len(full_ids) > self.block_size:
+                full_ids = full_ids[:self.block_size]
+            pad_len = self.block_size - len(full_ids)
+            full_ids = full_ids + [self.PAD] * pad_len
+            t = torch.tensor(full_ids, dtype=torch.long)
+            return t[:-1], t[1:]
+
+        # Pre-tokenized fast path (no FIM)
+        if hasattr(self, '_tokenized') and self._tokenized:
             full_ids = self._tokenized[idx]
             return full_ids[:-1], full_ids[1:]
 
@@ -668,11 +692,22 @@ def cosine_with_warmup(step, warmup_steps, total_steps, max_lr, min_lr=1e-6):
 # ============================================================
 def train(resume_path=None):
     """Main training loop for NovaX Ternary Transformer."""
+    # Reduce CUDA memory fragmentation on 8GB cards
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     config = load_config()
     train_cfg = config["training"]
     model_cfg = config["model"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # CUDA performance flags (RTX 4060 Ada Lovelace)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True          # Auto-tune convolution algorithms
+        torch.backends.cuda.matmul.allow_tf32 = True   # TF32 for matmul (19-bit, ~2x speed)
+        torch.backends.cudnn.allow_tf32 = True          # TF32 for cuDNN ops
+        torch.set_float32_matmul_precision('high')      # Enable TF32 globally
+
     print(f"\n{'='*60}")
     print(f"  NovaX LLM v2 -- Ternary Transformer Training")
     print(f"{'='*60}")
@@ -692,6 +727,10 @@ def train(resume_path=None):
     print(f"  Grad accum:     {train_cfg['gradient_accumulation']}")
     if train_cfg.get('fim_rate', 0) > 0:
         print(f"  FIM rate:       {train_cfg['fim_rate']*100:.0f}% (Fill-in-the-Middle)")
+    sdpa = hasattr(F, 'scaled_dot_product_attention')
+    print(f"  Flash Attn:     {'YES (SDPA)' if sdpa else 'NO (manual)'}")
+    print(f"  pin_memory:     {train_cfg.get('pin_memory', False)}")
+    print(f"  num_workers:    {train_cfg.get('num_workers', 0)}")
     print(f"  Eff batch:      {train_cfg['batch_size'] * train_cfg['gradient_accumulation']}")
     print(f"  Warmup:         {train_cfg['warmup_steps']} (RE_TURBULENT)")
     print(f"  Total steps:    {train_cfg['total_steps']}")
@@ -715,13 +754,15 @@ def train(resume_path=None):
     dataset = NovaXDataset(DATA_PATH, VOCAB_PATH, block_size=model_cfg["block_size"],
                            fim_rate=fim_rate)
     dataset._pretokenize()  # Pre-tokenize once, eliminates BPE overhead per step
+    # Dataloader with parallel workers and pinned memory for async GPU transfer
     dataloader = DataLoader(
         dataset,
         batch_size=train_cfg["batch_size"],
         shuffle=True,
-        num_workers=0,
-        pin_memory=False,
+        num_workers=4,
+        pin_memory=True,
         drop_last=True,
+        persistent_workers=True,
     )
 
     # Optimizer
@@ -732,10 +773,10 @@ def train(resume_path=None):
         betas=(0.9, 0.95),  # Slightly lower beta2 for ternary stability
     )
 
-    # Enable mixed precision — bf16 on Ada Lovelace Tensor Cores (2-2.5x speedup)
+    # Enable mixed precision -- bf16 on Ada Lovelace Tensor Cores (2-2.5x speedup)
     # RTX 4060 supports bf16 natively; ternary {-1,0,+1} values are exact in bf16
-    from torch.amp import GradScaler, autocast
-    scaler = GradScaler("cuda")
+    # NOTE: bfloat16 does NOT need GradScaler (no underflow risk like fp16)
+    scaler = None
 
     # Training state
     global_step = 0
@@ -752,8 +793,6 @@ def train(resume_path=None):
         global_step = ckpt.get("global_step", 0)
         best_loss = ckpt.get("best_loss", float("inf"))
         training_log = ckpt.get("training_log", [])
-        if scaler and "scaler_state_dict" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
         print(f"  Resumed at step {global_step}, best_loss={best_loss:.4f}")
 
     # Ensure checkpoint directory exists
@@ -787,38 +826,29 @@ def train(resume_path=None):
             input_ids = input_ids.to(device)
             target_ids = target_ids.to(device)
 
-            # Forward pass with mixed precision
-            if scaler:
-                with autocast("cuda", dtype=torch.bfloat16):
-                    logits, loss = model(input_ids, target_ids)
-                    loss = loss / grad_accum
-            else:
+            # Forward pass with mixed precision (bf16, no scaler needed)
+            with autocast("cuda", dtype=torch.bfloat16):
                 logits, loss = model(input_ids, target_ids)
                 loss = loss / grad_accum
 
-            # NaN guard: check BEFORE backward to prevent gradient poisoning
-            loss_val = loss.item()
-            if math.isnan(loss_val) or math.isinf(loss_val):
+            # NaN guard: use detach() instead of .item() (avoids GPU sync)
+            loss_check = loss.detach()
+            if torch.isnan(loss_check) or torch.isinf(loss_check):
                 print(f"  WARNING: NaN/Inf loss at micro-step, skipping")
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 accum_steps = 0
                 accum_loss = 0.0
                 continue
 
-            # Backward pass (only if loss is clean)
-            if scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            # Backward pass (no scaler needed with bfloat16)
+            loss.backward()
 
-            accum_loss += loss_val
+            accum_loss += loss_check  # Stay on GPU, no sync
             accum_steps += 1
 
             # Gradient accumulation step (every H3=3 micro-batches)
             if accum_steps >= grad_accum:
                 # Clip gradients
-                if scaler:
-                    scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["max_grad_norm"])
 
                 # Update learning rate
@@ -831,13 +861,9 @@ def train(resume_path=None):
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
 
-                # Optimizer step
-                if scaler:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad()
+                # Optimizer step (no scaler needed with bfloat16)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
                 global_step += 1
 
@@ -847,22 +873,19 @@ def train(resume_path=None):
                     for module in model.modules():
                         if isinstance(module, TernaryLinear):
                             module._full_precision_mode = False
-                    # Skip torch.compile on Windows (Triton not supported)
-                    import platform
-                    if platform.system() != "Windows":
-                        try:
+                    try:
+                        if platform.system() == "Windows":
+                            print("  torch.compile: SKIPPED (Triton not available on Windows)")
+                        else:
                             model = torch.compile(model, mode="reduce-overhead")
-                            print("  >>> torch.compile enabled (reduce-overhead mode) <<<")
-                        except Exception as e:
-                            print(f"  >>> torch.compile failed ({e}), continuing without <<<")
-                    else:
-                        print("  >>> Skipping torch.compile (Windows/no Triton) <<<")
+                            print("  torch.compile: ENABLED")
+                    except Exception as e:
+                        print(f"  torch.compile: FAILED ({e}), continuing without")
 
-                avg_loss = accum_loss / accum_steps  # True average across micro-steps
-                perplexity = math.exp(min(avg_loss, 20))  # Cap to avoid overflow
-
-                # Log every 10 steps
+                # Compute avg loss only at logging time to minimize GPU syncs
                 if global_step % 10 == 0:
+                    avg_loss = (accum_loss / accum_steps).item()  # GPU sync only at log time
+                    perplexity = math.exp(min(avg_loss, 20))
                     elapsed = time.time() - start_time
                     steps_per_sec = global_step / elapsed if elapsed > 0 else 0
                     eta = (total_steps - global_step) / steps_per_sec if steps_per_sec > 0 else 0
@@ -895,7 +918,7 @@ def train(resume_path=None):
                         f"ETA: {eta/60:.1f}m"
                     )
 
-                # Checkpoint every 1000 steps
+                # Checkpoint every 1000 steps (1000 is divisible by 10, so avg_loss is set)
                 if global_step % 1000 == 0:
                     ckpt_path = CHECKPOINT_DIR / f"step_{global_step:06d}.pt"
                     ckpt = {
@@ -906,8 +929,6 @@ def train(resume_path=None):
                         "training_log": training_log,
                         "config": config,
                     }
-                    if scaler:
-                        ckpt["scaler_state_dict"] = scaler.state_dict()
                     torch.save(ckpt, ckpt_path)
                     print(f"  >>> Checkpoint saved: {ckpt_path}")
 
@@ -1020,11 +1041,19 @@ def export_ternary(checkpoint_path, output_path=None):
 # ============================================================
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="NovaX LLM v1 — Ternary Transformer Training")
+    parser = argparse.ArgumentParser(description="NovaX LLM v2 — Ternary Transformer Training")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--checkpoint", type=str, default=None, help="Resume from specific checkpoint")
     parser.add_argument("--export", type=str, default=None, help="Export checkpoint to trit-packed format")
+    parser.add_argument("--fast", action="store_true", help="Use fast training config (384 seq, batch 8, 12K steps)")
     args = parser.parse_args()
+
+    # Override config path if --fast
+    if args.fast and _fast_path.exists():
+        ARCH_PATH = _fast_path  # noqa: F841 — used by load_config()
+        print(f">>> FAST MODE: Using {_fast_path.name} <<<")
+    elif args.fast:
+        print(f"WARNING: --fast requested but {_fast_path} not found, using default")
 
     if args.export:
         export_ternary(args.export)

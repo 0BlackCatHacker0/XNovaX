@@ -220,11 +220,12 @@ def fill_template(template):
 
 
 def query_ollama(prompt, model, system_prompt=None, max_tokens=1024):
-    """Query local Ollama model."""
+    """Query local Ollama model. Uses keep_alive=24h to keep model in VRAM."""
     body = {
         "model": model,
         "prompt": prompt,
         "stream": False,
+        "keep_alive": "24h",
         "options": {"num_predict": max_tokens, "temperature": 0.8}
     }
     if system_prompt:
@@ -238,6 +239,29 @@ def query_ollama(prompt, model, system_prompt=None, max_tokens=1024):
         return result.get("response", "")
     except Exception as e:
         return ""
+
+
+def warmup_model(model):
+    """Pre-warm a model into VRAM with a tiny request + keep_alive."""
+    body = {
+        "model": model,
+        "prompt": "hi",
+        "stream": False,
+        "keep_alive": "24h",
+        "options": {"num_predict": 1}
+    }
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(OLLAMA_URL, data, {"Content-Type": "application/json"})
+    try:
+        t0 = time.time()
+        resp = urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS)
+        resp.read()
+        elapsed = time.time() - t0
+        print(f"  Warmup {model}: {elapsed:.1f}s (now cached in VRAM for 24h)")
+        return True
+    except Exception as e:
+        print(f"  Warmup {model}: FAILED ({e})")
+        return False
 
 
 def get_response_hash(text):
@@ -295,27 +319,34 @@ def main():
     existing_hashes = {get_response_hash(p.get("response", "")) for p in pairs}
     print(f"Existing pairs: {len(pairs)}, unique hashes: {len(existing_hashes)}")
 
-    # Check which models are available
+    # Check which models are available and pre-warm them into VRAM
+    print("\nWarming up models (keep_alive=24h)...")
     available_models = []
     for model in MODELS:
-        try:
-            test = query_ollama("Say 'ok'", model, max_tokens=5)
-            if test:
-                available_models.append(model)
-                print(f"  Model OK: {model}")
-        except:
-            print(f"  Model SKIP: {model}")
+        if warmup_model(model):
+            available_models.append(model)
 
     if not available_models:
         print("ERROR: No Ollama models available!")
         sys.exit(1)
 
-    print(f"\nUsing {len(available_models)} models: {', '.join(available_models)}")
+    print(f"\nUsing {len(available_models)} models (all cached in VRAM): {', '.join(available_models)}")
 
-    # Build prompt pool
+    # Build prompt pool - try fresh external prompts first
     all_prompts = []
+    fresh_file = Path(__file__).parent / "fresh_prompts_500.json"
+    if fresh_file.exists():
+        try:
+            fresh = json.load(open(fresh_file, "r"))
+            for p in fresh:
+                all_prompts.append(("mixed", p))
+            print(f"Loaded {len(fresh)} fresh external prompts")
+        except:
+            pass
+
+    # Add internal domain prompts too
     for domain, templates in DOMAINS.items():
-        for _ in range(25):  # 25 variations per template
+        for _ in range(25):
             template = random.choice(templates)
             prompt = fill_template(template)
             all_prompts.append((domain, prompt))
@@ -334,7 +365,7 @@ def main():
     print(f"\nStarting generation...\n")
 
     for i, (domain, prompt) in enumerate(all_prompts):
-        # Rotate models every 3 pairs
+        # Rotate models every 3 pairs for diversity (keep_alive=24h eliminates load penalty)
         if i % 3 == 0:
             model_idx = (model_idx + 1) % len(available_models)
         current_model = available_models[model_idx]
