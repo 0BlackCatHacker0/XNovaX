@@ -4,10 +4,12 @@ NovaX LLM Evaluation Harness
 Lightweight benchmark evaluation for the NovaX 235M Ternary Transformer.
 
 Benchmarks:
-    hellaswag  - Commonsense reasoning (4-way multiple choice)
-    arc_easy   - ARC-Easy science questions (4-way multiple choice)
-    piqa       - Physical Intuition QA (2-way multiple choice)
-    perplexity - Perplexity on held-out training data
+    hellaswag   - Commonsense reasoning (4-way multiple choice)
+    arc_easy    - ARC-Easy science questions (4-way multiple choice)
+    piqa        - Physical Intuition QA (2-way multiple choice)
+    winogrande  - Coreference / commonsense (2-way fill-in-the-blank)
+    boolq       - Boolean question answering (yes/no)
+    perplexity  - Perplexity on held-out training data
 
 Usage:
     python eval_harness.py --all                   # Run all benchmarks
@@ -147,7 +149,7 @@ def load_model(checkpoint_path: Optional[str] = None) -> Tuple[TernaryTransforme
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def score_sequence(model: TernaryTransformer, token_ids: List[int],
-                   device: torch.device, max_len: int = 512) -> float:
+                   device: torch.device, max_len: int = 256) -> float:
     """Compute total log-probability of a token sequence.
 
     Returns sum of log P(token_i | token_0..i-1) for i >= 1.
@@ -173,13 +175,13 @@ def score_sequence(model: TernaryTransformer, token_ids: List[int],
 @torch.no_grad()
 def score_continuation(model: TernaryTransformer, context_ids: List[int],
                        continuation_ids: List[int], device: torch.device,
-                       max_len: int = 512) -> float:
+                       max_len: int = 256) -> float:
     """Score how likely continuation_ids follow context_ids.
 
     Returns average log-probability of continuation tokens only,
     conditioned on the context.
     """
-    full_ids = (context_ids + continuation_ids)[:min(max_len, 256)]
+    full_ids = (context_ids + continuation_ids)[:max_len]
     n_ctx = min(len(context_ids), max_len)
     n_cont = len(full_ids) - n_ctx
 
@@ -248,36 +250,56 @@ def download_json(url: str, cache_name: str) -> list:
     return data
 
 
-def get_hellaswag_data(n: int = 500) -> list:
-    """Get HellaSwag validation examples."""
+def get_hellaswag_data(n: int = 0) -> list:
+    """Get HellaSwag validation examples.
+
+    Downloads the full validation JSONL and caches locally.
+    Pass n=0 (default) to use the full dataset.
+    """
     url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
     data = download_json(url, "hellaswag_val.json")
     if not data:
         print("  [WARN] HellaSwag download failed, using embedded mini sample")
         data = _embedded_hellaswag()
-    return data[:n]
+    return data[:n] if n > 0 else data
 
 
-def get_arc_easy_data(n: int = 500) -> list:
-    """Get ARC-Easy test examples from HuggingFace datasets API."""
-    # ARC-Easy via HuggingFace datasets viewer API
-    url = "https://datasets-server.huggingface.co/rows?dataset=allenai/ai2_arc&config=ARC-Easy&split=test&offset=0&length=500"
-    data = download_json(url, "arc_easy_test.json")
-    # HF datasets API returns {"rows": [...], "features": ...}
-    if data and isinstance(data, dict):
-        rows = data.get("rows", [])
-        data = [r.get("row", r) for r in rows]
-    elif data and isinstance(data, list) and len(data) > 0:
-        if "row" in data[0]:
-            data = [r["row"] for r in data]
-    if not data:
-        print("  [WARN] ARC-Easy download failed, using embedded mini sample")
-        data = _embedded_arc_easy()
-    return data[:n]
+def get_arc_easy_data(n: int = 0) -> list:
+    """Get ARC-Easy test examples via HuggingFace datasets library.
+
+    Downloads the full test split and caches to eval_cache/arc_easy_test.json.
+    Pass n=0 (default) to use the full dataset.
+    """
+    BENCHMARK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = BENCHMARK_CACHE_DIR / "arc_easy_test.json"
+
+    if cache_path.exists():
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"  Loaded {len(data)} ARC-Easy examples from cache")
+    else:
+        try:
+            from datasets import load_dataset
+            print("  Downloading ARC-Easy via datasets library ...")
+            ds = load_dataset("allenai/ai2_arc", "ARC-Easy", split="test")
+            data = [dict(row) for row in ds]
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            print(f"  Cached {len(data)} ARC-Easy examples to {cache_path}")
+        except Exception as e:
+            print(f"  [WARN] ARC-Easy download failed: {e}")
+            print("  Using embedded mini sample")
+            data = _embedded_arc_easy()
+
+    return data[:n] if n > 0 else data
 
 
-def get_piqa_data(n: int = 500) -> list:
-    """Get PIQA validation examples."""
+def get_piqa_data(n: int = 0) -> list:
+    """Get PIQA validation examples.
+
+    Downloads the full validation JSONL and caches locally.
+    Pass n=0 (default) to use the full dataset.
+    """
     # PIQA labels and data
     data_url = "https://raw.githubusercontent.com/ybisk/ybisk.github.io/master/piqa/data/valid.jsonl"
     label_url = "https://raw.githubusercontent.com/ybisk/ybisk.github.io/master/piqa/data/valid-labels.lst"
@@ -311,7 +333,65 @@ def get_piqa_data(n: int = 500) -> list:
     if not data:
         print("  [WARN] PIQA download failed, using embedded mini sample")
         data = _embedded_piqa()
-    return data[:n]
+    return data[:n] if n > 0 else data
+
+
+def get_winogrande_data(n: int = 0) -> list:
+    """Get WinoGrande validation examples via HuggingFace datasets library.
+
+    Downloads the full validation split (winogrande_xl) and caches to
+    eval_cache/winogrande_val.json.  Pass n=0 (default) to use the full dataset.
+    """
+    BENCHMARK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = BENCHMARK_CACHE_DIR / "winogrande_val.json"
+
+    if cache_path.exists():
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"  Loaded {len(data)} WinoGrande examples from cache")
+    else:
+        try:
+            from datasets import load_dataset
+            print("  Downloading WinoGrande via datasets library ...")
+            ds = load_dataset("allenai/winogrande", "winogrande_xl", split="validation")
+            data = [dict(row) for row in ds]
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            print(f"  Cached {len(data)} WinoGrande examples to {cache_path}")
+        except Exception as e:
+            print(f"  [WARN] WinoGrande download failed: {e}")
+            data = []
+
+    return data[:n] if n > 0 else data
+
+
+def get_boolq_data(n: int = 0) -> list:
+    """Get BoolQ validation examples via HuggingFace datasets library.
+
+    Downloads the full validation split and caches to
+    eval_cache/boolq_val.json.  Pass n=0 (default) to use the full dataset.
+    """
+    BENCHMARK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = BENCHMARK_CACHE_DIR / "boolq_val.json"
+
+    if cache_path.exists():
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"  Loaded {len(data)} BoolQ examples from cache")
+    else:
+        try:
+            from datasets import load_dataset
+            print("  Downloading BoolQ via datasets library ...")
+            ds = load_dataset("google/boolq", split="validation")
+            data = [dict(row) for row in ds]
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            print(f"  Cached {len(data)} BoolQ examples to {cache_path}")
+        except Exception as e:
+            print(f"  [WARN] BoolQ download failed: {e}")
+            data = []
+
+    return data[:n] if n > 0 else data
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +466,7 @@ def _embedded_piqa() -> list:
 # Benchmark: HellaSwag
 # ---------------------------------------------------------------------------
 def eval_hellaswag(model: TernaryTransformer, tokenizer: SimpleTokenizer,
-                   device: torch.device, n: int = 500) -> Dict:
+                   device: torch.device, n: int = 0) -> Dict:
     """Evaluate on HellaSwag - commonsense sentence completion."""
     print("\n" + "=" * 60)
     print("  HELLASWAG (Commonsense Reasoning)")
@@ -449,7 +529,7 @@ def eval_hellaswag(model: TernaryTransformer, tokenizer: SimpleTokenizer,
 # Benchmark: ARC-Easy
 # ---------------------------------------------------------------------------
 def eval_arc_easy(model: TernaryTransformer, tokenizer: SimpleTokenizer,
-                  device: torch.device, n: int = 500) -> Dict:
+                  device: torch.device, n: int = 0) -> Dict:
     """Evaluate on ARC-Easy - science multiple choice."""
     print("\n" + "=" * 60)
     print("  ARC-EASY (Science Questions)")
@@ -530,7 +610,7 @@ def eval_arc_easy(model: TernaryTransformer, tokenizer: SimpleTokenizer,
 # Benchmark: PIQA
 # ---------------------------------------------------------------------------
 def eval_piqa(model: TernaryTransformer, tokenizer: SimpleTokenizer,
-              device: torch.device, n: int = 500) -> Dict:
+              device: torch.device, n: int = 0) -> Dict:
     """Evaluate on PIQA - physical intuition QA."""
     print("\n" + "=" * 60)
     print("  PIQA (Physical Intuition)")
@@ -584,6 +664,156 @@ def eval_piqa(model: TernaryTransformer, tokenizer: SimpleTokenizer,
 
     return {
         "benchmark": "piqa",
+        "score": correct,
+        "total": total,
+        "accuracy": round(accuracy, 2),
+        "details": details[:20],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Benchmark: WinoGrande
+# ---------------------------------------------------------------------------
+def eval_winogrande(model: TernaryTransformer, tokenizer: SimpleTokenizer,
+                    device: torch.device, n: int = 0) -> Dict:
+    """Evaluate on WinoGrande - coreference / commonsense (2-way).
+
+    Each example has a sentence with a blank (_), option1, option2, and
+    answer (1 or 2).  We score the full sentence with each option filled in.
+    """
+    print("\n" + "=" * 60)
+    print("  WINOGRANDE (Coreference / Commonsense)")
+    print("=" * 60)
+
+    data = get_winogrande_data(n)
+    if not data:
+        return {"score": 0, "total": 0, "accuracy": 0.0, "error": "no data"}
+
+    correct = 0
+    total = 0
+    details = []
+
+    for i, item in enumerate(data):
+        sentence = item.get("sentence", "")
+        option1 = item.get("option1", "")
+        option2 = item.get("option2", "")
+        answer = item.get("answer", "")
+
+        if not sentence or "_" not in sentence or not option1 or not option2:
+            continue
+        # answer is "1" or "2" (string); convert to 0-based index
+        try:
+            label = int(answer) - 1
+        except (ValueError, TypeError):
+            continue
+        if label not in (0, 1):
+            continue
+
+        # Build two candidate sentences by filling in the blank
+        sent1 = sentence.replace("_", option1)
+        sent2 = sentence.replace("_", option2)
+
+        # Score full sequences
+        ids1 = tokenizer.encode(sent1)[:256]
+        ids2 = tokenizer.encode(sent2)[:256]
+        score1 = score_sequence(model, ids1, device, max_len=256)
+        score2 = score_sequence(model, ids2, device, max_len=256)
+
+        predicted = 0 if score1 >= score2 else 1
+        is_correct = predicted == label
+        correct += int(is_correct)
+        total += 1
+
+        details.append({
+            "idx": i, "predicted": predicted, "label": label,
+            "correct": is_correct,
+        })
+
+        if (i + 1) % 100 == 0 or i == len(data) - 1:
+            acc = correct / total * 100 if total > 0 else 0
+            print(f"  [{i+1}/{len(data)}] accuracy: {acc:.1f}% ({correct}/{total})")
+
+    accuracy = correct / total * 100 if total > 0 else 0
+    print(f"\n  WinoGrande Final: {accuracy:.2f}% ({correct}/{total})")
+
+    return {
+        "benchmark": "winogrande",
+        "score": correct,
+        "total": total,
+        "accuracy": round(accuracy, 2),
+        "details": details[:20],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Benchmark: BoolQ
+# ---------------------------------------------------------------------------
+def eval_boolq(model: TernaryTransformer, tokenizer: SimpleTokenizer,
+               device: torch.device, n: int = 0) -> Dict:
+    """Evaluate on BoolQ - boolean question answering.
+
+    Each example has a passage, a question, and a boolean answer.
+    We score "Yes" vs "No" as continuations of "Passage: ... Question: ... Answer:"
+    """
+    print("\n" + "=" * 60)
+    print("  BOOLQ (Boolean Question Answering)")
+    print("=" * 60)
+
+    data = get_boolq_data(n)
+    if not data:
+        return {"score": 0, "total": 0, "accuracy": 0.0, "error": "no data"}
+
+    correct = 0
+    total = 0
+    details = []
+
+    yes_tok = None
+    no_tok = None
+
+    for i, item in enumerate(data):
+        question = item.get("question", "")
+        passage = item.get("passage", "")
+        answer = item.get("answer", None)
+
+        if not question or answer is None:
+            continue
+
+        # True -> label 0 ("Yes"), False -> label 1 ("No")
+        label = 0 if answer else 1
+
+        # Truncate passage to leave room for question + answer tokens
+        ctx_text = f"Passage: {passage} Question: {question} Answer:"
+        ctx_ids = tokenizer.encode(ctx_text)
+        # Reserve space for continuation tokens within the 256 limit
+        ctx_ids = ctx_ids[:240]
+
+        # Lazy-init continuation token ids
+        if yes_tok is None:
+            yes_tok = tokenizer.encode(" Yes")
+            no_tok = tokenizer.encode(" No")
+
+        score_yes = score_continuation(model, ctx_ids, yes_tok, device, max_len=256)
+        score_no = score_continuation(model, ctx_ids, no_tok, device, max_len=256)
+
+        predicted = 0 if score_yes >= score_no else 1
+        is_correct = predicted == label
+        correct += int(is_correct)
+        total += 1
+
+        details.append({
+            "idx": i, "predicted": predicted, "label": label,
+            "correct": is_correct,
+        })
+
+        if (i + 1) % 100 == 0 or i == len(data) - 1:
+            acc = correct / total * 100 if total > 0 else 0
+            print(f"  [{i+1}/{len(data)}] accuracy: {acc:.1f}% ({correct}/{total})")
+
+    accuracy = correct / total * 100 if total > 0 else 0
+    print(f"\n  BoolQ Final: {accuracy:.2f}% ({correct}/{total})")
+
+    return {
+        "benchmark": "boolq",
         "score": correct,
         "total": total,
         "accuracy": round(accuracy, 2),
@@ -713,10 +943,12 @@ def print_summary(results: Dict):
     print("+" + "-" * 22 + "+" + "-" * 17 + "+" + "-" * 17 + "+")
 
     targets = {
-        "hellaswag":  "46-50%",
-        "arc_easy":   "45-50%",
-        "piqa":       "69-71%",
-        "perplexity": "lower=better",
+        "hellaswag":   "46-50%",
+        "arc_easy":    "45-50%",
+        "piqa":        "69-71%",
+        "winogrande":  "50-55%",
+        "boolq":       "55-62%",
+        "perplexity":  "lower=better",
     }
 
     for bench_name, bench_data in results.items():
@@ -744,6 +976,8 @@ BENCHMARKS = {
     "hellaswag": eval_hellaswag,
     "arc_easy": eval_arc_easy,
     "piqa": eval_piqa,
+    "winogrande": eval_winogrande,
+    "boolq": eval_boolq,
     "perplexity": eval_perplexity,
 }
 
@@ -757,8 +991,8 @@ def main():
                         help="Run all benchmarks")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to model checkpoint")
-    parser.add_argument("--samples", type=int, default=500,
-                        help="Number of samples per benchmark (default: 500)")
+    parser.add_argument("--samples", type=int, default=0,
+                        help="Max samples per benchmark (0 = full dataset, default: 0)")
     args = parser.parse_args()
 
     if not args.benchmark and not args.all:

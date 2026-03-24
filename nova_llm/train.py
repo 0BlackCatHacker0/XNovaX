@@ -39,13 +39,69 @@ from gqa_attention import TernaryGQAttention
 import random
 
 # Research Bible: Muon optimizer (~2x convergence, 33% less memory)
-try:
-    from muon import Muon
-    HAS_MUON = True
-    print("[Optimizer] Muon available - will use for 2D hidden weights")
-except ImportError:
-    HAS_MUON = False
-    print("[Optimizer] Muon not installed - falling back to AdamW")
+# Single-GPU implementation: Newton-Schulz orthogonalization of momentum
+class MuonSingleGPU(torch.optim.Optimizer):
+    """Muon optimizer for single GPU — no torch.distributed needed.
+
+    MomentUm Orthogonalized by Newton-Schulz iterations.
+    Only maintains first moment (no second moment like Adam), saving 33% memory.
+    Applies Newton-Schulz orthogonalization to the momentum before update.
+    """
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                       ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def _newton_schulz(self, G, steps=5):
+        """Newton-Schulz iteration to orthogonalize matrix G."""
+        # Only works on 2D matrices
+        if G.ndim != 2:
+            return G
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        X = G.float()
+        # Normalize
+        X = X / (X.norm() + 1e-7)
+        for _ in range(steps):
+            A = X @ X.T
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+        return X.to(G.dtype)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            mu = group['momentum']
+            ns_steps = group['ns_steps']
+            nesterov = group['nesterov']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                g = p.grad
+
+                # Initialize momentum buffer
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(p)
+                buf = state['momentum_buffer']
+                buf.mul_(mu).add_(g)
+
+                if nesterov:
+                    update = g + mu * buf
+                else:
+                    update = buf
+
+                # Apply Newton-Schulz orthogonalization for 2D params
+                if p.ndim == 2:
+                    update = self._newton_schulz(update, steps=ns_steps)
+
+                p.add_(update, alpha=-lr)
+
+HAS_MUON = True
+print("[Optimizer] MuonSingleGPU loaded - Newton-Schulz momentum orthogonalization")
 
 # ============================================================
 # 3-5-7-13 HARMONIC CONSTANTS
@@ -118,7 +174,7 @@ def apply_fim_transform(token_ids, fim_rate=FIM_RATE):
 _fast_path = Path(__file__).parent / "architecture_v2_fast.json"
 _v2_path = Path(__file__).parent / "architecture_v2.json"
 ARCH_PATH = _v2_path if _v2_path.exists() else Path(__file__).parent / "architecture.json"
-DATA_PATH = Path("C:/NovaX/data/llm_training/training_pairs_mega.json")
+DATA_PATH = Path("C:/NovaX/data/llm_training/training_pairs_round7.json")
 VOCAB_PATH = Path(__file__).parent / "vocab.json"
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
 LOG_PATH = Path(__file__).parent / "training_log.json"
@@ -872,36 +928,79 @@ def train(resume_path=None):
     )
 
     # Optimizer — Research Bible: Muon for 2D weights, AdamW for rest
-    if HAS_MUON:
-        # Split params: Muon for 2D hidden weights, AdamW for embeddings/norms/biases
-        muon_params = []
-        adamw_params = []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            # Muon works on 2D weight matrices (not embeddings, norms, or 1D params)
-            if param.ndim == 2 and "embed" not in name and "lm_head" not in name:
-                muon_params.append(param)
-            else:
-                adamw_params.append(param)
+    # Split params: Muon for 2D hidden weights, AdamW for embeddings/norms/biases
+    muon_params = []
+    adamw_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim == 2 and "embed" not in name and "lm_head" not in name:
+            muon_params.append(param)
+        else:
+            adamw_params.append(param)
 
-        print(f"[Optimizer] Muon: {len(muon_params)} params, AdamW: {len(adamw_params)} params")
-        optimizer = Muon(
-            muon_params=muon_params,
-            lr=0.02,  # Muon default for hidden weights
-            momentum=0.95,
-            adamw_params=adamw_params,
-            adamw_lr=train_cfg["learning_rate"],
-            adamw_betas=(0.9, 0.95),
-            adamw_wd=train_cfg["weight_decay"],
+    print(f"[Optimizer] Muon: {len(muon_params)} params, AdamW: {len(adamw_params)} params")
+
+    if HAS_MUON and muon_params:
+        # Two separate optimizers — step both each iteration
+        optimizer_muon = MuonSingleGPU(muon_params, lr=0.02, momentum=0.95)
+        optimizer_adamw = torch.optim.AdamW(
+            adamw_params,
+            lr=train_cfg["learning_rate"],
+            weight_decay=train_cfg["weight_decay"],
+            betas=(0.9, 0.95),
         )
+        optimizer = None  # Signal to use dual optimizers
     else:
+        optimizer_muon = None
+        optimizer_adamw = None
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=train_cfg["learning_rate"],
             weight_decay=train_cfg["weight_decay"],
             betas=(0.9, 0.95),
         )
+
+    # Helper functions for dual optimizer setup
+    def opt_zero_grad():
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            optimizer_muon.zero_grad(set_to_none=True)
+            optimizer_adamw.zero_grad(set_to_none=True)
+
+    def opt_step():
+        if optimizer is not None:
+            optimizer.step()
+        else:
+            optimizer_muon.step()
+            optimizer_adamw.step()
+
+    def opt_state_dict():
+        if optimizer is not None:
+            return optimizer.state_dict()
+        return {"muon": optimizer_muon.state_dict(), "adamw": optimizer_adamw.state_dict()}
+
+    def opt_load_state_dict(sd):
+        if optimizer is not None:
+            optimizer.load_state_dict(sd)
+        elif isinstance(sd, dict) and "muon" in sd:
+            optimizer_muon.load_state_dict(sd["muon"])
+            optimizer_adamw.load_state_dict(sd["adamw"])
+
+    def opt_set_lr(lr, wd):
+        if optimizer is not None:
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
+                pg["weight_decay"] = wd
+        else:
+            # Muon: scale relative to base 0.02
+            scale = lr / train_cfg["learning_rate"]
+            for pg in optimizer_muon.param_groups:
+                pg["lr"] = 0.02 * scale
+            for pg in optimizer_adamw.param_groups:
+                pg["lr"] = lr
+                pg["weight_decay"] = wd
 
     # Enable mixed precision -- bf16 on Ada Lovelace Tensor Cores (2-2.5x speedup)
     # RTX 4060 supports bf16 natively; ternary {-1,0,+1} values are exact in bf16
@@ -919,7 +1018,7 @@ def train(resume_path=None):
         print(f"Resuming from checkpoint: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        opt_load_state_dict(ckpt["optimizer_state_dict"])
         global_step = ckpt.get("global_step", 0)
         best_loss = ckpt.get("best_loss", float("inf"))
         training_log = ckpt.get("training_log", [])
@@ -965,7 +1064,7 @@ def train(resume_path=None):
             loss_check = loss.detach()
             if torch.isnan(loss_check) or torch.isinf(loss_check):
                 print(f"  WARNING: NaN/Inf loss at micro-step, skipping")
-                optimizer.zero_grad(set_to_none=True)
+                opt_zero_grad()
                 accum_steps = 0
                 accum_loss = 0.0
                 continue
@@ -990,19 +1089,11 @@ def train(resume_path=None):
                 )
                 # Spectra recipe: remove weight decay at 67% of training
                 wd = get_weight_decay(global_step, total_steps, train_cfg["weight_decay"])
-                # Update LR per param group (Muon has separate groups)
-                for pg in optimizer.param_groups:
-                    if HAS_MUON and pg.get("muon", False):
-                        # Muon params: scale relative to base 0.02
-                        scale = lr / train_cfg["learning_rate"]
-                        pg["lr"] = 0.02 * scale
-                    else:
-                        pg["lr"] = lr
-                        pg["weight_decay"] = wd
+                opt_set_lr(lr, wd)
 
                 # Optimizer step (no scaler needed with bfloat16)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                opt_step()
+                opt_zero_grad()
 
                 global_step += 1
 
@@ -1062,7 +1153,7 @@ def train(resume_path=None):
                     ckpt_path = CHECKPOINT_DIR / f"step_{global_step:06d}.pt"
                     ckpt = {
                         "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
+                        "optimizer_state_dict": opt_state_dict(),
                         "global_step": global_step,
                         "best_loss": best_loss,
                         "training_log": training_log,
@@ -1099,7 +1190,7 @@ def train(resume_path=None):
     final_path = CHECKPOINT_DIR / "final.pt"
     torch.save({
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
+        "optimizer_state_dict": opt_state_dict(),
         "global_step": global_step,
         "best_loss": best_loss,
         "training_log": training_log,
