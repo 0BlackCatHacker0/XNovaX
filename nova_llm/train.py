@@ -485,13 +485,19 @@ class TernaryTransformer(nn.Module):
         logits = self.lm_head(x)
 
         # Compute loss if targets provided
+        # Research Bible: label smoothing (0.1) smooths landscape at ternary
+        # quantization boundaries where STE introduces gradient bias
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
+            ce_loss = F.cross_entropy(
                 logits.view(-1, self.vocab_size),
                 targets.view(-1),
-                ignore_index=0  # PAD token
+                ignore_index=0,  # PAD token
+                label_smoothing=0.1,
             )
+            # Z-loss for ternary stability (prevents logit explosion)
+            zl = z_loss(logits)
+            loss = ce_loss + zl
 
         return logits, loss
 
@@ -687,6 +693,56 @@ def cosine_with_warmup(step, warmup_steps, total_steps, max_lr, min_lr=1e-6):
     return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def wsd_schedule(step, warmup_steps, total_steps, max_lr, min_lr=1e-6):
+    """Warmup-Stable-Decay schedule (Research Bible: ICLR 2025).
+
+    Three phases:
+      1. Linear warmup (0 to warmup_steps)
+      2. Stable at peak LR (warmup_steps to 50% of total)
+         - Spectra LR cut: halve LR at 50% of training
+      3. Linear decay to min_lr (50% to 100%)
+
+    Spectra recipe (ICLR 2025 Spotlight):
+      - LR reduction at 50% of training
+      - Weight decay removal at 67% (handled in training loop)
+    """
+    stable_end = int(total_steps * 0.50)
+
+    # Phase 1: Warmup
+    if step < warmup_steps:
+        return max_lr * step / warmup_steps
+
+    # Phase 2: Stable at peak LR
+    if step < stable_end:
+        return max_lr
+
+    # Phase 3: Linear decay from peak/2 to min_lr (post-Spectra cut)
+    decay_steps = total_steps - stable_end
+    progress = (step - stable_end) / max(1, decay_steps)
+    return (max_lr * 0.5) * (1.0 - progress) + min_lr * progress
+
+
+def get_weight_decay(step, total_steps, base_wd):
+    """Spectra recipe: remove weight decay at 67% of training.
+
+    Ternary quantization provides sufficient regularization in late training.
+    (Spectra/TriLM, ICLR 2025 Spotlight)
+    """
+    if step >= int(total_steps * 0.67):
+        return 0.0
+    return base_wd
+
+
+def z_loss(logits, coeff=1e-5):
+    """Z-loss: penalize large logit magnitudes for ternary stability.
+
+    Prevents logit explosion which is more likely in quantized models.
+    Used by OLMo, Switch Transformer (coefficient 1e-5).
+    """
+    log_z = torch.logsumexp(logits, dim=-1)
+    return coeff * log_z.square().mean()
+
+
 # ============================================================
 # TRAINING LOOP
 # ============================================================
@@ -851,15 +907,18 @@ def train(resume_path=None):
                 # Clip gradients
                 torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["max_grad_norm"])
 
-                # Update learning rate
-                lr = cosine_with_warmup(
+                # Update learning rate (Research Bible: WSD schedule)
+                lr = wsd_schedule(
                     global_step,
                     train_cfg["warmup_steps"],
                     total_steps,
                     train_cfg["learning_rate"],
                 )
+                # Spectra recipe: remove weight decay at 67% of training
+                wd = get_weight_decay(global_step, total_steps, train_cfg["weight_decay"])
                 for pg in optimizer.param_groups:
                     pg["lr"] = lr
+                    pg["weight_decay"] = wd
 
                 # Optimizer step (no scaler needed with bfloat16)
                 optimizer.step()
