@@ -179,7 +179,7 @@ def score_continuation(model: TernaryTransformer, context_ids: List[int],
     Returns average log-probability of continuation tokens only,
     conditioned on the context.
     """
-    full_ids = (context_ids + continuation_ids)[:max_len]
+    full_ids = (context_ids + continuation_ids)[:min(max_len, 256)]
     n_ctx = min(len(context_ids), max_len)
     n_cont = len(full_ids) - n_ctx
 
@@ -595,7 +595,9 @@ def eval_piqa(model: TernaryTransformer, tokenizer: SimpleTokenizer,
 # Benchmark: Perplexity
 # ---------------------------------------------------------------------------
 def eval_perplexity(model: TernaryTransformer, tokenizer: SimpleTokenizer,
-                    device: torch.device, max_samples: int = 200) -> Dict:
+                    device: torch.device, n: int = 200, max_samples: int = None) -> Dict:
+    if max_samples is None:
+        max_samples = n
     """Compute perplexity on held-out 10% of training data."""
     print("\n" + "=" * 60)
     print("  PERPLEXITY (Held-out Data)")
@@ -622,7 +624,7 @@ def eval_perplexity(model: TernaryTransformer, tokenizer: SimpleTokenizer,
 
     total_log_prob = 0.0
     total_tokens = 0
-    max_seq = 512
+    max_seq = 256  # Must match model's max_seq_len
 
     for i, pair in enumerate(heldout):
         prompt = pair.get("prompt", "") or pair.get("input", "")

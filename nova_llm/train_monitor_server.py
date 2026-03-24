@@ -3,7 +3,7 @@ import http.server, json, os
 
 LOG = "C:/NovaX/nova_llm/training_log.json"
 PORT = 9802
-TOTAL = 30000
+TOTAL = 50000
 
 # Tracks the last-known file mtime and max step so we can detect new runs
 _last_mtime = 0.0
