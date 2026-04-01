@@ -756,19 +756,28 @@ class PretrainDataset(Dataset):
 
     def __init__(self, data_dir, vocab_path, block_size=512):
         self.block_size = block_size
+        data_dir = Path(data_dir)
 
-        # Load BPE tokenizer
+        # Fast path: load pre-tokenized numpy array if it exists
+        npy_path = data_dir / "tokenized" / "pretrain_tokens.npy"
+        if npy_path.exists():
+            import numpy as np
+            print(f"  Loading pre-tokenized data from {npy_path}...")
+            self._tokens = np.load(str(npy_path)).tolist()
+            self._num_chunks = max(1, (len(self._tokens) - 1) // block_size)
+            print(f"  Total tokens: {len(self._tokens):,} ({len(self._tokens)/1e6:.1f}M)")
+            print(f"  Chunks (block_size={block_size}): {self._num_chunks:,}")
+            return
+
+        # Slow path: tokenize from JSONL files
         bpe_path = Path(__file__).parent / "bpe_vocab_32k.json"
         from bpe_tokenizer import NovaXTokenizer
         self._bpe = NovaXTokenizer(str(bpe_path))
         print(f"  Tokenizer: BPE ({self._bpe.vocab_size} tokens)")
 
-        # Find all JSONL files in data_dir
-        data_dir = Path(data_dir)
         jsonl_files = sorted(data_dir.glob("*.jsonl"))
         print(f"  Found {len(jsonl_files)} JSONL files in {data_dir}")
 
-        # Stream-tokenize all files into one giant token buffer
         all_tokens = []
         for fpath in jsonl_files:
             count = 0
@@ -777,7 +786,7 @@ class PretrainDataset(Dataset):
                     try:
                         obj = json.loads(line)
                         text = obj.get("text", "")
-                        if len(text) < 50:  # skip very short texts
+                        if len(text) < 50:
                             continue
                         tokens = self._bpe.encode(text)
                         all_tokens.append(self.BOS)
