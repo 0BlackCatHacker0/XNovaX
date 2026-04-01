@@ -743,6 +743,72 @@ class NovaXDataset(Dataset):
         return input_ids, target_ids
 
 
+class PretrainDataset(Dataset):
+    """Dataset for next-token prediction pretraining on raw text.
+
+    Reads JSONL files with {"text": ...} format, concatenates all text
+    into one giant token stream, then chunks into block_size windows.
+    No prompt/response structure — pure language modeling.
+    """
+    BOS = 1
+    EOS = 2
+    PAD = 0
+
+    def __init__(self, data_dir, vocab_path, block_size=512):
+        self.block_size = block_size
+
+        # Load BPE tokenizer
+        bpe_path = Path(__file__).parent / "bpe_vocab_32k.json"
+        from bpe_tokenizer import NovaXTokenizer
+        self._bpe = NovaXTokenizer(str(bpe_path))
+        print(f"  Tokenizer: BPE ({self._bpe.vocab_size} tokens)")
+
+        # Find all JSONL files in data_dir
+        data_dir = Path(data_dir)
+        jsonl_files = sorted(data_dir.glob("*.jsonl"))
+        print(f"  Found {len(jsonl_files)} JSONL files in {data_dir}")
+
+        # Stream-tokenize all files into one giant token buffer
+        all_tokens = []
+        for fpath in jsonl_files:
+            count = 0
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                        text = obj.get("text", "")
+                        if len(text) < 50:  # skip very short texts
+                            continue
+                        tokens = self._bpe.encode(text)
+                        all_tokens.append(self.BOS)
+                        all_tokens.extend(tokens)
+                        all_tokens.append(self.EOS)
+                        count += 1
+                    except Exception:
+                        continue
+            print(f"    {fpath.name}: {count:,} documents")
+
+        self._tokens = all_tokens
+        self._num_chunks = max(1, (len(all_tokens) - 1) // block_size)
+        print(f"  Total tokens: {len(all_tokens):,} ({len(all_tokens)/1e6:.1f}M)")
+        print(f"  Chunks (block_size={block_size}): {self._num_chunks:,}")
+
+    def __len__(self):
+        return self._num_chunks
+
+    def __getitem__(self, idx):
+        start = idx * self.block_size
+        end = start + self.block_size + 1  # +1 for target shift
+        chunk = self._tokens[start:end]
+
+        # Pad if at the end
+        if len(chunk) < self.block_size + 1:
+            chunk = chunk + [self.PAD] * (self.block_size + 1 - len(chunk))
+
+        t = torch.tensor(chunk, dtype=torch.long)
+        return t[:-1], t[1:]  # input, target
+
+
 # ============================================================
 # LEARNING RATE SCHEDULER
 # ============================================================
@@ -852,7 +918,7 @@ def z_loss(logits, coeff=1e-5):
 # ============================================================
 # TRAINING LOOP
 # ============================================================
-def train(resume_path=None):
+def train(resume_path=None, pretrain_dir=None):
     """Main training loop for NovaX Ternary Transformer."""
     # Reduce CUDA memory fragmentation on 8GB cards
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -912,10 +978,14 @@ def train(resume_path=None):
     print(f"  Ternary model size: ~{param_count * 2 / 8 / 1e6:.0f} MB (2-bit packed)")
 
     # Dataset and dataloader
-    fim_rate = train_cfg.get("fim_rate", 0.0)  # v2: FIM training
-    dataset = NovaXDataset(DATA_PATH, VOCAB_PATH, block_size=model_cfg["block_size"],
-                           fim_rate=fim_rate)
-    dataset._pretokenize()  # Pre-tokenize once, eliminates BPE overhead per step
+    if pretrain_dir:
+        print(f"\n>>> PRETRAINING MODE: Loading raw text from {pretrain_dir} <<<")
+        dataset = PretrainDataset(pretrain_dir, VOCAB_PATH, block_size=model_cfg["block_size"])
+    else:
+        fim_rate = train_cfg.get("fim_rate", 0.0)  # v2: FIM training
+        dataset = NovaXDataset(DATA_PATH, VOCAB_PATH, block_size=model_cfg["block_size"],
+                               fim_rate=fim_rate)
+        dataset._pretokenize()  # Pre-tokenize once, eliminates BPE overhead per step
     # Dataloader with parallel workers and pinned memory for async GPU transfer
     dataloader = DataLoader(
         dataset,
@@ -1276,10 +1346,19 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, default=None, help="Resume from specific checkpoint")
     parser.add_argument("--export", type=str, default=None, help="Export checkpoint to trit-packed format")
     parser.add_argument("--fast", action="store_true", help="Use fast training config (384 seq, batch 8, 12K steps)")
+    parser.add_argument("--pretrain", type=str, default=None,
+                        help="Pretrain on raw text JSONL files in given directory (e.g. --pretrain C:/NovaX/data/pretraining)")
     args = parser.parse_args()
 
-    # Override config path if --fast
-    if args.fast and _fast_path.exists():
+    # Override config path
+    if args.pretrain:
+        _pretrain_path = Path(__file__).parent / "architecture_pretrain.json"
+        if _pretrain_path.exists():
+            ARCH_PATH = _pretrain_path
+            print(f">>> PRETRAIN MODE: Using {_pretrain_path.name} <<<")
+        else:
+            print(f"WARNING: architecture_pretrain.json not found, using default config")
+    elif args.fast and _fast_path.exists():
         ARCH_PATH = _fast_path  # noqa: F841 — used by load_config()
         print(f">>> FAST MODE: Using {_fast_path.name} <<<")
     elif args.fast:
@@ -1297,4 +1376,4 @@ if __name__ == "__main__":
                 print(f"Auto-resuming from: {resume_path}")
             else:
                 print("No checkpoints found, starting fresh")
-        train(resume_path)
+        train(resume_path, pretrain_dir=args.pretrain)
