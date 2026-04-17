@@ -580,8 +580,8 @@ def cleanup_loop():
 
 
 # ─── HTTP Handler ───────────────────────────────────────────────────
-def parse_qs(query):
-    """Minimal query string parser."""
+def _parse_query_string(query):
+    """Minimal query string parser. (Renamed from parse_qs to avoid shadowing urllib.parse.parse_qs.)"""
     params = {}
     if not query:
         return params
@@ -629,7 +629,7 @@ class MonitorHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         query = self.path.split("?")[1] if "?" in self.path else ""
-        params = parse_qs(query)
+        params = _parse_query_string(query)
 
         # /health
         if path == "/health":

@@ -7,12 +7,15 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const LOG_PATH: &str = "C:/NovaX/web/nova_llm_training_log.json";
 const PORT: u16 = 9802;
 const TOTAL_STEPS: u64 = 50000;
+const MAX_REQUEST_BYTES: usize = 8192;
 
 #[derive(Debug, Deserialize, Clone)]
 struct LogEntry {
@@ -199,16 +202,16 @@ fn build_health(log_len: usize) -> String {
 fn send_response(mut stream: TcpStream, status_code: u16, status_text: &str, body: &str) {
     let response = format!(
         "HTTP/1.1 {} {}\r\n\
-         Content-Type: application/json\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type, Accept, Origin\r\n\
-         Access-Control-Max-Age: 3600\r\n\
-         Cache-Control: no-cache, no-store\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
+Content-Type: application/json\r\n\
+Access-Control-Allow-Origin: *\r\n\
+Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+Access-Control-Allow-Headers: Content-Type, Accept, Origin\r\n\
+Access-Control-Max-Age: 3600\r\n\
+Cache-Control: no-cache, no-store\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\
+\r\n\
+{}",
         status_code,
         status_text,
         body.len(),
@@ -218,23 +221,49 @@ fn send_response(mut stream: TcpStream, status_code: u16, status_text: &str, bod
     let _ = stream.flush();
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    let mut buf = [0u8; 2048];
-    let n = match stream.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return,
+fn handle_connection(mut stream: TcpStream, cache: Arc<Mutex<Vec<LogEntry>>>) {
+    // Per-request read timeout to protect against slow-loris
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+    // Read request line + headers until \r\n\r\n, with 8KB cap
+    let (method, path) = {
+        let mut reader = std::io::BufReader::new(&mut stream);
+        let mut first_line = String::new();
+        if reader.read_line(&mut first_line).is_err() {
+            return;
+        }
+        let mut total_bytes = first_line.len();
+        if total_bytes > MAX_REQUEST_BYTES {
+            return;
+        }
+
+        // Drain headers until blank line
+        let mut header_line = String::new();
+        loop {
+            header_line.clear();
+            let n = match reader.read_line(&mut header_line) {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            if n == 0 {
+                break;
+            }
+            total_bytes += n;
+            if total_bytes > MAX_REQUEST_BYTES {
+                return;
+            }
+            // Blank line (\r\n or \n) marks end of headers
+            if n <= 2 {
+                break;
+            }
+        }
+
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return;
+        }
+        (parts[0].to_string(), parts[1].to_string())
     };
-
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let first_line = request.lines().next().unwrap_or("");
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-
-    if parts.len() < 2 {
-        return;
-    }
-
-    let method = parts[0];
-    let path = parts[1];
 
     // Handle OPTIONS (CORS preflight)
     if method == "OPTIONS" {
@@ -242,9 +271,13 @@ fn handle_connection(mut stream: TcpStream) {
         return;
     }
 
-    let log = read_current_run();
+    // Snapshot log from in-memory cache (no disk I/O per request)
+    let log: Vec<LogEntry> = match cache.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
 
-    match path {
+    match path.as_str() {
         "/health" | "/status" => {
             let body = build_health(log.len());
             send_response(stream, 200, "OK", &body);
@@ -285,9 +318,28 @@ fn main() {
     // Handle Ctrl+C gracefully on Windows
     let _ = ctrlc_handler();
 
+    // In-memory log cache, refreshed by a background thread every 500ms.
+    // This eliminates disk I/O on every HTTP request (previously read_current_run
+    // was invoked per connection, causing redundant file reads & JSON parses).
+    let cache: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(read_current_run()));
+    {
+        let cache_bg = Arc::clone(&cache);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let fresh = read_current_run();
+            match cache_bg.lock() {
+                Ok(mut g) => *g = fresh,
+                Err(poisoned) => *poisoned.into_inner() = fresh,
+            }
+        });
+    }
+
     for stream in listener.incoming() {
         match stream {
-            Ok(s) => handle_connection(s),
+            Ok(s) => {
+                let c = Arc::clone(&cache);
+                std::thread::spawn(move || handle_connection(s, c));
+            }
             Err(e) => eprintln!("Connection error: {}", e),
         }
     }

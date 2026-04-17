@@ -23,6 +23,9 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, List
 
 from trit_kv_cache import TritKVCache, PagedTritKVCache, TritQuantizer, BLOCK
+# Hoisted from inside decode hot loops — train.py does not import this module,
+# so there is no circular-import risk.
+from train import apply_rotary
 
 
 class CachedInference:
@@ -183,7 +186,6 @@ class CachedInference:
 
             # Rotary encoding
             cos, sin = attn.rope(q, T)
-            from train import apply_rotary
             q = apply_rotary(q, cos, sin)
             k = apply_rotary(k, cos, sin)
 
@@ -242,7 +244,6 @@ class CachedInference:
 
             # Rotary encoding at position T_total-1
             cos, sin = attn.rope(q, T_total)
-            from train import apply_rotary
             # Only apply rotary for the current position
             cos_pos = cos[:, :, -1:, :]
             sin_pos = sin[:, :, -1:, :]

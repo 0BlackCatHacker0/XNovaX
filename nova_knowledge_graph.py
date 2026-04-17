@@ -91,6 +91,7 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
                 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
+                CREATE INDEX IF NOT EXISTS idx_nodes_content ON nodes(content);
                 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
                 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
                 CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);

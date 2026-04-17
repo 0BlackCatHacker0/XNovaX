@@ -49,8 +49,8 @@ def load_goals():
                 g["status"] = "paused"
                 save_goal(g)
             goals[g["id"]] = g
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[AGENT] load failed: {e}")
 
 
 def cloud_query(prompt, model=None):
@@ -148,22 +148,28 @@ def execute_subtask(subtask, goal):
 
     for attempt_idx in range(subtask["max_attempts"]):
         model = MODELS_FALLBACK[attempt_idx % len(MODELS_FALLBACK)]
-        subtask["attempts"] = attempt_idx + 1
-        subtask["assigned_model"] = model or "default"
-        subtask["status"] = "running"
-        save_goal(goal)
+        # Guard subtask dict mutations — multiple goal_worker threads can run
+        # execute_subtask concurrently on sibling subtasks of the same goal.
+        with goals_lock:
+            subtask["attempts"] = attempt_idx + 1
+            subtask["assigned_model"] = model or "default"
+            subtask["status"] = "running"
+            save_goal(goal)
 
+        # cloud_query is long-running; do not hold the lock over network I/O.
         result = cloud_query(prompt, model=model)
         if result and len(result.strip()) > 5:
-            subtask["status"] = "completed"
-            subtask["result"] = result
-            save_goal(goal)
+            with goals_lock:
+                subtask["status"] = "completed"
+                subtask["result"] = result
+                save_goal(goal)
             return True
         time.sleep(2)
 
-    subtask["status"] = "failed"
-    subtask["result"] = "Failed after %d attempts" % subtask["max_attempts"]
-    save_goal(goal)
+    with goals_lock:
+        subtask["status"] = "failed"
+        subtask["result"] = "Failed after %d attempts" % subtask["max_attempts"]
+        save_goal(goal)
     return False
 
 

@@ -25,6 +25,10 @@ use trit_lut::TRIT_LUT;
 // Send/Sync wrappers for raw pointers (safe because we guarantee no aliasing)
 // ---------------------------------------------------------------------------
 
+// Module-private raw-pointer wrapper used only inside rayon parallel loops
+// where each worker writes to a non-overlapping output slice. The Send/Sync
+// impls are sound ONLY under that invariant — do NOT export this type.
+#[doc(hidden)]
 #[derive(Copy, Clone)]
 struct SendPtr<T>(*mut T);
 unsafe impl<T> Send for SendPtr<T> {}

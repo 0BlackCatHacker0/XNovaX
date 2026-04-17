@@ -171,11 +171,22 @@ impl Runtime {
                 let obj = self.get_var(name);
                 match obj {
                     Value::List(mut items) => {
-                        let i = idx.to_int() as usize;
-                        if i < items.len() {
-                            items[i] = val;
-                            self.update_var(name, Value::List(items));
+                        let i_signed = idx.to_int();
+                        if i_signed < 0 {
+                            return Err(format!(
+                                "IndexAssign: negative index {} on list '{}'",
+                                i_signed, name
+                            ));
                         }
+                        let i = i_signed as usize;
+                        if i >= items.len() {
+                            return Err(format!(
+                                "IndexAssign: index {} out of bounds for list '{}' (len {})",
+                                i, name, items.len()
+                            ));
+                        }
+                        items[i] = val;
+                        self.update_var(name, Value::List(items));
                     }
                     Value::Dict(mut pairs) => {
                         let key = idx.to_display();
@@ -1133,7 +1144,7 @@ impl Runtime {
                         if method == "POST" && path_only == "/_hotswap" {
                             // Extract source_file and base_dir under a short lock to avoid deadlock
                             let (src_opt, bdir) = {
-                                let vm = vm_ref.lock().unwrap();
+                                let vm = vm_ref.lock().unwrap_or_else(|e| e.into_inner());
                                 (vm.source_file.clone(), vm.base_dir.clone())
                             };
                             let swap_result = if let Some(src_path) = src_opt {
@@ -1152,7 +1163,7 @@ impl Runtime {
                                             format!("{{\"ok\":false,\"error\":\"parse error: {}\",\"trit\":-1}}", e)
                                         } else {
                                             // Swap functions and top-level vars into the live VM
-                                            let mut vm = vm_ref.lock().unwrap();
+                                            let mut vm = vm_ref.lock().unwrap_or_else(|e| e.into_inner());
                                             vm.functions = fresh.functions;
                                             // Merge top-level scope (preserve runtime state like _stats)
                                             if let Some(fresh_global) = fresh.scopes.first() {
@@ -1204,9 +1215,12 @@ impl Runtime {
                             });
 
                         if let Some(fn_name) = handler_name {
-                            // Read request body
+                            // Read request body (capped at 1 MiB to prevent memory exhaustion)
+                            use std::io::Read as _IoRead;
                             let mut body = String::new();
-                            if let Ok(_) = request.as_reader().read_to_string(&mut body) {}
+                            let _ = request.as_reader()
+                                .take(1024 * 1024)
+                                .read_to_string(&mut body);
 
                             // Build request dict
                             let mut req_pairs: Vec<(String, Value)> = vec![
@@ -1237,7 +1251,7 @@ impl Runtime {
 
                             // Call handler under lock (concurrent via mutex)
                             let response_body = {
-                                let mut vm = vm_ref.lock().unwrap();
+                                let mut vm = vm_ref.lock().unwrap_or_else(|e| e.into_inner());
                                 let result = vm.call_fn(&fn_name, vec![req_dict]);
                                 match result {
                                     Ok(val) => builtins::call_builtin("json_encode", &[val])
@@ -1259,8 +1273,11 @@ impl Runtime {
                                 );
                             let _ = request.respond(response);
                         } else {
-                            // 404 not found
-                            let not_found = format!("{{\"error\":\"not found\",\"path\":\"{}\"}}", path_only);
+                            // 404 not found — escape path to prevent JSON injection
+                            let escaped_path = path_only
+                                .replace('\\', "\\\\")
+                                .replace('"', "\\\"");
+                            let not_found = format!("{{\"error\":\"not found\",\"path\":\"{}\"}}", escaped_path);
                             let response = tiny_http::Response::from_string(&not_found)
                                 .with_status_code(404)
                                 .with_header(

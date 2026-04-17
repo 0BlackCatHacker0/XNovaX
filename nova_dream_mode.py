@@ -252,7 +252,8 @@ class DreamJournal:
                 with open(self.path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.entries = data.get("entries", [])
-        except Exception:
+        except Exception as e:
+            print(f"[DREAM] load failed: {e}")
             self.entries = []
 
     def _save(self):

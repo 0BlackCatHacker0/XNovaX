@@ -41,7 +41,7 @@ SCRIPT_DIR = Path(__file__).parent
 ARCH_PATH = SCRIPT_DIR / "architecture.json"
 CHECKPOINT_DIR = SCRIPT_DIR / "checkpoints"
 BPE_VOCAB_PATH = SCRIPT_DIR / "bpe_vocab_32k.json"
-DATA_PATH = Path("C:/NovaX/data/llm_training/training_pairs_mega.json")
+DATA_PATH = Path(os.environ.get("NOVAX_EVAL_DATA", "C:/NovaX/data/llm_training/training_pairs_mega.json"))
 RESULTS_PATH = SCRIPT_DIR / "eval_results.json"
 BENCHMARK_CACHE_DIR = SCRIPT_DIR / "eval_cache"
 

@@ -984,6 +984,10 @@ def train(resume_path=None, pretrain_dir=None):
     # Create model
     print("Building TernaryTransformer...")
     model = TernaryTransformer(config).to(device)
+    # Default avg_loss so checkpoint save block is always well-defined
+    avg_loss = float('inf')
+    # Keep reference to uncompiled model for methods torch.compile may wrap (e.g. ternary_ratio)
+    orig_model = model
     # Enable gradient checkpointing to save VRAM (trades compute for memory)
     use_grad_ckpt = config.get("model", {}).get("gradient_checkpointing", False)
     if use_grad_ckpt:
@@ -1269,7 +1273,7 @@ def train(resume_path=None, pretrain_dir=None):
     print(f"  Total steps:    {global_step}")
     print(f"  Best loss:      {best_loss:.4f}")
     print(f"  Total time:     {elapsed/3600:.2f} hours")
-    print(f"  Ternary ratio:  {model.ternary_ratio():.1f}%")
+    print(f"  Ternary ratio:  {orig_model.ternary_ratio():.1f}%")
     print(f"{'='*60}\n")
 
     # Save final checkpoint

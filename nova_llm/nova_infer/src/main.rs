@@ -197,9 +197,14 @@ fn print_banner(config: &ModelConfig) {
     println!("============================================================");
     println!("  NovaX Ternary LLM Inference (Rust)");
     println!("============================================================");
-    println!("  Parameters:    ~{}M",
-        config.embed_dim * config.vocab_size / 1_000_000 +
-        config.num_layers * config.embed_dim * config.ffn_dim * 3 / 1_000_000);
+    // Param count = token embedding + per-layer (attention Q/K/V/O + FFN gate/up/down)
+    //             = vocab*embed + layers * (4*embed^2 + 3*embed*ffn_dim)
+    // Previously missed the 4*embed^2 attention-projection term entirely.
+    let attn_params = 4 * config.embed_dim * config.embed_dim;
+    let ffn_params = 3 * config.embed_dim * config.ffn_dim;
+    let total_params = config.embed_dim * config.vocab_size
+        + config.num_layers * (attn_params + ffn_params);
+    println!("  Parameters:    ~{}M", total_params / 1_000_000);
     println!("  Embed dim:     {}", config.embed_dim);
     println!("  Layers:        {}", config.num_layers);
     println!("  Heads:         {}", config.num_heads);

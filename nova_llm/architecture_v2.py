@@ -59,6 +59,7 @@ from train import (
 # ============================================================
 # CONFIGURATION
 # ============================================================
+# MUST stay in sync with architecture_v2.json
 V2_CONFIG = {
     "name": "NovaX-v2-RingFormer",
     "model": {
@@ -68,7 +69,7 @@ V2_CONFIG = {
         "num_kv_heads": 4,         # GQA-4
         "head_dim": 64,            # 1024 / 16
         "ffn_dim": 2730,
-        "max_seq_len": 512,
+        "max_seq_len": 256,
         "num_loops": 8,            # shared block looped 8x
         "lora_rank": 32,           # per-loop LoRA rank
         "mod_capacity": 0.625,     # MoD: top 62.5% tokens get full compute

@@ -16,6 +16,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# NOTE: train.py imports TernaryGQAttention from this module, so a top-level
+# `from train import apply_rotary` would be circular. We use a module-level
+# cache populated on first use — still avoids the repeated `from train import`
+# dict lookup cost on every forward() call.
+_apply_rotary = None
+
+def _get_apply_rotary():
+    global _apply_rotary
+    if _apply_rotary is None:
+        from train import apply_rotary as _ar
+        _apply_rotary = _ar
+    return _apply_rotary
+
 
 class TernaryGQAttention(nn.Module):
     """Grouped Query Attention with ternary weight projections.
@@ -76,7 +89,7 @@ class TernaryGQAttention(nn.Module):
         # Apply RoPE if available
         if self.rope is not None:
             cos, sin = self.rope(q, T)
-            from train import apply_rotary
+            apply_rotary = _get_apply_rotary()
             q = apply_rotary(q, cos, sin)
             k = apply_rotary(k, cos, sin)
 

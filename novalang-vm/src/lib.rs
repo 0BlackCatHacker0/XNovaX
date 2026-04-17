@@ -5,5 +5,6 @@ pub mod lexer;
 pub mod parser;
 pub mod vm;
 pub mod builtins;
-pub mod tmatmul;
-pub mod isa;
+// Internal implementation details — not part of the public LSP/tooling API.
+pub(crate) mod tmatmul;
+pub(crate) mod isa;

@@ -54,14 +54,22 @@ sys.modules["__main__"] = module
 # Schedule health check patch to apply after orchestrator initializes
 import threading
 def _apply_health_patch():
-    """Apply health check fix after orchestrator module finishes loading."""
+    """Apply health check fix as soon as orchestrator module is importable.
+
+    Preserves the old ~3s maximum wait but applies the patch the moment
+    `health_patch` becomes importable, instead of always sleeping 3 seconds.
+    """
     import time
-    time.sleep(3)  # Wait for orchestrator to finish init
-    try:
-        import health_patch
-        print("[boot] Health check patch applied successfully")
-    except Exception as e:
-        print(f"[boot] Health patch failed: {e}")
+    last_err = None
+    for _ in range(10):  # up to 10 * 0.5s = 5s maximum
+        time.sleep(0.5)
+        try:
+            import health_patch  # noqa: F401
+            print("[boot] Health check patch applied successfully")
+            return
+        except Exception as e:
+            last_err = e
+    print(f"[boot] Health patch failed: {last_err}")
 threading.Thread(target=_apply_health_patch, daemon=True, name="health-patcher").start()
 
 spec.loader.exec_module(module)

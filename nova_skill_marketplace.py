@@ -50,7 +50,7 @@ def save_registry(reg):
     tmp = REGISTRY_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(reg, f, indent=2)
-    shutil.move(tmp, REGISTRY_FILE)
+    os.replace(tmp, REGISTRY_FILE)  # atomic on same filesystem
 
 
 def now_iso():

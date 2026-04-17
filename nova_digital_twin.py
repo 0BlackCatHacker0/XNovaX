@@ -51,8 +51,8 @@ def load_profile():
                 if k not in data:
                     data[k] = v
             return data
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[TWIN] load failed: {e}")
     return default_profile()
 
 
@@ -189,7 +189,7 @@ def observe(query, response, feedback="none"):
     """Process one interaction and update the profile."""
     global PROFILE
     now = datetime.now(timezone.utc)
-    hour = datetime.now().hour  # local hour
+    hour = datetime.now(timezone.utc).hour  # UTC hour (consistent with first_seen/last_seen)
 
     # Interaction count
     PROFILE["interaction_count"] += 1

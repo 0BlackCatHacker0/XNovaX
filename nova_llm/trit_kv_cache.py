@@ -562,7 +562,15 @@ class PagedTritKVCache:
 
             existing = self._fetch_page(page_id)
             if existing is not None and offset_in_page > 0:
-                # Append to existing page — for simplicity, dequantize, concat, re-quantize
+                # PERFORMANCE WARNING: O(page_size) per-token cost — every append to an
+                # existing page fully dequantizes the page, concatenates the new tokens,
+                # then re-quantizes the entire page. For a page_size of N this is O(N)
+                # work per token, i.e. O(N^2) to fill a page. Accuracy-critical today
+                # because quantization scales depend on the full page tensor.
+                # TODO: replace with a buffered-append pattern — keep a small FP buffer
+                # of unquantized tail tokens per page, and only re-quantize when the
+                # buffer reaches a threshold or the page is evicted. Deferred
+                # quantization would make this O(1) amortized per token.
                 ek = self.quantizer.dequantize(*existing["k"], self.device)
                 ev = self.quantizer.dequantize(*existing["v"], self.device)
                 new_k = torch.cat([ek, self.quantizer.dequantize(k_packed, k_scales, k_shape, self.device)], dim=-2)
