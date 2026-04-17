@@ -319,17 +319,23 @@ fn main() {
     let _ = ctrlc_handler();
 
     // In-memory log cache, refreshed by a background thread every 500ms.
-    // This eliminates disk I/O on every HTTP request (previously read_current_run
-    // was invoked per connection, causing redundant file reads & JSON parses).
+    // This eliminates disk I/O on every HTTP request.
     let cache: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(read_current_run()));
+
+    // Shutdown flag — set to true if the listener loop exits so the background
+    // thread can exit cleanly instead of leaving the process hanging.
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let cache_bg = Arc::clone(&cache);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(500));
-            let fresh = read_current_run();
-            match cache_bg.lock() {
-                Ok(mut g) => *g = fresh,
-                Err(poisoned) => *poisoned.into_inner() = fresh,
+        let shutdown_bg = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            while !shutdown_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+                let fresh = read_current_run();
+                match cache_bg.lock() {
+                    Ok(mut g) => *g = fresh,
+                    Err(poisoned) => *poisoned.into_inner() = fresh,
+                }
             }
         });
     }
@@ -340,9 +346,16 @@ fn main() {
                 let c = Arc::clone(&cache);
                 std::thread::spawn(move || handle_connection(s, c));
             }
-            Err(e) => eprintln!("Connection error: {}", e),
+            Err(e) => {
+                eprintln!("Connection error: {}", e);
+                // On fatal listener errors, signal the background thread to exit
+                // so the process can terminate cleanly.
+                shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
+    // Main loop ended: signal shutdown to background thread.
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Set up Ctrl+C handler so the process exits cleanly (no zombie)

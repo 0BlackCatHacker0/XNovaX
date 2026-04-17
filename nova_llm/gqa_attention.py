@@ -89,9 +89,12 @@ class TernaryGQAttention(nn.Module):
         # Apply RoPE if available
         if self.rope is not None:
             cos, sin = self.rope(q, T)
-            apply_rotary = _get_apply_rotary()
-            q = apply_rotary(q, cos, sin)
-            k = apply_rotary(k, cos, sin)
+            # Hot path: use module-level cache directly (skip function call after first load)
+            global _apply_rotary
+            if _apply_rotary is None:
+                _get_apply_rotary()  # populates _apply_rotary
+            q = _apply_rotary(q, cos, sin)
+            k = _apply_rotary(k, cos, sin)
 
         # Expand KV heads to match Q heads via zero-copy expand (no memory alloc)
         # k shape: (B, 4, T, 64) -> (B, 16, T, 64)

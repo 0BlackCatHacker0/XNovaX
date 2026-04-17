@@ -178,11 +178,14 @@ class CachedInference:
             # Pre-norm
             h = layer.attn_norm(x)
 
-            # Compute Q, K, V
+            # Compute Q, K, V. For GQA: Q uses num_heads, K/V use num_kv_heads.
+            # For MHA: num_kv_heads == num_heads (no difference).
             attn = layer.attn
-            q = attn.q_proj(h).view(B, T, attn.num_heads, attn.head_dim).transpose(1, 2)
-            k = attn.k_proj(h).view(B, T, attn.num_heads, attn.head_dim).transpose(1, 2)
-            v = attn.v_proj(h).view(B, T, attn.num_heads, attn.head_dim).transpose(1, 2)
+            _nh = attn.num_heads
+            _nkv = getattr(attn, 'num_kv_heads', _nh)
+            q = attn.q_proj(h).view(B, T, _nh, attn.head_dim).transpose(1, 2)
+            k = attn.k_proj(h).view(B, T, _nkv, attn.head_dim).transpose(1, 2)
+            v = attn.v_proj(h).view(B, T, _nkv, attn.head_dim).transpose(1, 2)
 
             # Rotary encoding
             cos, sin = attn.rope(q, T)
@@ -237,10 +240,12 @@ class CachedInference:
             h = layer.attn_norm(x)
             attn = layer.attn
 
-            # Compute Q, K, V for the NEW token only
-            q = attn.q_proj(h).view(B, T_new, attn.num_heads, attn.head_dim).transpose(1, 2)
-            k_new = attn.k_proj(h).view(B, T_new, attn.num_heads, attn.head_dim).transpose(1, 2)
-            v_new = attn.v_proj(h).view(B, T_new, attn.num_heads, attn.head_dim).transpose(1, 2)
+            # Compute Q, K, V for the NEW token only. GQA: K/V have num_kv_heads.
+            _nh = attn.num_heads
+            _nkv = getattr(attn, 'num_kv_heads', _nh)
+            q = attn.q_proj(h).view(B, T_new, _nh, attn.head_dim).transpose(1, 2)
+            k_new = attn.k_proj(h).view(B, T_new, _nkv, attn.head_dim).transpose(1, 2)
+            v_new = attn.v_proj(h).view(B, T_new, _nkv, attn.head_dim).transpose(1, 2)
 
             # Rotary encoding at position T_total-1
             cos, sin = attn.rope(q, T_total)

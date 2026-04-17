@@ -1160,7 +1160,9 @@ impl Runtime {
                                         fresh.skip_tstart = true; // Don't re-bind during hotswap
                                         // Execute top-level statements to register functions and set vars
                                         if let Err(e) = fresh.execute(&ast) {
-                                            format!("{{\"ok\":false,\"error\":\"parse error: {}\",\"trit\":-1}}", e)
+                                            // Escape backslashes and quotes in error message to keep JSON valid.
+                                            let msg = format!("{}", e).replace('\\', "\\\\").replace('"', "\\\"");
+                                            format!("{{\"ok\":false,\"error\":\"parse error: {}\",\"trit\":-1}}", msg)
                                         } else {
                                             // Swap functions and top-level vars into the live VM
                                             let mut vm = vm_ref.lock().unwrap_or_else(|e| e.into_inner());
@@ -1181,7 +1183,10 @@ impl Runtime {
                                                     vm.functions.len())
                                         }
                                     }
-                                    Err(e) => format!("{{\"ok\":false,\"error\":\"read error: {}\",\"trit\":-1}}", e),
+                                    Err(e) => {
+                                        let msg = format!("{}", e).replace('\\', "\\\\").replace('"', "\\\"");
+                                        format!("{{\"ok\":false,\"error\":\"read error: {}\",\"trit\":-1}}", msg)
+                                    }
                                 }
                             } else {
                                 "{\"ok\":false,\"error\":\"no source file for hotswap\",\"trit\":-1}".to_string()

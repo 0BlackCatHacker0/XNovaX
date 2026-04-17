@@ -28,6 +28,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import List, Optional
 
+import pickle
 import torch
 import torch.nn.functional as F
 
@@ -98,8 +99,11 @@ def load_model(config: dict, checkpoint_path: Path, device: torch.device):
     # supported by PyTorch's weights_only safelist.
     try:
         checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=True)
-    except Exception:
-        # Fallback for checkpoints saved by older training code
+    except (pickle.UnpicklingError, AttributeError, RuntimeError) as e:
+        # Narrow fallback: only catches unpickling/safelist errors, not I/O or OOM.
+        # WARN so the user knows the security check was bypassed for this checkpoint.
+        print(f"[chat] WARN: weights_only=True rejected ({type(e).__name__}): {e}")
+        print(f"[chat] WARN: falling back to weights_only=False — trust this checkpoint source!")
         checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
 
     # Checkpoints may store state_dict directly or under a key

@@ -24,6 +24,7 @@ import argparse
 import json
 import math
 import os
+import pickle
 import sys
 import time
 import urllib.request
@@ -129,7 +130,9 @@ def load_model(checkpoint_path: Optional[str] = None) -> Tuple[TernaryTransforme
     # Security: weights_only=True blocks pickle-based code execution.
     try:
         ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=True)
-    except Exception:
+    except (pickle.UnpicklingError, AttributeError, RuntimeError) as e:
+        print(f"[eval] WARN: weights_only=True rejected ({type(e).__name__}): {e}")
+        print(f"[eval] WARN: falling back to weights_only=False — trust this checkpoint source!")
         ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
 
     # Handle different checkpoint formats

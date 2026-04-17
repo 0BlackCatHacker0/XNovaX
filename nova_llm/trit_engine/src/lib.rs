@@ -426,6 +426,11 @@ pub extern "C" fn trit_attention_proj(
         return -1;
     }
 
+    // Reject negative dimensions — `as usize` on negative i32 yields huge values.
+    if batch < 0 || seq_len < 0 || embed_dim < 0 || proj_dim < 0 {
+        return -2;
+    }
+
     let total_tokens = (batch * seq_len) as usize;
     let ed = embed_dim as usize;
     let pd = proj_dim as usize;

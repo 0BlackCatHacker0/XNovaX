@@ -368,8 +368,12 @@ class DreamEngine:
                 "phase": self.phase,
             }
             self.config.STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.config.STATE_PATH, "w", encoding="utf-8") as f:
+            # Atomic save: write to .tmp then replace, so a crash mid-write
+            # leaves the old state intact rather than a truncated file.
+            tmp = self.config.STATE_PATH.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            tmp.replace(self.config.STATE_PATH)
         except Exception as e:
             print(f"[DREAM] State save error: {e}")
 

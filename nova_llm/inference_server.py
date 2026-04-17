@@ -24,6 +24,7 @@ import http.server
 import json
 import math
 import os
+import pickle
 import sys
 import time
 import threading
@@ -108,7 +109,9 @@ def load_model():
     # Security: weights_only=True blocks pickle-based code execution.
     try:
         ckpt = torch.load(CHECKPOINT, map_location=_device, weights_only=True)
-    except Exception:
+    except (pickle.UnpicklingError, AttributeError, RuntimeError) as e:
+        print(f"[infer] WARN: weights_only=True rejected ({type(e).__name__}): {e}")
+        print(f"[infer] WARN: falling back to weights_only=False — trust this checkpoint!")
         ckpt = torch.load(CHECKPOINT, map_location=_device, weights_only=False)
     _model.load_state_dict(ckpt["model_state_dict"])
     _model.to(_device)
