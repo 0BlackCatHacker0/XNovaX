@@ -197,18 +197,35 @@ All KNOWN_SERVICES ports have corresponding BOOT_ORDER entries.
 
 ---
 
-## CATEGORY E: Truly Stub Services (Health-Only, No Real Logic)
+## CATEGORY E: Known Stub / No-Op Services (updated 2026-04)
 
-**NONE FOUND.**
+The previous version of this section claimed "NONE FOUND — zero true stubs."
+That was inaccurate: the audit only scanned BOOT_ORDER services, not the
+support modules they import. A fuller Round-4 audit found the following
+deliberate stubs, all now returning HONEST `{"ok": false, "disabled": true}`
+markers instead of silent `{"status": "stub_mode"}` pseudo-success:
 
-Every single .nova and .py service file in the BOOT_ORDER has:
-- Real route handlers beyond /health
-- Business logic (data processing, state management, external calls)
-- Ternary state tracking (+1/0/-1)
-- N-S flow constants (3-5-7-13)
+1. **`core/os_integration.nova`** — 26 Win32-integration endpoints
+   (wallpaper/theme/protocol/tray/taskbar/lockscreen/file-assoc). These
+   are PERMANENTLY DISABLED per MEMORY.md ABSOLUTE PROHIBITIONS (the user
+   was locked out of Windows by an earlier shell-replace path). Returns
+   honest disabled marker. Reachable via `/api/os/*` on the orchestrator.
 
-The term "stub" appears to be a legacy label. All services are fully
-implemented and ready for activation.
+2. **`core/gameplay/learning.py`** — `GameplayLearner` class. Previously
+   silently returned `{}` / `0` / `[]` from every method. Now returns
+   `{"ok": false, "disabled": true}` with `is_enabled() → False`.
+
+3. **`core/godmode/session.py`** — `GodModeEngine.get_dashboard()` /
+   `execute_bootstrap()`. Honest — returns `{"status": "DISABLED"}`.
+
+4. **`nova_llm/nova_infer/`** — Rust inference binary SKELETON. CLI loads
+   checkpoint and tokenizer but forward pass is not implemented. Now
+   `exit(2)` with a pointer to `chat.py` instead of returning input tokens
+   as if they were generated output.
+
+All other NovaX-owned services have real route handlers, real business
+logic, and genuine state management. The list above is the complete set of
+intentional stubs, each now behaving honestly.
 
 ---
 

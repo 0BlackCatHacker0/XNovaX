@@ -163,29 +163,29 @@ impl TernaryModel {
         })
     }
 
-    fn generate(&self, input_ids: &[u32], max_new_tokens: usize, temperature: f32) -> Vec<u32> {
-        let mut output = input_ids.to_vec();
-
-        // TODO: Implement the full transformer forward pass:
-        // 1. Token embedding lookup
-        // 2. For each layer:
-        //    a. RMSNorm
-        //    b. Multi-head attention (Q/K/V projections via trit_engine matmul)
-        //    c. RoPE positional encoding
-        //    d. Attention scores + softmax
-        //    e. Output projection
-        //    f. Residual connection
-        //    g. RMSNorm
-        //    h. FFN (SwiGLU: gate * up * silu, then down projection)
-        //    i. Residual connection
-        // 3. Final RMSNorm
-        // 4. LM head projection -> logits
-        // 5. Temperature sampling
-
-        // Placeholder: return input as-is with a message token
-        println!("  [Inference engine skeleton — forward pass not yet implemented]");
-        println!("  [trit_engine SIMD matmul ready, transformer layers needed]");
-        output
+    fn generate(&self, _input_ids: &[u32], _max_new_tokens: usize, _temperature: f32) -> Vec<u32> {
+        // HONEST ERROR: the Rust inference path is NOT YET IMPLEMENTED.
+        // Previous version silently returned the input unchanged, which was a
+        // hallucination — the CLI printed "Ternary LLM Inference (Rust)" and
+        // loaded a checkpoint but did no forward pass. Now we refuse to
+        // generate and point the user to the working Python path.
+        //
+        // To implement: port the TernaryTransformer forward pass from train.py:
+        //   1. Token embedding lookup
+        //   2. For each layer: RMSNorm → QKV → RoPE → Attn → OutProj → residual → RMSNorm → FFN → residual
+        //   3. Final RMSNorm → LM head → logits → temperature sampling
+        // The trit_engine crate provides SIMD matmul primitives ready for use.
+        eprintln!();
+        eprintln!("  ERROR: Rust inference forward pass is not yet implemented.");
+        eprintln!("  Use the Python path instead:");
+        eprintln!("      python C:/NovaX/nova_llm/chat.py --prompt \"your prompt here\"");
+        eprintln!();
+        eprintln!("  When this Rust path is ready, the trit_engine SIMD matmul");
+        eprintln!("  will drive all Q/K/V/O and FFN layers. Skeleton is complete");
+        eprintln!("  (tokenizer, checkpoint loader, CLI); forward pass is the");
+        eprintln!("  remaining work (~500-800 lines of transformer math).");
+        eprintln!();
+        std::process::exit(2);
     }
 }
 
@@ -195,7 +195,8 @@ impl TernaryModel {
 
 fn print_banner(config: &ModelConfig) {
     println!("============================================================");
-    println!("  NovaX Ternary LLM Inference (Rust)");
+    println!("  NovaX Ternary LLM Inference (Rust) — SKELETON ONLY");
+    println!("  Forward pass not yet implemented — use chat.py for real inference");
     println!("============================================================");
     // Param count = token embedding + per-layer (attention Q/K/V/O + FFN gate/up/down)
     //             = vocab*embed + layers * (4*embed^2 + 3*embed*ffn_dim)

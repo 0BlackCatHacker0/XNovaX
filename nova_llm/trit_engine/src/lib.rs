@@ -1,6 +1,14 @@
-//! trit_engine — Zero-multiply ternary matrix operations for NovaX LLM
+//! trit_engine — Ternary matrix operations for NovaX LLM
 //!
-//! Ternary weights {-1, 0, +1} replace float32 matmul with add/subtract/skip.
+//! Ternary weights {-1, 0, +1} so each matmul element is semantically an
+//! add / subtract / skip — no learned-precision float multiply. Internally
+//! the AVX2 path still uses `_mm256_mul_ps` against {0.0, 1.0} masks for
+//! SIMD-friendly throughput; functionally this is a masked add/subtract
+//! and the weight values remain in {-1, 0, +1} end-to-end (no fp weight
+//! reconstruction), but the instruction stream does contain multiplies.
+//! A genuinely multiply-free AVX-512 path would use VADD with mask
+//! predication — that is future work.
+//!
 //! TZip packing: 5 trits per byte (3^5 = 243 states in a u8).
 //! LUT decode: 243-entry table stays in L1 cache (1.2 KB).
 //!
@@ -740,7 +748,7 @@ pub extern "C" fn trit_unpack_kv(
 // Version is pulled from Cargo.toml at compile time so it stays in sync.
 static ENGINE_INFO: &[u8] = concat!(
     "trit_engine v", env!("CARGO_PKG_VERSION"),
-    " | NovaX LLM | zero-multiply ternary matmul | TZip(3^5=243) LUT decode",
+    " | NovaX LLM | ternary matmul (add/sub/skip semantics, mul-by-mask SIMD) | TZip(3^5=243) LUT decode",
     " | AVX2 SIMD + tiled matmul | rayon parallel",
     " | embed=768 heads=13 layers=13 vocab=32768\0"
 ).as_bytes();

@@ -479,9 +479,15 @@ class TernaryTransformerBlock(nn.Module):
 # TERNARY TRANSFORMER MODEL
 # ============================================================
 class TernaryTransformer(nn.Module):
-    """NovaX Ternary Transformer — 1B parameter LLM.
+    """NovaX Ternary Transformer — ~210M parameter LLM.
 
-    Architecture (3-5-7-13 harmonic):
+    IMPORTANT: This docstring describes the abstract 3-5-7-13 harmonic target,
+    but the LIVE configuration that this class actually instantiates comes from
+    architecture.json / architecture_v2.json / architecture_pretrain.json. The
+    real runtime shapes do NOT match the harmonic target — they use
+    conventional power-of-2 sizes that fit within 8 GB VRAM on an RTX 4060.
+
+    Harmonic-ideal target (aspirational, NOT currently instantiated):
         Embedding:  32768 vocab -> 2187 dim (3^7 = BLOCK)
         Layers:     13 transformer blocks (H13)
         Heads:      7 per layer (H7)
@@ -489,7 +495,14 @@ class TernaryTransformer(nn.Module):
         FFN dim:    6561 (3^8)
         Max seq:    2187 (BLOCK)
 
-    Weights quantized to {-1, 0, +1} during forward pass.
+    Actual runtime config (from architecture_v2.json, the default):
+        Embedding:  32768 vocab -> 1024 dim
+        Layers:     16 transformer blocks
+        Heads:      16 Q × 4 KV (GQA-4), head_dim = 64
+        FFN dim:    2730 (SwiGLU)
+        Max seq:    256
+
+    Weights quantized to {-1, 0, +1} during forward pass after warmup.
     Full precision maintained for gradient computation (STE).
     """
     def __init__(self, config):

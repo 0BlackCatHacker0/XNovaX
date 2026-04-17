@@ -2,6 +2,22 @@
 // NovaX Ternary Instruction Set Architecture (ISA) v1.0
 // ============================================================================
 //
+// STATUS: DESIGN SPEC / REFERENCE ONLY — NOT WIRED TO THE VM.
+// ---------------------------------------------------------------------------
+// This file contains a complete ternary bytecode ISA design (1700+ lines)
+// but NO module or binary in this crate actually imports or executes it.
+// The NovaLang VM (vm.rs) is a tree-walking interpreter that operates on
+// the AST directly — it does NOT compile to this bytecode.
+//
+// This file is kept because:
+//   1. It documents the ternary-first ISA vision for a future compiler pass.
+//   2. The opcode definitions, encoding layout, and register model are
+//      reference material for anyone building a bytecode backend.
+//
+// If you're here looking for the active interpreter, see vm.rs. If you
+// implement a bytecode compiler later, this ISA is a starting point.
+// ---------------------------------------------------------------------------
+//
 // A native ternary ISA built on the 3-5-7-13 harmonic system.
 // Every value is a balanced ternary trit: {-1, 0, +1} (written as {N, Z, P})
 //
