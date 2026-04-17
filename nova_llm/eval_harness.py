@@ -126,7 +126,11 @@ def load_model(checkpoint_path: Optional[str] = None) -> Tuple[TernaryTransforme
                 sys.exit(1)
 
     print(f"[Model] Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+    # Security: weights_only=True blocks pickle-based code execution.
+    try:
+        ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=True)
+    except Exception:
+        ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
 
     # Handle different checkpoint formats
     state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))

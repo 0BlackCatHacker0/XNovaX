@@ -73,14 +73,35 @@ def make_metadata(name, version="1.0.0", author="unknown",
     }
 
 
+def _safe_skill_name(name):
+    """Strip path-traversal characters and assert result stays inside SKILLS_DIR."""
+    # Remove ALL path separators and parent-directory markers
+    safe = name.replace("..", "").replace("/", "").replace("\\", "").replace("\x00", "")
+    # Strip leading dots and whitespace that could still cause issues
+    safe = safe.lstrip(". ").strip()
+    if not safe:
+        raise ValueError("Invalid skill name (empty after sanitization)")
+    return safe
+
+
+def _assert_inside_skills_dir(full_path):
+    """Belt-and-suspenders: resolve the final path and verify it stays in SKILLS_DIR."""
+    abs_skills = os.path.abspath(SKILLS_DIR)
+    abs_target = os.path.abspath(full_path)
+    # Must start with skills dir + separator (to prevent prefix-match tricks)
+    if not abs_target.startswith(abs_skills + os.sep):
+        raise ValueError(f"Path traversal attempt blocked: {full_path}")
+    return abs_target
+
+
 def skill_path(name):
-    safe = name.replace("..", "").replace("/", "").replace("\\", "")
-    return os.path.join(SKILLS_DIR, safe + ".nova")
+    safe = _safe_skill_name(name)
+    return _assert_inside_skills_dir(os.path.join(SKILLS_DIR, safe + ".nova"))
 
 
 def sidecar_path(name):
-    safe = name.replace("..", "").replace("/", "").replace("\\", "")
-    return os.path.join(SKILLS_DIR, safe + ".meta.json")
+    safe = _safe_skill_name(name)
+    return _assert_inside_skills_dir(os.path.join(SKILLS_DIR, safe + ".meta.json"))
 
 
 def read_sidecar(name):

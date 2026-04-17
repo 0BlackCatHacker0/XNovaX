@@ -428,10 +428,15 @@ impl TernaryMatrix {
     //
     // Crossover: use Strassen for N >= 81 (3^4), naive below.
     // --------------------------------------------------------
+    /// NOTE: Despite the historical name, this currently runs NAIVE O(N^3)
+    /// ternary matmul — the Strassen recursion (M1..M7 products) was never
+    /// implemented in `strassen_recurse`. Reports itself honestly as
+    /// "naive_ternary_fallback" in MatmulStats.algorithm. If you need real
+    /// Strassen behavior, implement the recursive sub-matrix splits first.
     pub fn matmul_strassen(
         a: &[i32],
         b: &TernaryMatrix,
-        n: usize, // must be square N×N for Strassen
+        n: usize,
     ) -> (Vec<i32>, MatmulStats) {
         assert_eq!(a.len(), n * n);
         assert_eq!(b.rows, n);
@@ -451,10 +456,9 @@ impl TernaryMatrix {
         let ternary_ops = total_add + total_sub;
         let fp16_flops = 2 * total;
         let zero_pct = (total_skip as f64 / total as f64) * 100.0;
-        // Strassen effective speedup accounts for reduced multiply count
-        let strassen_factor = (n as f64).powf(2.807) / (n as f64).powi(3);
+        // Actual complexity is O(N^3) — no Strassen speedup applied.
         let speedup = if ternary_ops > 0 {
-            fp16_flops as f64 / (ternary_ops as f64 * 1.5) / strassen_factor.max(0.5)
+            fp16_flops as f64 / (ternary_ops as f64 * 1.5)
         } else {
             f64::INFINITY
         };
@@ -470,7 +474,8 @@ impl TernaryMatrix {
             fp16_flops,
             ternary_ops,
             speedup_vs_fp16: speedup,
-            algorithm: "strassen_ternary".into(),
+            // Report honestly: this is naive, not Strassen.
+            algorithm: "naive_ternary_fallback".into(),
         };
 
         (c, stats)

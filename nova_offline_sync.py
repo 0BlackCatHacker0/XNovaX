@@ -78,10 +78,8 @@ class SyncState:
             tmp = STATE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            # Atomic-ish rename on Windows
-            if os.path.exists(STATE_FILE):
-                os.remove(STATE_FILE)
-            os.rename(tmp, STATE_FILE)
+            # os.replace is ATOMIC on Windows NTFS — no gap where file is missing
+            os.replace(tmp, STATE_FILE)
         except Exception as e:
             print("[SYNC] Failed to save state: %s" % str(e))
 
@@ -321,7 +319,7 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "localhost")
+        self.send_header("Access-Control-Allow-Origin", "http://localhost:9999")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
@@ -339,7 +337,7 @@ class SyncHandler(http.server.BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "localhost")
+        self.send_header("Access-Control-Allow-Origin", "http://localhost:9999")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()

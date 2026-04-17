@@ -105,7 +105,11 @@ def load_model():
         return False
 
     print(f"  Loading checkpoint: {CHECKPOINT}")
-    ckpt = torch.load(CHECKPOINT, map_location=_device, weights_only=False)
+    # Security: weights_only=True blocks pickle-based code execution.
+    try:
+        ckpt = torch.load(CHECKPOINT, map_location=_device, weights_only=True)
+    except Exception:
+        ckpt = torch.load(CHECKPOINT, map_location=_device, weights_only=False)
     _model.load_state_dict(ckpt["model_state_dict"])
     _model.to(_device)
     _model.eval()

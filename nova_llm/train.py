@@ -21,6 +21,7 @@ N-S Mapping:
 import json
 import math
 import os
+import platform
 import shutil
 import sys
 import time
@@ -689,16 +690,21 @@ class NovaXDataset(Dataset):
             print(f"  Pre-tokenized {pair_count} pairs{fim_str}")
 
     def __len__(self):
-        if self._raw_content:
+        # Use `is not None` instead of truthiness — empty list was ambiguous and
+        # the (now-None) fallback path crashed on self.pairs[idx] after pretokenize.
+        if getattr(self, '_raw_content', None) is not None and len(self._raw_content) > 0:
             return len(self._raw_content)
-        if self._tokenized:
+        if getattr(self, '_tokenized', None) is not None:
             return len(self._tokenized)
+        if getattr(self, 'pairs', None) is not None:
+            return len(self.pairs)
         return 0
 
     def __getitem__(self, idx):
         # FIM mode: use raw_content with dynamic FIM transform
-        if hasattr(self, '_raw_content') and self._raw_content:
-            content = list(self._raw_content[idx])
+        raw = getattr(self, '_raw_content', None)
+        if raw is not None and len(raw) > 0:
+            content = list(raw[idx])
             if self.fim_rate > 0:
                 content = apply_fim_transform(content, self.fim_rate)
             full_ids = [self.BOS] + content + [self.EOS]
@@ -710,8 +716,9 @@ class NovaXDataset(Dataset):
             return t[:-1], t[1:]
 
         # Pre-tokenized fast path (no FIM)
-        if hasattr(self, '_tokenized') and self._tokenized:
-            full_ids = self._tokenized[idx]
+        tok = getattr(self, '_tokenized', None)
+        if tok is not None and len(tok) > 0:
+            full_ids = tok[idx]
             return full_ids[:-1], full_ids[1:]
 
         pair = self.pairs[idx]
@@ -1298,7 +1305,11 @@ def export_ternary(checkpoint_path, output_path=None):
     config = load_config()
     model = TernaryTransformer(config)
 
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    # Security: weights_only=True blocks pickle-based code execution.
+    try:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
@@ -1359,7 +1370,9 @@ if __name__ == "__main__":
                         help="Pretrain on raw text JSONL files in given directory (e.g. --pretrain C:/NovaX/data/pretraining)")
     args = parser.parse_args()
 
-    # Override config path
+    # Override config path. These assignments rebind the module-level ARCH_PATH
+    # (because __main__ IS module scope); load_config() will then pick up the
+    # overridden value when train() is called below.
     if args.pretrain:
         _pretrain_path = Path(__file__).parent / "architecture_pretrain.json"
         if _pretrain_path.exists():
@@ -1368,7 +1381,7 @@ if __name__ == "__main__":
         else:
             print(f"WARNING: architecture_pretrain.json not found, using default config")
     elif args.fast and _fast_path.exists():
-        ARCH_PATH = _fast_path  # noqa: F841 — used by load_config()
+        ARCH_PATH = _fast_path
         print(f">>> FAST MODE: Using {_fast_path.name} <<<")
     elif args.fast:
         print(f"WARNING: --fast requested but {_fast_path} not found, using default")

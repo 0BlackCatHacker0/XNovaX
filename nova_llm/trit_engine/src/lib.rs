@@ -237,6 +237,12 @@ pub extern "C" fn trit_matmul_simd(
         return -1;
     }
 
+    // Reject negative dimensions — `as usize` on a negative i32 yields huge values
+    // that cause UB in slice::from_raw_parts.
+    if m < 0 || k < 0 || n < 0 {
+        return -2;
+    }
+
     let m = m as usize;
     let k = k as usize;
     let n = n as usize;
@@ -297,8 +303,10 @@ fn trit_dot(input_row: &[f32], weight_col_packed: &[u8], k: usize) -> f32 {
 
     // Process full 5-trit chunks
     for chunk_idx in 0..full_chunks {
-        let byte_val = weight_col_packed[chunk_idx] as usize;
-        // Safety: byte_val < 243 guaranteed by valid TZip encoding
+        // Mask to 0..242 to keep within LUT bounds even if corrupted/malformed input.
+        // Valid TZip bytes are 0..=242; the `% 243` keeps us safe from UB if someone
+        // hands us a byte in 243..=255 (the wasted bit patterns in u8).
+        let byte_val = (weight_col_packed[chunk_idx] as usize) % 243;
         let trits = unsafe { TRIT_LUT.get_unchecked(byte_val) };
         let base = chunk_idx * 5;
 
@@ -315,7 +323,7 @@ fn trit_dot(input_row: &[f32], weight_col_packed: &[u8], k: usize) -> f32 {
 
     // Process remaining trits
     if remainder > 0 {
-        let byte_val = weight_col_packed[full_chunks] as usize;
+        let byte_val = (weight_col_packed[full_chunks] as usize) % 243;
         let trits = unsafe { TRIT_LUT.get_unchecked(byte_val) };
         let base = full_chunks * 5;
         for r in 0..remainder {
@@ -349,6 +357,11 @@ pub extern "C" fn trit_matmul(
 ) -> i32 {
     if input.is_null() || weights.is_null() || output.is_null() || scales.is_null() {
         return -1;
+    }
+
+    // Reject negative dimensions — `as usize` on a negative i32 yields huge values.
+    if m < 0 || k < 0 || n < 0 {
+        return -2;
     }
 
     let m = m as usize;
@@ -474,6 +487,11 @@ pub extern "C" fn trit_quantize_weights(
 ) -> i32 {
     if weights.is_null() || packed.is_null() || scales.is_null() {
         return -1;
+    }
+
+    // Reject negative dimensions — `as usize` on a negative i32 yields huge values.
+    if k < 0 || n < 0 {
+        return -2;
     }
 
     let k = k as usize;
@@ -677,7 +695,8 @@ pub extern "C" fn trit_unpack_kv(
             let remainder = hd % 5;
 
             for chunk in 0..full_chunks {
-                let byte_val = pack_row[chunk] as usize;
+                // Mask to 0..242 to prevent UB from malformed bytes (243..=255).
+                let byte_val = (pack_row[chunk] as usize) % 243;
                 let trits = unsafe { TRIT_LUT.get_unchecked(byte_val) };
                 let base = out_offset + chunk * 5;
                 unsafe {
@@ -690,7 +709,7 @@ pub extern "C" fn trit_unpack_kv(
             }
 
             if remainder > 0 {
-                let byte_val = pack_row[full_chunks] as usize;
+                let byte_val = (pack_row[full_chunks] as usize) % 243;
                 let trits = unsafe { TRIT_LUT.get_unchecked(byte_val) };
                 let base = out_offset + full_chunks * 5;
                 for r in 0..remainder {
@@ -709,7 +728,13 @@ pub extern "C" fn trit_unpack_kv(
 // Engine info
 // ---------------------------------------------------------------------------
 
-static ENGINE_INFO: &[u8] = b"trit_engine v1.1.0 | NovaX LLM | zero-multiply ternary matmul | TZip(3^5=243) LUT decode | AVX2 SIMD + tiled matmul | rayon parallel | embed=768 heads=13 layers=13 vocab=32768\0";
+// Version is pulled from Cargo.toml at compile time so it stays in sync.
+static ENGINE_INFO: &[u8] = concat!(
+    "trit_engine v", env!("CARGO_PKG_VERSION"),
+    " | NovaX LLM | zero-multiply ternary matmul | TZip(3^5=243) LUT decode",
+    " | AVX2 SIMD + tiled matmul | rayon parallel",
+    " | embed=768 heads=13 layers=13 vocab=32768\0"
+).as_bytes();
 
 /// Returns a static C string with engine info.
 #[no_mangle]

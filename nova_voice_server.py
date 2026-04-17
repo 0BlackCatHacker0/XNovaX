@@ -215,8 +215,14 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
         communicate = edge_tts.Communicate(text, voice, rate=rate)
         await communicate.save(output_path)
 
-print(f"NovaX Neural Voice Server v1.1 on port {PORT}")
-print(f"Voice: {VOICE} | Audio dir: {AUDIO_DIR}")
-print("Endpoints: /speak, /voice/query, /set-voice, /voices, /audio/*, /health")
-server = http.server.HTTPServer(("127.0.0.1", PORT), VoiceHandler)
-server.serve_forever()
+def main():
+    """Start the voice server. Guarded so imports don't auto-start it."""
+    print(f"NovaX Neural Voice Server v1.1 on port {PORT}")
+    print(f"Voice: {VOICE} | Audio dir: {AUDIO_DIR}")
+    print("Endpoints: /speak, /voice/query, /set-voice, /voices, /audio/*, /health")
+    server = http.server.HTTPServer(("127.0.0.1", PORT), VoiceHandler)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

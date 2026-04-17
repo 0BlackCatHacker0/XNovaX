@@ -196,7 +196,9 @@ class CachedInference:
             scores = scores.masked_fill(~causal_mask, float("-inf"))
             weights = F.softmax(scores, dim=-1)
             out = torch.matmul(weights, v)
-            out = out.transpose(1, 2).contiguous().view(B, T, attn.inner_dim)
+            # GQA uses q_dim; MHA uses inner_dim. Pick whichever the layer exposes.
+            _out_dim = getattr(attn, 'q_dim', None) or getattr(attn, 'inner_dim', None)
+            out = out.transpose(1, 2).contiguous().view(B, T, _out_dim)
             x = x + layer.attn_drop(attn.out_proj(out))
 
             # FFN
@@ -271,7 +273,9 @@ class CachedInference:
             # No masking needed -- single query token attends to all past
             weights = F.softmax(scores, dim=-1)
             out = torch.matmul(weights, v_full)
-            out = out.transpose(1, 2).contiguous().view(B, T_new, attn.inner_dim)
+            # GQA uses q_dim; MHA uses inner_dim. Pick whichever the layer exposes.
+            _out_dim = getattr(attn, 'q_dim', None) or getattr(attn, 'inner_dim', None)
+            out = out.transpose(1, 2).contiguous().view(B, T_new, _out_dim)
             x = x + layer.attn_drop(attn.out_proj(out))
 
             # FFN

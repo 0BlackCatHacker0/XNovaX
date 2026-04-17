@@ -268,10 +268,9 @@ class DreamJournal:
             tmp_path = self.path.with_suffix(".tmp")
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            # Atomic rename for crash safety
-            if self.path.exists():
-                self.path.unlink()
-            tmp_path.rename(self.path)
+            # Path.replace() == os.replace() — ATOMIC on Windows.
+            # Previous unlink+rename had a crash window where the file was missing.
+            tmp_path.replace(self.path)
         except Exception as e:
             print(f"[DREAM] Journal save error: {e}")
 

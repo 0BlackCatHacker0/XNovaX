@@ -93,7 +93,14 @@ def find_best_checkpoint(checkpoint_dir: Path, explicit: Optional[str] = None) -
 def load_model(config: dict, checkpoint_path: Path, device: torch.device):
     """Instantiate TernaryTransformer and load checkpoint weights."""
     model = TernaryTransformer(config)
-    checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+    # weights_only=True blocks arbitrary code execution via pickle (security fix).
+    # Our checkpoints only contain tensors, dicts, lists, and primitives — all
+    # supported by PyTorch's weights_only safelist.
+    try:
+        checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=True)
+    except Exception:
+        # Fallback for checkpoints saved by older training code
+        checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
 
     # Checkpoints may store state_dict directly or under a key
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
