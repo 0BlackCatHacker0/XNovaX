@@ -2216,73 +2216,119 @@ pub fn call_builtin(name: &str, args: &[Value]) -> Option<Value> {
         }
 
         // ── HTTP Methods (PUT, DELETE, PATCH) ──
+        // SECURITY: fixed command injection — previously used `cmd /c` with
+        // format!()-interpolated URL/body. Now invokes curl.exe directly with
+        // separate args, body via stdin — no shell parsing, no escape hazard.
         "http_put" => {
+            use std::io::Write;
             let url = args.first().unwrap_or(&Value::Null).to_display();
             let body = args.get(1).unwrap_or(&Value::Str("".into())).to_display();
             let timeout_ms = args.get(2).map(|v| v.to_int() as u64).unwrap_or(30_000);
-            let cmd = format!("curl -s -X PUT -H \"Content-Type: application/json\" -d \"{}\" --connect-timeout {} \"{}\"",
-                body.replace("\"", "\\\""),
-                timeout_ms / 1000,
-                url);
-            match std::process::Command::new("cmd").args(&["/c", &cmd]).output() {
+            let timeout_secs = (timeout_ms / 1000).max(1);
+            let curl_exe = if std::path::Path::new("C:\\Windows\\System32\\curl.exe").exists() {
+                "C:\\Windows\\System32\\curl.exe"
+            } else { "curl" };
+            let mut child = match std::process::Command::new(curl_exe)
+                .arg("-s").arg("-X").arg("PUT")
+                .arg("-H").arg("Content-Type: application/json")
+                .arg("--connect-timeout").arg(timeout_secs.to_string())
+                .arg("--data-binary").arg("@-")
+                .arg(&url)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn() {
+                Ok(c) => c,
+                Err(e) => return Some(Value::Dict(vec![
+                    ("ok".into(), Value::Trit(-1)),
+                    ("error".into(), Value::Str(e.to_string())),
+                ])),
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(body.as_bytes());
+            }
+            match child.wait_with_output() {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let mut pairs = Vec::new();
-                    pairs.push(("ok".into(), Value::Trit(if output.status.success() { 1 } else { -1 })));
-                    pairs.push(("body".into(), Value::Str(stdout)));
-                    pairs.push(("status".into(), Value::Int(if output.status.success() { 200 } else { 500 })));
-                    Some(Value::Dict(pairs))
+                    Some(Value::Dict(vec![
+                        ("ok".into(), Value::Trit(if output.status.success() { 1 } else { -1 })),
+                        ("body".into(), Value::Str(stdout)),
+                        ("status".into(), Value::Int(if output.status.success() { 200 } else { 500 })),
+                    ]))
                 }
-                Err(e) => {
-                    let mut pairs = Vec::new();
-                    pairs.push(("ok".into(), Value::Trit(-1)));
-                    pairs.push(("error".into(), Value::Str(e.to_string())));
-                    Some(Value::Dict(pairs))
-                }
+                Err(e) => Some(Value::Dict(vec![
+                    ("ok".into(), Value::Trit(-1)),
+                    ("error".into(), Value::Str(e.to_string())),
+                ])),
             }
         }
         "http_delete" => {
+            // SECURITY: fixed command injection — curl args passed directly.
             let url = args.first().unwrap_or(&Value::Null).to_display();
             let timeout_ms = args.get(1).map(|v| v.to_int() as u64).unwrap_or(30_000);
-            let cmd = format!("curl -s -X DELETE --connect-timeout {} \"{}\"", timeout_ms / 1000, url);
-            match std::process::Command::new("cmd").args(&["/c", &cmd]).output() {
+            let timeout_secs = (timeout_ms / 1000).max(1);
+            let curl_exe = if std::path::Path::new("C:\\Windows\\System32\\curl.exe").exists() {
+                "C:\\Windows\\System32\\curl.exe"
+            } else { "curl" };
+            match std::process::Command::new(curl_exe)
+                .arg("-s").arg("-X").arg("DELETE")
+                .arg("--connect-timeout").arg(timeout_secs.to_string())
+                .arg(&url)
+                .output() {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let mut pairs = Vec::new();
-                    pairs.push(("ok".into(), Value::Trit(if output.status.success() { 1 } else { -1 })));
-                    pairs.push(("body".into(), Value::Str(stdout)));
-                    Some(Value::Dict(pairs))
+                    Some(Value::Dict(vec![
+                        ("ok".into(), Value::Trit(if output.status.success() { 1 } else { -1 })),
+                        ("body".into(), Value::Str(stdout)),
+                    ]))
                 }
-                Err(e) => {
-                    let mut pairs = Vec::new();
-                    pairs.push(("ok".into(), Value::Trit(-1)));
-                    pairs.push(("error".into(), Value::Str(e.to_string())));
-                    Some(Value::Dict(pairs))
-                }
+                Err(e) => Some(Value::Dict(vec![
+                    ("ok".into(), Value::Trit(-1)),
+                    ("error".into(), Value::Str(e.to_string())),
+                ])),
             }
         }
         "http_patch" => {
+            // SECURITY: fixed command injection — body via stdin, args direct.
+            use std::io::Write;
             let url = args.first().unwrap_or(&Value::Null).to_display();
             let body = args.get(1).unwrap_or(&Value::Str("".into())).to_display();
             let timeout_ms = args.get(2).map(|v| v.to_int() as u64).unwrap_or(30_000);
-            let cmd = format!("curl -s -X PATCH -H \"Content-Type: application/json\" -d \"{}\" --connect-timeout {} \"{}\"",
-                body.replace("\"", "\\\""),
-                timeout_ms / 1000,
-                url);
-            match std::process::Command::new("cmd").args(&["/c", &cmd]).output() {
+            let timeout_secs = (timeout_ms / 1000).max(1);
+            let curl_exe = if std::path::Path::new("C:\\Windows\\System32\\curl.exe").exists() {
+                "C:\\Windows\\System32\\curl.exe"
+            } else { "curl" };
+            let mut child = match std::process::Command::new(curl_exe)
+                .arg("-s").arg("-X").arg("PATCH")
+                .arg("-H").arg("Content-Type: application/json")
+                .arg("--connect-timeout").arg(timeout_secs.to_string())
+                .arg("--data-binary").arg("@-")
+                .arg(&url)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn() {
+                Ok(c) => c,
+                Err(e) => return Some(Value::Dict(vec![
+                    ("ok".into(), Value::Trit(-1)),
+                    ("error".into(), Value::Str(e.to_string())),
+                ])),
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(body.as_bytes());
+            }
+            match child.wait_with_output() {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                    let mut pairs = Vec::new();
-                    pairs.push(("ok".into(), Value::Trit(if output.status.success() { 1 } else { -1 })));
-                    pairs.push(("body".into(), Value::Str(stdout)));
-                    Some(Value::Dict(pairs))
+                    Some(Value::Dict(vec![
+                        ("ok".into(), Value::Trit(if output.status.success() { 1 } else { -1 })),
+                        ("body".into(), Value::Str(stdout)),
+                    ]))
                 }
-                Err(e) => {
-                    let mut pairs = Vec::new();
-                    pairs.push(("ok".into(), Value::Trit(-1)));
-                    pairs.push(("error".into(), Value::Str(e.to_string())));
-                    Some(Value::Dict(pairs))
-                }
+                Err(e) => Some(Value::Dict(vec![
+                    ("ok".into(), Value::Trit(-1)),
+                    ("error".into(), Value::Str(e.to_string())),
+                ])),
             }
         }
 
